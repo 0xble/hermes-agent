@@ -224,7 +224,7 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
         persistence.bindings.bind_api(epoch=authority.epoch, binding=binding, gate=authority.gate_refusal(),
                                       walked_from=walked_from)
     yield write
-    return restore_api_session(authority, session_id)
+    return (yield partial(restore_api_session, authority, session_id))
 
 
 def _heal_replacement(persistence, caller, holder):

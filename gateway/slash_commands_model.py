@@ -508,7 +508,7 @@ class GatewayModelCommandsMixin:
         return ContextNotice(reply) if global_error is None else reply
 
     def _model_switch_context(
-        self, source, session_key: str, *, profile_home=None, **fields,
+        self, source, session_key: str, *, profile_home=None, rehydrate=True, **fields,
     ) -> _ModelSwitchContext:
         """Context for a model switch on ``session_key``: current route from the owning profile's
         config, with any session override applied (one builder for every switch entry point). The
@@ -528,7 +528,7 @@ class GatewayModelCommandsMixin:
             self._serving_channel_config(source) if source is not None else None, source)
         if _ch_model:
             ctx.apply_override({"model": _ch_model, **(_ch_route or ({"provider": _ch_forced} if _ch_forced else {}))})
-        if session_key:
+        if session_key and rehydrate:
             self._rehydrate_session_model_override(session_key)
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         return ctx
@@ -547,7 +547,9 @@ class GatewayModelCommandsMixin:
         profile_home = None
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             profile_home = self._resolve_profile_home_for_source(source)
-        ctx = self._model_switch_context(source, session_key, profile_home=profile_home, persist_global=False)
+        await self._rehydrate_session_model_override_async(session_key)
+        ctx = self._model_switch_context(source, session_key, profile_home=profile_home,
+                                         rehydrate=False, persist_global=False)
         result, error = await self._perform_model_switch(ctx, model, provider, source)
         if error is not None:
             return None, None, error
@@ -960,8 +962,9 @@ class GatewayModelCommandsMixin:
             return ContextNotice(t("gateway.model.role_set", role=role))
 
         if route.model:
+            await self._rehydrate_session_model_override_async(session_key)
             ctx = self._model_switch_context(source, session_key, profile_home=profile_home,
-                                             persist_global=False)
+                                             rehydrate=False, persist_global=False)
             result, error = await self._perform_model_switch(ctx, route.model, route.provider, source)
             if error is not None:
                 return error
@@ -1053,8 +1056,10 @@ class GatewayModelCommandsMixin:
             "session" if request.is_session or requested_global or effective_global else
             "temporary" if attended_enabled or pick_ttl else "session"
         )
+        await self._rehydrate_session_model_override_async(session_key)
         ctx = self._model_switch_context(
             source, session_key, profile_home=profile_home,
+            rehydrate=False,
             persist_global=effective_global,
             one_turn=request.is_once,
             reasoning_effort=request.reasoning_effort,

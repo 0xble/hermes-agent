@@ -67,7 +67,7 @@ A loop ends when any of these fires:
 
 | Condition | How |
 |---|---|
-| The agent decides it's done | The wakeup prompt teaches the agent to end its reply with `LOOP_COMPLETE` on its own line when the task is finished or moot. |
+| The agent decides it's done | The agent ends its reply with `LOOP_COMPLETE` on its own line when the task is finished or moot. In messaging gateway sessions this works from loop, goal, relay and ordinary turns for the active loop present when that turn started. A revision, replacement or pause/resume during the turn protects the newer loop. |
 | A run cap | `--times N` — stop after N wakeups. |
 | An evidence-based condition | `--until <condition>` — after each wakeup, the same auxiliary judge that powers `/goal` checks the reply against your condition. If the judge rules the condition unachievable, the loop **pauses** with the reason instead of re-firing until the tick budget (fail-open: a broken judge never wedges the loop). |
 | You | `/loop stop` (or `/loop pause` to keep it around). |

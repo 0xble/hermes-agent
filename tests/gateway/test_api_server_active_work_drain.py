@@ -191,7 +191,7 @@ class TestDrainWaitsForApiWork:
 
         runner._interrupt_running_agents("gateway shutdown")
 
-        agent.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
+        agent.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
 
     @pytest.mark.asyncio
     async def test_drain_still_waits_for_chat_cron_and_api_work(self):
@@ -324,6 +324,19 @@ def _make_async_noop():
     return _noop
 
 
+
+@pytest.mark.asyncio
+async def test_session_stream_disconnect_uses_soft_system_interrupt():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    agent = MagicMock()
+    task = asyncio.create_task(asyncio.sleep(0))
+    await asyncio.sleep(0)
+    adapter._active_run_agents = {"run-1": agent}
+    await adapter._drain_session_stream_task_on_disconnect(
+        "run-1", task, interrupt_message="SSE client disconnected", shield_wait=False)
+    agent.interrupt.assert_called_once_with("SSE client disconnected", interrupt_source="system")
+
+
 class TestRunAgentRegistersForShutdownInterrupt:
     @pytest.mark.asyncio
     async def test_run_agent_registers_and_unregisters_the_agent(self):
@@ -416,7 +429,7 @@ class TestInterruptActiveRuns:
         adapter._active_run_agents = {"run-1": agent}
 
         assert adapter.interrupt_active_runs("gateway shutdown") == 1
-        agent.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
+        agent.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
 
     def test_interrupts_each_agent_exactly_once_across_both_registries(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -430,9 +443,9 @@ class TestInterruptActiveRuns:
         }
 
         assert adapter.interrupt_active_runs("gateway shutdown") == 3
-        shared.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
-        run_only.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
-        turn_only.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
+        shared.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
+        run_only.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
+        turn_only.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
 
     def test_one_bad_agent_does_not_strand_the_others(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
@@ -447,7 +460,7 @@ class TestInterruptActiveRuns:
         }
 
         assert adapter.interrupt_active_runs("gateway shutdown") == 1
-        healthy.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown")
+        healthy.interrupt.assert_called_once_with("gateway shutdown", tool_reason="gateway shutdown", interrupt_source="system")
 
 
 
@@ -548,7 +561,7 @@ class TestShutdownInterruptReachesEveryApiTurn:
 
                     runner._interrupt_running_agents(_INTERRUPT_REASON_GATEWAY_SHUTDOWN)
 
-                    agent.interrupt.assert_called_once_with(_INTERRUPT_REASON_GATEWAY_SHUTDOWN, tool_reason="gateway shutdown")
+                    agent.interrupt.assert_called_once_with(_INTERRUPT_REASON_GATEWAY_SHUTDOWN, tool_reason="gateway shutdown", interrupt_source="system")
                     response = await asyncio.wait_for(request, _TURN_UNBLOCK_TIMEOUT)
                     assert response.status == 200
         finally:
@@ -589,7 +602,7 @@ class TestShutdownInterruptReachesEveryApiTurn:
 
                     runner._interrupt_running_agents(_INTERRUPT_REASON_GATEWAY_SHUTDOWN)
 
-                    agent.interrupt.assert_called_once_with(_INTERRUPT_REASON_GATEWAY_SHUTDOWN, tool_reason="gateway shutdown")
+                    agent.interrupt.assert_called_once_with(_INTERRUPT_REASON_GATEWAY_SHUTDOWN, tool_reason="gateway shutdown", interrupt_source="system")
                     response = await asyncio.wait_for(request, _TURN_UNBLOCK_TIMEOUT)
                     assert response.status == 200
                     await asyncio.wait_for(response.text(), _TURN_UNBLOCK_TIMEOUT)

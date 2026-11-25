@@ -141,7 +141,6 @@ class _ExecApprovalDeclined(RuntimeError):
 from gateway.run_turn_runner_approval import TurnRunner as TurnRunnerApprovalMixin
 
 
-
 def _observed_turn_persist_message(run_message, override, live_text):
     """Retain the clean native-image input when an observed group wraps its live view."""
     if not isinstance(run_message, list):
@@ -236,7 +235,7 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            ctx.track_cleanup_id(str(result.message_id))
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -793,14 +792,8 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
         ctx = self._ctx
-        from gateway.session_policy import policy_for_source
-        # Launch-policy sessions resolve their own frozen or followed route and effort.
-        # Messaging attended routing must not replace that owner's explicit choices.
-        if policy_for_source(runner, ctx.source) is not None:
-            return
-        if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
-            return
-        if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
+        from gateway.run_turn_runner_attended import attended_switch_exempt
+        if isinstance(getattr(agent, "_pinned_fallback_model", None), str) or attended_switch_exempt(runner, ctx, agent):
             return
         def _handoff(*, conversation=None, runner_state=None):
             handoff = getattr(runner, "_handoff_attended_state", None)
@@ -922,6 +915,9 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
                     agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
+                if decision.switched_back and previous_decision is not None:
+                    from hermes_cli.observability.request_usage_ledger import note_attended_switch
+                    note_attended_switch(runner, ctx, agent, previous_decision, model)
             if decision.reasoning_effort:
                 # The committed decision already carries the destination effort. Re-resolving here
                 # would read session state whose handoff to the gateway loop may not have landed yet,
@@ -986,7 +982,8 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         agent.step_callback = ctx._step_callback_sync if (ctx._hooks_ref.loaded_hooks or self._approval_owner is not None) else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
-        from gateway.run_turn_progress import local_viewer_turn
+        agent._gateway_interim_messages_enabled = bool(want_interim_messages)
+        agent._session_interim_assistant_messages_enabled = bool(getattr(ctx, "interim_assistant_messages_enabled", False))
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
         agent.reasoning_callback = None
@@ -1893,11 +1890,6 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
             resolved_route = route_snapshot(runtime_kwargs)
             from gateway.session_api_turn import prepare_api_runtime
             model, runtime_kwargs = prepare_api_runtime(model, runtime_kwargs)
-            if policy and policy.model and not pending_fallback_notice:
-                # The frozen route's model, unless resolution just fell back: the fallback entry's
-                # model is the one this agent must send (#112600).
-                from gateway.session_authorities import active_authority
-                model = policy.current_model(active_authority(runner))
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.
             from gateway.session_cli_turn import one_turn_route
             model, runtime_kwargs = one_turn_route(self, policy, model, runtime_kwargs)
@@ -1908,13 +1900,13 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
-            # but return a failed turn with a stable user-facing recovery message and reason.
+            # Resolution failed before the turn began: raw cause to logs, a stable recovery reply to the user.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
             return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
-                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
+                                  "failed": True, "completed": False, "error": str(exc),
+                                  "pre_execution_runtime_refusal": True}, reason, retryable)
         from gateway.session_authorities import active_authority
         from gateway.session_worker_construct import session_routing
         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing
@@ -1926,18 +1918,17 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         reasoning_config = one_turn_reasoning(self, reasoning_config)
         service_tier = (policy.current_service_tier(runner, ctx.session_key) if policy else
             runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key))
-        from gateway.run_turn_runner_runtime import apply_api_request_options
+        from gateway.run_turn_runner_runtime import apply_api_request_options, attach_preflight_fallback
         # The tier stays turn-local (turn_route): one runner serves concurrent turns of every profile.
         reasoning_config, service_tier = apply_api_request_options(reasoning_config, service_tier)
         runner._reasoning_config = reasoning_config
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs, tier=service_tier)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
-        if pending_fallback_notice:
-            # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
-            agent._pending_fallback_notice = pending_fallback_notice
+        attach_preflight_fallback(agent, preflight_fallback, pending_fallback_notice)
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         # Set every turn (None clears it): a cached agent must not keep a login failure that resolved.
@@ -2009,7 +2000,7 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
             "usage_limit": result.get("usage_limit"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
-            "error": result.get("error"),
+            "interrupt_source": result.get("interrupt_source"), "error": result.get("error"),
             **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),

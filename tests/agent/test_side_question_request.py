@@ -279,6 +279,46 @@ def test_side_call_writes_only_one_usage_row(provider, issued, tmp_path):
     assert {p.name: p.read_bytes() for p in memories.iterdir()} == memory_before
 
 
+def test_side_request_emits_one_ledger_row_for_one_successful_provider_request(provider, issued, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_response",
+        lambda *_args, **_kwargs: events.append("response") or True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_auxiliary",
+        lambda *_args, **_kwargs: events.append("auxiliary") or True,
+    )
+    parent = _make_parent()
+    _run_parent_turn(parent, provider, tool_round=False)
+    before = len(events)
+    provider.replies.append(_response("Ask: why 42?", usage=_usage()))
+    assert redeem_side_question(issued[-1], SIDE_PROMPT, plugin_id="next-prompt") == "Ask: why 42?"
+    assert events[before:] == ["auxiliary"]
+
+
+def test_side_request_emits_one_ledger_row_for_one_failed_provider_request(provider, issued, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_response",
+        lambda *_args, **_kwargs: events.append("response") or True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_error",
+        lambda *_args, **_kwargs: events.append("error") or True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_auxiliary",
+        lambda *_args, **_kwargs: events.append("auxiliary") or True,
+    )
+    parent = _make_parent()
+    _run_parent_turn(parent, provider, tool_round=False)
+    before = len(events)
+    provider.replies.append(RuntimeError("provider failed"))
+    assert redeem_side_question(issued[-1], SIDE_PROMPT, plugin_id="next-prompt") is None
+    assert events[before:] == ["auxiliary"]
+
+
 def test_side_call_bills_the_session_the_token_was_issued_for(provider, issued, tmp_path):
     """The parent's session id can rotate between issue and redeem (``/compress``, a session
     reset): the side call's spend belongs to the session whose turn it replays."""

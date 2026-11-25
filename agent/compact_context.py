@@ -9,6 +9,7 @@ from typing import Any, Optional
 from agent.model_metadata import estimate_messages_tokens_rough
 
 
+MAX_COMPACTION_FOCUS_CHARS = 1500
 _DEFAULT_FLOOR_RATIO = 0.30
 _DEFAULT_COOLDOWN_API_CALLS = 10
 
@@ -64,6 +65,12 @@ def request_compaction(agent: Any, args: dict, *, messages: Optional[list] = Non
     current, threshold = context_usage(agent, messages)
     reason = str(args.get("reason") or "").strip()
     focus = str(args.get("focus") or "").strip()
+    if len(focus) > MAX_COMPACTION_FOCUS_CHARS:
+        return _result(
+            accepted=False,
+            reason=f"focus exceeds {MAX_COMPACTION_FOCUS_CHARS} characters; shorten narration, preserving exact identifiers, paths, decisions and open items, then retry",
+            current=current, threshold=threshold,
+        )
     if not reason:
         return _result(accepted=False, reason="reason is required", current=current, threshold=threshold)
 

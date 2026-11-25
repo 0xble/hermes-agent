@@ -489,6 +489,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**Oturum kimliği:** `{session_id}`"
+    incognito: "**Gizli mod:** {state}"
     title: "**Başlık:** {title}"
     created: "**Oluşturuldu:** {timestamp}"
     last_activity: "**Son etkinlik:** {timestamp}"
@@ -774,6 +775,7 @@ gateway:
     drain_rejected: "⏳ Gateway {action} ve şu anda yeni bir tur kabul etmiyor."
     drain_rejected_new_work: "⏳ Gateway {action} ve şu anda yeni iş kabul etmiyor."
     demoted_tail: " — mesajınız, mevcut iş bitince işlenmek üzere sıraya alındı (her şeyi iptal etmek için /stop kullanın)."
+    deferred_dropped: "⚠️ `/{command}` çalışmadı: Hermes ondan önce yeniden başladı veya yeniden bağlandı. Hâlâ gerekiyorsa tekrar gönderin."
     elapsed_min: "{minutes} dk geçti"
     running_tool: "çalışıyor: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -911,7 +913,7 @@ gateway:
     interrupted_turn: "↻ Hermes durduğu için kesintiye uğradı. Geri döner dönmez buradan otomatik olarak devam edeceğim."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ Gateway başarıyla yeniden başlatıldı. Oturumunuz devam ediyor."
+    restarted: "♻ Gateway başarıyla yeniden başlatıldı."
     online: "♻️ Gateway çevrimiçi — Hermes geri döndü ve hazır."
     db_corrupt: "⚠️ Oturum veritabanında bozulma tespit edildi. Mesajlar kalıcı olarak kaydedilmeyebilir. Kurtarma seçenekleri:\n1. `hermes {profile_arg}doctor --fix` çalıştırın\n2. Gateway'i durdurun, ardından şununla kurtarın:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (kurtarılabilir olduğunu bildirirse) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — kurtarma önce hasarlı dosyanın anlık görüntüsünü alır; canlı state.db üzerinde `sqlite3 ... \".recover\"` ÇALIŞTIRMAYIN, açığı olan bir sqlite3 CLI dosyayı daha da bozabilir\n3. {backups_dir}/ içindeki bir yedekten geri yükleyin\nTemizlenmiş tanılama için `hermes {profile_arg}doctor` çalıştırın."
     db_fts_corrupt: "⚠️ Oturum veritabanı yalnızca arama dizinini (FTS5) etkileyen bir bozulma hatası bildirdi; mesaj tabloları hasarlı değil. Onarılana kadar mesajlar kalıcı olarak kaydedilmeyebilir: `hermes {profile_arg}doctor --fix` çalıştırıp gateway'i yeniden başlatın. `hermes {profile_arg}doctor` hasarı doğrulamadıkça kurtarma araçlarını çalıştırmayın veya yedek geri yüklemeyin."
@@ -3621,7 +3623,7 @@ explainer:
     partial_stream_recovery: "akış erken kesildi ve yalnızca kısmi bir yanıt kurtarılabildi. Kaldığı yerden devam etmesi için `continue` gönderin."
     fallback_prior_turn_content: "bu turda yeni içerik üretilmedi; kurtarılan önceki bağlam gösteriliyor. Yeniden denemek için `continue` gönderin."
     redirect_restart_limit_exceeded: "istek her denemede yeni bir düzeltmeyle iptal edildiği için tur, sonsuza dek yeniden denemek yerine durduruldu. Son düzeltmeniz bir sonraki mesaj olarak kuyruğa alındı."
-    rebuilt_restart_limit_exceeded: "yedek zincirindeki her sağlayıcı sürekli bir sonrakine devrettiği için tur, sonsuza dek yeniden denemek yerine durduruldu. `continue` gönderin veya sağlayıcı değiştirin."
+    rebuilt_restart_limit_exceeded: "rota değiştirme sınırına ulaşıldı. İstenen rotalar: {routes}. Yapılandırılmış diğer rotalar denenmemiş olabilir. `continue` gönderin veya sağlayıcı değiştirin."
     budget_exhausted: "tur başına yineleme/maliyet bütçesi nihai bir yanıt üretilmeden tükendi. Devam etmek için `continue` gönderin."
     ollama_runtime_context_too_small: "yerel modelin bağlam penceresi işi bitirmek için çok küçüktü. Bağlam boyutunu artırın veya daha büyük bir model kullanın."
     pending_tool_result: "tur, bir araç sonucu hâlâ beklenirken durdu ve model devam metni üretmedi. Özetlemesi için `continue` gönderin."
@@ -3648,6 +3650,9 @@ explainer:
     failed: "başarısız"
   shared:
     and_more: "  • … ve {count} tane daha"
+    no_routes_requested: "kayıt yok"
+    attempted_routes: "İstenen rotalar: {routes}."
+    chain_exhausted: "Yedek zinciri tükendi; uygun rota kalmadı."
     the_model: "Model"
 tips:
   t001: "/bg <prompt> bir görevi ayrı bir oturumda çalıştırır, mevcut oturumunuz boş kalır; /btw <question> ise bu konuşma hakkındaki yan bir soruyu konuşmayı bölmeden yanıtlar."

@@ -2,12 +2,13 @@
 
 A continuing session replays its stored system prompt verbatim so the provider prefix cache stays
 warm, which also means SOUL.md, skills and project-context edits never reach it before ``/new``.
-``hermes sessions refresh-prompts`` records a refresh epoch in the profile's state.db. At the start
-of the session's next turn this module compares that epoch with the one stamped when the session's
-prompt was built (``model_config``) and, when the prompt is older, rebuilds it once through the
-normal builder: history, session id and the tools[] pin are kept, ``on_session_start`` does not
-fire, and the new bytes plus the epoch are persisted so every later turn restores them verbatim.
-One prefix-cache break per request.
+``hermes sessions refresh-prompts`` records a refresh epoch in the profile's state.db
+(``hermes_state_prompt_refresh``). At the start of the session's next turn this module compares
+that epoch with the one stamped when the session's prompt was built (``model_config``) and, when
+the prompt is older, rebuilds it once through the normal builder: history and session id are kept,
+the existing tools[] pin is kept except that an explicit gateway delegation mode is converged at
+this cache-break boundary, ``on_session_start`` does not fire, and the new bytes plus the epoch are
+persisted so every later turn restores them verbatim. One prefix-cache break per request.
 
 No request recorded means the stored prompt is reused exactly as before: the only extra work is
 one ``state_meta`` point read. Nothing watches files and nothing changes mid-turn.
@@ -90,6 +91,7 @@ def rebuild_for_refresh(agent: Any, system_message: Any, conversation_history: A
     from agent.agent_init_session import agent_interface
     from agent.prompt_builder import clear_skills_system_prompt_cache
     from agent.surface_switch import stage_surface_switch_note
+    from tools.mcp_tool_agent import refresh_agent_delegation_tool
     from hermes_cli.observability.shared_metrics_efficiency import record_cache_break
 
     logger.info("Operator requested a system prompt refresh (epoch %d) for session %s; rebuilding it "
@@ -100,6 +102,9 @@ def rebuild_for_refresh(agent: Any, system_message: Any, conversation_history: A
     agent._auto_load_skills_resolved = False  # pinned skills (skills.auto_load) re-read too
     # As in the Bot Chat capability refresh: build the index from disk, not a cached render.
     clear_skills_system_prompt_cache(clear_snapshot=True)
+    # This boundary already breaks the prompt prefix, so converge the cached
+    # delegate_task schema and its dispatch mode from current gateway config.
+    refresh_agent_delegation_tool(agent)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
     record_cache_break(agent, "system_prompt_rebuild")
     stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)

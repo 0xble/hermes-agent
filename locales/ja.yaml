@@ -489,6 +489,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**セッション ID:** `{session_id}`"
+    incognito: "**シークレット:** {state}"
     title: "**タイトル:** {title}"
     created: "**作成日時:** {timestamp}"
     last_activity: "**最終アクティビティ:** {timestamp}"
@@ -774,6 +775,7 @@ gateway:
     drain_rejected: "⏳ ゲートウェイは{action}のため、現在は次のターンを受け付けていません。"
     drain_rejected_new_work: "⏳ ゲートウェイは{action}のため、現在は新しい作業を受け付けていません。"
     demoted_tail: " — メッセージは完了後に処理されるようキューしました (/stop ですべてキャンセルできます)。"
+    deferred_dropped: "⚠️ `/{command}` は実行されませんでした：その前に Hermes が再起動または再接続しました。まだ必要なら再送してください。"
     elapsed_min: "{minutes} 分経過"
     running_tool: "実行中: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -911,7 +913,7 @@ gateway:
     interrupted_turn: "↻ Hermes が停止したため中断されました。戻り次第、ここで自動的に続行します。"
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ ゲートウェイの再起動に成功しました。セッションは継続します。"
+    restarted: "♻ ゲートウェイの再起動に成功しました。"
     online: "♻️ ゲートウェイがオンラインです — Hermes が復帰し、準備完了です。"
     db_corrupt: "⚠️ セッションデータベースの破損を検出しました。メッセージが永続化されない可能性があります。復旧オプション:\n1. `hermes {profile_arg}doctor --fix` を実行\n2. ゲートウェイを停止し、次で復旧:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (復旧可能と報告された場合) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 復旧は先に破損ファイルのスナップショットを取ります。稼働中の state.db に対して `sqlite3 ... \".recover\"` を実行しないでください。脆弱な sqlite3 CLI はさらに破損させる可能性があります\n3. {backups_dir}/ のバックアップから復元\nサニタイズ済みの診断情報は `hermes {profile_arg}doctor` で確認できます。"
     db_fts_corrupt: "⚠️ セッションデータベースが検索インデックス (FTS5) に限定された破損エラーを報告しました。メッセージテーブルは損傷していません。修復されるまでメッセージが永続化されない可能性があります: `hermes {profile_arg}doctor --fix` を実行し、ゲートウェイを再起動してください。`hermes {profile_arg}doctor` が損傷を確認しない限り、復旧ツールの実行やバックアップからの復元は行わないでください。"
@@ -3621,7 +3623,7 @@ explainer:
     partial_stream_recovery: "ストリーミングが途中で停止し、部分的な応答のみ復元できました。`continue` を送信すると停止した箇所から再開します。"
     fallback_prior_turn_content: "このターンでは新しい内容が生成されなかったため、復元した以前のコンテキストを表示しています。`continue` を送信して再試行してください。"
     redirect_restart_limit_exceeded: "毎回の試行が新しい修正指示によってキャンセルされたため、無限に再試行せずにターンを停止しました。最後の修正指示は次のメッセージとしてキューに入っています。"
-    rebuilt_restart_limit_exceeded: "フォールバックチェーン内のすべてのプロバイダーがフェイルオーバーを繰り返したため、無限に再試行せずにターンを停止しました。`continue` を送信するか、プロバイダーを切り替えてください。"
+    rebuilt_restart_limit_exceeded: "ルート切り替えの上限に達しました。リクエストしたルート: {routes}。設定済みの他のルートは試されていない可能性があります。`continue` を送信するか、プロバイダーを切り替えてください。"
     budget_exhausted: "最終回答の前に、ターンあたりのイテレーション/コスト予算を使い切りました。`continue` を送信すると続行します。"
     ollama_runtime_context_too_small: "ローカルモデルのコンテキストウィンドウが小さすぎて完了できませんでした。コンテキストサイズを増やすか、より大きなモデルを使用してください。"
     pending_tool_result: "ツール結果が保留中のままターンが停止し、モデルは後続のテキストを生成しませんでした。`continue` を送信すると要約させることができます。"
@@ -3648,6 +3650,9 @@ explainer:
     failed: "失敗"
   shared:
     and_more: "  • … 他 {count} 件"
+    no_routes_requested: "記録なし"
+    attempted_routes: "リクエストしたルート: {routes}。"
+    chain_exhausted: "フォールバックチェーンを使い切りました。利用可能なルートは残っていません。"
     the_model: "モデル"
 tips:
   t001: "/bg <prompt> は現在のセッションを空けたまま別セッションでタスクを実行します。/btw <question> は会話を中断せずに、この会話に関する補足の質問に答えます。"

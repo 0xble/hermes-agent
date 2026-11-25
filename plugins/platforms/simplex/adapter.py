@@ -717,6 +717,7 @@ def interactive_setup() -> None:
 def register(ctx) -> None:
     ctx.register_platform(
         name="simplex", label="SimpleX Chat", adapter_factory=lambda cfg: SimplexAdapter(cfg),
+        adapter_class=SimplexAdapter,
         dashboard_description="Talk to Hermes over SimpleX Chat via a local simplex-chat daemon.",
         docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/simplex",
         check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,

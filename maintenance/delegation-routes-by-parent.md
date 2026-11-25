@@ -7,3 +7,6 @@ options replace `delegation.model_preset`, named custom-subagent routes and the
 `delegation.by_parent` map. Migration v54 removes the keys together with their
 uncensored-parent exception. The main-chat `uncensored` model alias remains.
 Plain delegation uses the plugin's default worker route.
+
+
+Contract tests: none. Retired during the v0.23.1 integration; the record is kept for published trailers.

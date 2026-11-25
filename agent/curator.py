@@ -1136,6 +1136,8 @@ def _run_llm_review(prompt: str) -> dict[str, Any]:
         # write guards (external/bundled/hub) fire; turn_context binds this onto
         # the write-origin ContextVar at turn start.
         review_agent._memory_write_origin = "background_review"
+        # Use the same fork-turn tag as background_review.py for request scheduling.
+        setattr(review_agent, "_turn_origin", "background_review")
         # Seed a shared read-before-write marks store in THIS context before any
         # tool worker spawns: workers run on copied contexts, so a store
         # auto-created later stays private to one worker and every patch is

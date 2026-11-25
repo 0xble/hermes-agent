@@ -1,5 +1,6 @@
 """Tests for gateway/shutdown_flush.py — pending message durability (#72680)."""
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -376,6 +377,86 @@ def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatc
     assert recover_pending_to_db(db) == 1
     assert db.append_message.call_args.kwargs["content"] == "next turn"
     assert list(flush_dir.glob("*.json")) == []
+
+
+
+
+@pytest.mark.parametrize("reason, source", [
+    ("Profile runtime is stopping", "system"),
+    ("Profile stopping", "system"),
+    ("unregistered internal reason", "system"),
+])
+def test_system_interrupt_is_not_preserved_as_a_user_followup(tmp_path, monkeypatch, caplog, reason, source):
+    """Shutdown-owned interrupt text is control flow, never a durable user message."""
+    from gateway.run_turn import GatewayTurnMixin
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+
+        def _take_wake_admitted_before_drain(self, key, adapter):
+            return None
+
+        def _promote_queued_event(self, key, adapter, event):
+            return event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+    adapter = MagicMock()
+    adapter.get_pending_message.return_value = None
+    adapter._pending_messages = {}
+    with caplog.at_level("WARNING"):
+        event, text = asyncio.run(Runner()._run_agent_drain_pending(
+            {"final_response": "", "interrupted": True, "interrupt_message": reason,
+             "interrupt_source": source},
+            adapter, MagicMock(), "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    assert list(flush_dir.glob("*.json")) == []
+
+
+@pytest.mark.parametrize("tool_reason", ["gateway shutdown", None])
+def test_shutdown_does_not_replace_pending_user_interrupt(tmp_path, monkeypatch, tool_reason):
+    """A shutdown arriving after a user message keeps that message durable."""
+    from agent.interrupt_compat import request_hard_interrupt
+    from agent.interrupt_control import interrupt_issuer
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from tests.agent.test_interrupt_issuer_attribution import _bare_agent
+    from tools.interrupt import set_interrupt
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    agent = _bare_agent()
+    try:
+        agent.interrupt("please use staging")
+        request_hard_interrupt(agent, "Profile runtime is stopping", tool_reason=tool_reason,
+                               interrupt_source="system")
+        assert vars(agent)["_hard_interrupt_requested"].is_set()
+    finally:
+        set_interrupt(False)
+    assert agent._interrupt_message == "please use staging"
+    issuer = interrupt_issuer(agent)
+    assert issuer is None, "the user's interrupt stays the recorded cause"
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+        def _take_wake_admitted_before_drain(self, key, adapter): return None
+        def _promote_queued_event(self, key, adapter, event): return event
+        def _pending_event_audio_paths(self, event): return []
+        def _is_shared_session_source(self, source): return False
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="user")
+    event, text = asyncio.run(Runner()._run_agent_drain_pending(
+        {"final_response": "done", "interrupted": True, "interrupt_message": agent._interrupt_message,
+         **({"interrupt_source": issuer} if issuer else {})},
+        MagicMock(get_pending_message=lambda _key: None, _pending_messages={}), source, "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    assert json.loads(next(flush_dir.glob("*.json")).read_text())["data"]["text"] == "please use staging"
+
 
 
 def test_draining_follow_up_spool_initialization_failure_does_not_abort_turn(monkeypatch, caplog):

@@ -15,6 +15,7 @@ from typing import Any
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
 from agent.prompt_cache_lifecycle import cancel_prompt_cache_warming
+from agent.proxy_request_class import apply_turn_request_class
 from hermes_cli.observability.shared_metrics_efficiency import observe_request_tools
 from utils import env_var_enabled
 
@@ -159,6 +160,7 @@ def build_request_payload(
     if agent._empty_content_retries > 0 and agent._is_openrouter_url():
         _set_extra_header(api_kwargs, "X-OpenRouter-Cache", "false")
     _apply_user_turn_request_headers(agent, api_kwargs)
+    api_kwargs = apply_turn_request_class(agent, api_kwargs)
     try:
         from hermes_cli.middleware import apply_llm_request_middleware
 

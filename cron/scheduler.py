@@ -54,6 +54,7 @@ from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting
+from cron.constants import job_priority
 from cron.scheduler_diagnostics import dispatch_context, note_dispatch_stage, run_dispatched_job
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
@@ -64,7 +65,7 @@ from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
-from agent.memory_provider import ctx_bound
+from agent.memory_provider import ctx_bound, spawn_context_thread
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
 from hermes_cli._startup_fast import project_root_str
@@ -124,8 +125,10 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
         # Unlike a delegated child's malformed override, an explicit cron override
         # never silently restores the global chain (including legacy fallback_model).
         return get_cron_fallback_chain(cfg) or None
+    pinned = _job_route_pinned(job)
+    allow_billing_fallback = bool(cron.get("allow_billing_fallback", False)) if isinstance(cron, dict) else False
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), None, pinned=pinned and not allow_billing_fallback, owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -148,7 +151,7 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
             "for an explicit cron backup chain."
         )
     return (
-        "No backup provider is configured — check `cron.fallback_providers` or add a global backup with `hermes fallback add`, "
+        "No backup provider is configured — configure at least three ordered providers from independent domains under `cron.fallback_providers`, "
         "or set a cron fleet default via `cron.model` + `cron.model_provider` in config.yaml."
     )
 
@@ -392,6 +395,9 @@ def _upsert_incident_for_failure(
                           scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
+        # A shared dependency outage follows the same rule: only a notice that actually reached
+        # the operator (``alerted``) quiets the other jobs, and only inside the repeat window.
+        # ``detected`` is never withheld, or an undelivered first notice would silence it for good.
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
         return withheld, incident_id
     except Exception as exc:
@@ -1904,7 +1910,13 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        chain = _job_fallback_chain(job, jc.cfg) or []
+        # Resolve-time fallback handles auth and transport failures. A pinned job may use an
+        # explicitly owned cron chain, but it never substitutes through the inherited global chain.
+        cron_cfg = jc.cfg.get("cron") if isinstance(jc.cfg, dict) else None
+        owns_chain = isinstance(cron_cfg, dict) and cron_cfg.get("fallback_providers") is not None
+        chain = _job_fallback_chain(job, jc.cfg) or [] if (
+            not _job_route_pinned(job) or owns_chain
+        ) else []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
@@ -1928,8 +1940,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 logger.info(
                     "Job '%s': fallback resolved to %s model %s",
                     job_id, runtime.get("provider"), fb_model)
-                # Delivered with the job output (#74349): a cron agent has no status rail, so the
-                # switch would otherwise stay in the scheduler log only. run_job pops it.
+                # Delivered with wrapped job output (#74349): a cron agent has no status rail.
+                # Raw output opts out of decoration, retaining the scheduler logs. run_job pops it.
                 from hermes_cli.fallback_config import pre_agent_fallback_notice
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
@@ -2136,7 +2148,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        from cron.dependency_timeout import agent_reported_failure
+        raise agent_reported_failure(result.get("error") or final_response_text or "agent reported failure")
     if max_iteration_summary:
         logger.warning(
             "Job '%s' reached the iteration limit but produced a final fallback response; "
@@ -2473,6 +2486,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    cron_cfg = _cfg.get("cron") if isinstance(_cfg.get("cron"), dict) else {}
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2487,6 +2501,11 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         reasoning_config=setup.reasoning_config,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
+        model_pinned=_job_route_pinned(job),
+        fallback_chain_owned=(
+            cron_cfg.get("fallback_providers") is not None
+        ),
+        allow_billing_fallback=bool(cron_cfg.get("allow_billing_fallback", False)),
         credential_pool=setup.credential_pool,
         providers_allowed=pr.get("only"),
         providers_ignored=pr.get("ignore"),
@@ -2584,6 +2603,7 @@ def run_job(
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
+    _dependency_started = time.monotonic()
     try:
         scope.enter()
         # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
@@ -2615,10 +2635,12 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
-        if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
+        if (setup.fallback_notice and _cfg.get("cron", {}).get("wrap_response", True)
+                and final_response.strip() and not _is_cron_silence_response(final_response)
                 and scheduler_failure_copy.cron_failure_marker_error(final_response) is None):
-            # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
-            # agent-declared failure marker keep their first-line/whole-response contract.
+            # Pre-agent switch notices share the response-wrapper opt-out. Raw reports,
+            # silence, and failure markers retain their exact response contract.
+            # Provider selection and its scheduler logs remain unchanged.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -2639,8 +2661,12 @@ def run_job(
     except (Exception, ConfigBackendUnavailable) as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
+        from cron.dependency_timeout import annotate_job_failure
+        named = annotate_job_failure(
+            e, base_url=getattr(agent, "base_url", None) or job.get("base_url"),
+            elapsed=time.monotonic() - _dependency_started)
         error_msg = _merge_script_failure(
-            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
+            (False, "", "", f"{type(named).__name__}: {named!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
@@ -4118,7 +4144,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
             extra={"HERMES_HOME": str(profile_home)},
         ))
     note_dispatch_stage(job, "secret_scope_ready")
-    worker_env = systemd_user_bus_env(worker_env)
+    worker_env = {**systemd_user_bus_env(worker_env), "HERMES_WORK_PRIORITY": job_priority(job)}
     note_dispatch_stage(job, "worker_env_ready")
     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
     # the other two), and an inherited presence var makes every env-fallback consumer in the
@@ -4177,75 +4203,21 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # around one handoff disagree.
     deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
     note_dispatch_stage(job, "ack_wait_enter")
-    while time.monotonic() < deadline:
-        if ack_path.exists():
-            try:
-                acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
-            except Exception:
-                logger.exception(
-                    "Cron external worker %s published an unreadable acknowledgement; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    expected_fire_owner=expected_fire_owner,
-                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
-                    worker_hard_wall_deadline=worker_hard_wall_deadline,
-                )
-            finally:
-                ack_path.unlink(missing_ok=True)
-            if (
-                not isinstance(acknowledgement, dict)
-                or acknowledgement.get("execution_id") != execution_id
-            ):
-                logger.error(
-                    "Cron external worker acknowledgement mismatch for %s; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    expected_fire_owner=expected_fire_owner,
-                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
-                    worker_hard_wall_deadline=worker_hard_wall_deadline,
-                )
-            worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
-            acknowledged_deadline_value = acknowledgement.get("hard_wall_deadline")
-            if isinstance(acknowledged_deadline_value, (int, float)):
-                acknowledged_deadline = float(acknowledged_deadline_value)
-            else:
-                acknowledged_deadline = worker_hard_wall_deadline
-            # The watchdog arms before publishing this acknowledgement. Use its
-            # same monotonic deadline so the parent never extends the worker's
-            # lifetime merely because startup/ack polling took time.
-            worker_hard_wall_deadline = acknowledged_deadline
-            note_dispatch_stage(job, "acknowledged")
-            logger.info(
-                "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
-                job_id,
-                acknowledgement.get("pid"),
+
+    def _consume_acknowledgement() -> bool:
+        """Consume a published acknowledgement (even if discovered after the worker has
+        already exited). Factors the ack-handling block so the race re-check can reuse it
+        without duplication.
+        """
+        nonlocal worker_hard_wall_deadline
+        try:
+            acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            logger.exception(
+                "Cron external worker %s published an unreadable acknowledgement; "
+                "treating handoff as ownership-uncertain",
                 execution_id,
-                dispatch.mode,
             )
-            _record_external_cron_worker(
-                job_id,
-                acknowledgement.get("pid") or process.pid,
-                scope_isolated=dispatch.mode == "scoped",
-            )
-            with _running_lock, contextlib.suppress(TypeError, ValueError):
-                worker_pid = int(acknowledgement.get("pid") or process.pid)
-                if _external_worker_modes.get(worker_key) in {"scoped", "detached"} and worker_pid > 0:
-                    _restart_safe_external_worker_job_ids.add(worker_key)
-                    _restart_safe_waiter_job_ids.add(worker_key)
             return _wait_for_external_cron_worker(
                 process,
                 execution_id=execution_id,
@@ -4256,8 +4228,73 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 terminal_exit_grace_seconds=terminal_exit_grace_seconds,
                 worker_hard_wall_deadline=worker_hard_wall_deadline,
             )
+        finally:
+            ack_path.unlink(missing_ok=True)
+        if (
+            not isinstance(acknowledgement, dict)
+            or acknowledgement.get("execution_id") != execution_id
+        ):
+            logger.error(
+                "Cron external worker acknowledgement mismatch for %s; "
+                "treating handoff as ownership-uncertain",
+                execution_id,
+            )
+            return _wait_for_external_cron_worker(
+                process,
+                execution_id=execution_id,
+                job_id=job_id,
+                handoff_files=(payload_path, stderr_path),
+                stderr_path=stderr_path,
+                expected_fire_owner=expected_fire_owner,
+                terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+                worker_hard_wall_deadline=worker_hard_wall_deadline,
+            )
+        worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
+        acknowledged_deadline_value = acknowledgement.get("hard_wall_deadline")
+        if isinstance(acknowledged_deadline_value, (int, float)):
+            acknowledged_deadline = float(acknowledged_deadline_value)
+        else:
+            acknowledged_deadline = worker_hard_wall_deadline
+        # The watchdog arms before publishing this acknowledgement. Use its
+        # same monotonic deadline so the parent never extends the worker's
+        # lifetime merely because startup/ack polling took time.
+        worker_hard_wall_deadline = acknowledged_deadline
+        note_dispatch_stage(job, "acknowledged")
+        logger.info(
+            "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
+            job_id,
+            acknowledgement.get("pid"),
+            execution_id,
+            dispatch.mode,
+        )
+        _record_external_cron_worker(
+            job_id,
+            acknowledgement.get("pid") or process.pid,
+            scope_isolated=dispatch.mode == "scoped",
+        )
+        with _running_lock, contextlib.suppress(TypeError, ValueError):
+            worker_pid = int(acknowledgement.get("pid") or process.pid)
+            if _external_worker_modes.get(worker_key) in {"scoped", "detached"} and worker_pid > 0:
+                _restart_safe_external_worker_job_ids.add(worker_key)
+                _restart_safe_waiter_job_ids.add(worker_key)
+        return _wait_for_external_cron_worker(
+            process,
+            execution_id=execution_id,
+            job_id=job_id,
+            handoff_files=(payload_path, stderr_path),
+            stderr_path=stderr_path,
+            expected_fire_owner=expected_fire_owner,
+            terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+            worker_hard_wall_deadline=worker_hard_wall_deadline,
+        )
+
+    while time.monotonic() < deadline:
+        if ack_path.exists():
+            return _consume_acknowledgement()
         returncode = process.poll()
         if returncode is not None:
+            if ack_path.exists():
+                return _consume_acknowledgement()
             with _running_lock:
                 _restart_safe_waiter_job_ids.discard(worker_key)
                 _restart_safe_external_worker_job_ids.discard(worker_key)
@@ -4405,8 +4442,27 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False,
-                                        hard_wall_fence=watchdog_stop)
+                cancel_event = threading.Event()
+                cancel_stop = threading.Event()
+
+                def watch_cancel() -> None:
+                    from cron.detached_authority import _cancel_path
+
+                    while not cancel_stop.wait(.1):
+                        if _cancel_path(job["id"], execution_id).exists():
+                            cancel_event.set()
+                            return
+
+                cancel_watcher = spawn_context_thread(
+                    watch_cancel, name=f"cron-cancel-{execution_id}")
+                cancel_watcher.start()
+                try:
+                    completed = run_one_job(
+                        job, adapters=None, loop=None, verbose=False,
+                        cancel_event=cancel_event, hard_wall_fence=watchdog_stop)
+                finally:
+                    cancel_stop.set()
+                    cancel_watcher.join(timeout=1)
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
                 return completed
@@ -4797,7 +4853,7 @@ def _submit_with_guard(
                          execution_err)
         return None
 
-    from cron.scheduler_admission import AgentAdmissionRequired
+    from cron.scheduler_admission import AgentAdmissionRequired, submit_ranked
 
     # A script queued from a stale snapshot may need agent admission. Flatten the
     # executor handoff into one completion: sync ticks, drain, and dedup must still
@@ -4819,7 +4875,7 @@ def _submit_with_guard(
                         target_pool = script_pool(_get_hermes_home())
                     else:
                         target_pool = _get_parallel_pool(_resolve_max_parallel_workers())
-                    return target_pool.submit(_run_and_release, target_ctx)
+                    return submit_ranked(target_pool, job, _run_and_release, target_ctx)
                 except BaseException as exc:
                     settle_unstarted_execution(
                         execution["id"], job_id, f"{target_lane} admission handoff failed: {exc}")
@@ -4844,7 +4900,7 @@ def _submit_with_guard(
 
     try:
         _ctx.run(note_dispatch_stage, dispatched_job, "executor_queued")
-        fut = pool.submit(_run_and_release)
+        fut = submit_ranked(pool, job, _run_and_release)
         if dispatch_lane in {"script", "person-send"}:
             completion.set_running_or_notify_cancel()
             fut.add_done_callback(_complete)

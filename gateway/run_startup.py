@@ -1827,8 +1827,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
         if connected_count > 0:
             await asyncio.sleep(1.0)
-        # Before _send_restart_notification() unlinks the marker: did we boot from a chat /restart?
-        # One-shot signal for _is_stale_restart_redelivery.
+        self._retain_background_task(asyncio.create_task(self._sweep_orphan_progress_cards(), name="sweep-orphan-progress-cards"))
+        # Booted from a chat /restart? Read before _send_restart_notification() unlinks the marker.
         if _restart_notification_pending():
             self._booted_from_restart = True
         # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an

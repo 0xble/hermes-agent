@@ -43,13 +43,12 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.message_metadata import (
     ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, REPLAY_PERSISTED_CONTENT,
-    copy_identity_fields, is_compaction_scaffolding, scaffolding_replay_fields, replay_metadata_fields,
+    apply_unstamped_replay_fields, copy_identity_fields, replay_metadata_fields, unstamped_replay_fields,
 )
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
 from gateway.run_common import _csv_or_list_to_set
-from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
 
@@ -1205,8 +1204,7 @@ def _build_replay_entry(
     # Replay rebuilds the SAME conversation: every role keeps its uid and merge witness, so a context engine sees the
     # uids the store holds. Tool-call uid maps stay on rows that still carry their calls (those pass through whole).
     copy_identity_fields({key: msg[key] for key in (MESSAGE_UID, ABSORBED_MESSAGE_UIDS) if key in msg}, entry)
-    # Compaction provenance must survive replay so summary/restatement rows stay unstamped.
-    entry.update(scaffolding_replay_fields(msg))
+    apply_unstamped_replay_fields(msg, entry)  # compaction and host-notice rows stay unstamped through replay
     if msg.get("_db_persisted"):
         entry["_db_persisted"] = True
     snapshot = msg.get(DB_ROW_SNAPSHOT)
@@ -1354,7 +1352,7 @@ def _build_gateway_agent_history(
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             if (inject_timestamps and role == "user" and isinstance(content, str)
-                    and not is_compaction_scaffolding(msg) and not msg.get("_compressed_summary")):
+                    and not unstamped_replay_fields(msg) and not msg.get("_compressed_summary")):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
@@ -2275,7 +2273,7 @@ from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_resul
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.zero_cut_busy import ZeroCutBusyRoutingMixin
-from gateway.run_config_loaders import GatewayConfigLoadersMixin
+from gateway.run_config_loaders import GatewayConfigLoadersMixin, resolve_default_runtime_agent_kwargs
 from gateway.run_startup import GatewayStartupMixin, _own_policy_envs
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
@@ -2373,46 +2371,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
-    """Resolve provider credentials for gateway-created AIAgent instances.
-    ``resolve_runtime_provider()`` may fall back to env vars; behavioral config is config.yaml only.
-    An ``AuthError`` from the primary walks the configured fallback chain through the shared
-    ``resolve_runtime_with_fallback`` (the gateway keeps no resolver loop of its own)."""
-    from hermes_cli.runtime_provider import (
-        resolve_runtime_with_fallback, format_runtime_provider_error, _get_model_config)
-
-    # Capture primary provider/model from config before the try block so we
-    # can include it in the fallback notice if the primary fails (#74349).
-    from hermes_cli.model_alias_runtime import resolve_default_route
-    _primary_route = resolve_default_route(_load_gateway_config())
-    if not _primary_route.model and not _primary_route.provider:
-        _legacy_route = _get_model_config()
-        _primary_model = str(_legacy_route.get("default") or _legacy_route.get("model") or "").strip()
-        _primary_provider = str(_legacy_route.get("provider") or "").strip()
-    else:
-        _primary_model = _primary_route.model.strip()
-        _primary_provider = _primary_route.provider.strip()
-
-    try:
-        runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
-    except Exception as exc:
-        raise RuntimeError(format_runtime_provider_error(exc)) from exc
-
-    if fallback_entry is not None:
-        # The entry's model is what this agent sends (#112600); the caller pops the notice (#74349).
-        from agent.primary_auth_fallback import RUNTIME_KEY  # and the primary's failed login (#147212)
-        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
-                RUNTIME_KEY: runtime.get(RUNTIME_KEY),
-                "_fallback_notice": pre_agent_fallback_notice(
-                    _primary_provider, _primary_model,
-                    runtime.get("provider") or fallback_entry.get("provider") or "unknown",
-                    fallback_entry.get("model") or "default")}
-
-    capabilities = runtime.get("capabilities")
-    capabilities = (
-        {k: v for k, v in capabilities.items() if isinstance(k, str) and isinstance(v, bool)}
-        if isinstance(capabilities, dict) else {})
-
-    return {**_runtime_agent_kwargs(runtime), "capabilities": capabilities}
+    return resolve_default_runtime_agent_kwargs()
 
 
 def _runtime_agent_kwargs(runtime: dict) -> dict:
@@ -5602,7 +5561,7 @@ async def _start_gateway_start_control_socket(runner):
 
         from gateway.cron_review import CronReviewControl
         from gateway.session_snapshot import make_session_snapshot_handler
-        from gateway import zero_cut_standby as zcs
+        from gateway import writer_census as census, zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
@@ -5621,7 +5580,8 @@ async def _start_gateway_start_control_socket(runner):
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
                            "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
                            "handover": lambda: request_handover(runner, _main_loop),
-                           "handover-status": lambda: handover_status(runner)})
+                           "handover-status": lambda: handover_status(runner),
+                           "writer-census": lambda: census.writer_census(runner)})
         _control_server.ticket_store = runner.session_ticket_store
         from gateway.session_worker_discovery import worker_discovery_handler
         _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)

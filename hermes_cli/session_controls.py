@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_cli.goals import (
     _REPLY_QUOTE_RE,
@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TTL_SECONDS = 24 * 60 * 60
 _CONTROL_PREFIX = "session_control:"
+_CONTROL_ERROR_REASONS = {
+    "target_changed": "target changed since the request",
+}
+
+
+def control_error_reason(error: Any, *, kind: Optional[str] = None) -> str:
+    """Turn durable control error codes into concise user-facing explanations."""
+    code = str(error or "unknown error")
+    if code == "nothing_to_resume":
+        subject = kind or "target"
+        return f"{subject} was not paused (already running or cleared)"
+    return _CONTROL_ERROR_REASONS.get(code, code)
+
+
 _CURRENT_AUTHORITY: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "session_control_authority", default=None
 )
@@ -503,7 +517,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
-        # Only a paused goal resumes: never revive a done/cleared goal or re-arm an active one.
+        # Only paused goals need a state transition. Resuming an active goal is an idempotent
+        # success, while done/cleared goals remain protected from resurrection.
+        if manager.state is not None and manager.state.status == "active":
+            return {"result": {"ok": True, "idempotent": True}, "state": manager.state}
         if manager.state is None or manager.state.status != "paused":
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
@@ -548,13 +565,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
-    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
-        seconds = state.waiting_seconds
-        duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
-        receipt.update(
-            outcome="timed_wait", wait_seconds=seconds, waiting_until=state.waiting_until,
-            notice=f"Goal waiting {duration} (autonomous timed wait, no approval); still active",
-        )
+    if cleared_goal and (authority or {}).get("via") == "autonomy":
+        receipt["notice"] = f"Goal cleared autonomously without approval. Reason: {reason}"
+    if (kind, action) == ("goal", "pause"):
+        receipt.update(outcome="paused", notice="Goal paused; use /goal resume to continue")
     return receipt
 
 
@@ -1077,14 +1091,18 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                   payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Apply an authorized control immediately, or queue an asynchronous approval request.
 
-    A session may clear or replace another session's goal directly. Only a self-targeted
-    destructive goal change falls back to Brian's approval when it lacks a fresh user quote.
+    Under goals.autonomy, clearing requires a recorded reason, not approval. Otherwise a
+    session may clear or replace another session's goal directly; a self-targeted destructive
+    goal change falls back to Brian's approval when it lacks a fresh user quote.
     """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
-    if autonomous and action == "clear":
-        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
+    if autonomous and kind == "goal" and action == "clear":
+        if not isinstance(reason, str) or not reason.strip():
+            return {"ok": False, "error_code": "reason_required",
+                    "error": "clearing a goal requires a nonempty reason"}
+        reason = reason.strip()
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1122,20 +1140,24 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                                 authority=authority, cursor=conn)
         manager_result = result.get("result")
         code = ""
+        error = ""
+        details = {}
         if isinstance(manager_result, dict) and not manager_result.get("ok", True):
             code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
+            error = manager_result.get("error") or code
+            details = {key: manager_result[key] for key in ("missing_requirements",) if key in manager_result}
             conn.execute(f"ROLLBACK TO {savepoint}")
         conn.execute(f"RELEASE {savepoint}")
         now = _now()
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                              authority=authority, status="failed" if code else "applied", now=now,
                              expires_at=None, affected_text=affected_before, cursor=conn)
-        record["resolved_at"], record["error"] = now, code or None
+        record["resolved_at"], record["error"] = now, error or None
         record["current_max_turns"] = _current_max_turns(kind, raw)
         _bind_control_result(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
-                **({"error_code": code, "error": code} if code else {}), **result}
+                **({"error_code": code, "error": error} if code else {}), **details, **result}
 
     if autonomous:
         # No route/approval requirement: goal and loop writes use the same transaction and wake
@@ -1281,7 +1303,11 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
         _save_record(record, cursor=conn)
         return record
 
-    return db._execute_write(resolve)
+    record = db._execute_write(resolve)
+    if record is not None and record.get("status") == "failed":
+        # Not persisted: the explanation is for the card that tapped approve, which renders it as-is.
+        record["error_reason"] = control_error_reason(record.get("error"), kind=record.get("kind"))
+    return record
 
 
 def continuation_is_current(request_id: str) -> bool:
@@ -1412,12 +1438,42 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
     manager = GoalManager(sid, cursor=cursor)
-    if authority.get("via") == "autonomy":
-        if not manager.is_active():
-            return None
-        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
-                                        reason=reason or "session-control")
-    return manager.pause(reason=reason or "session-control")
+    autonomous = (authority or {}).get("via") == "autonomy"
+    # Mark explicit controls separately from migratable legacy judge/budget pauses.
+    # Model-supplied reason text must not accidentally opt this pause into migration.
+    # Record the agent as owner of its own pause so it may later lift it, as for loops.
+    return manager.pause(reason="session-control: " + (reason or "paused"),
+                         by="agent" if autonomous else "user")
+
+
+
+def _clear_goal(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.goals import GoalManager
+    import re
+
+    manager = GoalManager(sid, cursor=cursor)
+    if (authority or {}).get("via") == "autonomy":
+        state = manager.state
+        if state is not None and state.status == "paused" and state.paused_by != "agent":
+            # A reason never ends a /goal pause, /stop, Ctrl+C, quoted or system pause.
+            return _user_paused(state, "goal")
+        reason_text = str(reason or "").strip()
+        verified_handoff = re.search(r"(?i)\bverified\s+takeover\b", reason_text)
+        if re.search(r"(?i)\b(?:hand(?:ed)?[- ]off|handoff|takeover)\b", reason_text) and not verified_handoff:
+            return {"ok": False, "error_code": "retirement_proof_required",
+                    "error": "a handoff retirement requires a verified takeover"}
+        # Autonomous retirement is a destructive control. It is only available for
+        # an agent-owned pause, or for an active goal whose reason names a concrete
+        # retirement class. A generic model instruction such as "next step" cannot
+        # erase an active goal, even when goals.autonomy is enabled.
+        if state is not None and state.status == "active":
+            retirement_class = re.search(
+                r"(?i)\b(?:obsolete|superseded|duplicate|duplicated)\b", reason_text)
+            if not retirement_class and not verified_handoff:
+                return {"ok": False, "error_code": "retirement_proof_required",
+                        "error": "autonomous clear requires an obsolete, superseded, duplicate or verified handoff reason"}
+        return manager.clear(reason=reason, actor="agent", authority="autonomy")
+    return manager.clear()
 
 
 def _pause_loop(sid, reason, payload, authority, cursor=None):
@@ -1463,7 +1519,7 @@ def _user_paused(state, kind):
 CONTROLS = {
     ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
-    ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
+    ("goal", "clear"): _clear_goal,
     ("loop", "pause"): _pause_loop,
     ("loop", "resume"): _resume_loop,
     ("loop", "stop"): _stop_loop,

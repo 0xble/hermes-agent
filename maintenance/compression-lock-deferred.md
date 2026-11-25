@@ -48,3 +48,5 @@ There is no schema, configuration, prompt, dependency, or compression-threshold 
 ## Update
 
 Retire the fork implementation only when released upstream behavior covers both admission and post-hygiene deferral, automatically retries retained inputs, preserves control provenance and ordering, and passes the same regression. Preserve the existing lock lease, commit fencing, and bounded requeue limits.
+
+Contract tests: `tests/gateway/test_compression_admission_retry.py`, `tests/gateway/test_compression_deferred_retry.py`, `tests/gateway/test_compression_retry_lifecycle.py`, `tests/gateway/test_bot_loop_guard.py`, `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_cancelled_command_tail_ownership.py`, `tests/gateway/test_cancelled_retained_successor.py`, `tests/gateway/test_session_hygiene.py`, `tests/gateway/test_session_hygiene_turnhold_adoption.py`, `tests/gateway/test_busy_requeue_hot_loop.py`, `tests/gateway/test_busy_session_ack.py`.

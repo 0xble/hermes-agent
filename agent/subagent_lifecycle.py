@@ -296,6 +296,8 @@ class SubagentLifecycleService:
             {"provider": request.provider, "model": request.model or ""}
             if request.provider is not None else _load_config()
         )
+        if request.model:
+            routing_cfg = {**routing_cfg, "model": request.model}
         try:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:

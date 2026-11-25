@@ -22,3 +22,5 @@ Retire the backported part when released upstream consults `api_human_users` bef
 ## Rollback
 
 Revert this PR's fork commit, then the `fix(slack): consult api_human_users before the bot_id/bot_profile short-circuit` cherry-pick.
+
+Contract tests: `tests/gateway/test_slack_api_human_senders.py`.

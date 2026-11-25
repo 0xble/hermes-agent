@@ -18,7 +18,7 @@ from agent.prompt_cache_lifecycle import start_prompt_cache_warming
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
-from agent.turn_usage import record_response_usage
+from agent.turn_usage import record_response_ledger, record_response_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -177,6 +177,9 @@ def check_api_response(
         return _verdict("break")
 
     if finish_reason == "length":
+        # Truncation recovery can return before the normal accounting fold. Queue the
+        # physical response first, then suppress the fold's duplicate ledger note.
+        record_response_ledger(agent, response)
         _tv = recover_from_truncation(
             agent, response, finish_reason, _retry, messages=messages,
             conversation_history=conversation_history, api_kwargs=api_kwargs,
@@ -202,6 +205,7 @@ def check_api_response(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,
         max_compression_attempts=max_compression_attempts,
+        ledger_already_recorded=(finish_reason == "length"),
     )
     compression_attempts = _usage_outcome.compression_attempts
     if _usage_outcome.rearmed:
@@ -211,6 +215,8 @@ def check_api_response(
     # ends, so a tool round longer than the TTL does not turn the next request into a full-price cache write.
     start_prompt_cache_warming(agent, api_kwargs, response)
 
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
     if agent.provider == "nous":
@@ -223,6 +229,9 @@ def check_api_response(
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
+    # A validated response ends the switch-cap allowance; a tool continuation is a normal request.
+    from agent.fallback_endpoint_domain import settle_independent_attempt
+    settle_independent_attempt(agent)
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

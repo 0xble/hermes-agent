@@ -35,6 +35,7 @@ def insert_single_message(db, conn, session_id, params, tool_count, *, archived=
 
     db._check_transcript_write_guards(conn, session_id, compression_lock_holder,
         turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+    db._disable_fts_automerge_for_writer(conn.cursor())
     row_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
     if archived:
         conn.execute('UPDATE messages SET active=0, compacted=1 WHERE id=?', (row_id,))
@@ -81,6 +82,7 @@ def insert_message_rows(db, conn, session_id, messages, *, prune_checkpoints=Tru
     row_limit = min(_INSERT_PAGE_ROWS, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // columns)
     if row_limit < 1:
         raise sqlite3.OperationalError("too many SQL variables")
+    db._disable_fts_automerge_for_writer(conn.cursor())
     for msg in messages:
         with write_phase("insert_prepare", thread_cpu=True):
             role = msg.get("role", "unknown")

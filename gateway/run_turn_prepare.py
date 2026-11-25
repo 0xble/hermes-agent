@@ -50,7 +50,7 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
     leaves the runner's one-shot fallback notice alone (see ``_resolve_session_agent_runtime``)."""
     from gateway.run import _runtime_agent_kwargs
     from gateway.session_policy import route_launch_key
-    from gateway.session_worker_construct import route_runtime
+    from gateway.session_worker_construct import policy_pins_model, route_runtime
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     # A follow_profile_config session's route is the profile's current one, model and endpoint from one read.
@@ -67,6 +67,10 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
             fallback_entry.get('model') or 'default')
         model = fallback_entry['model']
     kwargs = _runtime_agent_kwargs(runtime)
+    if runtime.get("_preflight_fallback"):
+        kwargs["_preflight_fallback"] = runtime["_preflight_fallback"]
+    if policy_pins_model(policy, frozen):
+        kwargs["model_pinned"] = True
     if session_key:
         # Use the same session-scoped publication as ordinary resolution. The turn consumes this
         # notice before choosing its model, so a runner-global notice would reapply the primary model
@@ -199,13 +203,17 @@ def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> 
         override.update(api_key=runtime["api_key"], credential_pool=runtime.get("credential_pool"))
 
 
-def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str, dict]:
+def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
-    cfg = runner._serving_channel_config(source) if source is not None else None
-    if cfg:
+    # Keep the helper compatible with older internal callers that passed the runner
+    # while the turn setup path passes its config snapshot directly.
+    if (config is not None and not hasattr(config, "platforms")
+            and hasattr(config, "config")):
+        config = getattr(config, "config", None)
+    if config and source is not None:
         ch = _get_channel_override(
-            cfg, source.platform, str(source.chat_id) if source.chat_id else "",
+            config, source.platform, str(source.chat_id) if source.chat_id else "",
             thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
             parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
         )
@@ -219,6 +227,138 @@ def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str
                 if ch_runtime_model and not ch.model:
                     model = ch_runtime_model
     return model, runtime_kwargs
+
+
+def _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice):
+    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+    from agent.notice_style import ContextNotice
+    if attended_route and attended_route.get("active"):
+        attended_model = attended_route.get("model") or model
+        attended_provider = attended_route.get("provider") or ""
+        if attended_provider:
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                    attended_provider, target_model=attended_model or None,
+                )
+                provider_model = runtime_kwargs.pop("model", None)
+                if provider_model and not attended_route.get("model"):
+                    attended_model = provider_model
+                model = attended_model
+            except Exception as exc:  # health: allow BLE001 -- preserve the attended fallback boundary for every provider-resolution failure
+                logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
+                notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
+        else:
+            model = attended_model
+    return model, runtime_kwargs, notice
+
+
+def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route):
+    """Resolve a detached route snapshot; the caller owns the session-state commit."""
+    from gateway.run import (
+        _resolve_gateway_model,
+        _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
+    )
+    from gateway.run_agent_cache import GatewayAgentCacheMixin
+
+    model = _resolve_gateway_model(user_config)
+    selected = resolve_stored_override(override, model)
+    if selected is not None:
+        if override.get("model"):
+            selected[1]["model_pinned"] = True
+        return *selected, None, False
+
+    runtime_kwargs, unavailable_override = None, None
+    if override and override.get("provider"):
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                override["provider"], target_model=override.get("model") or None)
+        except Exception as exc:
+            # A provider-only override may fall back to the whole default route with a notice.
+            # Never pair an explicitly picked model with the default provider's credentials.
+            logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
+            if override.get("model"):
+                from hermes_cli.fallback_config import get_fallback_chain, same_model_fallbacks
+                from hermes_cli.fallback_config import (
+                    effective_runtime_provider, pre_agent_fallback_notice, resolve_entry_api_key,
+                )
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                from gateway.run import _runtime_agent_kwargs
+                for fallback in same_model_fallbacks(get_fallback_chain(user_config), override["model"]):
+                    try:
+                        fallback_kwargs = {
+                            "requested": fallback["provider"], "target_model": fallback["model"],
+                        }
+                        if fallback.get("base_url"):
+                            fallback_kwargs["explicit_base_url"] = fallback["base_url"]
+                        if fallback_key := resolve_entry_api_key(fallback):
+                            fallback_kwargs["explicit_api_key"] = fallback_key
+                        resolved_fallback = resolve_runtime_provider(**fallback_kwargs)
+                        resolved_fallback["provider"] = effective_runtime_provider(fallback, resolved_fallback)
+                        fallback_runtime = {
+                            **_runtime_agent_kwargs(resolved_fallback),
+                            "capabilities": dict(resolved_fallback.get("capabilities") or {}),
+                        }
+                    except Exception as exc:  # health: allow BLE001 -- malformed or unavailable fallback entries are skipped
+                        logger.debug("Pinned same-model fallback entry unavailable: %s", exc)
+                        continue
+                    fallback_runtime["model_pinned"] = True
+                    fallback_runtime["_preflight_fallback"] = {
+                        "requested_model": override["model"],
+                        "fallback_model": fallback["model"],
+                        "fallback_reason": "credentials_unavailable",
+                    }
+                    notice = pre_agent_fallback_notice(
+                        override.get("provider"), override["model"],
+                        fallback.get("provider"), fallback["model"])
+                    return fallback["model"], fallback_runtime, notice, False
+                raise  # An explicit model has no eligible same-model route.
+            unavailable_override, override = override, None
+    if runtime_kwargs is None:
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+    # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
+    # runner surfaces it through the agent's one-shot fallback notice (#74349).
+    notice = runtime_kwargs.pop("_fallback_notice", None)
+    runtime_model = runtime_kwargs.pop("model", None)
+    if runtime_model:
+        logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
+        model = runtime_model
+    if unavailable_override and not notice:
+        from hermes_cli.fallback_config import pre_agent_fallback_notice
+        notice = pre_agent_fallback_notice(
+            unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
+
+    model, runtime_kwargs = _resolve_channel_runtime(config, source, model, runtime_kwargs)
+    model, runtime_kwargs, notice = _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice)
+
+    if override and skey:
+        model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
+        if override.get("model"):
+            runtime_kwargs["model_pinned"] = True
+
+    # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
+    # provider's first catalog model.
+    if not model and runtime_kwargs.get("provider"):
+        with suppress(Exception):
+            from hermes_cli.models import get_default_model_for_provider
+            model = get_default_model_for_provider(runtime_kwargs["provider"])
+            if model:
+                logger.info(
+                    "No model configured — defaulting to %s for provider %s", model, runtime_kwargs["provider"],
+                )
+
+    # Final safety net: an empty model (transient config-cache miss) makes every API call 400 and
+    # the session goes silent — reuse the last model resolved for this session, else process-wide.
+    cache_model = bool(model and not runtime_kwargs.get("_preflight_fallback"))
+    if not model:
+        if last_model:
+            logger.warning(
+                "Empty model resolved for session=%s — recovering "
+                "last-known-good model %s (config read likely returned "
+                "empty; see #35314)", skey or "", last_model,
+            )
+            model = last_model
+
+    return model, runtime_kwargs, notice, cache_model
 
 
 class GatewayTurnPrepareMixin:
@@ -277,6 +417,8 @@ class GatewayTurnPrepareMixin:
                 "credential_pool", "max_tokens", "capabilities",
             )
         }
+        if runtime_kwargs.get("model_pinned") is True:
+            runtime["model_pinned"] = True
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
@@ -339,7 +481,10 @@ class GatewayTurnPrepareMixin:
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            if row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items()):
+            # Off a fallback, the route is the session's own: a stale fallback marker must not undo it (#152333).
+            stale_marker = not runtime["fallback_active"] and config.pop("_fallback_route", None) is not None
+            if (row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items())
+                    and not stale_marker):
                 return
             config["gateway_runtime"] = runtime
             db.update_session_meta(session_id, json.dumps(config), model=model)
@@ -649,12 +794,82 @@ class GatewayTurnPrepareMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
+        async def _preempt_machine_holder(holder):
+            """A genuine user waiter may yield an internal holder before waiting on the lease.
+
+            This is deliberately narrower than adapter busy dispatch: relays, agent-origin text,
+            internal events, steer mode, active subagents, and compression all retain queue semantics.
+            """
+            if event is None:
+                return
+            is_user_turn = getattr(self, "_is_user_turn_event", None)
+            if callable(is_user_turn) and not is_user_turn(event):
+                return
+            if not callable(is_user_turn) and getattr(event, "internal", False):
+                return
+            from gateway.response_filters import is_agent_origin_text
+            if is_agent_origin_text(getattr(event, "text", None)):
+                return
+            holder_event = getattr(holder, "event", None)
+            if holder_event is None or not getattr(holder_event, "internal", False):
+                return
+            from gateway.meeting_lane import busy_input_mode
+            if await busy_input_mode(self, event, _quick_key) == "steer":
+                return
+            state = self._peek_session_state(holder.owner_key)
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
+            from gateway.run import _AGENT_PENDING_SENTINEL
+            # A pending sentinel/None means the machine turn has not exposed an interruptible agent yet.
+            # Do not cancel its task: admission waits for the ordinary lease release path.
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if self._agent_has_active_subagents(running_agent):
+                return
+            compression_check = getattr(self, "_session_has_compression_in_flight", None)
+            if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
+                return
+            adapter = self._delivery_adapter_for(event.source)
+            if adapter is None:
+                return
+            # The callback above can yield while the holder releases and a different turn starts.
+            # Never interrupt a stale token or the newly published agent.
+            if holder.lease.holder is not holder or holder.released:
+                return
+            state = self._peek_session_state(holder.owner_key)
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if self._agent_has_active_subagents(running_agent):
+                return
+            # A system-sourced soft interrupt with no message: the user's event is not in the adapter
+            # FIFO yet and runs as the next lease owner, so carrying its text would process it twice.
+            try:
+                running_agent.interrupt(None, tool_reason="gateway user turn preemption")
+            except Exception:
+                logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
+                return
+            logger.info("User message preempts autonomous turn on lease wait (session=%s)", _quick_key)
+            # Use the same busy-ack channel as warm-path preemption. The flag prevents the
+            # later lease-wait notice from sending a second (queued) acknowledgement.
+            if not getattr(event, "_gateway_busy_ack_sent", False):
+                from agent.i18n import t
+                from agent.notice_style import ContextNotice
+                notice = ContextNotice(t(
+                    "gateway.busy.ack", head=t("gateway.busy.interrupting_head"), detail="",
+                    tail=t("gateway.busy.interrupting_tail")))
+                notice._temporary = True  # type: ignore[attr-defined]
+                send_ack = getattr(self, "_send_busy_ack_reply", None)
+                if callable(send_ack):
+                    await send_ack(event, adapter, notice)  # type: ignore[reportGeneralTypeIssues]
+
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
                 max_wait=lease_wait_max_seconds(),
                 on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_contended=_preempt_machine_holder if event is not None else None,
+                event=event,
                 on_timeout=(lambda: preserve_lease_wait_async(
                     self, _quick_key, session_entry.session_id, event,
                 )) if event is not None else None,

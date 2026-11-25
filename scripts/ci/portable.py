@@ -879,6 +879,23 @@ def pm_setup_phase(phase: str, env: dict[str, str], *args: str) -> None:
             env[f'HERMES_CI_PINNED_{name.upper()}'] = executable
 
 
+def collect_ci_dependency_generations(env: dict[str, str]) -> None:
+    """Best-effort GC for the PM home selected by this portable CI run."""
+    try:
+        run([
+            python(env), '-c',
+            'import sys; from pathlib import Path; from hermes_cli.venv_sync import '
+            'collect_superseded_generations; collect_superseded_generations('
+            'Path(sys.argv[1]), include_test_environment=True)',
+            str(ROOT),
+        ], env=env)
+    except (OSError, subprocess.SubprocessError) as error:
+        # Reclaiming disk must never turn a successful dependency publish into a
+        # failed CI setup. The collector itself also respects install locks.
+        print(f'portable CI: dependency generation cleanup skipped: {error}',
+              file=sys.stderr, flush=True)
+
+
 def setup(env: dict[str, str]) -> None:
     ensure_setup_free_space()
     require_checkout_venv_isolation()
@@ -892,6 +909,7 @@ def setup(env: dict[str, str]) -> None:
     pm_setup_phase('install', env)
     env.update(HERMES_HOME=str(STATE / 'pm-home'), HERMES_RUNTIME_DIR=str(STATE / 'pm-home/tools'))
     pm_setup_phase('dependencies', env, '--extras', json.dumps(EXTRAS), '--test-environment')
+    collect_ci_dependency_generations(env)
     require_tools(('uv', 'node', 'npm', 'pnpm'), env)
     run(['node', 'scripts/build/node-deps.mjs', '--source', str(ROOT), '--reuse',
          *[arg for workspace in ('apps/desktop', 'apps/bootstrap-installer', 'ui-tui', 'ui-tui/packages/hermes-ink', 'web', 'tests-js')

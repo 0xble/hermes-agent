@@ -21,3 +21,6 @@ Retire this patch when the dependency is published through a trusted package ind
 - `pyproject.toml` contains the direct wheel URL, exact SHA-256, and unchanged platform markers.
 - `uv.lock` resolves the declared KittenTTS artifact consistently.
 - The optional-extra dependency checks reject a changed wheel hash before installation.
+
+
+Contract tests: none. A dependency pin: `pyproject.toml` and `uv.lock` carry the wheel URL and hash, and the lock check proves them.

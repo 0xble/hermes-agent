@@ -9096,6 +9096,11 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "human": {
+            "default": true,
+            "title": "Human",
+            "type": "boolean"
           }
         },
         "required": [
@@ -12263,6 +12268,18 @@
               }
             ],
             "default": null
+          },
+          "turn_origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Origin"
           },
           "api_text": {
             "anyOf": [
@@ -38901,6 +38918,11 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "human": {
+            "default": true,
+            "title": "Human",
+            "type": "boolean"
           }
         },
         "required": [
@@ -40709,6 +40731,18 @@
             ],
             "default": null,
             "title": "Now"
+          },
+          "max_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Seconds"
           }
         },
         "title": "SessionPruneParams",

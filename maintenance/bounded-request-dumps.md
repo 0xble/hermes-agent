@@ -48,3 +48,5 @@ Retire when released upstream satisfies the full size, valid-JSON, write-time
 retention, full-scan progress, and non-dump-preservation contract. Roll back by reverting
 the patch; previously pruned diagnostics cannot be recovered. No profile config
 or runtime activation belongs to this unit.
+
+Contract tests: `tests/agent/test_request_dump_bounds.py`.

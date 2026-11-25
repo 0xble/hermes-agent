@@ -380,6 +380,10 @@ class CLIAgentSetupMixin:
         if not isinstance(primary_exc, AuthError):
             return None
         _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
+        requested_model = self.model
+        if getattr(self, "_explicit_model_override", False):
+            from hermes_cli.fallback_config import same_model_fallbacks
+            _fb_chain = same_model_fallbacks(_fb_chain, requested_model)
         for _fb in _fb_chain:
             _fb_provider = (_fb.get("provider") or "").strip().lower()
             _fb_model = (_fb.get("model") or "").strip()
@@ -390,20 +394,26 @@ class CLIAgentSetupMixin:
                 # target_model: the fallback entry names the model that will be sent; without it the
                 # ladder keys off config `default` (see _ensure_runtime_credentials, #112600).
                 runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(_fb))
-                _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
-                logger.warning(
-                    "Primary provider %s (%s). Falling through to fallback: %s/%s",
-                    _why_log, primary_exc, _fb_provider, _fb_model)
-                from gateway.warning_notifications import render_notification
-                render_notification(
-                    lambda: _cprint(t("cli.startup.switching_to_fallback", reason=_why, provider=_fb_provider, model=_fb_model)),
-                    platform="cli")
-                self.requested_provider = _fb_provider
-                self.model = _fb_model
-                # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).
-                return runtime
-            except Exception:
+            except Exception as exc:  # health: allow BLE001 -- one unavailable fallback must not stop the ladder
+                logger.debug("Fallback runtime unavailable for %s/%s: %s", _fb_provider, _fb_model, exc)
                 continue
+            _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
+            logger.warning(
+                "Primary provider %s for model %s (%s). Falling through to fallback: %s/%s",
+                _why_log, requested_model, primary_exc, _fb_provider, _fb_model)
+            from gateway.warning_notifications import render_notification
+            render_notification(
+                lambda: _cprint(t("cli.startup.switching_to_fallback", reason=_why, provider=_fb_provider, model=_fb_model)),
+                platform="cli")
+            self._preflight_fallback = {
+                "requested_model": requested_model,
+                "fallback_model": _fb_model,
+                "fallback_reason": "rate_limit" if _why_log.startswith("rate-limited") else "credentials_unavailable",
+            }
+            self.requested_provider = _fb_provider
+            self.model = _fb_model
+            # reasoning_config follows the swap in _ensure_runtime_credentials (the only caller).
+            return runtime
         return None
 
     def _runtime_credentials_ready(self) -> bool:
@@ -720,7 +730,9 @@ class CLIAgentSetupMixin:
                 one_turn_reasoning=(pending_one_turn or {}).get("one_turn_reasoning") if one_turn else None,
                 one_turn_alias=(pending_one_turn or {}).get("one_turn_alias", "") if one_turn else "",
                 reasoning_callback=self._current_reasoning_callback(),
-                fallback_model=self._fallback_model, thinking_callback=self._on_thinking,
+                fallback_model=self._fallback_model,
+                model_pinned=bool(model_override or getattr(self, "_explicit_model_override", False)),
+                thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
@@ -733,6 +745,8 @@ class CLIAgentSetupMixin:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
                 notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction)
+            if not model_override and getattr(self, "_preflight_fallback", None) is not None:
+                self.agent._preflight_fallback = self._preflight_fallback
             # Reference for atexit memory-provider shutdown: ``_run_cleanup`` in cli.py
             # reads ``cli._active_agent_ref``, so this MUST write the ``cli`` module's
             # global — a ``global`` statement here would bind this module's namespace.

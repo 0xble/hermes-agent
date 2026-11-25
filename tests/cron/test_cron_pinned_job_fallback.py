@@ -77,10 +77,13 @@ def _runtime(provider):
             "api_mode": "chat_completions"}
 
 
-def _run(tmp_path, job, *, primary_error=None):
+def _run(tmp_path, job, *, primary_error=None, allow_billing_fallback=False):
     """Run *job*; the primary resolve raises *primary_error* (if any), fallback entries succeed.
     Returns ``(success, error, requested providers, AIAgent kwargs — {} when never built)``."""
-    (tmp_path / "config.yaml").write_text(_CONFIG, encoding="utf-8")
+    config = _CONFIG + (
+        f"cron:\n  allow_billing_fallback: {str(allow_billing_fallback).lower()}\n"
+        if allow_billing_fallback else "")
+    (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
     requested = []
 
     def resolve(**kwargs):
@@ -171,6 +174,25 @@ def test_pinned_job_agent_gets_no_runtime_fallback_ladder(tmp_path, pin):
     success, error, _requested, agent_kwargs = _run(tmp_path, _job(**pin))
     assert (success, error) == (True, None)
     assert agent_kwargs["fallback_model"] is None
+
+
+def test_pinned_job_receives_billing_fallback_opt_in(tmp_path):
+    success, error, _requested, agent_kwargs = _run(
+        tmp_path, _job(provider="anthropic", model="claude-sonnet-5"), allow_billing_fallback=True)
+    assert (success, error) == (True, None)
+    assert agent_kwargs["model_pinned"] is True
+    assert agent_kwargs["allow_billing_fallback"] is True
+    assert agent_kwargs["fallback_model"] == _CHAIN
+
+
+def test_pinned_job_billing_opt_in_does_not_resolve_on_auth_failure(tmp_path):
+    success, error, requested, agent_kwargs = _run(
+        tmp_path, _job(provider="anthropic", model="claude-sonnet-5"),
+        primary_error=AuthError("No credentials stored"), allow_billing_fallback=True)
+    assert success is False
+    assert "No credentials stored" in (error or "")
+    assert requested == ["anthropic"]
+    assert agent_kwargs == {}
 
 
 def test_unpinned_job_still_walks_the_global_chain_at_resolve_time(tmp_path):

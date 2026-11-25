@@ -82,7 +82,7 @@ def interrupt_side_agents(runner, reason):
     for authority in all_authorities(runner):
         for _, holder in side_agents(authority):
             if holder and holder[0] is not None:
-                count += bool(request_hard_interrupt(holder[0], reason))
+                count += bool(request_hard_interrupt(holder[0], reason, interrupt_source="system"))
     return count
 
 
@@ -204,7 +204,7 @@ def stop_authority_work(authority):
     stop_authority_turns(authority, in_process=True)
     for _, holder in [*physical_workers(authority), *side_agents(authority)]:
         if holder and holder[0] is not None:
-            request_hard_interrupt(holder[0], 'Profile runtime is stopping')
+            request_hard_interrupt(holder[0], 'Profile runtime is stopping', interrupt_source="system")
     for cancel in getattr(authority, '_cron_cancellations', {}).values():
         cancel.set()
 

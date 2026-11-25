@@ -293,7 +293,7 @@ async def test_status_command_includes_incognito_and_actual_model(harness, monke
     status._running_agents[entry.session_key] = SimpleNamespace(model="active-private-model", provider="openrouter")
     monkeypatch.setattr(status, "_resolve_route_context", AsyncMock(return_value=None))
     reply = await status._handle_status_command(event("/status"))
-    assert "Incognito: ON" in reply and "active-private-model" in reply
+    assert "**Incognito:** ON" in reply and "active-private-model" in reply
 
 
 @pytest.mark.asyncio

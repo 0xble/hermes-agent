@@ -20,6 +20,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_nt_namespace_error, get_read_block_error, is_blocked_device_path
+from agent.file_safety import get_credential_write_error, get_nt_namespace_error, get_read_block_error
 from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
 from tools.skill_provenance import is_background_review
@@ -29,6 +30,7 @@ from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_bloc
 from tools import file_state
 from hermes_platform.host import facts
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
+from tools import file_tools_paths
 from tools.file_tools_paths import (
     _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
     _resolve_path_for_task)
@@ -851,6 +853,25 @@ def _resolve_or_none(filepath: str, task_id: str, *, entry: bool = False) -> str
         return None
 
 
+def _check_credential_spelling(filepath: str, task_id: str) -> str | None:
+    """Credential refusal for the path as the caller spelled it.
+
+    Host resolution realpaths the target, and that resolved target is all the backend
+    guard sees, so a credential location reached through a symlink (a leaf link, or a
+    link nested under a credential directory) would be judged only by where it points.
+    Vetting the unresolved spelling here, beside the backend's check of the target,
+    refuses the write when either is a credential path. SSH, container and node paths
+    are never host-resolved, so the backend already sees their spelling."""
+    paths = file_tools_paths
+    if current_execution() or paths._terminal_env_type_for_task(task_id) == "ssh" or paths._uses_container_paths(task_id):
+        return None
+    text = paths._host_text(filepath, False)
+    if not os.path.isabs(text):
+        root = paths._authoritative_workspace_root(task_id) or os.getcwd()
+        text = os.path.join(paths._host_text(root, False), text)
+    return get_credential_write_error(os.path.normpath(text))
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
                           cross_profile: bool) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
@@ -860,7 +881,7 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
     prompt covers every path of a multi-file patch.
     """
     for p in paths:
-        err = _check_sensitive_path(p, task_id) or (
+        err = _check_sensitive_path(p, task_id) or _check_credential_spelling(p, task_id) or (
             None if cross_profile else _check_cross_profile_path(p, task_id))
         if err:
             return err
@@ -973,6 +994,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     """
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
+           or _check_credential_spelling(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)

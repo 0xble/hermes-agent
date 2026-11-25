@@ -27,6 +27,7 @@ from gateway.platforms.helpers import clarify_text_with_choices
 from agent.i18n import t
 from gateway.relay.adapter_discord_interaction import RelayDiscordInteractionMixin
 from gateway.relay.admitted_authors import note_delivered
+from gateway.relay.adapter_draft_lifecycle import RelayDraftLifecycleMixin
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.egress import (
     EGRESS_DECLINE_CODE,
@@ -113,7 +114,7 @@ def _profile_from_session_key(session_key: str) -> Optional[str]:
     return None if profile == "default" else profile
 
 
-class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
+class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BasePlatformAdapter):
     """Generic relay adapter advertising a connector-negotiated capability profile."""
 
     # The connector splits to max_message_length (never pre-truncate); its result cannot report a lost chunk.
@@ -573,80 +574,6 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             raw_response=result,
         )
 
-    async def _seal_open_draft(
-        self,
-        chat_id: str,
-        content: str,
-        metadata: Optional[dict[str, Any]],
-        *,
-        draft_key: Optional[str] = None,
-    ) -> SendResult:
-        """Convert the turn-final send into the sealing draft frame."""
-        if draft_key is None:
-            draft_key = self._draft_key(str(chat_id), metadata)
-        draft_id = self._open_draft_by_chat.pop(draft_key)
-        # Tombstone BEFORE the transport call: whatever the ack says, this draft_id
-        # must never be re-armed by a straggler frame.
-        self._sealed_draft_by_chat[draft_key] = draft_id
-        self._evict_oldest(self._sealed_draft_by_chat)
-        if self._transport is None:
-            return SendResult(success=False, error="no transport")
-        seal_frame = self._draft_frame(chat_id, draft_id, content, True, metadata)
-
-        _seal_platform = self._platform_by_chat.get(str(chat_id))
-        _transport = self._transport  # narrowed by the None-guard above
-
-        async def _attempt() -> Optional[dict[str, Any]]:
-            """One seal attempt; None means ambiguous (exception or lost ack)."""
-            try:
-                r = await _transport.send_outbound(seal_frame, platform=_seal_platform)
-            except Exception as e:
-                logger.warning("relay seal transport error (ambiguous): %s", e)
-                return None
-            if r.get("ambiguous"):
-                logger.warning("relay seal ack lost (ambiguous): %s", r.get("error"))
-                return None
-            return r
-
-        # Ambiguous outcomes retry the SAME idempotent frame once: the connector's
-        # sealed-key tombstone returns the original stream ts for a repeated final
-        # and never opens a second stream. Two consecutive ack losses on one socket
-        # almost always mean the transport is down. Cancellation safety: the open
-        # entry was popped and the tombstone written BEFORE the await; restore both
-        # before re-raising so the later abandon pass can still seal the stream.
-        try:
-            result = await _attempt()
-            if result is None:
-                result = await _attempt()
-        except asyncio.CancelledError:
-            self._open_draft_by_chat[draft_key] = draft_id
-            if self._sealed_draft_by_chat.get(draft_key) == draft_id:
-                self._sealed_draft_by_chat.pop(draft_key, None)
-            raise
-        if result is None:
-            # Same ambiguity contract as send_draft: the retry's ack was lost,
-            # so the seal may have been applied. Marked explicitly rather than
-            # left to text inference.
-            return SendResult(
-                success=False,
-                error="draft seal ambiguous after retry (transport ack lost)",
-                raw_response={"success": False, "ambiguous": True},
-            )
-        if result.get("success"):
-            # The connector returns the stream's ts as the message identity.
-            return SendResult(success=True, message_id=str(result.get("message_id") or "") or None)
-        # P5(b): carry the structured body. Without it the caller cannot tell a
-        # lane failure (fall through to a plain send, correct) from an
-        # AUTHORIZATION decline (a plain send re-delivers the very content the
-        # connector refused, to the same chat).
-        if is_egress_decline(result):
-            log_decline("draft_seal", chat_id, result)
-        return SendResult(
-            success=False,
-            error=str(result.get("error") or decline_error(result) or "draft seal failed"),
-            raw_response=result,
-        )
-
     async def _absorb_into_open_draft(
         self, chat_id: str, content: str, metadata: dict[str, Any], interim: bool
     ) -> Optional[SendResult]:
@@ -789,21 +716,6 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             error=result.get("error"),
             raw_response=result,
         )
-
-    async def abandon_open_draft(
-        self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None,
-    ) -> SendResult:
-        """Seal an orphaned stream when its turn dies (/stop, /new, supersede), in
-        place with ``content`` (the text already on screen) so the seal adds and
-        claims nothing; otherwise the live indicator stays forever and the NEXT turn
-        could inherit the armed interception state. Failure is reported, never raised."""
-        draft_key = self._match_open_draft(str(chat_id), metadata)
-        if draft_key is None:
-            return SendResult(success=True)  # nothing armed — no-op
-        try:
-            return await self._seal_open_draft(chat_id, content, metadata, draft_key=draft_key)
-        except Exception as e:
-            return SendResult(success=False, error=f"abandon seal transport error: {e}")
 
     # ── abstract methods (delegated to the transport) ────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -1044,20 +956,21 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         await localize_inbound_media(event, self._get_media_client)
 
     def prime_routing_cache(self, event) -> None:
-        """Fill cold scope/user egress caches for a restored turn; preserve newer live routing."""
+        """Warm cold restored/synthetic egress; never replace newer live routing.
+
+        This fills scope/user egress caches from a synthetic completion after restart so connector
+        tenant guards have the routing discriminators they need, while preserving newer live routing.
+        """
         if event is None or getattr(event, "source", None) is None:
             return
         self._capture_scope(event, fill_only=True)
 
-
     def _capture_scope(self, event, fill_only: bool = False) -> None:
         """Remember a chat's egress discriminators from an inbound event. Never raises.
 
-        scope_id: scoped (guild/channel) message → routing-table resolution. user_id:
-        authentic author id, captured for EVERY message — sole discriminator for a DM
-        AND the author-first fallback for a scoped reply whose guild has no route row
-        (managed agents join guilds dynamically). Without a resolvable discriminator
-        the connector declines egress as 'target not routed to an onboarded tenant'.
+        scope_id resolves guild/channel routing; user_id identifies DMs and is
+        the author fallback for scoped replies without a route row (dynamic guilds).
+        Without either, the connector declines egress as not routed to a tenant.
         """
         try:
             src = getattr(event, "source", None)
@@ -1065,6 +978,8 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             if not chat:
                 return
             chat = str(chat)
+            # A restored route may have only some discriminators cached. Fill each
+            # missing field independently, never treating platform alone as complete.
             put = dict.setdefault if fill_only else dict.__setitem__
             # Underlying platform's string VALUE, skipping the generic RELAY
             # fallback (the connector's session default handles egress then).
@@ -1077,6 +992,10 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
                 ("chat_type", self._chat_type_by_chat),
                 ("profile", self.__dict__.setdefault("_profile_by_chat", {})),
             ):
+                if (fill_only and attr == "profile" and
+                        any(cache.get(chat) for cache in (
+                            self._dm_user_by_chat, self._scope_by_chat, self._chat_type_by_chat))):
+                    continue
                 value = getattr(src, attr, None)
                 if value:
                     put(cache, chat, str(value))
@@ -1093,6 +1012,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         first and only falls back to user_id on a route miss, so carrying both never
         overrides routing-table resolution."""
         meta: dict[str, Any] = dict(metadata or {})
+        meta.pop("_draft_id", None)  # Native ownership is gateway-local, never wire metadata.
         # ``getattr``: relay tests build bare adapters via ``__new__`` without ``__init__``.
         for key, cache in (
             ("scope_id", self._scope_by_chat), ("user_id", self._dm_user_by_chat),

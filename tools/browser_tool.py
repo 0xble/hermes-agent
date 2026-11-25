@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, Any, Optional, Union
+from typing import Any, Optional, Union
 from pathlib import Path
 from agent.redact import redact_cdp_url
 from hermes_constants import get_hermes_home, hermes_home_key
@@ -477,7 +477,21 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 # ----------------------------------------------------------------------------
 # Tool Schemas
 # ----------------------------------------------------------------------------
+BROWSER_CLOSE_SCHEMA = {
+    "name": "browser_close",
+    "description": (
+        "Close 1 Camofox tab created by this browser task, defaulting to its current tab. "
+        "Optionally pass a caller-owned tab_id from browser_tabs. Adopted/shared tabs and "
+        "other tasks' tabs cannot be closed. Success requires server readback confirming "
+        "the tab is gone. Does not close the browser, account, or other tabs."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "tab_id": {"type": "string", "description": "Optional exact caller-owned tab ID. Omit for the current tab."}
+    }, "required": []},
+}
+
 BROWSER_TOOL_SCHEMAS = [
+    BROWSER_CLOSE_SCHEMA,
     {
         "name": "browser_handoff",
         "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
@@ -948,6 +962,14 @@ def _tool_response(result: dict[str, Any], ok: dict[str, Any], default_error: st
     if not result.get("success"):
         return _failed_response(result, default_error)
     return _json_with_fallback({"success": True, **ok}, result)
+
+
+def browser_close(tab_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Close one caller-owned Camofox tab, confirming its absence on the server."""
+    from tools.browser_camofox import is_camofox_mode, camofox_close_tab
+    if is_camofox_mode():
+        return camofox_close_tab(task_id=task_id, tab_id=tab_id)
+    return tool_error("browser_close currently requires the Camofox backend", success=False, closed=False)
 
 
 def browser_tabs(tab_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
@@ -1504,6 +1526,10 @@ registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCH
                                                                release=args.get("release") is True),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
+
+registry.register(name="browser_close", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_close"],
+                  handler=lambda args, **kw: browser_close(args.get("tab_id"), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, emoji="🌐")
 
 registry.register(name="browser_tabs", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_tabs"],
                   handler=lambda args, **kw: browser_tabs(args.get("tab_id"), task_id=kw.get("task_id")),

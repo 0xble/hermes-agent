@@ -147,6 +147,81 @@ def test_invalid_model_routes_are_refused_before_anything_is_written(client, hom
     assert (work / "config.yaml").read_text(encoding="utf-8") == before
 
 
+@pytest.mark.parametrize(("chain", "problem"), [
+    ([{"provider": "openai", "model": "gpt-6-sol"}], "at least 3 fallback entries"),
+    ([{"provider": "custom:openai-proxy", "model": f"gpt-{n}"} for n in "abc"], "upstream families"),
+    ([{"provider": "openai", "model": "gpt-6-sol"}, {"provider": "anthropic", "model": "claude-opus-5-5"},
+      {"provider": "xai-oauth", "model": "grok-4.7"}], "duplicates the primary route"),
+])
+def test_model_route_chains_below_the_resilience_bar_are_refused_before_anything_is_written(client, homes, chain, problem):
+    _root, work = homes
+    before = (work / "config.yaml").read_text(encoding="utf-8")
+    route = {"name": "deep", "description": "Careful", "provider": "openai", "model": "gpt-6-sol",
+             "fallback_providers": chain}
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": [route]})
+    assert resp.status_code == 400
+    assert problem in resp.json()["detail"]
+    assert (work / "config.yaml").read_text(encoding="utf-8") == before
+
+
+def test_routes_without_a_chain_save_beside_one_that_declares_a_chain(client, homes):
+    """Only a route that declares a chain is held to the resilience bar. One with no chain, or an
+    explicit empty one, saves as before; a weak chain on a sibling still refuses the whole save."""
+    _root, work = homes
+    chain = [{"provider": "anthropic", "model": "claude-opus-5-5"},
+             {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"},
+             {"provider": "xai-oauth", "model": "grok-4.7"}]
+    base = {"description": "x", "provider": "openai", "model": "gpt-6-sol"}
+    options = [{**base, "name": "plain"}, {**base, "name": "opted-out", "fallback_providers": []},
+               {**base, "name": "chained", "fallback_providers": chain}]
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": options})
+    assert resp.status_code == 200, resp.text
+    saved = {o["name"]: o for o in _delegation(work)["backends"]["model_map"]["options"]}
+    assert "fallback_providers" not in saved["plain"]
+    assert saved["opted-out"]["fallback_providers"] == []
+    assert saved["chained"]["fallback_providers"] == chain
+
+    before = (work / "config.yaml").read_text(encoding="utf-8")
+    options.append({**base, "name": "weak", "fallback_providers": chain[:1]})
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": options})
+    assert resp.status_code == 400
+    assert "options[3].fallback_providers needs at least 3 fallback entries" in resp.json()["detail"]
+    assert (work / "config.yaml").read_text(encoding="utf-8") == before
+
+
+_CLAUDE = {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"}
+_GROK = {"provider": "xai-oauth", "model": "grok-4.7"}
+
+
+@pytest.mark.parametrize(("chain", "problem"), [
+    # The alias's real route, written out: a duplicate of the primary.
+    ([{"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}, _CLAUDE, _GROK], "duplicates the primary route"),
+    # GPT primary, GPT and Claude backups: two real families, whatever the alias is called.
+    ([{"provider": "custom:openai-proxy", "model": "gpt-6.1-terra"}, _CLAUDE,
+      {"provider": "custom:claude-proxy", "model": "claude-haiku-5-5"}], "spans only 2 upstream families"),
+    ([_CLAUDE, {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"}, _GROK], None),
+])
+def test_an_alias_named_route_is_expanded_before_its_chain_is_checked(client, homes, chain, problem):
+    """A model-map route names a ``model_aliases`` entry (the migrated shape). The alias lives at the
+    config root, so the save has to judge the chain against the whole config, not the block."""
+    _root, work = homes
+    path = work / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    config["model_aliases"] = {"coder": {"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}}
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+    route = {"name": "coder", "description": "Builds", "provider": "custom:openai-proxy", "model": "coder",
+             "fallback_providers": chain}
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": [route]})
+    if problem is None:
+        assert resp.status_code == 200, resp.text
+        assert _delegation(work)["backends"]["model_map"]["options"][0]["model"] == "coder"
+    else:
+        assert resp.status_code == 400, resp.text
+        assert problem in resp.json()["detail"]
+        assert path.read_text(encoding="utf-8") == before
+
+
 def test_saving_model_routes_replaces_the_block_and_keeps_the_stored_key(client, homes):
     root, work = homes
     shown = client.get("/api/delegation/routing?profile=work").json()["model_map"]["options"][0]

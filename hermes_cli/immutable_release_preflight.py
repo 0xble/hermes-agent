@@ -183,7 +183,8 @@ def _check_activation(candidate: Path, previous: Path | str | None, home: Path,
         try:
             config = read_home_selection(profile) or {}
             provider = (config.get("memory") or {}).get("provider")
-            if provider and provider.strip():
+            from agent.memory_provider import is_core_memory_provider
+            if not is_core_memory_provider(provider):
                 issues = _probe(candidate, _PROVIDER_PROBE, [provider.strip()], profile, deadline)
                 if not issues:
                     continue

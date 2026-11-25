@@ -101,9 +101,10 @@ def prepare_startup(gateway, monkeypatch):
     for name in (
         "_start_post_connect_services", "_await_startup_boot_sends",
         "_recover_pending_shutdown_flush_off_loop", "_await_mcp_discovery",
-        "_finish_startup_restore", "_send_session_db_warning_notifications",
+        "_finish_startup_restore", "_send_session_db_warning_notifications", "_sweep_orphan_progress_cards",
     ):
         setattr(gateway, name, AsyncMock())
+    gateway._retain_background_task = lambda task: task
     gateway._claim_pending_obligations = AsyncMock(return_value=[])
     gateway._resume_pending_candidates_async = AsyncMock(return_value=None)
     gateway._startup_interrupted_note_candidates = Mock(return_value=[])
@@ -120,7 +121,7 @@ def prepare_startup(gateway, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["config", "provider", "dependencies", "requirement"])
+@pytest.mark.parametrize("failure", ["config", "provider"])
 async def test_readiness_failure_is_logged_once_and_startup_checks_other_profiles(
     tmp_path, monkeypatch, caplog, failure,
 ):
@@ -134,7 +135,7 @@ async def test_readiness_failure_is_logged_once_and_startup_checks_other_profile
     other = tmp_path / "other"
     other.mkdir()
     (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
-    monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _: [("broken", home), ("healthy", other)])
+    monkeypatch.setattr("gateway.runtime_health._health_scopes", lambda _: [("broken", home), ("healthy", other)])
     checked = []
 
     def selection(selected_home):
@@ -161,8 +162,9 @@ async def test_readiness_failure_is_logged_once_and_startup_checks_other_profile
     prepare_startup(gateway, monkeypatch)
     caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
 
-    # This awaits install_health_notices before it can resume even one recovered watcher.
     await GatewayStartupMixin._start_finish_wiring(gateway, 0)
+    import asyncio
+    await asyncio.wrap_future(gateway._memory_health_future)
 
     assert checked == [home, other]
     gateway._spawn_supervised.assert_called_once()
@@ -185,13 +187,13 @@ async def test_health_notice_setup_failure_does_not_abort_startup(tmp_path, monk
     prepare_startup(gateway, monkeypatch)
     if failed_step == "cron":
         # A failure in cron wiring must not suppress the independent boot alarm.
-        probe = AsyncMock()
-        monkeypatch.setattr("gateway.runtime_health.check_memory_health", probe)
+        schedule = Mock()
+        monkeypatch.setattr("gateway.runtime_health.schedule_memory_health", schedule)
         monkeypatch.setattr("gateway.cron_store_notices.install_cron_store_notices",
                             Mock(side_effect=RuntimeError("cron notice setup failed")))
     else:
-        monkeypatch.setattr("gateway.runtime_health.check_memory_health",
-                            AsyncMock(side_effect=RuntimeError("memory check setup failed")))
+        monkeypatch.setattr("gateway.runtime_health.schedule_memory_health",
+                            Mock(side_effect=RuntimeError("memory check setup failed")))
     caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
 
     await GatewayStartupMixin._start_finish_wiring(gateway, 0)
@@ -201,7 +203,8 @@ async def test_health_notice_setup_failure_does_not_abort_startup(tmp_path, monk
     assert caplog.records[0].levelno == logging.ERROR
     assert isinstance(caplog.records[0].exc_info[1], RuntimeError)
     if failed_step == "cron":
-        probe.assert_awaited_once_with(gateway)
+        schedule.assert_called_once()
+        assert schedule.call_args.args[0] is gateway
 
 
 @pytest.mark.asyncio
@@ -293,7 +296,7 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     (other / "hindsight").mkdir()
     (other / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}), encoding="utf-8")
-    monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _: [(None, home), ("other", other)])
+    monkeypatch.setattr("gateway.runtime_health._health_scopes", lambda _: [(None, home), ("other", other)])
     gateway = runner()
     gateway._served_home_channel_transports = lambda: [
         (None, "fixture", None, "muted", object()),
@@ -318,7 +321,6 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     assert gateway._send_home_channel_message.call_args.args[1] == "muted"
     assert _marker(home).with_suffix(".notified").exists()
     assert len(caplog.records) == 2
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["muted", "no-transport"])

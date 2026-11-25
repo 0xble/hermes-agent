@@ -57,6 +57,29 @@ def test_a_reused_worker_sees_none_of_the_previous_turns_thread_state():
         ex.shutdown(wait=True)
 
 
+def test_a_reset_during_another_threads_first_import_keeps_the_worker(monkeypatch):
+    """Another thread's first import publishes a module in sys.modules before its body finishes.
+
+    The live gateway parked a worker while ``tools.terminal_tool_sudo`` was mid-import: the cache
+    dict existed but its lock did not, the reset raised AttributeError and the worker retired on
+    every start. A half-built module has run no setter, so the reset skips it.
+    """
+    import sys
+    import types
+
+    from gateway.turn_thread_reset import reset_reused_thread_state
+
+    half_sudo = types.ModuleType("tools.terminal_tool_sudo")
+    half_sudo._sudo_password_cache = {}  # executed up to the dict, not yet the lock
+    half_interrupt = types.ModuleType("tools.interrupt")  # globals bound, set_interrupt not yet
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool_sudo", half_sudo)
+    monkeypatch.setitem(sys.modules, "tools.interrupt", half_interrupt)
+
+    reset_reused_thread_state()
+
+    assert half_sudo._sudo_password_cache == {}
+
+
 def test_submit_to_a_parked_worker_starts_no_thread_and_shutdown_releases_it(monkeypatch):
     from gateway.run import GatewayRunner
 

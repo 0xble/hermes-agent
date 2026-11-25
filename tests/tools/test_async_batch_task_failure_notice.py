@@ -5,18 +5,135 @@ child died in a 401 storm at 08:29 and the parent learned of it at 09:36 from th
 block: 66 minutes of a dead wave with nothing running.
 """
 import queue
+import threading
+from contextlib import contextmanager
 from unittest.mock import patch
+
+import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
-from tui_gateway.session_notifications import _notification_event_dedup_key
+
+
+def _drain_completion_queue():
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+@pytest.fixture(autouse=True)
+def _home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _drain_completion_queue()
+    ad._reset_for_tests()
+    yield
+    ad._reset_for_tests()
+    _drain_completion_queue()
 
 
 def _record(status="running"):
     return {"delegation_id": "deleg_x", "status": status, "is_batch": True, "goals": ["a", "b", "c"], "goal": "a",
             "session_key": "sk", "origin_ui_session_id": "ui", "origin_session_id": "", "parent_session_id": "root",
             "dispatched_at": 1.0, "role": "leaf", "model": "m", "context": None, "toolsets": None}
+
+
+@contextmanager
+def _real_running_batch(goals):
+    """Dispatch a real batch whose runner stays blocked until explicitly released.
+
+    The runner never finishes on its own: a slow dispatch or SQLite write must not let the batch
+    finalize mid-test. Yields ``(delegation_id, release)``; ``release()`` lets the runner finish and
+    joins it, and leaving the block (passing or failing) always releases and joins.
+    """
+    gate = threading.Event()
+
+    def runner():
+        gate.wait()
+        return {"results": []}
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=goals, context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:1", parent_session_id="root",
+        runner=runner, max_async_children=1,
+    )
+    delegation_id = handle.get("delegation_id")
+    future = ad._records.get(delegation_id, {}).get("_future")
+
+    def release():
+        gate.set()
+        if future is not None:
+            future.result(timeout=5)
+
+    try:
+        assert handle["status"] == "dispatched"
+        assert future is not None
+        assert ad._records[delegation_id]["status"] == "running"
+        yield delegation_id, release
+    finally:
+        release()
+
+
+@pytest.mark.parametrize("retry_attempt,root_age", [(0, 0), (6, 0), (0, 24 * 3600 + 1)])
+def test_real_dispatched_multi_child_terminal_notice_uses_persisted_retry_row(retry_attempt, root_age):
+    """A transient child in a real persisted multi-goal row is terminal, not silently auto-retried."""
+    from tools import delegation_resume as dr
+
+    with _real_running_batch(["a", "b"]) as (delegation_id, release):
+        entry = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit", "error": "429"}
+        assert ad.record_unit_child(delegation_id, entry) is None
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET retry_attempt=?, retry_root_started_at=? WHERE delegation_id=?",
+                         (retry_attempt, ad._records[delegation_id]["dispatched_at"] - root_age, delegation_id))
+        q = queue.Queue()
+        with patch("tools.process_registry.process_registry") as reg:
+            reg.completion_queue = q
+            ad.push_task_failure_notice(delegation_id, entry, n_tasks=2)
+            assert q.qsize() == 1
+            release()
+    persisted = dr.retry_status(delegation_id)
+    assert persisted["retry_state"] == dr.RETRY_TERMINAL
+
+
+@pytest.mark.parametrize("retry_attempt,root_age,notice", [(0, 0, False), (6, 0, True), (0, 24 * 3600 + 1, True)])
+def test_real_dispatched_scalar_notice_uses_persisted_classifier_and_budget(retry_attempt, root_age, notice):
+    with _real_running_batch(["a"]) as (delegation_id, release):
+        entry = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit", "error": "429"}
+        ad.record_unit_child(delegation_id, entry)
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET retry_attempt=?, retry_root_started_at=? WHERE delegation_id=?",
+                         (retry_attempt, ad._records[delegation_id]["dispatched_at"] - root_age, delegation_id))
+        q = queue.Queue()
+        with patch("tools.process_registry.process_registry") as reg:
+            reg.completion_queue = q
+            ad.push_task_failure_notice(delegation_id, entry, n_tasks=1)
+            assert q.qsize() == int(notice)
+            release()
+
+
+@pytest.mark.parametrize("reason", ["auth", "rate_limit"])
+def test_each_terminal_child_with_the_same_failure_reason_gets_a_durable_notice(reason):
+    q = queue.Queue()
+    with _real_running_batch(["a", "b"]) as (delegation_id, _release), \
+            patch("tools.process_registry.process_registry") as reg:
+        reg.completion_queue = q
+        for index in range(2):
+            entry = {"task_index": index, "status": "failed", "failure_reason": reason, "error": reason}
+            ad.record_unit_child(delegation_id, entry)
+            ad.push_task_failure_notice(delegation_id, entry, n_tasks=2)
+        assert q.qsize() == 2
+        notices = [q.get_nowait(), q.get_nowait()]
+        assert {notice["results"][0]["task_index"] for notice in notices} == {0, 1}
+        assert {notice["_delivery_event_id"] for notice in notices} == {
+            f"{delegation_id}:task-failure:0", f"{delegation_id}:task-failure:1"}
+        with ad._DB_LOCK, ad._transaction() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM async_delegation_events WHERE delegation_id=? AND event_kind='task_failure'",
+                (delegation_id,),
+            ).fetchone() == (2,)
 
 
 def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_formats_as_early_warning():

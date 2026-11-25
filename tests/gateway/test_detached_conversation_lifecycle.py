@@ -6,6 +6,7 @@ reaches the chat, and the old one stays fully usable from the apps. Real Gateway
 the stand-in of ``test_authority_lane_moves_on``.
 """
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -243,11 +244,38 @@ async def test_a_reminder_the_app_set_on_the_old_conversation_fires_into_it(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('revise_metadata', [False, True])
+async def test_route_switch_publishes_before_worker_returns_without_locking_the_loop(monkeypatch, revise_metadata):
+    from hermes_loop_guard import set_loop_thread
+
+    runner, _adapter, authority, _source, _sent, _ran, _gates, lane, ref_a = await _moved_on(monkeypatch)
+    store = runner.session_store
+    assert authority.sessions[ref_a.session_id].route != lane
+    if revise_metadata:
+        announce = store._announce_route
+
+        def update_role_before_announcement(route, entry):
+            store.set_model_role(route, 'reviewer')
+            assert store.lookup_by_session_key(route) is not entry
+            announce(route, entry)
+
+        monkeypatch.setattr(store, '_announce_route', update_role_before_announcement)
+
+    set_loop_thread(threading.get_ident())
+    try:
+        entry = await asyncio.to_thread(store.switch_session, lane, ref_a.session_id)
+    finally:
+        set_loop_thread(None)
+
+    assert entry.session_id == ref_a.session_id
+    assert authority.sessions[ref_a.session_id].route == lane
+
+
+@pytest.mark.asyncio
 async def test_a_late_route_announcement_never_hands_the_chat_back_its_old_conversation(monkeypatch):
     """Review on #144840: a worker's ``/resume`` of A announces its route after a newer ``/new``
     moved the chat on to C. The stale announcement must not reattach A to the chat: the app's next
     prompt on A still runs in A, off the chat, and the chat keeps C."""
-    import threading
     runner, adapter, authority, source, sent, ran, _gates, lane, ref_a = await _moved_on(monkeypatch)
     store = runner.session_store
     announce, paused, release = store._announce_route, threading.Event(), threading.Event()

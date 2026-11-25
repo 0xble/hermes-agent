@@ -9,6 +9,7 @@ a patch on ``hermes_cli.plugins.<name>`` reaches ctx methods as it did when the 
 from __future__ import annotations
 
 import asyncio
+import math
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
@@ -274,11 +275,23 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", override: bool = False, eager: bool = False,
+        execution_timeout: float | None = None,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
         needs operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override: true`` — otherwise
-        any enabled plugin could silently replace a privileged built-in like ``write_file`` (#23194)."""
+        any enabled plugin could silently replace a privileged built-in like ``write_file`` (#23194).
+        ``execution_timeout`` declares a finite per-tool budget in seconds; the executor uses it
+        when it exceeds the generic tool deadline, as it already does for MCP server timeouts."""
+        try:
+            invalid_timeout = not math.isfinite(execution_timeout) if execution_timeout is not None else False
+        except (OverflowError, TypeError):
+            invalid_timeout = True
+        if execution_timeout is not None and (
+            isinstance(execution_timeout, bool) or not isinstance(execution_timeout, (int, float))
+            or invalid_timeout or execution_timeout <= 0
+        ):
+            raise ValueError(f"tool {name!r}: execution_timeout must be a finite positive number of seconds")
         if override and not self._tool_override_allowed(name):
             raise _facade().PluginToolOverrideError(
                 f"Plugin {self.manifest.name!r} cannot override built-in tool {name!r}. Set "
@@ -296,6 +309,7 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope, eager=eager,
+            execution_timeout=float(execution_timeout) if execution_timeout is not None else None,
             incognito_safe=self.manifest.incognito_safe is True,
         )
         registered = registry.snapshot_registration(name, scope=scope)

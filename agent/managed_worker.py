@@ -246,17 +246,20 @@ class WorkerControls:
         self.channel, self.route = channel, route
         self.agent = None
         self.stopped = threading.Event()
+        self.stop_source = None
         self.finish = threading.Event()
         self.clarifications = {}
         self.lock = threading.Lock()
         self.reader = threading.Thread(target=self.read, name='managed-controls', daemon=True)
         self.reader.start()
 
-    def stop(self):
+    def stop(self, *, interrupt_source=None):
+        if not self.stopped.is_set():
+            self.stop_source = interrupt_source
         self.stopped.set()
         if self.agent is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(self.agent)  # parity with the canonical Stop (SessionAuthority.interrupt)
+            request_hard_interrupt(self.agent, interrupt_source=interrupt_source)
         with self.lock:
             for state in self.clarifications.values():
                 state['answer'] = _INTERRUPTED
@@ -267,8 +270,9 @@ class WorkerControls:
         try:
             while True:
                 frame = read_frame(sys.stdin.buffer)
-                if frame == {'type': 'stop'}:
-                    self.stop()
+                if frame in ({'type': 'stop'}, {'type': 'stop', 'source': 'system'}):
+                    # The owner's shutdown Stop names its source; a user's Stop carries none.
+                    self.stop(interrupt_source=frame.get('source'))
                     continue
                 if frame == {'type': 'finish'}:
                     self.finish.set()
@@ -288,7 +292,7 @@ class WorkerControls:
                             state['answer'] = frame['value']
                             state['event'].set()
         except (EOFError, OSError, ValueError) as exc:
-            self.stop()
+            self.stop(interrupt_source="system")
             # The owner is gone (EOF/OSError) — before the hard-exit SIGKILLs this process group, give
             # in-flight background subagents a bounded chance to finish + persist a real result.
             if not isinstance(exc, ValueError):
@@ -465,7 +469,7 @@ def execute(frame, channel):
                                      args=(agent, channel, turn_done, interval)).start()
             if controls.stopped.is_set():
                 from agent.interrupt_compat import request_hard_interrupt
-                request_hard_interrupt(agent)
+                request_hard_interrupt(agent, interrupt_source=getattr(controls, 'stop_source', None))
             channel.send('ready', pid=os.getpid())
             history = store.get_messages_as_conversation(scope['session_id'])
             from gateway.session_kanban import run_worker_turns

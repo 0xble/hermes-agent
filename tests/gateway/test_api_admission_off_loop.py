@@ -24,6 +24,7 @@ DOORS = [
 async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, monkeypatch, name, path, body,
                                                                 headers, expected):
     from gateway.platforms import api_server_runs
+    from gateway import session_api
 
     async def handle(event):
         from gateway.session_results import execution_result
@@ -42,6 +43,7 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
     owner_thread = threading.get_ident()
     contended = asyncio.Event()
     write_threads = []
+    restore_threads = []
     execute_write = owner.db._execute_write
     retry_write = owner.db._sleep_before_write_retry
 
@@ -59,6 +61,13 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
 
     monkeypatch.setattr(owner.db, '_execute_write', off_loop_write)
     monkeypatch.setattr(owner.db, '_sleep_before_write_retry', observed_retry)
+    original_restore = session_api.restore_api_session
+
+    def off_loop_restore(*args, **kwargs):
+        restore_threads.append(threading.get_ident())
+        return original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(session_api, 'restore_api_session', off_loop_restore)
     async with TestClient(TestServer(app)) as client:
         holder = sqlite3.connect(store_location(owner.persistence.scope), timeout=0, isolation_level=None)
         holder.execute('BEGIN IMMEDIATE')
@@ -79,3 +88,4 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
             await asyncio.gather(observed, return_exceptions=True)
             response = await asyncio.wait_for(request, 10)
         assert response.status == expected, await response.text()
+        assert restore_threads and all(thread != owner_thread for thread in restore_threads)

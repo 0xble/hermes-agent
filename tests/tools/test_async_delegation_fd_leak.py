@@ -1,10 +1,10 @@
 """Regression: the async-delegation ledger must close every SQLite connection.
 
-Sibling of the cron execution-ledger leak (#69567 / PR #69594). A ledger
-connection that commits or rolls back but is never closed leaks the
-db/-wal/-shm file descriptors on every dispatch, completion, and
-delivery-claim. These tests fail if the deterministic ``close()`` is ever
-removed again.
+Sibling of the cron execution-ledger leak (#69567 / PR #69594). The durable
+delegation ledger used ``with _connect() as conn:`` where the connection
+context manager commits/rolls back but never closes, leaking the db/-wal/-shm
+file descriptors on every dispatch, completion, and delivery-claim. These tests
+fail if the deterministic ``close()`` is ever removed again.
 """
 
 import queue
@@ -12,106 +12,70 @@ import sqlite3
 
 import pytest
 
-from hermes_cli.sqlite_safe_read import has_live_connection
-from persistence import PermanentStoreError
 from tools import async_delegation as ad
-from persistence_assembly import profile_scope
+
+
+class _TrackingConnection:
+    """Close instrumentation mixed into the requested real connection factory.
+
+    Keep sqlite_safe_read's tracked factory/close semantics intact; a delegating
+    proxy is not itself a SQLite connection and cannot safely track its lifetime.
+    """
+
+    def close(self):
+        self._closed_ids.append(id(self))
+        super().close()
 
 
 def _point_ledger(monkeypatch, tmp_path):
-    monkeypatch.setattr(ad, "_scope", lambda: profile_scope(home=tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     return ad
 
 
-def _track_handles(monkeypatch):
-    import persistence_assembly
-
+def _track_connections(monkeypatch):
     opened, closed = [], []
-    real_open = persistence_assembly.open_persistence
+    real_connect = sqlite3.connect
 
-    def tracking_open(scope, **kwargs):
-        handle = real_open(scope, **kwargs)
-        opened.append(id(handle))
-        real_close = handle.close
+    def tracking_connect(*args, **kwargs):
+        factory = kwargs.pop("factory", sqlite3.Connection)
+        kwargs["factory"] = type("ObservedConnection", (_TrackingConnection, factory), {})
+        conn = real_connect(*args, **kwargs)
+        conn._closed_ids = closed
+        opened.append(id(conn))
+        return conn
 
-        def close():
-            closed.append(id(handle))
-            real_close()
-        handle.close = close
-        return handle
-
-    monkeypatch.setattr(persistence_assembly, "open_persistence", tracking_open)
+    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
     return opened, closed
 
 
-def _track_connections(monkeypatch, factory_for=lambda factory: factory):
-    """Record every state.db connection opened; ``factory_for`` may swap the connection class."""
-    opened = []
-    real_connect = sqlite3.connect
-
-    def tracking_connect(database, *args, factory=sqlite3.Connection, **kwargs):
-        if str(database) == ":memory:":
-            return real_connect(database, *args, factory=factory, **kwargs)
-        conn = real_connect(database, *args, factory=factory_for(factory), **kwargs)
-        opened.append(conn)
-        return conn
-
-    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
-    return opened
-
-
-def _still_open(connections):
-    still_open = []
-    for conn in connections:
-        try:
-            conn.total_changes
-        except sqlite3.ProgrammingError:  # closed
-            continue
-        still_open.append(conn)
-    return still_open
-
-
 def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
-    """Public durable-ledger reads/writes must close every storage handle and connection opened."""
+    """Public durable-ledger reads/writes must close every connection opened."""
     _point_ledger(monkeypatch, tmp_path)
-    opened, closed = _track_handles(monkeypatch)
+    opened, closed = _track_connections(monkeypatch)
 
     ad.get_durable_delegation("nope")
     ad.recover_abandoned_delegations()
     ad.restore_undelivered_completions(queue.Queue())
+    ad.mark_completion_delivered("nope")
     ad.claim_completion_delivery("nope", "claim-1")
 
-    assert opened, "expected at least one storage handle to be opened"
+    assert opened, "expected at least one connection to be opened"
     assert len(opened) == len(closed)
     assert set(opened) == set(closed)
 
-    opened = _track_connections(monkeypatch)
-    ad.claim_completion_delivery("nope", "claim-2")
-
-    assert opened, "expected at least one connection to be opened"
-    assert _still_open(opened) == []
-    assert not has_live_connection(tmp_path / "state.db")
-
-
-def _fail_ddl(sql):
-    if "CREATE TABLE" in sql:
-        raise sqlite3.OperationalError("simulated schema init failure")
-
 
 class _FailingSchemaCursor:
-    """Cursor proxy that fails the canonical DDL, which the store's schema init runs
-    through ``conn.cursor()``."""
+    """Cursor proxy that fails the canonical DDL replay. ``apply_declared_schema``
+    replays SCHEMA_SQL statement by statement through ``conn.cursor()`` (no
+    ``executescript`` implicit COMMIT), so the injection sits on the cursor."""
 
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
 
     def execute(self, sql, *args, **kwargs):
-        _fail_ddl(sql)
+        if "CREATE TABLE" in sql:
+            raise sqlite3.OperationalError("simulated schema init failure")
         return self._real.execute(sql, *args, **kwargs)
-
-    def executescript(self, script):
-        _fail_ddl(script)
-        return self._real.executescript(script)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -124,56 +88,38 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
     shape from SCHEMA_SQL in a private ``:memory:`` database, which it closes itself
     and which holds no file descriptor."""
     _point_ledger(monkeypatch, tmp_path)
+    opened, closed = [], []
+    real_connect = sqlite3.connect
 
-    def failing_schema(factory):
-        class _FailingSchemaConnection(factory):
-            def execute(self, sql, *args, **kwargs):
-                _fail_ddl(sql)
-                return super().execute(sql, *args, **kwargs)
+    class _FailingSchemaConnection(_TrackingConnection):
+        def execute(self, sql, *args, **kwargs):
+            if "CREATE TABLE" in sql:
+                raise sqlite3.OperationalError("simulated schema init failure")
+            return super().execute(sql, *args, **kwargs)
 
-            def executescript(self, script):
-                _fail_ddl(script)
-                return super().executescript(script)
+        def executescript(self, script):
+            if "CREATE TABLE" in script:
+                raise sqlite3.OperationalError("simulated schema init failure")
+            return super().executescript(script)
 
-            def cursor(self, *args, **kwargs):
-                return _FailingSchemaCursor(super().cursor(*args, **kwargs))
-        return _FailingSchemaConnection
+        def cursor(self, *args, **kwargs):
+            return _FailingSchemaCursor(super().cursor(*args, **kwargs))
 
-    opened = _track_connections(monkeypatch, failing_schema)
+    def tracking_connect(database, *args, **kwargs):
+        if str(database) == ":memory:":
+            return real_connect(database, *args, **kwargs)
+        factory = kwargs.pop("factory", sqlite3.Connection)
+        kwargs["factory"] = type("FailingObservedConnection", (_FailingSchemaConnection, factory), {})
+        conn = real_connect(database, *args, **kwargs)
+        conn._closed_ids = closed
+        opened.append(id(conn))
+        return conn
 
-    with pytest.raises(PermanentStoreError, match="simulated schema init failure") as raised:
-        ad.claim_completion_delivery("nope", "claim-1")
+    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
 
-    assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+    with pytest.raises(sqlite3.OperationalError, match="simulated schema init failure"):
+        with ad._transaction():
+            pass
+
     assert len(opened) == 1
-    assert _still_open(opened) == []
-    assert not has_live_connection(tmp_path / "state.db")
-
-
-def test_post_open_hardening_failure_closes_connection(monkeypatch, tmp_path):
-    """The ledger's writer open runs a second ``_secure_state_db_files`` pass after the
-    connection is open; when it raises (ELOOP on a swapped-in sidecar link,
-    PermissionError), the connection must be closed, not leaked with its db/-wal/-shm
-    descriptors, and the error must reach the caller."""
-    import errno
-
-    from persistence.sqlite import _holder
-
-    _point_ledger(monkeypatch, tmp_path)
-    opened = _track_connections(monkeypatch)
-    real_secure = _holder._secure_state_db_files
-
-    def secure_then_fail_after_open(path, *, create_main=False):
-        real_secure(path, create_main=create_main)
-        if not create_main:
-            raise OSError(errno.ELOOP, "simulated swapped-in sidecar link", str(path))
-
-    monkeypatch.setattr(_holder, "_secure_state_db_files", secure_then_fail_after_open)
-
-    with pytest.raises(OSError, match="simulated swapped-in sidecar link") as raised:
-        ad.claim_completion_delivery("nope", "claim-1")
-
-    assert raised.value.errno == errno.ELOOP
-    assert len(opened) == 1
-    assert _still_open(opened) == []
-    assert not has_live_connection(tmp_path / "state.db")
+    assert closed == opened

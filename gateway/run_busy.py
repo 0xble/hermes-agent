@@ -41,12 +41,16 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run_turn_runner import TurnRunner
 
 
-def _call_with_steer_delivery(method, text: str, on_delivered=None) -> bool:
-    """Native controls report insertion. Legacy controls expose acceptance only."""
-    if on_delivered is not None and "on_delivered" in inspect.signature(method).parameters:
-        return bool(method(text, on_delivered=on_delivered))
-    accepted = bool(method(text))
-    if accepted and on_delivered is not None:
+def _call_with_steer_delivery(method, text: str, on_delivered=None, *, human: bool = True) -> bool:
+    """Native controls report insertion; legacy controls expose acceptance only."""
+    parameters = inspect.signature(method).parameters
+    kwargs = {}
+    if on_delivered is not None and "on_delivered" in parameters:
+        kwargs["on_delivered"] = on_delivered
+    if "human" in parameters:
+        kwargs["human"] = human
+    accepted = bool(method(text, **kwargs))
+    if accepted and on_delivered is not None and "on_delivered" not in kwargs:
         on_delivered()
     return accepted
 
@@ -264,7 +268,8 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         max_sessions = self._get_max_concurrent_sessions()
         if max_sessions is None or self._is_session_running(session_key):
             return None
-        active_count = self._running_agent_count()
+        # A queued restart resume holds a preclaim for ordering, not a running session.
+        active_count = self._running_agent_count() - self._queued_resume_preclaims()
         if active_count < max_sessions:
             return None
         from hermes_cli.active_sessions import active_session_limit_message
@@ -322,7 +327,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             return False
 
     @staticmethod
-    def _steer_active_subagents(running_agent: Any, text: str) -> int:
+    def _steer_active_subagents(running_agent: Any, text: str, *, human: bool = True) -> int:
         """Queue *text* into every live child of *running_agent*; returns how many accepted it.
 
         A parent blocked inside ``delegate_task`` only drains its own steer queue after the tool
@@ -344,16 +349,18 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             if not callable(steer):
                 continue
             try:
-                accepted += bool(steer(text))
+                accepted += bool(_call_with_steer_delivery(steer, text, human=human))
             except Exception as exc:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str, *, on_delivered=None) -> bool:
+    def _steer_running_agent(
+        self, running_agent: Any, text: str, *, on_delivered=None, human: bool = True,
+    ) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = _call_with_steer_delivery(running_agent.steer, text, on_delivered)
-        child_accepted = bool(self._steer_active_subagents(running_agent, text))
+        accepted = _call_with_steer_delivery(running_agent.steer, text, on_delivered, human=human)
+        child_accepted = bool(self._steer_active_subagents(running_agent, text, human=human))
         if child_accepted and not accepted and on_delivered is not None:
             # Child-only acceptance: the parent never owns the text, so its callback will not fire.
             on_delivered()
@@ -854,8 +861,8 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
                 if event is not None else None
             )
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text, on_delivered=on_delivered)
-            return _call_with_steer_delivery(getattr(running_agent, verb), call_text, on_delivered)
+                return self._steer_running_agent(running_agent, call_text, on_delivered=on_delivered, human=True)
+            return _call_with_steer_delivery(getattr(running_agent, verb), call_text, on_delivered, human=True)
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -1571,6 +1578,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             accepted = self._steer_running_agent(
                 running_agent, self._steer_text_with_origin(steer_text, event),
                 on_delivered=functools.partial(self._fold_into_running_turn, running_agent, quick_key, event),
+                human=True,
             )
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)

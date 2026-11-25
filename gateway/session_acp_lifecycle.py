@@ -5,7 +5,10 @@ is only a viewer, so the owner stamps it when the last subscription goes or the 
 a writer, source='acp' rows stay open forever and the ended-session guard keeps prune/archive away.
 A later ``session/load`` + prompt reopens the row (``session_local_recovery.reopen_local_session``).
 """
+import asyncio
+from functools import partial
 import logging
+from threading import Event
 
 from gateway.session_persistence import authority_persistence
 from persistence.core.errors import AuthorityRefusal
@@ -67,7 +70,31 @@ async def reopen_if_reattached(authority, session_id, ended):
     return ended
 
 
-def end_idle_acp_sessions(authority):
+def _end_idle_acp_sessions(authority, stopped):
     """Gateway shutdown: every ACP session nobody is viewing, attached this run or not."""
+    if stopped.is_set():
+        return 0
     ids = authority_persistence(authority).bindings.local_session_ids()
-    return sum(end_idle_acp_session(authority, sid) for sid in ids)
+    ended = 0
+    for session_id in ids:
+        if stopped.is_set():
+            break
+        ended += end_idle_acp_session(authority, session_id)
+    return ended
+
+
+async def end_idle_acp_sessions(authority, deadline):
+    """Close unviewed ACP sessions within shutdown's remaining settle budget."""
+    from gateway.session_runtime_workers import tracked_write
+
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        return 0
+    stopped = Event()
+    try:
+        close = partial(_end_idle_acp_sessions, authority, stopped)
+        return await asyncio.wait_for(tracked_write(authority, close), remaining)
+    finally:
+        # A waiting SQLite call may still be running. It retains authority ownership,
+        # but it must not start closing more sessions after the deadline or cancellation.
+        stopped.set()

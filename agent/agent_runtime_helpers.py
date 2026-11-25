@@ -2112,6 +2112,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
     install_served_model_capture(agent, client)

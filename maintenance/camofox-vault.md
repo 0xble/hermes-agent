@@ -339,7 +339,7 @@ CLI, never recording or granting a broader authorization. The keyed acceptance
 path must not reuse the unkeyed one-shot response filter.
 
 Contract tests: `tests/tools/test_mcp_trust_approval_scope.py`,
-`tests/gateway/test_mcp_consent_scope.py`, `tests/tools/test_mcp_trust_gating.py`.
+  `tests/gateway/test_mcp_consent_scope.py`, `tests/tools/test_mcp_trust_gating.py`.
 
 `scripts/run_tests.sh` on `tests/tools/test_browser_camofox_accounts.py`,
 `tests/agent/test_vault_connect.py`, `tests/agent/test_vault_backends.py`,

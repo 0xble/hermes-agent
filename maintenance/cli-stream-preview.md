@@ -43,3 +43,5 @@ This patch establishes preview identity, not complete erasure of transient rows.
 Remove when upstream renders streaming previews distinct from transcript and
 the resize-scrollback e2e passes without it. Roll back by reverting the commit
 carrying `Fork-Patch: cli-stream-preview-framing`.
+
+Contract tests: `tests/hermes_cli/test_cli_stream_preview_rule.py`, `tests/hermes_cli/test_cli_modern_layout.py`, `tests/e2e/core/cli_tmux/test_resize_scrollback.py`.

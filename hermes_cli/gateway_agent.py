@@ -32,7 +32,7 @@ VOICE_STOPPED = "voice_stopped"
 
 _RESULT_DEFAULTS = {
     "final_response": "", "failed": False, "partial": False, "error": None, "failure_reason": None,
-    "completed": True, "interrupted": False, "interrupt_message": None, "api_calls": 0,
+    "completed": True, "interrupted": False, "interrupt_message": None, "interrupt_source": None, "api_calls": 0,
     "pending_steer": None, "last_reasoning": None, "response_previewed": False,
     "response_transformed": False, "pre_transform_response": None, "billing_block": None,
     "auxiliary_usage": {},
@@ -603,7 +603,7 @@ class GatewayAgent:
     def hard_interrupt(self, message=None, tool_reason=None):
         self.interrupt(message)
 
-    def _correct(self, verb, text):
+    def _correct(self, verb, text, *, human=True):
         """-> ``True`` (accepted), ``False`` (not taken: the caller queues the text), or
         ``"voice_stopped"`` (TUI-26: the owner took a bare stop phrase as the end of this LOCAL
         session's voice chat; the text is consumed and reaches no turn, so it is never re-queued)."""
@@ -612,7 +612,7 @@ class GatewayAgent:
             return False
         try:
             result = self.connection.call(f"session.{verb}", session_id=self.session_id, text=text,
-                                          execution_generation=generation)
+                                          execution_generation=generation, human=human)
         except GatewayClientError:
             return False
         if (result or {}).get("voice_stopped") is True:
@@ -660,11 +660,11 @@ class GatewayAgent:
         return [{k: v for k, v in m.items() if k != "row_id"} for m in after.get("messages") or []
                 if not m.get("archived")], system_message
 
-    def steer(self, text):
-        return self._correct("steer", text)
+    def steer(self, text, *, human=True):
+        return self._correct("steer", text, human=human)
 
-    def redirect(self, text):
-        accepted = self._correct("redirect", text)
+    def redirect(self, text, *, human=True):
+        accepted = self._correct("redirect", text, human=human)
         if accepted is True:
             # Main's turn then answers the redirect row first (the interrupted call has no usage), so
             # its anchor is priced through that row: it, not the original ask, is the turn's ask.
@@ -672,7 +672,7 @@ class GatewayAgent:
         return accepted
 
     # -- the turn ------------------------------------------------------------------------------
-    def _submit_params(self, user_message, persist_user_message, turn_author):
+    def _submit_params(self, user_message, persist_user_message, turn_author, turn_origin):
         attachments = None
         if isinstance(user_message, list):
             # Main's native image turn: OpenAI content parts built from local files. The gateway takes
@@ -688,6 +688,8 @@ class GatewayAgent:
             params["api_text"] = user_message
         if turn_author:
             params["turn_author"] = turn_author
+        if turn_origin is not None:
+            params["turn_origin"] = turn_origin
         if self._voice_turn_pending:
             params["voice_turn"] = True
         staged = self._pending_cli_user_message
@@ -749,7 +751,7 @@ class GatewayAgent:
         return "\n\n".join(t for t in texts if t), attachments
 
     def run_conversation(self, user_message, conversation_history=None, stream_callback=None,
-                         task_id=None, persist_user_message=None, turn_author=None, **_kw):
+                         task_id=None, persist_user_message=None, turn_author=None, *, turn_origin=None, **_kw):
         turn = self._turn = _Turn(self.session_id)  # first: a turn main gave up on stops consuming
         history = list(conversation_history or [])
         self._turn_ask_index = len(history)  # the staged ask's row in this turn's transcript
@@ -775,7 +777,7 @@ class GatewayAgent:
                 notice = self._prepare_submit(turn)
                 if notice:
                     return self._unadmitted(history, user_message, notice)
-                params = self._submit_params(user_message, persist_user_message, turn_author)
+                params = self._submit_params(user_message, persist_user_message, turn_author, turn_origin)
                 if self._stop(turn)():
                     raise CallStopped("prompt.submit")
                 receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})

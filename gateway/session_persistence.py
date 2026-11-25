@@ -32,6 +32,7 @@ import contextlib
 import logging
 import json
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from utils import atomic_json_write
@@ -54,6 +55,12 @@ _SESSIONS_JSON_README = (
     "in ~/.hermes/state.db and are shown by `hermes sessions list` and `/sessions`. Disable this "
     "file with `gateway.write_sessions_json: false` in config.yaml."
 )
+
+
+# A full routing save writes only its diff against the rows this process last persisted; this often
+# it re-reads the stored rows instead (outside the write lock), restoring rows another process or a
+# direct row write changed behind that baseline.
+_ROUTING_RECONCILE_S = 600.0
 
 
 def _is_live_system_guard(exc: BaseException) -> bool:
@@ -631,7 +638,8 @@ class SessionPersistenceMixin:
             replacer = self._routing_db_method("replace_gateway_routing_entries")
             if replacer is not None:
                 try:
-                    retired = replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
+                    retired = self._write_routing_index_locked(
+                        replacer, {k: json.dumps(v) for k, v in data.items()})
                     db_saved = True
                     # A retired route the save skipped stays out of the mirror too: its fence may
                     # age out (a prune's), and the next start's legacy import would restore it.
@@ -656,6 +664,44 @@ class SessionPersistenceMixin:
             if fast_persisted:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
+
+    def _write_routing_index_locked(self, replacer, encoded: dict[str, str]) -> set[str]:
+        """Persist the whole routing index (``_save_lock`` held); return the skipped retired keys.
+
+        A full replace parses and checks every route inside the state.db write lock, which held it
+        for seconds on a large index and stalled every other session's write. So write only the diff
+        against ``_routing_baseline`` ({key: entry_json} as stored, None meaning unknown). With no
+        trusted baseline (first save, a failed or skipped write, another store or scope) and every
+        ``_ROUTING_RECONCILE_S``, the baseline is the stored rows, read without the write lock, which
+        restores rows other writers changed. Private keys the delta leaves alone stay unknown.
+        """
+        db = getattr(replacer, "__self__", replacer)
+        owner = (id(db), self._routing_scope())
+        apply_delta = getattr(db, "apply_gateway_routing_delta", None)
+        loader = getattr(db, "load_gateway_routing_entries", None)
+        if not callable(apply_delta) or not callable(loader):
+            return replacer(encoded, scope=owner[1])
+        baseline = getattr(self, "_routing_baseline", None)
+        self._routing_baseline = None  # uncertain until a write below returns
+        if (baseline is None or getattr(self, "_routing_baseline_owner", None) != owner
+                or time.monotonic() - getattr(self, "_routing_full_at", 0.0) >= _ROUTING_RECONCILE_S):
+            started = time.monotonic()
+            baseline = dict(loader(scope=owner[1]))
+            self._routing_baseline_owner, self._routing_full_at = owner, started
+        upserts = {k: v for k, v in encoded.items() if baseline.get(k) != v}
+        removed = [k for k in baseline if k not in encoded]
+        held: set[str] = set()
+        retired = apply_delta(upserts, removed, scope=owner[1], held=held) if upserts or removed else set()
+        if retired is None:  # a private turn: nothing written, the next save re-reads the rows
+            return set()
+        for key in removed:
+            if key not in held:
+                baseline.pop(key, None)
+        baseline.update({k: None if k in held else v for k, v in upserts.items()})
+        for key in retired:
+            baseline.pop(key, None)
+        self._routing_baseline = baseline
+        return retired
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
@@ -700,6 +746,11 @@ class SessionPersistenceMixin:
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
+                    baseline = getattr(self, "_routing_baseline", None)
+                    if baseline is not None:
+                        # The upsert may have skipped a retired route: the next full save
+                        # rewrites this key and reports it, as a full replace would.
+                        baseline[session_key] = None
                 return
             except Exception as exc:
                 logger.warning(

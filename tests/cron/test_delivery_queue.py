@@ -195,6 +195,40 @@ def test_legacy_queue_schema_adds_failure_lane_before_enqueue(tmp_path, monkeypa
     assert queue.get_status("exec-migrated")["for_failure"] == 1
 
 
+_UNCONSTRAINED_STATUS = "status TEXT NOT NULL"
+_UPSTREAM_STATUS_BEFORE_REVIEWING = (
+    "status TEXT NOT NULL CHECK(status IN ('pending','delivering','delivered','failed','unknown'))")
+
+
+@pytest.mark.parametrize("status_column", [_UNCONSTRAINED_STATUS, _UPSTREAM_STATUS_BEFORE_REVIEWING])
+def test_an_older_queue_is_migrated_once_not_on_every_open(tmp_path, monkeypatch, status_column):
+    """SQLite cannot widen a CHECK in place, so the queue is rebuilt to admit new statuses. The
+    rebuild must converge: a table it cannot widen (no CHECK) must not be renamed and copied again on every open, which rewrites the whole file each time."""
+    import cron.delivery_queue as queue
+
+    db = tmp_path / "deliveries.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(f"""CREATE TABLE deliveries (
+            execution_id TEXT PRIMARY KEY, job_json TEXT NOT NULL, content TEXT NOT NULL,
+            {status_column}, owner_process_id TEXT, owner_pid INTEGER, owner_started_at INTEGER,
+            created_at TEXT NOT NULL, finished_at TEXT, error TEXT)""")
+        conn.execute("INSERT INTO deliveries (execution_id, job_json, content, status, created_at)"
+                     " VALUES ('kept', '{}', 'body', 'pending', '2026-11-01T00:00:00+00:00')")
+    monkeypatch.setattr(queue, "DELIVERY_DB", db)
+
+    def schema():
+        with sqlite3.connect(db) as conn:
+            return (conn.execute("PRAGMA schema_version").fetchone()[0],
+                    conn.execute("SELECT name, rootpage, sql FROM sqlite_master ORDER BY name").fetchall())
+
+    assert queue.get_status("kept")["status"] == "pending"  # first open migrates and keeps the row
+    settled = schema()
+    queue.get_status("kept")
+    queue.get_status("kept")
+
+    assert schema() == settled
+
+
 def test_wait_timeout_marks_inflight_delivery_unknown_without_retry(
     tmp_path, monkeypatch
 ):

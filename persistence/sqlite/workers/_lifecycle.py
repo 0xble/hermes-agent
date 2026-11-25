@@ -114,17 +114,13 @@ def worker_next_title(db, conn, session_id, payload):
 
 
 def worker_title_collision(db, conn, session_id, payload):
-    from hermes_state_titles import _auto_title_matches
+    from hermes_state_titles import _auto_title_collides
     if (set(payload) != {'title', 'exclude_session_id'} or not isinstance(payload['title'], str)
             or payload['exclude_session_id'] not in (None, session_id)):
         raise RuntimeStoreError('invalid_params')
     if not payload['title']:
         return {'value': False}
-    conn.create_function('auto_title_matches', 2, _auto_title_matches, deterministic=True)
-    return {'value': conn.execute(
-        'SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL '
-        'AND auto_title_matches(title, ?) LIMIT 1',
-        (payload['exclude_session_id'] or '', payload['title'].casefold())).fetchone() is not None}
+    return {'value': _auto_title_collides(conn, payload['title'], payload['exclude_session_id'])}
 
 
 def worker_activity(db, conn, session_id, payload):
@@ -309,7 +305,7 @@ def insert_session_row_in_transaction(
         ),
     )
     if system_prompt_hash is not None:
-        self._delete_unreferenced_system_prompts(conn)
+        self._delete_prompt_if_unreferenced(conn, system_prompt_hash)
     if parent_session_id:
         self._inherit_parent_session_metadata(conn, session_id)
     # The upsert may have just filled a compression tip's created_source (update_token_counts).

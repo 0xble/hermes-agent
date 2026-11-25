@@ -116,11 +116,17 @@ def _transaction(*, immediate: bool = False):
 def _capture_routing_origin() -> dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
-    Best-effort: empty values are omitted."""
+    Empty ``thread_id`` is retained when a route is captured so a top-level
+    completion can clear a stale restored topic. Other empty values are omitted.
+    """
     from tools.async_delegation import _ROUTING_KEYS
     try:
         from gateway.session_context import get_session_env
-        return {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+        values = {k: get_session_env(f"HERMES_SESSION_{k.upper()}", "") for k in _ROUTING_KEYS}
+        return {
+            k: v for k, v in values.items()
+            if v or (k == "thread_id" and values.get("platform") and values.get("chat_id"))
+        }
     except Exception:
         return {}
 
@@ -146,7 +152,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "route_chain", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     if child_sessions := record.get("child_sessions"):
         task_payload["child_execution"] = {

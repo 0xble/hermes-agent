@@ -6,6 +6,7 @@ state model and the drain loop that calls into these."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -237,11 +238,38 @@ class StreamTransportMixin:
             self._draft_retry_until, time.monotonic() + float(retry_after))
         return True
 
-    async def _abandon_native_stream(self) -> None:
+    async def _finish_transports(self) -> None:
+        """Close unfinished output before releasing any pending flush barriers."""
+        try:
+            if not self._final_content_delivered and not self._native_stream_abandoned:
+                abandon_task = asyncio.create_task(
+                    self._abandon_native_stream(reconcile=self._run_still_current())
+                )
+                try:
+                    await asyncio.wait_for(asyncio.shield(abandon_task), timeout=5.0)
+                except TimeoutError:
+                    abandon_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await abandon_task
+                    logger.debug("abandon_open_draft timed out during transport cleanup")
+                except asyncio.CancelledError:
+                    abandon_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await abandon_task
+                    raise
+                except Exception:
+                    logger.debug("abandon_open_draft failed during transport cleanup", exc_info=True)
+        finally:
+            # Flush waiters must be released even when cancellation or a connector hang interrupts
+            # draft cleanup. A stale stream is recoverable; a blocked turn queue is not.
+            self._wake_flush_waiters()
+
+    async def _abandon_native_stream(self, *, reconcile: bool = True) -> None:
         """Seal an orphaned draft stream on turn death (stale exit / cancel): else the live
         indicator stays forever and armed interception state leaks into the next turn.
-        Never sets delivery flags. The edit transport has no draft to seal, but its preview still
-        ends in the live cursor: re-edit the text already on screen without it."""
+        Never sets delivery flags; stale exits must not expose a reconciliation target. The edit transport has no draft to seal, but its preview still ends in the live cursor: re-edit the text already on screen without it."""
+        if self._native_stream_abandoned:
+            return
         if not self._use_draft_streaming:
             if self.cfg.cursor and self.cfg.cursor in (self._last_sent_text or ""):
                 await self._try_strip_cursor()
@@ -249,9 +277,16 @@ class StreamTransportMixin:
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
             return
         try:
-            await self.adapter.abandon_open_draft(
+            result = await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
-                metadata=self._draft_metadata())
+                metadata={**(self._draft_metadata() or {}), "_draft_id": self._draft_id})
+            if not getattr(result, "success", False):
+                return
+            self._native_stream_abandoned = True
+            if reconcile and getattr(result, "success", False) and getattr(result, "message_id", None):
+                # A sealed preview is editable, not yet a confirmed final.
+                self._message_id = result.message_id
+                self._abandoned_draft_message_id = result.message_id
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
 

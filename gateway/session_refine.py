@@ -69,7 +69,9 @@ async def refine_local_session(runner, source, focus):
             finish_background_review_run(live.review, run)
             from gateway.session_retirement import retire_after_review
             with contextlib.suppress(RuntimeError):  # the loop already closed
-                loop.call_soon_threadsafe(retire_after_review, authority, ref, live)
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(retire_after_review(authority, ref, live))
+                )
         return ''  # the summary (if any) was published above; an empty review.summary draws nothing
 
     def review_body():

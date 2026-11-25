@@ -1,12 +1,9 @@
 """The empty-chain failure alert must tell the operator how to fix it.
 
-Field report: a user whose cron died with "No fallback
-chain configured." still cannot self-serve — the alert names the problem but
-not the remedy. The empty-chain branch of _fallback_chain_phrase() must name
-the exact commands: `hermes fallback add` for the chain, and the
-cron.model / cron.model_provider fleet-default keys as the operator-level
-alternative. The exhausted branch stays terse — the chain is intact and the
-problem is provider-side, so no config command applies.
+The empty-chain branch of _fallback_chain_phrase() names the required three
+independent ordered providers under cron.fallback_providers and the
+cron.model / cron.model_provider fleet-default keys. The exhausted branch
+stays terse because the chain is intact and the problem is provider-side.
 """
 
 from cron import scheduler
@@ -20,7 +17,7 @@ def test_empty_chain_alert_names_the_remediation_commands(monkeypatch):
     msg = _summarize_cron_failure_for_delivery(job, "Request timed out.")
     assert "No backup provider is configured" in msg
     assert "cron.fallback_providers" in msg
-    assert "hermes fallback add" in msg
+    assert "three ordered providers" in msg
     assert "cron.model_provider" in msg
 
 
@@ -45,4 +42,4 @@ def test_rate_limit_empty_chain_also_carries_the_hint(monkeypatch):
     job = {"name": "kz-coverage", "id": "bbb222"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
     assert "No backup provider is configured" in msg
-    assert "hermes fallback add" in msg
+    assert "three ordered providers" in msg

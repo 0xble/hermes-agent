@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
+from agent.agent_init_fallback import _bind_init_fallback, _fallback_entries, _init_fallback_chain, _pin_init_fallbacks
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
@@ -422,7 +422,7 @@ _CONTROL_STATE: dict[str, Any] = {
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
-    "_interrupt_message": None,  # optional message that triggered the interrupt
+    "_interrupt_message": None, "_interrupt_source": None,  # trigger text; system/user provenance
     "_hard_interrupt_requested": threading.Event,
     "_execution_thread_id": None,  # set at run_conversation() start
     "_interrupt_thread_signal_pending": False,
@@ -793,18 +793,11 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             )
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
-        agent._fallback_activated = True
-        if _fb_provider.strip().lower() == "moa":
-            # The chokepoint handed back the preset's aggregator client, which only proves the
-            # preset resolves and its aggregator has credentials. A MoA entry means the preset
-            # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
-            from agent.moa_loop import bind_moa_runtime
-            bind_moa_runtime(agent, _fb["model"])
-            return None
-        agent.provider = agent.requested_provider = _fb["provider"]
-        agent.model = _fb_model or _fb["model"]
-        recompute_init_fallback_api_mode(agent, _fb_client)
-        return _client_kwargs_from_routed(_fb_client, _provider_timeout)
+        # A MoA entry names the preset itself; the resolved model is only its aggregator.
+        next_model = _fb["model"] if str(_fb["provider"]).strip().lower() == "moa" else (_fb_model or _fb["model"])
+        accepted, needs_client = _bind_init_fallback(agent, _fb["provider"], next_model, _fb_client)
+        if accepted:
+            return _client_kwargs_from_routed(_fb_client, _provider_timeout) if needs_client else None
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
     # so name it even when no fallback entries are configured.
     _pool_exhausted = False
@@ -2115,8 +2108,8 @@ def init_agent(
     load_soul_identity: bool = False, skip_memory: bool = False,
     skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
-    fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
-    checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
+    fallback_model: dict[str, Any] | None = None, model_pinned: bool = False, credential_pool=None, checkpoints_enabled: bool = False,
+    fallback_chain_owned: bool = False, allow_billing_fallback: bool = False, checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None, memory_agent_context: str | None = None,
@@ -2198,8 +2191,9 @@ def init_agent(
     _init_prompt_cache_config(agent)
     _init_turn_state(agent, run_budget_seconds)
     _set_defaults(agent, _STREAM_STATE)
-    _build_client(agent, api_key, base_url, fallback_model)
-    _init_fallback_chain(agent, fallback_model)
+    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned, fallback_chain_owned)
+    _build_client(agent, api_key, base_url, fallback_chain)
+    _init_fallback_chain(agent, fallback_chain)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
     _init_session_state(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,

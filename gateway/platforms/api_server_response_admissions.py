@@ -53,7 +53,7 @@ def _lookup_admission(authority, store, durable_key, request_id):
 
 
 def _restore_admitted(found):
-    """The owner-loop half of a found admission: a live one's session is restored and checked."""
+    """Restore and check a found admission's live session in the store worker."""
     if found is not None and found[2]['status'] in {'queued', 'started'}:
         from gateway.session_api import restore_api_session
         from gateway.session_api_turn import check_api_turn
@@ -72,9 +72,13 @@ def _lookup_call(adapter, durable_key, request_id):
 
 
 async def find_admission(adapter, durable_key, request_id):
-    """``_lookup_admission`` off the loop, then the session restore on it."""
+    """Look up the receipt and restore its live session off the owner loop."""
     store, call = _lookup_call(adapter, durable_key, request_id)
-    return _restore_admitted(await store.off_loop(*call))
+    found = await store.off_loop(*call)
+    if found is None or found[2]['status'] not in {'queued', 'started'}:
+        return found
+    from gateway.session_runtime_workers import tracked_write
+    return await tracked_write(found[0], partial(_restore_admitted, found))
 
 
 def admitted_context(admitted, *, replay=False):
@@ -92,13 +96,14 @@ def admitted_context(admitted, *, replay=False):
 
 def _admit_steps(adapter, durable_key, request_id, binding, run_kwargs, model):
     """The final lookup and the admission are one API admission drive (``run_steps_off_loop``
-    serializes them per authority): simultaneous observers converge on one admission. Every
-    store call is a yielded step, so a worker runs it: only the session restore stays on the loop."""
+    serializes them per authority): simultaneous observers converge on one admission. Workers
+    run the yielded store and restore steps."""
     from gateway.session_api_turn import admit_api_steps
     store, lookup = _lookup_call(adapter, durable_key, request_id)
     if not (yield partial(store.bind_request_key, durable_key[0], binding, model=model)):
         raise AuthorityRefusal('admission_conflict')
-    admitted = _restore_admitted((yield partial(store.atomically, *lookup)))
+    found = yield partial(store.atomically, *lookup)
+    admitted = yield partial(_restore_admitted, found)
     if admitted is not None:
         return (*admitted, True)
     try:
@@ -108,7 +113,8 @@ def _admit_steps(adapter, durable_key, request_id, binding, run_kwargs, model):
     except Exception:
         # A definite pre-admission refusal does not reserve a poisoned identity. If storage
         # cannot prove absence, leave the binding intact for later recovery.
-        if _restore_admitted((yield partial(store.atomically, *lookup))) is None:
+        found = yield partial(store.atomically, *lookup)
+        if (yield partial(_restore_admitted, found)) is None:
             yield partial(store.forget_unadmitted_request, durable_key[0])
         raise
     yield partial(store.bind_request_admission, durable_key[0], admitted[2]['admission_id'])

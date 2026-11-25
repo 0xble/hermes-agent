@@ -313,7 +313,7 @@ def test_tool_payload_bytes_bound_each_transaction(tmp_path):
         db.create_session("tools", source="cli")
         db.append_messages_batch("tools", [
             {"role": "assistant", "content": None, "tool_calls": [{
-                "id": str(i), "type": "function", "function": {"name": "payload", "arguments": "x" * 120000},
+                "id": str(i), "type": "function", "function": {"name": "payload", "arguments": "x" * (DELETE_BYTES // 2 + 1024)},
             }]} for i in range(6)
         ])
         sizes = dict(db._read_all("SELECT id,length(CAST(tool_calls AS BLOB)) FROM messages"))

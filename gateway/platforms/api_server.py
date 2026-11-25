@@ -32,7 +32,6 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
-
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
     single-profile gateway answering /p/<x>/ served the owner's toolsets under another URL."""
@@ -149,7 +148,7 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from gateway.platforms.api_server_response_store import ResponseStore
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import request_hard_interrupt, request_soft_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
     ArtifactError, ArtifactRateLimiter, ArtifactStore, ArtifactTooLarge, DEFAULT_ALLOWED_MIME_TYPES,
@@ -301,7 +300,9 @@ def _clean_request_string(value: Any) -> Optional[str]:
 
 # model_options decoding lives in the topical sibling (line-cap offset);
 # re-exported here so importers are unaffected.
-from gateway.platforms.api_server_request_options import _request_reasoning_config, _request_service_tier
+from gateway.platforms.api_server_request_options import (
+    _request_agent_overrides, _request_reasoning_config, _request_service_tier,
+)
 
 
 def _apply_runtime_agent_overrides(
@@ -330,31 +331,6 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command")},
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool")}
-
-
-def _request_agent_overrides(
-    body: Any, *, virtual_model: Optional[str] = None, allow_bare_model: bool = True
-) -> dict[str, Any]:
-    """Extract per-request model/provider/options for _run_agent.
-
-    The virtual model (``hermes-agent``) means "gateway default". A bare ``model`` without
-    ``provider`` is honored only when ``allow_bare_model`` (generic clients hardcode "gpt-4o";
-    OpenAI-compatible handlers pass the ``direct_model_requests`` opt-in, Hermes-native
-    endpoints always allow it). An explicit ``provider`` is always honored.
-    """
-    if not isinstance(body, dict):
-        return {}
-    overrides: dict[str, Any] = {}
-    provider = _clean_request_string(body.get("provider"))
-    if provider:
-        overrides["requested_provider"] = provider
-    model = _clean_request_string(body.get("model"))
-    if model and model != virtual_model and (provider or allow_bare_model):
-        overrides["requested_model"] = model
-    model_options = body.get("model_options")
-    if isinstance(model_options, dict):
-        overrides["model_options"] = dict(model_options)
-    return overrides
 
 
 def _request_relay_metadata(body: Any) -> dict[str, Any]:
@@ -1925,9 +1901,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return self._model_routes.get(model_alias) if isinstance(model_alias, str) else None
 
     def _stored_session_model(self, session: Any) -> Optional[str]:
-        """The model persisted on a session row, minus the virtual alias (replaying
-        "hermes-agent" upstream as a provider model id 400s)."""
-        stored = session.get("model") if isinstance(session, dict) else None
+        """The persisted model minus the virtual alias (upstream 400s on "hermes-agent") and a fallback's (#152333)."""
+        from agent.fallback_session_route import fallback_restored_row
+        stored = fallback_restored_row(session).get("model") if isinstance(session, dict) else None
         if not stored or stored == self._model_name:
             return None
         return stored
@@ -2315,7 +2291,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
         from agent.primary_auth_fallback import RUNTIME_KEY, attach_primary_auth_failure, failure_for_route, route_snapshot
         _primary_auth_failure, resolved_route = runtime_kwargs.pop(RUNTIME_KEY, None), route_snapshot(runtime_kwargs)
-        request_reasoning_config, request_service_tier = _request_reasoning_config(model_options), _request_service_tier(model_options)
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
+        request_reasoning_config = _request_reasoning_config(model_options)
+        request_service_tier = _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
@@ -2360,8 +2338,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        model_pinned = bool(request_model or route or session_model or (session_override or {}).get("model"))
+        if model_pinned:
+            agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
         attach_primary_auth_failure(agent, failure_for_route(_primary_auth_failure, resolved_route, runtime_kwargs))
+        if preflight_fallback is not None and not model_pinned:
+            agent._preflight_fallback = preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -3753,7 +3736,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     await task
             return
         with suppress(Exception):
-            agent.interrupt(interrupt_message)
+            request_soft_interrupt(agent, interrupt_message, interrupt_source="system")
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)

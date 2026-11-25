@@ -7,17 +7,10 @@ docs of config.yaml.
 from hermes_cli.config_defaults_auxiliary import _aux
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
 from hermes_cli.config_defaults_voice import VOICE_DEFAULTS
-
-
-from hermes_cli.config_defaults_sandbox import (
-    DEFAULT_SANDBOX_IMAGE as DEFAULT_SANDBOX_IMAGE,
-    LEGACY_SANDBOX_IMAGES as LEGACY_SANDBOX_IMAGES,
-    LEGACY_SANDBOX_IMAGE as LEGACY_SANDBOX_IMAGE,
-    DEFAULT_VERCEL_IMAGE as DEFAULT_VERCEL_IMAGE,
-    LEGACY_VERCEL_RUNTIME as LEGACY_VERCEL_RUNTIME,
+from hermes_cli.config_defaults_runtime import (
+    DEFAULT_CRON_MAX_PARALLEL_JOBS, DEFAULT_SANDBOX_IMAGE, DEFAULT_VERCEL_IMAGE,
+    LEGACY_SANDBOX_IMAGE, LEGACY_SANDBOX_IMAGES, LEGACY_VERCEL_RUNTIME,
 )
-
-DEFAULT_CRON_MAX_PARALLEL_JOBS = 4
 
 
 DEFAULT_CONFIG = {
@@ -29,6 +22,9 @@ DEFAULT_CONFIG = {
     "incognito": {"model": ""},
     "providers": {},
     "fallback_providers": [],
+    # Daily input + cache-read + output token ceilings for fallback-only spare upstreams.
+    # Defaults protect Meta/Muse and xAI/Grok from storms; set per family to tune or 0 to disable.
+    "fallback_budgets": {"meta": 30_000_000, "xai": 30_000_000},
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
@@ -147,13 +143,13 @@ DEFAULT_CONFIG = {
             # drops from 3 to 1. Unknown pricing / missing usage leaves it untouched.
             "cost_threshold_usd": 0.25,
         },
-        # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first fast_auto_seconds of every
-        # turn), "cold" (first turn of a session only). Messaging gateway sessions only:
-        # agent.fast_expiry_seconds is the seconds before a session fast/ultrafast override switches
-        # to normal; 0 disables. CLI/TUI sessions do not expire.
+        # Fast: ""/normal (off), fast (always), auto (first fast_auto_seconds each turn),
+        # cold (first turn only). Gateway sessions expire per tier: Fast 30m, Ultrafast 5m.
+        # Zero disables that tier's expiry. CLI/TUI sessions do not expire.
         "service_tier": "",
         "fast_auto_seconds": 60,
-        "fast_expiry_seconds": 0,
+        "fast_expiry_seconds": 1800,
+        "ultrafast_expiry_seconds": 300,
         # Responses-only `text.verbosity` (never chat_completions): "" = not sent, or low | medium | high.
         "text_verbosity": "",
         "daybreak": False,  # opt-in; only catalog-listed Codex models (agent/codex_service_tiers.py)
@@ -1345,11 +1341,12 @@ DEFAULT_CONFIG = {
         "backends": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
-        # Fallback chain for delegated children (same entry format as the top-level list).
-        # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
-        # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
+        # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
+        "allow_billing_fallback": False,  # Pinned children may cross fallback models on billing exhaustion.
+        # Subagent/cron/side-agent runs retry transient errors on the same route this long before fallback; 0 = no wait.
+        "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |
@@ -1394,6 +1391,11 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Maximum parallel children that may be running on a fallback route owned by a spare
+        # upstream family. This shared cross-process lease protects the default spare families
+        # (Meta/Muse and xAI/Grok) from fan-out storms; 2 is intentionally conservative.
+        "max_concurrent_on_spare": 2,
+        "spare_upstreams": ["meta", "xai"],
         # Maximum pending background delegation calls while the async pool is full.
         # Zero rejects at capacity without blocking the parent turn.
         "max_queued_delegations": 8,
@@ -1429,7 +1431,7 @@ DEFAULT_CONFIG = {
         # True shows every goal card. False hides automatic lifecycle output, not queries or
         # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
         "notices": True,
-        "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        "autonomy": False,  # Inherit the contract; clearing obsolete goals requires a recorded reason.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
@@ -1868,6 +1870,7 @@ DEFAULT_CONFIG = {
         # null inherits the global fallback chain; [] disables cron fallback.
         # An explicit provider/model list replaces the global chain for cron only.
         "fallback_providers": None,
+        "allow_billing_fallback": False,  # Pinned cron jobs may cross fallback models on billing exhaustion.
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable
@@ -2157,14 +2160,11 @@ DEFAULT_CONFIG = {
     # Native hosted-room Discussion ceilings, shared by all members per discussion.
     # Positive integers only (no unlimited/0). Read from the root owner's config at service
     # startup for all hosted rooms; restart the owning service after changing them.
-    "hosted_rooms": {
-        "discussion": {
-            "max_rounds": 3,
-            "max_messages": 10,
-        },
-    },
+    "hosted_rooms": {"discussion": {"max_rounds": 3, "max_messages": 10}},
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "zero_cut_handover": {"enabled": False},
+        # Answer messages that arrived while a platform was disconnected (Slack DMs and @-mentions).
+        "missed_inbound_recovery": {"enabled": True},
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         "guardian": {
             "enabled": False,
@@ -2793,9 +2793,7 @@ DEFAULT_CONFIG = {
     "_config_version": 54,  # Config schema version - bump this when adding new required fields
 }
 
-
 from hermes_cli.config_defaults_env import OptionalEnvVars, _base_url, _env, _msg, _prov, _setting, _skill, _tool
-
 
 # Optional environment variables that enhance functionality. Feeds the dashboard keys page and setup
 # checklists; category: provider|tool|skill|messaging|setting, advanced=True hides from checklists,

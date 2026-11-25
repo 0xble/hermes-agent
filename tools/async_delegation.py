@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# health: allow FILE_LINES -- route persistence and lineage notice policy belong in this established registry.
 """Async (background) delegation registry behind ``delegate_task(background=true)``.
 
 The parent dispatches a subagent on a module-level daemon executor and returns a handle
@@ -184,7 +185,13 @@ _PENDING_ADMISSION_SLOTS: set = set()
 _BACKEND_RETIRING = "backend is retiring; reconnect to continue"
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
-_ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# Session keys do not retain the originating Slack reply thread (a DM session
+# can legitimately serve several threads), so detached completions persist the
+# complete source envelope captured before the child is built.
+_ROUTING_KEYS = (
+    "platform", "chat_type", "chat_id", "thread_id", "message_id",
+    "scope_id", "user_id", "user_name",
+)
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -775,6 +782,7 @@ def _dispatch_admitted(
     task_indexes: Optional[list[int]] = None,
     task_contexts: Optional[dict[str, str]] = None,
     task_transcripts: Optional[dict[str, str]] = None,
+    route_chain: Optional[list[tuple[str, str, str]]] = None,
     child_sessions: Optional[dict[str, str]] = None,
     cron_execution: Optional[dict[str, str]] = None,
     max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
@@ -804,6 +812,7 @@ def _dispatch_admitted(
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
         **(cron_execution or {}), **({"task_contexts": dict(task_contexts)} if task_contexts else {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
+        **({"route_chain": [tuple(route) for route in route_chain]} if route_chain else {}),
         **({"child_sessions": dict(child_sessions)} if child_sessions else {}),
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         "_context": contextvars.copy_context(),
@@ -971,6 +980,7 @@ def dispatch_async_delegation_batch(
     task_contexts: Optional[dict[str, str]] = None,
     task_transcripts: Optional[dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
     child_sessions: Optional[dict[str, str]] = None,
+    route_chain: Optional[list[tuple[str, str, str]]] = None,
 ) -> dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -990,7 +1000,7 @@ def dispatch_async_delegation_batch(
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         max_queued_delegations=max_queued_delegations, cancel_fn=cancel_fn,
         task_indexes=task_indexes, task_contexts=task_contexts, task_transcripts=task_transcripts,
-        child_sessions=child_sessions,
+        child_sessions=child_sessions, route_chain=route_chain,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -1129,7 +1139,7 @@ def completion_event(record: dict[str, Any], result: dict[str, Any], status: str
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({"cut_reason": cut_reason} if cut_reason else {}),
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in _ROUTING_KEYS if record.get(k) or (k == "thread_id" and k in record)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     return evt, result, silent
 
@@ -1241,6 +1251,43 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                          "result lost: %s", record.get("delegation_id"), exc, exc_info=True)
 
 
+
+def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -> bool:
+    """Classify the persisted row, including the child just checkpointed, before suppressing a notice.
+
+    The live registry record can be stale and does not carry retry lineage across a restart. A
+    multi-goal or indexed batch is deliberately terminal under ``classify_outcome`` even when one
+    child is transient, so only a scalar row classified for retry is suppressed here.
+    """
+    from tools.delegation_resume import (
+        MAX_LINEAGE_AGE_S,
+        MAX_RETRY_ATTEMPTS,
+        RETRY_ARMED,
+        RETRY_SCHEDULED,
+        classify_outcome,
+        retry_status,
+    )
+    try:
+        persisted = retry_status(delegation_id)
+    except Exception:
+        logger.debug("Could not classify persisted retry state for %s", delegation_id, exc_info=True)
+        return False
+    if persisted is None or persisted.get("retry_state") not in {RETRY_ARMED, RETRY_SCHEDULED}:
+        return False
+    result = dict(persisted.get("result") or {})
+    results = [item for item in result.get("results") or [] if isinstance(item, dict)]
+    task_index = entry.get("task_index")
+    results = [item for item in results if item.get("task_index") != task_index]
+    results.append(entry)
+    result["results"] = results
+    persisted["result"] = result
+    verdict, _ = classify_outcome(persisted)
+    started = float(persisted.get("retry_root_started_at") or persisted.get("dispatched_at") or time.time())
+    within_budget = (int(persisted.get("retry_attempt") or 0) < MAX_RETRY_ATTEMPTS
+                     and time.time() - started < MAX_LINEAGE_AGE_S)
+    return verdict == "retry" and within_budget
+
+
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:
     """Surface ONE failed child of a still-running detached batch to the parent now, instead of
     when the slowest sibling finishes. In a 1,393-agent run every wave-1 child died in a 401 storm
@@ -1249,13 +1296,18 @@ def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tas
     ``type="async_delegation"`` event shape as the batch result (so every drain/route/format path
     treats it identically) with ``task_failure_notice=True`` and a single-entry ``results`` list; the
     batch record is NOT finalized and its consolidated result still arrives as before. In-process
-    queue only (never persisted), so the parent's copy honours ``security.redact_secrets: false``."""
-    entry = redact_child_result(entry, force=False)
+    queue only (never persisted), so the parent's copy honours ``security.redact_secrets: false``.
+    Suppress it only when the persisted row is classified as an in-budget automatic retry; terminal
+    rows, including budget-exhausted rows, still emit the failure notice."""
+    will_retry = _failure_notice_will_auto_retry(delegation_id, entry)
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("status") not in _ACTIVE_STATES:
             return
+        if will_retry:
+            return
         snapshot = dict(record)
+    entry = redact_child_result(entry, force=False)
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover

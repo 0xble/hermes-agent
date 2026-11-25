@@ -102,6 +102,9 @@ class TurnContext:
     _status_delivery: Any = None
     _cleanup_adapter: Any = None
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _card_recorder: Optional[Callable[[str], None]] = None
+    _card_writes: set = field(default_factory=set)
+    _card_forgotten: set = field(default_factory=set)  # ids whose record is forgotten; a late record is dropped
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None
@@ -197,6 +200,12 @@ class TurnContext:
     def bind_status_adapter(self, resolve: Callable[[], Any]) -> None:
         """Pin the adapter that answers the turn now, and keep *resolve* to re-ask at every send."""
         self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
+
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Remember a temporary progress card for end-of-turn deletion, and record it durably."""
+        self._cleanup_msg_ids.append(message_id)
+        if self._card_recorder is not None:
+            self._card_recorder(message_id)
 
     def bind_agent_lifetime(self, agent: Any) -> None:
         """Keep only drain fences on the agent, never the entire turn context."""

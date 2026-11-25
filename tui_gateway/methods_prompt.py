@@ -1222,6 +1222,8 @@ def _(rid, params: dict) -> dict:
     def body():
         from run_agent import AIAgent
         kwargs = _background_agent_kwargs(session["agent"], task_id)
+        kwargs.pop("_preflight_fallback", None)
+        kwargs.pop("_fallback_notice", None)
         with _side_agent_session_db(kwargs.get("session_db")) as session_db:
             agent = AIAgent(**{**kwargs, "session_db": session_db})
             try:

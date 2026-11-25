@@ -69,7 +69,7 @@ Existing attempt-local metrics emit `display_incremental=1` or `display_fallback
 
 The 3 invariant tests in `test_display_fold_incremental.py` compare randomized archives with the full-fold oracle, exercise real snapshot/writer interleavings, and bound indexed work as unrelated history grows. Coverage includes both archive paths, split generations, colliding aliases across groups and sessions, order-only drift, NULLs, oldest-member removal, gap clones, handoff normalization, stable tool identities, paging, unavailable guards, missing indexes, connection replacement and a real writer retry after the first fold rolls back. The full-index diagnostic test explicitly selects fallback so both diagnostic paths retain coverage.
 
-Reproduce measurements through the repository test environment and `heavy-slot`:
+Reproduce measurements through the repository test environment and `semaphore`:
 
 ```sh
 python scripts/bench_display_fold_incremental.py --base 9cc95ec4b933e877c58e15357b194e7b016b1506 --output "$TMPDIR/display-fold-incremental.json"
@@ -142,3 +142,5 @@ Each page reads the actual inserted ids and logical message ids through the exis
 `tests/hermes_state/test_compaction_insert_batches.py` drives both archive paths and checks a deterministic insert-step budget, 999-variable compatibility, row and byte budgets, AUTOINCREMENT gaps, caller snapshots, synchronous FTS integrity, and rollback. Upstream v0.23.1 retires the native CJK tokenizer and third index. The contract continues to exercise both retained search indexes, all insert budgets and atomic rollback. `tests/agent/test_transcript_snapshot_hash_steps.py` checks digest equivalence and hash-update sizes across the 2,048-byte boundary, Unicode, BLOBs, numeric values, and surrogate text.
 
 `scripts/bench_compaction_insert.py` compares the base inserter and snapshot hash with batch-only, hash-only, and combined variants. It alternates variants on the same synthetic 400-row scratch store, compacts 201 rows per sample, performs 1 warmup and 5 measured rounds, and measures both idle execution and contention from 1 CPU-bound thread. Every sample must have identical stored rows and correct MATCH results and integrity checks for all 3 FTS tables. This tests scheduling amplification, not cold-cache behavior or the absolute hold bound of the live 73 GB store. If the combined variant leaves the loaded insert phase and hold cost unchanged, the scheduling hypothesis is falsified for this workload.
+
+Contract tests: `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/hermes_state/test_display_fold_writer_steps.py`, `tests/hermes_state/test_compaction_insert_batches.py`, `tests/agent/test_transcript_snapshot_hash_steps.py`.

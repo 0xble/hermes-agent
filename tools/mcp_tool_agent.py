@@ -127,7 +127,7 @@ def _publish_tool_snapshot(
 
 def refresh_agent_mcp_tools(
     agent, *, enabled_override=None, disabled_override=None, quiet_mode: bool = True,
-    content_aware: bool = False, preserve_prefix: bool = False) -> set:
+    content_aware: bool = False, preserve_prefix: bool = False, converge_delegation: bool = False) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry; returns the
     newly-added tool names (empty when unchanged). The agent snapshots ``agent.tools`` at build
     time, so servers that connect later (slow OAuth, ``/reload-mcp``) are invisible until
@@ -153,13 +153,19 @@ def refresh_agent_mcp_tools(
     from tools.registry import registry
     from toolsets import agent_tool_surface, tool_selection_key
     enabled, disabled = _resolve_refresh_toolsets(agent, enabled_override, disabled_override)
+    converged_delegation = refresh_agent_delegation_tool(agent) if converge_delegation else False
     # Generation captured BEFORE the slow get_tool_definitions call (a slower caller holding an
     # OLDER set must not clobber a newer one); definitions computed OUTSIDE the lock.
     snapshot_generation = registry._generation
     from agent.delegation_backends import adopt_built_backend, saved_backend
     built_backend = saved_backend()
-    new_defs = agent_tool_surface(agent, list(
-        get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or []))
+    if converged_delegation:
+        from tools.delegate_tool_config import gateway_delegation_inline_scope
+        with gateway_delegation_inline_scope(bool(getattr(agent, "_delegation_inline", False))):
+            built_defs = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode)
+    else:
+        built_defs = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode)
+    new_defs = agent_tool_surface(agent, list(built_defs or []))
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
@@ -193,6 +199,80 @@ def refresh_agent_mcp_tools(
         return set()
     persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
     return added
+
+
+def refresh_agent_delegation_tool(agent) -> bool:
+    """Replace only the pinned ``delegate_task`` schema after a gateway-mode change.
+
+    Prompt refresh already has a cache-breaking boundary, but it must not
+    rewrite unrelated tool pins just because a dynamic schema changed. The
+    delegation mode is re-derived first, then the one model-facing entry and
+    its dispatch decision are persisted together.
+    """
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    if not refresh_gateway_delegation_mode(agent, apply=False):
+        return False
+    pending_mode = getattr(agent, "_pending_delegation_inline", None)
+    current_defs = _agent_tool_defs(agent)
+    if not any(_def_name(tool) == "delegate_task" for tool in current_defs):
+        if hasattr(agent, "_pending_delegation_inline"):
+            del agent._pending_delegation_inline
+        return False
+
+    try:
+        from model_tools import get_tool_definitions
+        from model_tools import _clear_tool_defs_cache
+        from toolsets import agent_tool_surface
+        from tools.delegate_tool_config import gateway_delegation_inline_scope
+
+        _clear_tool_defs_cache()
+        previous_mode = getattr(agent, "_delegation_inline", None)
+        agent._delegation_inline = bool(pending_mode)
+        try:
+            with gateway_delegation_inline_scope(bool(pending_mode)):
+                fresh_defs = agent_tool_surface(agent, list(get_tool_definitions(
+                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    quiet_mode=True,
+                ) or []))
+        finally:
+            agent._delegation_inline = previous_mode
+    except Exception:
+        logger.debug("delegate_task schema refresh skipped", exc_info=True)
+        if hasattr(agent, "_pending_delegation_inline"):
+            del agent._pending_delegation_inline
+        return False
+    fresh_delegate = next((tool for tool in fresh_defs if _def_name(tool) == "delegate_task"), None)
+    if fresh_delegate is None:
+        if hasattr(agent, "_pending_delegation_inline"):
+            del agent._pending_delegation_inline
+        return False
+    if next(tool for tool in current_defs if _def_name(tool) == "delegate_task") == fresh_delegate:
+        if hasattr(agent, "_pending_delegation_inline"):
+            del agent._pending_delegation_inline
+        return False
+
+    with _agent_tools_lock:
+        published = _agent_tool_defs(agent)
+        for index, tool in enumerate(published):
+            if _def_name(tool) == "delegate_task":
+                published[index] = fresh_delegate
+                agent.tools = published
+                agent.valid_tool_names = {_def_name(item) for item in published if _def_name(item)}
+                break
+        else:
+            if hasattr(agent, "_pending_delegation_inline"):
+                del agent._pending_delegation_inline
+            return False
+    if pending_mode is not None:
+        agent._delegation_inline = pending_mode
+    if hasattr(agent, "_pending_delegation_inline"):
+        del agent._pending_delegation_inline
+    from agent.delegation_backends import adopt_built_backend, saved_backend
+    adopt_built_backend(agent, [fresh_delegate], saved_backend())
+    persist_agent_tool_names(agent)
+    return True
 
 
 def reprobe_tool_availability() -> None:
@@ -271,6 +351,15 @@ def _pin_restore_held(agent, registered: set) -> tuple[bool, frozenset]:
     return True, _frozen_tool_names(registered)
 
 
+def _reactions_capability_gated(agent) -> bool:
+    """Whether this agent's gateway adapter is known not to support reactions (the capability gate).
+    Non-gateway sources (desktop opt-in) never count: there is no registered adapter for them."""
+    from gateway.platform_registry import platform_registry
+    platform = getattr(agent, "platform", None)
+    name = str(getattr(platform, "value", platform) or "").strip().lower()
+    return bool(name) and platform_registry.reactions_supported(name) is False
+
+
 def _config_permitted_names(agent) -> set:
     """Tool names this agent's toolset selection allows before ``check_fn``: all a pin may carry
     forward. A client-surface toolset counts as allowed (only its client can add it, so its absence
@@ -282,6 +371,13 @@ def _config_permitted_names(agent) -> set:
     if enabled is not None:
         enabled = [*enabled, *CLIENT_SURFACE_TOOLSETS]
     disabled = getattr(agent, "disabled_toolsets", None)
+    # Adapter capability is no config choice either, and may only become known after the pin (a deferred
+    # platform plugin loads later): a pinned react stays on a gateway whose adapter cannot react, unless
+    # config disables it. Every other source of a "reactions" entry (config, the desktop opt-in) still strips.
+    if disabled and "reactions" in disabled and _reactions_capability_gated(agent):
+        configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())
+        if "reactions" not in configured:
+            disabled = [name for name in disabled if name != "reactions"]
     if disabled and agent_is_oneshot(agent):  # the one-shot gate is no config choice either: a pinned clarify stays,
         configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())  # unless config disables it
         disabled = [name for name in disabled if name not in ONESHOT_DISABLED_TOOLSETS or name in configured]

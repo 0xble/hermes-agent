@@ -21,3 +21,5 @@ The recognition boundary is the `environments/<generation>/workspace` layout plu
 `tests/cron/test_cron_script.py` owns the real-child snapshot regression, damaged-sibling refusal, ordinary workspace boundary, and existing checkout selection checks. Windows interpreter selection is intentionally unchanged.
 
 Retire this divergence when upstream's released selector handles the snapshot layout while retaining the missing-interpreter refusal and ordinary-checkout behavior.
+
+Contract tests: `tests/cron/test_cron_script.py`.

@@ -105,7 +105,7 @@ def register(ctx) -> None:
     try:
         from .adapter import A2AAdapter
         ctx.register_platform(
-            name="a2a", label="A2A", adapter_factory=lambda cfg: A2AAdapter(cfg),
+            name="a2a", label="A2A", adapter_factory=lambda cfg: A2AAdapter(cfg), adapter_class=A2AAdapter,
             check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,
             required_env=[], install_hint="No extra packages needed (stdlib only)", setup_fn=interactive_setup,
             emoji="\U0001f9e9",  # puzzle piece

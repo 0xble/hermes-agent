@@ -51,6 +51,8 @@ class RateLimitCreditsMixin:
             state = parse_rate_limit_headers(headers, provider=self.provider)
             if state is not None:
                 self._rate_limit_state = state
+                from agent.turn_api_call_admission import remember_bucket_route
+                remember_bucket_route(self, state)
         except Exception:
             pass  # Never let header parsing break the agent loop
 

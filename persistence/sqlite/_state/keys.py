@@ -13,6 +13,7 @@ import re
 # unified runtime were named ``cron_{job_id}_{YYYYmmdd_HHMMSS}`` (``cron/scheduler.py::run_job``).
 CRON_PRINCIPAL_ID = 'cron-owner'
 CRON_REQUEST_PREFIX = 'cron:'
+POLICY_PREFIX = 'gateway.local_policy.v1:'
 _LEGACY_CRON_RUN_ID = re.compile(r'^cron_(.+)_\d{8}_\d{6}$')
 
 

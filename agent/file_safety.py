@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import posixpath
 import re
 import socket
 from contextlib import suppress
@@ -139,6 +140,22 @@ def _resolve_target(path: str) -> Optional[Path]:
     return None
 
 
+def _write_path_spellings(path: str) -> set[str]:
+    """Keep the protected location even when a symlink redirects its target."""
+    return {os.path.abspath(path), _realpath(path)}
+
+
+def _lexical_write_path(path: str) -> Optional[str]:
+    """Normalized, unresolved spelling of a write target (``~`` expanded in the target's home).
+
+    A named node's relative path has no controller-side meaning, so it yields None."""
+    if _named_remote():
+        from tools.file_backend_state import file_ops
+        text = file_ops()._expand_path(str(path))
+        return posixpath.normpath(text) if text.startswith("/") else None
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
 def _guard_homes(path: str = "") -> set[str]:
     """Every home the write guards must cover. Process ``~`` alone is wrong whenever the
     process HOME is not the OS user's real home — ``TERMINAL_HOME_MODE=profile``,
@@ -164,7 +181,7 @@ def _guard_homes(path: str = "") -> set[str]:
         expanded = os.path.expanduser(f"~{name}")
         if not expanded.startswith("~"):
             homes.add(expanded)
-    return {_realpath(h) for h in homes}
+    return {spelling for home in homes for spelling in _write_path_spellings(home)}
 
 
 def _homes_and_resolved(path: str) -> tuple[set[str], str]:
@@ -321,7 +338,7 @@ def build_write_denied_paths(home: str) -> set[str]:
         *(str(base / f) for base in _credential_store_dirs() for f in hermes_files),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
-    return {_realpath(p) for p in paths}
+    return {spelling for path in paths for spelling in _write_path_spellings(path)}
 
 
 # Home-root single-file credential stores. Also hidden by the dashboard Files API (hermes_cli.web_routers.files);
@@ -351,7 +368,7 @@ def build_write_denied_prefixes(home: str) -> list[str]:
         *(os.path.join(home, *d.split("/")) for d in HOME_CREDENTIAL_DIRS),
         "/etc/sudoers.d", "/etc/systemd",
     ]
-    return [_realpath(p) + os.sep for p in paths]
+    return [spelling + os.sep for path in paths for spelling in _write_path_spellings(path)]
 
 
 def get_safe_write_roots() -> set[str]:
@@ -371,7 +388,7 @@ def build_write_approval_paths(home: str) -> set[str]:
     (approve-once/session/always, like the terminal tool's ``~/.ssh`` gate);
     non-interactive callers (ACP shims, background jobs) fail closed.
     """
-    return {_realpath(os.path.join(home, ".ssh", "config"))}
+    return _write_path_spellings(os.path.join(home, ".ssh", "config"))
 
 
 # Login shell startup files: approval-gated for the file tools and, via
@@ -414,8 +431,15 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     if not _named_remote() and (is_protected_path(path) or (entry and is_protected_path(path, follow=False))):
         return "credential"
     denial = _classify_resolved_write_denial(homes, resolved)
-    if denial or not entry:
+    if denial:
         return denial
+    lexical = _lexical_write_path(path)
+    # Only credential policy applies to the lexical spelling: safe roots still
+    # describe where the write lands, not where a harmless symlink is located.
+    if lexical and lexical != resolved and _classify_resolved_write_denial(homes, lexical) == "credential":
+        return "credential"
+    if not entry:
+        return None
     # A named node expands ``~`` in its own home during resolution, never the controller's.
     parent, leaf = split_entry(str(path) if _named_remote() else os.path.expanduser(str(path)))
     from tools.environments.sandbox_scope import sandbox_lexical_path
@@ -474,7 +498,18 @@ def get_write_denied_error(path: str, *, verb: str = "Write", entry: bool = Fals
         )
     if denial == "nt_namespace":
         return get_nt_namespace_error(path, verb=verb)
-    return f"{verb} denied: '{path}' is a protected system/credential file." if denial else None
+    return _credential_write_error(path, verb) if denial else None
+
+
+def get_credential_write_error(path: str, *, verb: str = "Write") -> Optional[str]:
+    """The credential refusal alone, for vetting the path a caller spelled beside the
+    resolved target its backend guard receives. Safe roots describe where the write
+    lands, so they stay with that target's check."""
+    return _credential_write_error(path, verb) if _classify_write_denial(path) == "credential" else None
+
+
+def _credential_write_error(path: str, verb: str) -> str:
+    return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
 def is_write_approval_required(path: str) -> bool:

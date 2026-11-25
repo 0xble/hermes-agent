@@ -219,12 +219,12 @@ def _connect() -> sqlite3.Connection:
     if is_incognito():
         from gateway.incognito import ram_connect
         return ram_connect("delivery:" + str(_db_path()), _initialize_schema)
-    from hermes_cli.sqlite_util import open_db
+    from hermes_cli.sqlite_util import open_shared_state_db
 
-    # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
-    # and the 10 s busy timeout it always had.
-    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
-                   row_factory=None, initialize=_initialize_schema)
+    # Shared state.db writers must participate in SessionDB startup serialization
+    # and connection tracking, not expose a live empty DB to its quarantine probe.
+    return open_shared_state_db(_db_path(), db_label="state.db (delivery_ledger)",
+                                initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -373,20 +373,23 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                             thread_id: Optional[str], content: str, since: float,
                             adapter_profile: Optional[str] = None,
                             resume_turn_id: Optional[str] = None, part: bool = False,
-                            supervisor_checkin: bool = False) -> None:
+                            supervisor_checkin: bool = False, boundary: bool = False) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
-    redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    redelivered once, with the recovered marker. A Hermes-authored turn boundary (``boundary``: an
+    interrupted or failed turn's notice) is never streamed, so it is owed 'pending' and goes out
+    plainly, not as a possible duplicate. A no-op when the same reply was already ledgered since
+    *since* (the turn start), and idempotent across boots that die before their sweep."""
     now = time.time()
     values = (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-              content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
+              content, "pending" if boundary else "attempting", now, now,
+              str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
               int(supervisor_checkin))
     insert = """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                owner_pid, owner_started_at, adapter_profile, resume_turn_id, supervisor_checkin)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?, ?"""
+               SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?"""
     with _DB_LOCK, _transaction() as conn:
         if part:
             # A copy part the caller already found missing: its per-part id is the only identity,

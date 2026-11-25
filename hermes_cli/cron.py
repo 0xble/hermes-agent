@@ -2,11 +2,12 @@
 
 import contextlib
 import json
+import logging
 import re
 import sys
 from datetime import timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, cast
 
 from hermes_cli._startup_fast import project_root_str
 
@@ -15,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[list[str]]:
@@ -716,7 +719,9 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
 
 
-def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
+def _cron_doctor_issues_for_job(
+    job: dict[str, Any], cfg: Optional[dict[str, Any]] = None, *, check_tool_requirements: bool = True,
+) -> list[str]:
     issues: list[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
@@ -745,6 +750,9 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
             issues.append(issue)
+    if check_tool_requirements:
+        from cron.tool_requirements import job_tool_requirement_issues
+        issues.extend(job_tool_requirement_issues(job, cfg=cfg))
     script = str(job.get("script") or "").strip()
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
@@ -773,9 +781,23 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
 def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
+    config_read = True
+    try:
+        from hermes_cli.config import _expand_env_vars, _merge_managed_overlay, read_raw_config_readonly
+        raw_cfg = read_raw_config_readonly()
+        expanded_cfg = _expand_env_vars(raw_cfg) if isinstance(raw_cfg, dict) else {}
+        cfg, _ = _merge_managed_overlay(cast(dict[str, Any], expanded_cfg))
+    except Exception:
+        logger.warning("Unable to read effective configuration for cron doctor", exc_info=True)
+        config_read = False
+        cfg = {}
     jobs = [job for job in list_jobs(include_disabled=True)
             if job.get("enabled", True) or job.get("state") == "missed"]
-    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
+    findings = [
+        (job, issues)
+        for job in jobs
+        if (issues := _cron_doctor_issues_for_job(job, cfg, check_tool_requirements=config_read))
+    ]
     if not findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
@@ -802,7 +824,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"),
                    ("max_catch_up_lateness_seconds", "max_catch_up_lateness_seconds"),
                    ("review_json", "review_json"), ("clear_review", "clear_review"),
-                   ("keep_pinned_lane", "keep_pinned_lane"), ("timezone", "timezone"),
+                   ("keep_pinned_lane", "keep_pinned_lane"), ("priority", "priority"), ("timezone", "timezone"),
                    ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"),
                    ("wrap_response", "wrap_response"))
 

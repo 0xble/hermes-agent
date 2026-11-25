@@ -68,13 +68,15 @@ def test_submit_does_not_send_enter_without_a_composer_acknowledgement():
     assert pane.tmux.call_args_list == [call("send-keys", "-t", "p", "-l", "new prompt")]
 
 
-def test_submit_accepts_a_slash_command_when_the_menu_displaces_the_prompt(monkeypatch):
-    """Linux completion-menu redraw leaves the buffer on its own line, not ``❯ /compress``."""
+@pytest.mark.parametrize("prefix", ["", "──", "As"])
+def test_submit_accepts_a_slash_command_when_the_menu_displaces_the_prompt(monkeypatch, prefix):
+    """Replay the unframed buffer and both post-interrupt hosted redraws."""
     now = _clock(monkeypatch)
     pane = Pane(Mock())
     pane.tmux = Mock()
+    pane.cursor_row = Mock(return_value=f"{prefix}/compress")
     before = "/compress           - Compress conversation context\n❯ STEP8 tell me a very long story\n"
-    after = before + "/compress   \n\n /compress  Compress conversation context\n"
+    after = before + f"{prefix}/compress   \n\n /compress  Compress conversation context\n"
     calls = {"n": 0}
 
     def scrollback():
@@ -90,15 +92,23 @@ def test_submit_accepts_a_slash_command_when_the_menu_displaces_the_prompt(monke
     assert now[0] < 10
 
 
-def test_submit_does_not_treat_a_completion_suggestion_as_the_buffer(monkeypatch):
+@pytest.mark.parametrize("visible", [
+    "/comp\n /compress  Compress conversation context\n",
+    "❯ /compress\n /compress  Compress conversation context\n",
+    "/compress\n",
+])
+def test_submit_does_not_treat_a_completion_suggestion_as_the_buffer(monkeypatch, visible):
     now = _clock(monkeypatch)
     pane = Pane(Mock())
     pane.tmux = Mock()
     pane.screen = Mock(return_value="menu still open")
+    # Even if auto-suggest paints the full command, the insertion cursor is
+    # still after the prefix. A menu or ghost suffix is not an acknowledgement.
+    pane.cursor_row = Mock(return_value="/comp")
     pane.dead = Mock(return_value=False)
     pane.ch.diagnostics = Mock(return_value="detail")
     before = "idle\n"
-    after = before + "/comp\n /compress  Compress conversation context\n"
+    after = before + visible
     calls = {"n": 0}
 
     def scrollback():
@@ -110,6 +120,31 @@ def test_submit_does_not_treat_a_completion_suggestion_as_the_buffer(monkeypatch
         pane.submit("/compress")
     assert pane.tmux.call_args_list == [call("send-keys", "-t", "p", "-l", "/compress")]
     assert now[0] >= 10
+
+
+def test_composer_rejects_an_unchanged_cursor_and_transcript(monkeypatch):
+    _clock(monkeypatch)
+    pane = Pane(Mock())
+    pane.tmux = Mock()
+    pane.scrollback = Mock(return_value="As/compress\n")
+    pane.cursor_row = Mock(return_value="As/compress")
+    pane.dead = Mock(return_value=False)
+    pane.screen = Mock(return_value="As/compress")
+    with pytest.raises(AssertionError, match="composer never showed"):
+        pane.submit("/compress")
+    assert pane.tmux.call_args_list == [call("send-keys", "-t", "p", "-l", "/compress")]
+
+
+@pytest.mark.parametrize("row,x,expected", [
+    ("As/compress", 11, "As/compress"),
+    ("──/compress", 11, "──/compress"),
+    ("❯ /compress", 7, "❯ /comp"),
+    ("界/compress", 11, "界/compress"),
+])
+def test_cursor_row_uses_terminal_cells_and_excludes_ghost_text(row, x, expected):
+    pane = Pane(Mock())
+    pane.tmux = Mock(return_value=f"transcript\n{row}\n /compress menu\n{x} 1\n")
+    assert pane.cursor_row() == expected
 
 
 @pytest.mark.platforms("linux", "macos")

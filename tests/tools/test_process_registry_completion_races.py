@@ -21,6 +21,47 @@ def _session(sid: str, **fields) -> ProcessSession:
     return ProcessSession(id=sid, command="cmd", task_id="task", started_at=time.time(), **fields)
 
 
+def test_wait_wakes_when_session_moves_to_finished(monkeypatch):
+    """A real completion signal releases wait(), rather than a polling timeout."""
+    registry = ProcessRegistry()
+    session = _session("proc_wait_event", output_buffer="done")
+    registry._running[session.id] = session
+    waiter_entered = threading.Event()
+    wait_returned = []
+    completion_wait = session._completion_event.wait
+
+    def observe_completion_wait(timeout=None):
+        waiter_entered.set()
+        woke = completion_wait(timeout)
+        wait_returned.append(woke)
+        return woke
+
+    monkeypatch.setattr(session._completion_event, "wait", observe_completion_wait)
+    # Receipt IO has its own ordering/contention tests. This check measures signaling.
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(module, "save_completed_result", lambda _session: None)
+
+    def finish_later():
+        if waiter_entered.wait(timeout=5):
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+    finisher = threading.Thread(target=finish_later)
+    finisher.start()
+    try:
+        result = registry.wait(session.id, timeout=5)
+    finally:
+        finisher.join(timeout=5)
+
+    assert not finisher.is_alive()
+    assert waiter_entered.is_set()
+    assert result["status"] == "exited", result
+    assert result["exit_code"] == 0
+    # A polling-only wait cannot satisfy this real-event handshake.
+    assert wait_returned == [True]
+
+
 def test_duplicate_finisher_leaves_completion_to_the_owner(monkeypatch):
     """A second finisher must not release waiters while the first is still publishing the notice."""
     registry = ProcessRegistry()

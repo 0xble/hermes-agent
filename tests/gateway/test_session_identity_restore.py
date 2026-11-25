@@ -153,3 +153,21 @@ def test_standalone_gateway_persists_nothing_and_keys_stay_agent_main(tmp_path, 
     assert identity_of(restored) is None
     assert fresh.runner._delivery_adapter_for(restored) is fresh.primary
     assert fresh.runner._session_key_for_source(restored) == "agent:main:telegram:dm:4040"
+
+
+def test_legacy_default_namespace_repins_default_transport(mux):
+    """Pre-transport rows in the historical agent:main namespace resume on the default bot."""
+    store = SessionStore(sessions_dir=mux.home / "sessions", config=mux.runner.config)
+    mux.runner.session_store = store
+    source = mux.primary.build_source(chat_id="4040", chat_type="dm", user_id="4040")
+    resolve_identity(source, runner=mux.runner)
+    entry = store.get_or_create_session(source)
+    legacy = entry.to_dict()
+    legacy.pop("transport_profile", None)
+
+    fresh = _runner(mux.home)
+    restored = fresh.runner._restored_source(SessionEntry.from_dict(legacy))
+    restored_identity = identity_of(restored)
+    assert restored_identity is not None
+    assert restored_identity.transport_profile == "default"
+    assert fresh.runner._delivery_adapter_for(restored) is fresh.primary

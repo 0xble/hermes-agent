@@ -321,6 +321,7 @@ class CellAuthority:
         from model_tools import handle_function_call
         from tools.code_execution_rpc import nested_tool_call_id
         from tools.file_tools_read_tracking import programmatic_file_read
+        from tools.web_search_attribution import search_call_context
         previous = None
         if self._callbacks:
             try:
@@ -337,7 +338,7 @@ class CellAuthority:
                 identity["turn_id"] = self.turn_id
             if self.conversation_id is not None:
                 identity["conversation_id"] = self.conversation_id
-            with programmatic_file_read():
+            with programmatic_file_read(), search_call_context("execute_code_rpc"):
                 return handle_function_call(tool_name, tool_args, task_id=self.task_id,
                                             tool_call_id=nested_tool_call_id(self.task_id), **identity)
         finally:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare real archive writer holds with one CPU-bound Python thread.
 
-Use the repository interpreter under heavy-slot. Only disposable TMPDIR SQLite
+Use the repository interpreter under semaphore. Only disposable TMPDIR SQLite
 files are opened. A pinned Git baseline supplies the original fold methods, not a
 reimplementation. Reports nearest-rank p99 with every sample and semantic checks.
 """

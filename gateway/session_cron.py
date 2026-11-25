@@ -229,6 +229,11 @@ async def operation(authority, name, params, actor=None):
     if set(params) != {'session_id', 'admission_id'} or name not in {'status', 'cancel'}:
         raise AuthorityRefusal('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
+    # Cron admissions are local sessions. Restore a cold local session through the async
+    # recovery path before authorization so a status/cancel poll never takes the store lock
+    # synchronously on the gateway event loop.
+    if ref.session_id not in authority.sessions:
+        await _restore_local_session_for_cron(authority, ref.session_id, admission_gate=False)
     authority.authorize(actor, ref, 'session:submit')
     # The firer polls this every <= 2 s per running job: one worker hop reads the row (and a terminal
     # row's saved result), so slow storage delays the poll, never the owner loop.
@@ -250,11 +255,13 @@ async def operation(authority, name, params, actor=None):
     from cron.detached_authority import recover_detached
     if row['status'] in ('started', 'unknown', 'terminal') and await asyncio.to_thread(
             recover_detached, authority.db, authority.epoch, row):
-        row = get_session_admission(authority.db, admission_id=row['admission_id'])
+        row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
         if row is None:
             raise RuntimeStoreError('not_found')
     result, flags = None, {}
     if row['status'] == 'terminal':
+        from gateway.session_results import admission_result
+        saved = admission_result(authority_persistence(authority), row['admission_id'])
         result = saved['result'].get('cron_result') if saved else None
         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
         if result is None:

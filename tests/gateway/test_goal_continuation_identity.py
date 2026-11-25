@@ -1343,6 +1343,7 @@ async def test_retired_topic_loop_defers_before_claiming_tick(state, monkeypatch
     lookup = _topic_lookup(runner, monkeypatch, [])
 
     await runner._loop_wakeup_fire_one("target", manager.state, 1e12, set())
+    await runner._loop_wakeup_fire_one("target", manager.state, 1e12, set())
 
     runner.adapter.handle_message.assert_not_awaited()
     lookup.assert_awaited_once_with(
@@ -1351,6 +1352,44 @@ async def test_retired_topic_loop_defers_before_claiming_tick(state, monkeypatch
     assert LoopManager("target").state.to_json() == before
     assert runner.adapter.sends == []
     runner.adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_idle_topic_absence_expires_and_is_scoped_to_connector(state, monkeypatch):
+    from dataclasses import replace
+
+    from gateway import wake
+
+    runner = _runner(state)
+    source = runner.target.origin
+    lookup = _topic_lookup(runner, monkeypatch, [])
+    start = 100.0
+    now = start
+    monkeypatch.setattr(wake, "monotonic", lambda: now)
+
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    lookup.assert_awaited_once()
+
+    lookup.return_value = [{"id": 42, "closed": True}]
+    assert await wake.automatic_route_available(runner, replace(source, profile="secondary"), idle_backoff=True)
+    assert await wake.automatic_route_available(runner, source)
+    assert lookup.await_count == 3
+
+    now = start + wake._IDLE_TOPIC_ABSENCE_RETRY_SECONDS
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 4
+
+    lookup.return_value = []
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    replacement = _topic_lookup(runner, monkeypatch, [{"id": 42}])
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    replacement.assert_awaited_once()
+
+    replacement.side_effect = [TimeoutError(), []]
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert replacement.await_count == 3
 
 
 @pytest.mark.asyncio

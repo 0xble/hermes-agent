@@ -103,11 +103,12 @@ class CLITuiRuntimeMixin:
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
+        from hermes_cli.cli_loops_mixin import ScheduledWakeup
+        scheduled = isinstance(user_input, ScheduledWakeup)
         notification_preview = user_input if isinstance(user_input, TimelineNotification) else None
         try:
-            from hermes_cli.cli_loops_mixin import _is_self_injected_turn
-            self._goal_turn_user_initiated = (
-                notification_preview is None and not _is_self_injected_turn(user_input))
+            from hermes_cli.cli_loops_mixin import _is_explicit_synthetic_turn
+            self._goal_turn_user_initiated = not _is_explicit_synthetic_turn(user_input)
         except Exception:
             self._goal_turn_user_initiated = notification_preview is None
         self._status_bar_suppressed_after_resize = False  # input ends post-resize suppression
@@ -152,6 +153,8 @@ class CLITuiRuntimeMixin:
 
         if isinstance(user_input, str) and _PASTE_REF_RE.search(user_input):
             user_input = self._expand_paste_references(user_input)
+        if scheduled and isinstance(user_input, str):
+            user_input = ScheduledWakeup(user_input)
         _cprint("")
         self._print_user_message_preview(notification_preview or user_input)
 

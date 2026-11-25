@@ -14,3 +14,11 @@ def apply_api_request_options(reasoning_config, service_tier):
         if tier is not _REQUEST_OPTION_MISSING:
             service_tier = tier
     return reasoning_config, service_tier
+
+
+def attach_preflight_fallback(agent, attribution, notice):
+    """Refresh per-turn fallback attribution even when the agent was reused."""
+    if attribution is not None:
+        agent._preflight_fallback = attribution
+    if notice:
+        agent._pending_fallback_notice = notice

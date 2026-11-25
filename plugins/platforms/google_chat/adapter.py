@@ -1797,6 +1797,7 @@ def register(ctx) -> None:
         docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/google_chat",
         label="Google Chat",
         adapter_factory=lambda cfg: GoogleChatAdapter(cfg),
+        adapter_class=GoogleChatAdapter,
         check_fn=_check_for_registry,
         ensure_deps_fn=ensure_google_chat_deps,
         validate_config=_validate_config,

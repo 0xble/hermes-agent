@@ -102,6 +102,7 @@ _TOPLEVEL_BRIDGE: tuple = (
     ("streaming", "streaming", "dict", None, None),
     ("durable_outbox", "durable_outbox", "presence", None, None),
     ("zero_cut_handover", "zero_cut_handover", "presence", lambda v: isinstance(v, dict), None),
+    ("missed_inbound_recovery", "missed_inbound_recovery", "presence", lambda v: isinstance(v, dict), None),
     *_presence(
         "reset_triggers", "always_log_local", "write_sessions_json", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s", "loop_watchdog_max_strikes",

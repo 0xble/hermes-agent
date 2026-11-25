@@ -136,12 +136,12 @@ repair without adding a policy knob or service. Retire this divergence only
 when released upstream preserves the complete lifetime, cache, authority and
 secret-safe attribution contract with these regressions passing.
 
-## Foreground heavy-slot queue waits
+## Foreground semaphore queue waits
 
 Interactive foreground local commands yield after
 `min(120, max(10, effective_timeout // 3))` while waiting for shared capacity.
-[Ticket-preserving handoff](heavy-slot-ticket-handoff.md) superseded the earlier
-`HEAVY_SLOT_MAX_WAIT` expiry and exit-75 replay: it adopts the original shell
+[Ticket-preserving handoff](semaphore-ticket-handoff.md) superseded the earlier
+`SEMAPHORE_MAX_WAIT` expiry and exit-75 replay: it adopts the original shell
 without losing queue age or repeating compound-shell side effects. Background
 commands keep the helper's unbounded wait.
 Provenance: 1,196 terminal calls timed out over two days, including 432 pytest and
@@ -155,7 +155,7 @@ the interactive foreground timeout cap. `cron/scheduler.py::_CronRunScope`
 binds `turn_origin="cron"`; terminal reads `bound_turn_origin()` from that
 task-local session context, never ambient environment state. The same binding
 survives `execute_code` RPC dispatch through its per-cell authority. The helper
-receives no `HEAVY_SLOT_MAX_WAIT`, and terminal does not automatically promote
+receives no `SEMAPHORE_MAX_WAIT`, and terminal does not automatically promote
 or adopt cron work. A terminal timeout with admission still pending kills the
 queued process and explicitly reports that the heavy command was not started.
 Inside `execute_code`, host-side RPC context also carries the cell's monotonic
@@ -167,8 +167,8 @@ per-cell authority and remote file-RPC dispatch, not a sandbox-supplied timeout.
 The terminal schema and generated prompt snapshots distinguish cron's inline
 wait from interactive timeout promotion.
 Interactive and gateway handoff budgets remain unchanged. Regressions live in
-`tests/tools/test_terminal_tool_heavy_slot.py` and
-`tests/tools/test_terminal_heavy_slot_handoff.py`.
+`tests/tools/test_terminal_tool_semaphore.py` and
+`tests/tools/test_terminal_semaphore_handoff.py`.
 
 ## Actionable failure hints
 
@@ -189,3 +189,5 @@ gives the terminal host-exit and missing-pytest failures equivalent no-retry and
 runner guidance, and makes execute_code file-tool error envelopes raise before
 user code can continue, with the proof surface passing without this fork
 implementation.
+
+Contract tests: `tests/agent/test_tool_guardrails.py`, `tests/agent/test_read_dedup_rewrite_boundaries.py`, `tests/tools/test_base_environment.py`, `tests/tools/test_terminal_hints.py`, `tests/agent/test_context_compressor.py`, `tests/agent/test_context_compressor_tail.py`, `tests/agent/test_ghost_skill_pruning.py`, `tests/tools/test_skill_view_dedup.py`, `tests/tools/test_code_kernel.py`, `tests/tools/test_code_execution_file_rpc.py`, `tests/agent/test_protected_tail_pressure.py`, `tests/tools/test_code_kernel_lifetime.py`, `tests/tools/test_code_kernel_remote.py`, `tests/tui_gateway/test_session_finalize_reaps_kernels.py`, `tests/tools/test_terminal_tool_semaphore.py`, `tests/tools/test_terminal_semaphore_handoff.py`, `tests/hermes_cli/test_plugins.py`, `tests/tools/test_sandbox_failure_hints.py`, `tests/tools/test_skills_tool.py`, `tests/tools/test_terminal_tool.py`, `tests/ci/test_prompt_surface.py`.

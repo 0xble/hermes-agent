@@ -128,7 +128,7 @@ def check_sandbox_requirements() -> bool:
 # Per-tool stub templates: (signature, docstring, args_dict_expr — the JSON payload sent over RPC).
 _TOOL_STUBS = {
     "web_search": ("query: str, limit: int = 5, stakes: str = None",
-        '"""Search the web. Optional quality hint. Exa Lite is paused by default: all Exa searches use full Auto regardless of this hint. If Lite is explicitly re-enabled, standard permits low-stakes lookups; high or omission retains Auto. Use high or omit for protected, time-sensitive or costly-if-wrong research. Returns dict with data.web list of {url, title, description}."""',
+        '"""Search the web. Search in rounds of about 5 queries and read results before widening; do not loop templated searches over a list from code, and reuse earlier results. If you already know the URL, or would use site: to reach a specific page, call web_extract on the URL instead. Optional quality hint. Exa Lite is paused by default: all Exa searches use full Auto regardless of this hint. If Lite is explicitly re-enabled, standard permits low-stakes lookups; high or omission retains Auto. Use high or omit for protected, time-sensitive or costly-if-wrong research. Returns dict with data.web list of {url, title, description}."""',
         '{"query": query, "limit": limit, "stakes": stakes}'),
     "web_extract": ("urls: list, char_limit: int = None",
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
@@ -874,8 +874,9 @@ def _get_execution_mode() -> str:
 
 # Per-tool documentation lines for the execute_code description, in canonical display order.
 _TOOL_DOC_LINES = [
-    ("web_search", "  web_search(query: str, limit: int = 5)\n"
-     "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
+    ("web_search", "  web_search(query: str, limit: int = 5) -> dict\n"
+     "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}\n"
+     "    Search in rounds of about 5 queries and read results before widening. Do not loop templated searches over a list; for a known URL (or a site: target) use web_extract instead."),
     ("web_extract", "  web_extract(urls: list[str], char_limit: int = None)\n"
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),

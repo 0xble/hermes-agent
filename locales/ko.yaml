@@ -489,6 +489,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**세션 ID:** `{session_id}`"
+    incognito: "**시크릿 모드:** {state}"
     title: "**제목:** {title}"
     created: "**생성됨:** {timestamp}"
     last_activity: "**최종 활동:** {timestamp}"
@@ -774,6 +775,7 @@ gateway:
     drain_rejected: "⏳ 게이트웨이가 {action}이어서 지금은 다른 턴을 받을 수 없어요."
     drain_rejected_new_work: "⏳ 게이트웨이가 {action}이어서 지금은 새 작업을 받을 수 없어요."
     demoted_tail: " — 메시지는 작업이 끝나면 처리되도록 대기열에 넣었어요 (모두 취소하려면 /stop을 사용하세요)."
+    deferred_dropped: "⚠️ `/{command}`이(가) 실행되지 않았습니다: 그 전에 Hermes가 재시작되거나 다시 연결되었습니다. 아직 필요하면 다시 보내 주세요."
     elapsed_min: "{minutes}분 경과"
     running_tool: "실행 중: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -911,7 +913,7 @@ gateway:
     interrupted_turn: "↻ Hermes가 중지되어 중단되었습니다. Hermes가 돌아오면 여기서 자동으로 계속하겠습니다."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ 게이트웨이가 성공적으로 재시작되었어요. 세션은 계속 이어져요."
+    restarted: "♻ 게이트웨이가 성공적으로 재시작되었어요."
     online: "♻️ 게이트웨이 온라인 — Hermes가 돌아왔고 준비되었어요."
     db_corrupt: "⚠️ 세션 데이터베이스 손상이 감지되었어요. 메시지가 저장되지 않을 수 있어요. 복구 방법:\n1. `hermes {profile_arg}doctor --fix` 실행\n2. 게이트웨이를 중지한 뒤 다음으로 복구:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (복구 가능하다고 나오면) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — 복구는 먼저 손상된 파일의 스냅샷을 만들어요. 실행 중인 state.db에 `sqlite3 ... \\\".recover\\\"`를 실행하지 마세요. 취약한 sqlite3 CLI가 손상을 더 키울 수 있어요\n3. {backups_dir}/의 백업에서 복원\n정리된 진단 정보는 `hermes {profile_arg}doctor`로 확인하세요."
     db_fts_corrupt: "⚠️ 세션 데이터베이스가 검색 인덱스(FTS5)에 한정된 손상 오류를 보고했어요. 메시지 테이블은 손상되지 않았어요. 수리될 때까지 메시지가 저장되지 않을 수 있어요: `hermes {profile_arg}doctor --fix`를 실행한 뒤 게이트웨이를 재시작하세요. `hermes {profile_arg}doctor`가 손상을 확인하지 않는 한 복구 도구를 실행하거나 백업을 복원하지 마세요."
@@ -3621,7 +3623,7 @@ explainer:
     partial_stream_recovery: "스트리밍이 일찍 중단되어 일부 응답만 복구됐어요. `continue`를 보내면 멈춘 지점부터 이어서 진행해요."
     fallback_prior_turn_content: "이번 턴에 새로운 내용이 생성되지 않아 복구된 이전 컨텍스트를 보여 드려요. `continue`를 보내 다시 시도하세요."
     redirect_restart_limit_exceeded: "매번 시도할 때마다 새 수정 지시로 요청이 취소되어, 무한히 재시도하지 않고 턴을 멈췄어요. 마지막 수정 지시는 다음 메시지로 대기 중이에요."
-    rebuilt_restart_limit_exceeded: "폴백 체인의 모든 제공자가 계속 장애 조치를 반복해서, 무한히 재시도하지 않고 턴을 멈췄어요. `continue`를 보내거나 제공자를 바꿔 보세요."
+    rebuilt_restart_limit_exceeded: "경로 전환 한도에 도달했어요. 요청한 경로: {routes}. 설정된 다른 경로는 시도되지 않았을 수 있어요. `continue`를 보내거나 제공자를 바꿔 보세요."
     budget_exhausted: "최종 답변 전에 턴당 반복/비용 예산을 모두 사용했어요. `continue`를 보내면 계속 진행해요."
     ollama_runtime_context_too_small: "로컬 모델의 컨텍스트 창이 너무 작아 작업을 끝낼 수 없었어요. 컨텍스트 크기를 늘리거나 더 큰 모델을 사용하세요."
     pending_tool_result: "도구 결과가 아직 대기 중인 상태에서 턴이 멈췄고 모델이 후속 텍스트를 만들지 않았어요. `continue`를 보내면 요약해 드려요."
@@ -3648,6 +3650,9 @@ explainer:
     failed: "실패"
   shared:
     and_more: "  • … 외 {count}개 더"
+    no_routes_requested: "기록 없음"
+    attempted_routes: "요청한 경로: {routes}."
+    chain_exhausted: "폴백 체인을 모두 사용했어요. 사용할 수 있는 경로가 남아 있지 않아요."
     the_model: "모델"
 tips:
   t001: "/bg <prompt>는 현재 세션을 그대로 두고 별도 세션에서 작업을 실행해요. /btw <question>은 대화를 끊지 않고 이 대화에 관한 부수적인 질문에 답해요."

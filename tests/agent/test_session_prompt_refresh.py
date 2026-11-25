@@ -52,6 +52,15 @@ def _update_profile(home: Path, project: Path) -> None:
     (project / "AGENTS.md").write_text("Project rules revision two.", encoding="utf-8")
 
 
+def _set_gateway_mode(home: Path, mode: str) -> None:
+    import hermes_yaml as yaml
+
+    config_path = home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text()) or {}
+    config["delegation"] = {"gateway_mode": mode}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+
 @pytest.fixture
 def profile(monkeypatch, tmp_path):
     home = Path(os.environ["HERMES_HOME"])
@@ -68,7 +77,8 @@ def _agent(srv, home, session_id):
     store = storage_handle(home)
     seed_session(store, session_id, "whatsapp")  # the gateway opens the row before the turn
     return AIAgent(provider="custom", base_url=srv.base_url, api_key="sk-fake-e2e", model="fake-model",
-                   session_db=store, persistence=store, session_id=session_id, quiet_mode=True, platform="whatsapp")
+                   session_db=store, persistence=store, session_id=session_id, quiet_mode=True, platform="whatsapp",
+                   gateway_session_key=f"agent:main:whatsapp:dm:{session_id}")
 
 
 def _system(request) -> str:
@@ -304,6 +314,21 @@ def test_refresh_keeps_the_sessions_tools_pin(profile, monkeypatch):
     _turn(srv, home, "chat-new", "hello", [])
     assert _tool_description(srv.main_requests()[-1], "clarify") == changed
 
+
+def test_refresh_converges_the_pinned_delegate_mode_from_explicit_config(profile, monkeypatch):
+    srv, home, project = profile
+    _set_gateway_mode(home, "background")
+    history, _ = _turn(srv, home, "chat-a", "hello", [])
+    first_tool = next(t["function"] for t in srv.main_requests()[-1]["tools"] if t["function"]["name"] == "delegate_task")
+    assert "Parallel children are joined and their results return in this tool call." not in first_tool["description"]
+
+    _set_gateway_mode(home, "inline")
+    _update_profile(home, project)
+    _refresh_prompts(monkeypatch, home)
+    _turn(srv, home, "chat-a", "next", history)
+
+    tool = next(t["function"] for t in srv.main_requests()[-1]["tools"] if t["function"]["name"] == "delegate_task")
+    assert "Parallel children are joined and their results return in this tool call." in tool["description"]
 
 def test_refresh_prompts_unknown_session_fails(profile, monkeypatch, capsys):
     import hermes_cli.main as main_mod

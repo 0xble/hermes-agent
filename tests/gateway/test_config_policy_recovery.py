@@ -285,7 +285,7 @@ def test_a_changed_fallback_secret_removes_that_fallback(tmp_path, monkeypatch, 
     with FakeLLMServer() as primary, FakeLLMServer() as backup:
         cfg = {'model': {'provider': 'anthropic', 'default': 'primary-model', 'base_url': primary.base_url},
                'providers': {'box': {'base_url': backup.base_url, 'api_key': 'sk-different-account'}},
-               'fallback_providers': [{'provider': 'custom:box', 'model': 'backup-model'}]}
+               'fallback_providers': [{'provider': 'custom:box', 'model': 'frozen'}]}
         if form == 'literal':
             cfg['fallback_providers'][0]['api_key'] = 'sk-original-fallback'
         elif form == 'reference':
@@ -294,7 +294,7 @@ def test_a_changed_fallback_secret_removes_that_fallback(tmp_path, monkeypatch, 
             cfg['providers']['box']['api_key'] = 'sk-original-fallback'
         policy, owner, config_path = _bound_session(tmp_path, monkeypatch, cfg)
         model, runtime = _policy_runtime(policy, owner)  # unchanged: the frozen fallback serves
-        assert (model, runtime['api_key']) == ('backup-model', 'sk-original-fallback')
+        assert (model, runtime['api_key']) == ('frozen', 'sk-original-fallback')
 
         if form == 'literal':
             cfg['fallback_providers'][0]['api_key'] = 'sk-rotated-fallback'

@@ -1491,7 +1491,7 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
             with authority.sessions[sid].event_stream.lock:
                 authority.check_approval_generation(sid, row['generation'])
                 # Before the claimed turn adopts its agent the steer is latched for that agent.
-                agent, latched = authority.steer_agent(SessionRef(authority.profile_id, sid), row['generation'], steer_text)
+                agent, latched = authority.steer_agent(SessionRef(authority.profile_id, sid), row['generation'], steer_text, human=True)
         except (KeyError, AuthorityRefusal):
             agent = None
         if not latched and not hasattr(agent, "steer"):
@@ -1500,7 +1500,7 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
             _mark_run_event(self, run_id, "run.steered", accepted=True)
             return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
     try:
-        accepted = bool(agent.steer(steer_text))
+        accepted = bool(agent.steer(steer_text, human=True))
     except Exception as exc:
         logger.exception("[api_server] steer failed for run %s", run_id)
         return _json_error(_openai_error, _api_server._redact_api_error_text(exc), code="steer_failed", status=500)

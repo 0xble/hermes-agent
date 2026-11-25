@@ -4,6 +4,7 @@ Dependency-free so it imports without a cycle."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -42,6 +43,9 @@ class TurnRetryState:
     llama_cpp_grammar_retry_attempted: bool = False
 
     # Transport / rate-limit recovery
+    # A pooled proxy can select a different credential on the next request. This is
+    # deliberately route-local and one-shot: direct providers keep billing terminal.
+    pooled_proxy_billing_retry_attempted: bool = False
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
     # Credit-limited 402 ("can only afford N tokens") already retried with a lowered output cap.
@@ -53,6 +57,8 @@ class TurnRetryState:
     shared_cooldown_arm_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
+    # ``max_retries`` before an unattended transient hold extended it; restored when the hold ends.
+    noninteractive_hold_base_retries: Optional[int] = None
 
     # Restart signals (read by the outer loop after the attempt)
     restart_with_compressed_messages: bool = False

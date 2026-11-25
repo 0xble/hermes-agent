@@ -25,3 +25,6 @@ Independent prior-art search on 2026-10-04 found no matching upstream issue or p
 ## Verification and retirement
 
 Focused gateway regression, affected goal/loop/restart suites, repository canonical gate, exact-head review, and remote readback. Retire when upstream provides equivalent stale-resume takeover behavior and the regression passes without this fork-only implementation. Roll back by reverting the focused patch; parked goal rows and session transcripts remain intact.
+
+
+Contract tests: `tests/gateway/test_goal_parked_idle_wake.py`.

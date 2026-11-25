@@ -489,6 +489,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**Sitzungs-ID:** `{session_id}`"
+    incognito: "**Inkognito:** {state}"
     title: "**Titel:** {title}"
     created: "**Erstellt:** {timestamp}"
     last_activity: "**Letzte Aktivität:** {timestamp}"
@@ -774,6 +775,7 @@ gateway:
     drain_rejected: "⏳ Gateway {action} und nimmt gerade keinen weiteren Zug an."
     drain_rejected_new_work: "⏳ Gateway {action} und nimmt gerade keine neue Arbeit an."
     demoted_tail: " — Ihre Nachricht ist eingereiht, bis der Vorgang abgeschlossen ist (mit /stop alles abbrechen)."
+    deferred_dropped: "⚠️ `/{command}` wurde nicht ausgeführt: Hermes wurde vorher neu gestartet oder neu verbunden. Sende es erneut, falls du es noch brauchst."
     elapsed_min: "{minutes} Min. vergangen"
     running_tool: "läuft: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -911,7 +913,7 @@ gateway:
     interrupted_turn: "↻ Unterbrochen, weil Hermes angehalten wurde. Ich fahre hier automatisch fort, sobald Hermes wieder da ist."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ Gateway erfolgreich neu gestartet. Ihre Sitzung wird fortgesetzt."
+    restarted: "♻ Gateway erfolgreich neu gestartet."
     online: "♻️ Gateway online — Hermes ist zurück und bereit."
     db_corrupt: "⚠️ Beschädigung der Sitzungsdatenbank erkannt. Nachrichten werden möglicherweise nicht gespeichert. Wiederherstellungsoptionen:\n1. Führen Sie `hermes {profile_arg}doctor --fix` aus\n2. Stoppen Sie das Gateway und stellen Sie dann wieder her mit:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (falls als wiederherstellbar gemeldet) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — die Wiederherstellung sichert zuerst einen Schnappschuss der beschädigten Datei; führen Sie NICHT `sqlite3 ... \\\".recover\\\"` gegen die laufende state.db aus, eine anfällige sqlite3-CLI kann sie weiter beschädigen\n3. Stellen Sie ein Backup aus {backups_dir}/ wieder her\nFühren Sie `hermes {profile_arg}doctor` für bereinigte Diagnosen aus."
     db_fts_corrupt: "⚠️ Die Sitzungsdatenbank hat einen Beschädigungsfehler gemeldet, der auf den Suchindex (FTS5) beschränkt ist; die Nachrichtentabellen sind nicht beschädigt. Nachrichten werden bis zur Reparatur möglicherweise nicht gespeichert: Führen Sie `hermes {profile_arg}doctor --fix` aus und starten Sie dann das Gateway neu. Verwenden Sie keine Wiederherstellungstools und stellen Sie kein Backup wieder her, sofern `hermes {profile_arg}doctor` keinen Schaden bestätigt."
@@ -3621,7 +3623,7 @@ explainer:
     partial_stream_recovery: "das Streaming wurde vorzeitig beendet und nur eine Teilantwort konnte wiederhergestellt werden. Senden Sie `continue`, um an der Abbruchstelle fortzufahren."
     fallback_prior_turn_content: "in diesem Zug wurde kein neuer Inhalt erzeugt; angezeigt wird wiederhergestellter vorheriger Kontext. Senden Sie `continue`, um es erneut zu versuchen."
     redirect_restart_limit_exceeded: "die Anfrage wurde bei jedem Versuch durch eine neue Korrektur abgebrochen, daher wurde der Zug beendet, statt endlos zu wiederholen. Ihre letzte Korrektur ist als nächste Nachricht eingereiht."
-    rebuilt_restart_limit_exceeded: "jeder Anbieter in der Fallback-Kette ist immer wieder auf den nächsten umgeschwenkt, daher wurde der Zug beendet, statt endlos zu wiederholen. Senden Sie `continue` oder wechseln Sie den Anbieter."
+    rebuilt_restart_limit_exceeded: "das Limit für Routenwechsel wurde erreicht. Angefragte Routen: {routes}. Andere konfigurierte Routen wurden möglicherweise nicht versucht. Senden Sie `continue` oder wechseln Sie den Anbieter."
     budget_exhausted: "das Iterations-/Kostenbudget pro Zug war vor einer endgültigen Antwort aufgebraucht. Senden Sie `continue`, um weiterzumachen."
     ollama_runtime_context_too_small: "das Kontextfenster des lokalen Modells war zu klein, um fertig zu werden. Erhöhen Sie die Kontextgröße oder verwenden Sie ein größeres Modell."
     pending_tool_result: "der Zug wurde beendet, während noch ein Tool-Ergebnis ausstand, und das Modell hat keinen Folgetext erzeugt. Senden Sie `continue`, damit es zusammenfasst."
@@ -3648,6 +3650,9 @@ explainer:
     failed: "fehlgeschlagen"
   shared:
     and_more: "  • … und {count} weitere"
+    no_routes_requested: "keine erfasst"
+    attempted_routes: "Angefragte Routen: {routes}."
+    chain_exhausted: "Die Fallback-Kette ist erschöpft; es bleibt keine geeignete Route übrig."
     the_model: "Das Modell"
 tips:
   t001: "/bg <prompt> führt eine Aufgabe in einer separaten Sitzung aus, während Ihre aktuelle frei bleibt; /btw <question> beantwortet eine Nebenfrage zu dieser Konversation, ohne sie zu unterbrechen."

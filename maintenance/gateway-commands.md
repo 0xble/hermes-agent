@@ -55,8 +55,10 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   `e169810be1581` and upstream `6696c7b0a404a` still lose ownership during creation.
 - Proof surface: `tests/gateway/test_exec_quick_command_tree.py` gates real transport readiness
   with an Event and verifies the original shell and child identities stop within 10 s, alongside
-  after-creation cancellation, timeout and genuine spawn-error controls. Fixture cleanup owns
-  failure-path survivors independently of the production cleanup.
+  after-creation cancellation, timeout and genuine spawn-error controls. The portable spawn-error
+  assertion accepts `OSError` (missing cwd is `FileNotFoundError` on POSIX but `NotADirectoryError`
+  on Windows), with injected `NotADirectoryError` coverage for both the reply and cancellation paths.
+  Fixture cleanup owns failure-path survivors independently of the production cleanup.
 - Retire when upstream drains creation ownership through cancellation with equivalent process
   cleanup. Roll back by reverting the commit carrying this identity.
 
@@ -72,3 +74,5 @@ Load this unit when changing the adapter active-session guard, the runner busy f
 Retire alias expansion when upstream expands alias quick commands on the busy path. Retire
 defer-until-idle when PR 116295 or equivalent is in the candidate release. Roll back by
 reverting the logical patch; no persistent data changes.
+
+Contract tests: `tests/gateway/test_exec_quick_command_tree.py`, `tests/gateway/test_telegram_voice_v0_regressions.py`, `tests/gateway/test_command_bypass_active_session.py`, `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_busy_command.py`, `tests/gateway/test_running_agent_session_toggles.py`.

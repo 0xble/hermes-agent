@@ -446,7 +446,7 @@ def test_a_moved_route_never_sends_its_frozen_key_to_the_new_endpoint(tmp_path, 
     try:
         if route == 'fallback_providers_dict':
             cfg = {'model': {'provider': 'anthropic', 'default': 'm'},
-                   'fallback_providers': {'provider': 'custom', 'model': 'backup', 'base_url': urls['A'],
+                   'fallback_providers': {'provider': 'custom', 'model': 'frozen', 'base_url': urls['A'],
                                           'api_key': 'SENTINEL-FB-A'}}
             move = lambda c: c['fallback_providers'].__setitem__('base_url', urls['B'])
         else:

@@ -152,6 +152,15 @@ def _dict_list(value):
     return value is None or (isinstance(value, list) and all(isinstance(e, dict) for e in value))
 
 
+def policy_pins_model(policy, config):
+    """Use effective pin provenance: a profile edit can supersede the immutable launch request."""
+    from gateway.session_policy import session_pinned
+    request = getattr(policy, 'request_json', None)
+    legacy_pin = bool((isinstance(request, str) and json.loads(request).get('model'))
+                      or (config.get('model') or {}).get('selection_profile'))
+    return session_pinned(config, 'model', legacy_pin)
+
+
 def route_runtime(policy, frozen, model, key, *, fallback=True):
     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
@@ -191,7 +200,8 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
             return resolve_runtime_provider(requested=provider, target_model=model,
                 explicit_base_url=launch_url, explicit_api_key=key), None
         return resolve_runtime_with_fallback(frozen, requested=provider,
-            explicit_api_key=key, explicit_base_url=launch_url, target_model=model)
+            explicit_api_key=key, explicit_base_url=launch_url, target_model=model,
+            **({'model_pinned': True} if policy_pins_model(policy, frozen) else {}))
 
 
 def worker_route(policy, construct):
@@ -210,8 +220,9 @@ def worker_route(policy, construct):
     if 'fallback_model' in construct:
         frozen = {**frozen, 'fallback_providers': construct['fallback_model'] or [], 'fallback_model': None}
     runtime, fallback_entry = route_runtime(policy, frozen, model, construct['api_key'])
+    pin = {'model_pinned': True} if policy_pins_model(policy, frozen) else {}
     if fallback_entry is not None:
-        return {}
+        return pin
     api_mode = runtime.get('api_mode')
     # A built-in provider's chat_completions is the resolver's default unless model.api_mode set it: None
     # leaves the agent's model-aware upgrade (GPT-5 on OpenRouter to Responses). A custom route's mode
@@ -221,7 +232,7 @@ def worker_route(policy, construct):
             and not (frozen.get('model') or {}).get('api_mode')):
         api_mode = None
     return {'api_key': construct['api_key'] or runtime.get('api_key'), 'base_url': runtime.get('base_url'),
-            'api_mode': api_mode}
+            'api_mode': api_mode, **pin}
 
 
 def checkpoint_agent_kwargs(config):

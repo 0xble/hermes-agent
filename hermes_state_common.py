@@ -13,12 +13,18 @@ from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
+from hermes_state_keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
 from hermes_state_session_signature import SESSION_SIGNATURE_TABLE_SQL, SESSION_SIGNATURE_TRIGGER_SQL
 from process_identity import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE
 from session_rules.turns import describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
+
+
+# The held-media query and its partial index must share this exact predicate: SQLite's partial-index
+# matcher is textual and a harmless-looking rewrite would make the writer scan all admissions.
+HELD_MEDIA_WHERE = "status!='terminal' OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL"
 
 
 # Persisted title provenance: automatic display labels are not user-selected identities.
@@ -439,6 +445,7 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         return
     try:
         from hermes_cli.lifecycle import invoke_hook
+        from hermes_state_prune_budget import current_budget, without_prune_budget
         from hermes_constants import (
             get_hermes_home, profile_name_for_home, reset_hermes_home_override, set_hermes_home_override,
         )
@@ -453,7 +460,8 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         rebind = profile is not None and os.path.realpath(home) != os.path.realpath(get_hermes_home())
         token = set_hermes_home_override(home) if rebind else None
         try:
-            invoke_hook("on_session_delete", **payload)
+            with without_prune_budget() if current_budget() is not None else contextlib.nullcontext():
+                invoke_hook("on_session_delete", **payload)
         finally:
             if token is not None:
                 reset_hermes_home_override(token)
@@ -624,6 +632,15 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+CREATE INDEX IF NOT EXISTS idx_session_admissions_held
+    ON session_admissions(seq) WHERE """ + HELD_MEDIA_WHERE + """;
+-- Worker adoption searches by generation/epoch and only ever considers started or unknown admissions.
+-- Keep terminal and queued history out of that writer-transaction candidate scan; the literal predicate
+-- is intentional because SQLite can only prove a parameterized status list satisfies a partial index at
+-- prepare time when the values are written into the SQL.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_worker_adoption
+    ON session_admissions(generation, owner_epoch, status, seq)
+    WHERE status IN ('started', 'unknown');
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay
@@ -632,6 +649,14 @@ CREATE INDEX IF NOT EXISTS session_admissions_pending
 -- The WHERE is built from CRON_PRINCIPAL_ID, the literal the run queries inline, so they cannot drift.
 CREATE INDEX IF NOT EXISTS idx_session_admissions_cron_request
     ON session_admissions(principal_id, request_id, target_session_id) WHERE principal_id = '""" + CRON_PRINCIPAL_ID + """';
+-- Restart recovery (``recover_session_inputs``) settles only the rows a lost owner left in flight.
+-- Without these it scanned the whole wide table at every start (status, outcome and owner_epoch sit
+-- behind the payload and lineage overflow pages), holding the writer ~20 s. Partial: settled history
+-- pays nothing. The query names the same literals, so the planner can prove the index applies.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_started
+    ON session_admissions(owner_epoch) WHERE status = 'started';
+CREATE INDEX IF NOT EXISTS idx_session_admissions_steering
+    ON session_admissions(owner_epoch) WHERE status = 'terminal' AND outcome = 'steering';
 CREATE TABLE IF NOT EXISTS worker_executions (
     execution_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
@@ -646,6 +671,9 @@ CREATE TABLE IF NOT EXISTS worker_executions (
 -- inside the write transaction; without this each probe scanned the whole (only-growing) table.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
     ON worker_executions(session_id, status);
+-- Restart recovery fences only live executions; terminal history (one per turn) stays out of it.
+CREATE INDEX IF NOT EXISTS idx_worker_executions_live
+    ON worker_executions(owner_epoch) WHERE status != 'terminal';
 CREATE TABLE IF NOT EXISTS worker_receipts (
     execution_id TEXT NOT NULL REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence > 0),
@@ -658,6 +686,10 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_route ON state_meta(
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.entry.session_id') END),
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.route') END), key)
+    WHERE key GLOB '""" + POLICY_PREFIX + """*';
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',

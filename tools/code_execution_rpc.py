@@ -42,17 +42,18 @@ def nested_tool_call_id(task_id) -> str:
 def _default_dispatch(task_id, session_id=None, turn_id=None, conversation_id=None):
     from model_tools import handle_function_call
     from tools.file_tools_read_tracking import programmatic_file_read
+    from tools.web_search_attribution import search_call_context
 
     def dispatch(tool_name, tool_args):
-        with programmatic_file_read():
+        with programmatic_file_read(), search_call_context("execute_code_rpc"):
             return handle_function_call(
                 tool_name,
                 tool_args,
                 task_id=task_id,
                 tool_call_id=nested_tool_call_id(task_id),
-            session_id=session_id,
-                                        turn_id=turn_id,
-            conversation_id=conversation_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                conversation_id=conversation_id,
             )
     return dispatch
 

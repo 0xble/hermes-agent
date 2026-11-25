@@ -50,3 +50,5 @@ Retire when the accepted upstream release supports lossless, bounded,
 interruptible direct local bridge batches and these behavior tests pass without
 this patch. Revert commits carrying this identity to roll back; no
 persisted-state migration is involved.
+
+Contract tests: `tests/tools/test_connector_local_batches.py`, `tests/tools/test_connector_bridge_wiring.py`, `tests/agent/test_local_tool_batches.py`.

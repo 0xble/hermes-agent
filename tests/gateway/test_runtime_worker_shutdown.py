@@ -31,7 +31,7 @@ async def test_managed_claims_participate_in_zero_and_nonzero_drain(tmp_path):
         _, timed_out = await GatewayShutdownMixin._drain_active_agents(runner, timeout=0)
         assert timed_out is True
         run_runtime.stop_managed_turns(runner)
-        assert stopped == [{'type': 'stop'}]
+        assert stopped == [{'type': 'stop', 'source': 'system'}]
         drain = asyncio.create_task(GatewayShutdownMixin._drain_active_agents(runner, timeout=5))
         await asyncio.sleep(0)
         assert not drain.done()

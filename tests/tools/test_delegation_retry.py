@@ -26,7 +26,7 @@ def _ledger(tmp_path, monkeypatch):
 T0 = 1_800_000_000.0
 
 
-def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goals=None, lineage=None, context="ctx"):
+def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goals=None, lineage=None, context="ctx", route_chain=None):
     record = {
         "delegation_id": delegation_id, "goal": goal, "goals": goals or [goal], "is_batch": True,
         "context": context, "toolsets": None, "role": "leaf", "model": "m",
@@ -34,6 +34,7 @@ def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goal
         "origin_session_id": "", "parent_session_id": "sess-owner",
         "dispatched_at": dispatched_at or T0,
         "task_transcripts": {"0": f"/live/{delegation_id}/task-0.log"},
+        **({"route_chain": route_chain} if route_chain else {}),
     }
     ad._persist_dispatch(record)
     if lineage:
@@ -74,6 +75,16 @@ def _row(delegation_id):
         cols = [c[1] for c in conn.execute("PRAGMA table_info(async_delegations)")]
         row = conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
     return dict(zip(cols, row)) if row else None
+
+
+def test_retry_sweep_body_error_rolls_back_its_writes():
+    delegation_id = _dispatch("deleg_rollback")
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with dr._best_effort_retry_transaction(ad) as conn:
+            conn.execute("UPDATE async_delegations SET retry_claim='partial' WHERE delegation_id=?",
+                         (delegation_id,))
+            raise sqlite3.OperationalError("database is locked")
+    assert _row(delegation_id)["retry_claim"] is None
 
 
 @pytest.mark.parametrize("state", ["interrupted", "unknown", "stalled"])

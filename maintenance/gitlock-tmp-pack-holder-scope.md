@@ -54,3 +54,5 @@ this unit and the focused holder-scope commit together.
 Retire when released upstream or the maintained fork provides equivalent
 repository-scoped tmp-pack and stale-lock liveness with conservative unknown-owner vetoes and
 regression coverage.
+
+Contract tests: `tests/hermes_cli/test_gitlock_process_scope.py`, `tests/hermes_cli/test_gitlock_pack_holders.py`.
