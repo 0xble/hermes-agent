@@ -1012,9 +1012,10 @@ class GatewayTurnExecutionMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            from gateway.run_turn import GatewayTurnMixin
             if pending_event is not None and GatewayTurnMixin._is_gateway_wake(cast(Any, pending_event)):
-                next_message = await getattr(self, "_internal_wake_input_at_execution")(
-                    pending_event, session_id, next_message)
+                next_message = await GatewayTurnMixin._internal_wake_input_at_execution(
+                    cast(Any, self), pending_event, session_id, next_message)
                 if next_message is None:
                     logger.info("Discarding queued wake superseded during preparation for %s", session_key or "?")
                     await _run_followup_processing_hook(
