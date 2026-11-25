@@ -1047,7 +1047,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         # Handled without a receipt: a strict event whose pinned session lost its key is dropped,
         # not queued behind (and later run in) the conversation that replaced it.
         from gateway.run_turn import GatewayTurnMixin
-        if not await self._strict_session_pin_holds(event):  # type: ignore[attr-defined]
+        if not await GatewayTurnMixin._strict_session_pin_holds(self, event):  # type: ignore[arg-type]
             return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.

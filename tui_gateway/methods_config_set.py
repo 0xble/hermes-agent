@@ -5,6 +5,7 @@ Keys match exactly except ``details_mode.<section>`` (prefix) and ``_DISPLAY_TOG
 """
 
 import os
+import time
 
 from hermes_cli.config_backend import ConfigWriteError
 from hermes_constants import INDICATOR_STYLES
@@ -182,7 +183,9 @@ def _set_model(rid, params, key, value, session):
     if session:
         from hermes_cli.model_switch import parse_model_switch_args
         sid = params.get("session_id", "")
-        _require_transcript_owner(session)
+        # Exact-plan guards run before any model switch or persistence; ownership itself is
+        # reclaimed without touching activity until that guard passes.
+        _require_transcript_owner(session, touch=False)
         parsed_flags = parse_model_switch_args(value)
         # Compute-host sessions ALWAYS defer, busy or idle. Their live agent is in
         # the child process — the direct path below would build a SECOND agent in
@@ -191,7 +194,9 @@ def _set_model(rid, params, key, value, session):
         # model. The stash crosses the boundary in the turn frame and the child's
         # turn thread applies it (_apply_pending_model_switch).
         if session.get("running") or session.get("_compute_host_active"):
-            return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
+            pending_result = _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
+            session["last_active"] = time.time()
+            return pending_result
         explicit_provider = parsed_flags.explicit_provider
         failed_agent_init = session.get("agent") is None and session.get("agent_error") is not None
         failed_ready = session.get("agent_ready") if failed_agent_init else None
@@ -210,6 +215,7 @@ def _set_model(rid, params, key, value, session):
         with _session_profile_runtime_scope(session):
             result = _apply_model_switch(sid, session, value, confirm_expensive_model=confirmed,
                                          parsed_flags=parsed_flags)
+        session["last_active"] = time.time()
         if failed_agent_init and not result.get("confirm_required"):
             _restart_completed_failed_agent_build(sid, session, failed_ready)
             if init_err := _cfgset_await_agent(session, rid):

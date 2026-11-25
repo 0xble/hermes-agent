@@ -553,11 +553,12 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, explicit_
     """``delegation.provider`` branch: full bundle via the runtime provider system. ``explicit_base_url`` is handed
     to the resolver the way the main agent hands it ``model.base_url``: the provider keeps its own key on it."""
     configured_provider = v["provider"]
+    from hermes_cli.auth import AuthError
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         endpoint = {"explicit_base_url": explicit_base_url} if explicit_base_url else {}
         # A route's own key (an explicit model alias's) wins over the provider's resolved one.
-        if v["api_key"]:
+        if v.get("api_key"):
             endpoint["explicit_api_key"] = v["api_key"]
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **endpoint)
     except Exception as exc:

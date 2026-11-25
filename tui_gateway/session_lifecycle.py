@@ -249,13 +249,15 @@ class SessionNotOwned(RuntimeError):
         self.reason = getattr(refusal, "reason", None) or "SESSION_NOT_OWNED"
 
 
-def _require_transcript_owner(session: dict) -> None:
+def _require_transcript_owner(session: dict, *, touch: bool = True) -> None:
     """Gate for every off-turn writer of this record's transcript (rewind, model-switch marker, manual compress),
     under ``history_lock``: re-claim an idle-released lease or raise ``SessionNotOwned``. A write counts as activity,
-    so the idle reaper cannot release the lease again before the writer finishes."""
+    so the idle reaper cannot release the lease again before the writer finishes. Callers that still need an exact
+    managed-key preflight may reclaim ownership first with ``touch=False`` and touch only after that preflight passes."""
     if (refusal := _reclaim_idle_released_lease(session)) is not None:
         raise SessionNotOwned(refusal)
-    session["last_active"] = time.time()
+    if touch:
+        session["last_active"] = time.time()
 
 
 # Upper bound on one held claim: the compute-host supervisor drops an unanswered late-ack handler after its
