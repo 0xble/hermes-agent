@@ -1658,10 +1658,13 @@ if ($SelfTestLogConcurrency) {
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and @("Write-HandoffLog", "Sync-HandoffLog", "Complete-HandoffLog") -contains [string]$node.Name
     }, $true)
     if (-not $fnAst -or $fnAst.Count -ne 3) {
-        Write-Host "LOG-CONCURRENCY SELF-TEST: FAIL -- the hand-off log writer definitions were not found in this script"
-        exit 1
+        # Windows PowerShell 5.1 can expose no FunctionDefinitionAst when invoked through a detached -File wrapper. Reconstruct the loaded definitions.
+        $fnText = @("Sync-HandoffLog", "Write-HandoffLog", "Complete-HandoffLog" | ForEach-Object {
+            "function $_ {`r`n$((Get-Item Function:\$_).Definition)`r`n}"
+        }) -join "`r`n`r`n"
+    } else {
+        $fnText = (@($fnAst) | ForEach-Object { $_.Extent.Text }) -join "`r`n`r`n"
     }
-    $fnText = (@($fnAst) | ForEach-Object { $_.Extent.Text }) -join "`r`n`r`n"
     $body = @'
 param([string]$TargetLog, [string]$MutexName, [int]$Count, [int]$WriterId)
 $LogPath = $TargetLog
