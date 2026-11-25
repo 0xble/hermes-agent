@@ -100,6 +100,30 @@ def _row_entry(row, platform, route, profile):
                         transport_profile=row.get('transport_profile'))
 
 
+def _cached_mount_plan(authority, sid, route):
+    """Build the same read-only plan from the already loaded routing entry after a cold row read fails.
+
+    This is a bounded recovery path for /stop and /new. It still runs off-loop and only reuses the
+    route entry that the durable-owner probe already observed, so a transient session-row failure
+    cannot discard a known owner before its queued admissions are settled.
+    """
+    store = authority.runner.session_store
+    with store._lock:
+        entry = store._entry_locked(route)
+    if (entry is None or entry.origin is None or entry.session_key != route
+            or authority.logical_owner(entry.session_id) != sid):
+        return None
+    return {
+        'sid': sid,
+        'route': route,
+        'entry': entry,
+        'row_entry': entry,
+        'route_entry': entry,
+        'route_version': getattr(entry, '_route_version', None),
+        'moved': False,
+    }
+
+
 def _mount_plan(authority, sid):
     """A read-only snapshot for mounting a row a route or messaging-platform row can stand for.
 
