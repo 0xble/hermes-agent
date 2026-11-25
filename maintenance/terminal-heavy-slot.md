@@ -72,6 +72,8 @@ Upstream: `heavy-slot` is a host-local tool, so this has no upstream equivalent 
 
 Both paths share one value-option validator table and the same help-flag set. `--max-wait` accepts finite, non-negative seconds, including decimal and exponent forms, matching the helper's `_argument_seconds` parser. Unknown options remain fail-closed, and accepting a wait limit never exempts the wrapped command or its scripts from lifecycle scanning.
 
+Contract tests: `tests/tools/test_terminal_tool_semaphore.py`, `tests/tools/test_terminal_semaphore_handoff.py`, `tests/tools/test_terminal_semaphore_lifecycle.py`, `tests/cron/test_lifecycle_guard_semaphore_minimal.py`, `tests/cron/test_lifecycle_guard_semaphore_round_two.py`, `tests/cron/test_lifecycle_guard_semaphore_urgency.py`.
+
 ## Verification and retirement
 
 Run `scripts/run_tests.sh tests/tools/test_terminal_tool_heavy_slot.py`. It covers classification in both directions, the exact rewrite, functions and aliases passing through the dispatcher in real bash and zsh, non-local backends, the nested-slot marker and opt-out, fail-open on classifier errors, a real `LocalEnvironment` command whose `cd` and export survive the wrapped call, and (when the helper is installed) a background run through the real helper with private slots, killed through the process registry, which must leave no process and no held slot.
