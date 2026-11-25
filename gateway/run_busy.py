@@ -444,18 +444,12 @@ class GatewayBusySessionMixin:
         self._start_compression_deferred_drain(session_key, adapter)
         return True
 
-    def _start_pending_drain_if_idle(self, session_key: str, adapter: Any) -> None:
-        """Start one pending FIFO head when no transport or runner owns the session."""
-        if (not getattr(self, "_is_session_running", lambda _key: False)(session_key)
-                and session_key not in getattr(adapter, "_active_sessions", {})
-                and session_key in getattr(adapter, "_pending_messages", {})):
-            pending_event = adapter._pending_messages.pop(session_key)
-            if not adapter._start_session_processing(pending_event, session_key):
-                adapter._pending_messages[session_key] = pending_event
-
     def _start_compression_deferred_drain(self, session_key: str, adapter: Any) -> None:
         """Use the normal adapter drain when no transport or runner owns retry."""
-        self._start_pending_drain_if_idle(session_key, adapter)
+        if (not self._is_session_running(session_key)
+                and session_key not in getattr(adapter, "_active_sessions", {})
+                and session_key in getattr(adapter, "_pending_messages", {})):
+            adapter._start_session_processing(adapter._pending_messages.pop(session_key), session_key)
 
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):

@@ -210,7 +210,6 @@ async def test_idle_post_turn_goal_continuation_starts_a_new_fifo_drain(hermes_h
     """
     from datetime import datetime
     from unittest.mock import AsyncMock, MagicMock, patch
-    import uuid
 
     from gateway.config import GatewayConfig
     from gateway.platforms.base import post_delivery_owner
@@ -293,7 +292,6 @@ async def test_deferred_goal_continuation_does_not_duplicate_a_running_successor
     """Deferred bookkeeping leaves a pending head for the successor that owns the guard."""
     from datetime import datetime
     from unittest.mock import AsyncMock, MagicMock, patch
-    import uuid
 
     from gateway.config import GatewayConfig
     from gateway.platforms.base import post_delivery_owner
@@ -321,7 +319,8 @@ async def test_deferred_goal_continuation_does_not_duplicate_a_running_successor
     event = MessageEvent(text="delivered question", message_type=MessageType.TEXT, source=src)
     guard = asyncio.Event()
     adapter._active_sessions[key] = guard
-    successor = asyncio.create_task(asyncio.sleep(30))
+    successor_hold = asyncio.Event()
+    successor = asyncio.create_task(successor_hold.wait())
     adapter._session_tasks[key] = successor
     GoalManager(entry.session_id).set("ship it")
     captured = {"post_delivery_owned": True}
