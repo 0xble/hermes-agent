@@ -1766,6 +1766,11 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
                 take_pending_primary_auth_failure,
             )
             pending_primary_auth = take_pending_primary_auth_failure()
+            # Resolution may occur in a worker thread, where the context-local notice is
+            # unavailable. Preserve the runtime marker carried by that resolution as the
+            # same one-turn primary failure before removing it from AIAgent kwargs.
+            if pending_primary_auth is None:
+                pending_primary_auth = runtime_kwargs.get(RUNTIME_KEY)
             resolved_route = route_snapshot(runtime_kwargs)
             # The marker is gateway bookkeeping, not an AIAgent constructor option. Keep the
             # pending failure separately and strip it before shaping the route runtime.

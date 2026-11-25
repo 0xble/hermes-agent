@@ -48,7 +48,10 @@ def session_action_allowed(session, task_id: str, session_key: str) -> bool:
     if binding is not None:
         from pathlib import Path
         db_path = Path(binding.profile_home) / "state.db"
-    if (task_id and _owns_result(task_id, owner, db_path=db_path)) or (session_key and _owns_result(session_key, session.session_key, db_path=db_path)):
+    lineage = {}
+    if db_path is not None:
+        lineage["db_path"] = db_path
+    if (task_id and _owns_result(task_id, owner, **lineage)) or (session_key and _owns_result(session_key, session.session_key, **lineage)):
         return True
     return not (task_id or session_key) or not (owner or session.session_key)
 

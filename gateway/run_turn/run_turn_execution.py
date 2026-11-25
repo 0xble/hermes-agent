@@ -879,7 +879,8 @@ class GatewayTurnExecutionMixin:
             next_reply_expected = False
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if not await getattr(self, "_strict_session_pin_holds")(pending_event, session_id):
+            from gateway.run_turn import GatewayTurnMixin
+            if not await GatewayTurnMixin._strict_session_pin_holds(cast(Any, self), pending_event, session_id):
                 return None
             from gateway.platforms.event import is_goal_continuation_event
             if is_goal_continuation_event(pending_event):
@@ -1023,8 +1024,10 @@ class GatewayTurnExecutionMixin:
             # Each drained follow-up is its own turn: bind its origin, not the chain head's.
             # Event-less interrupt/steer text continues the turn it follows, so it keeps that origin.
             _head_origin = bound_turn_origin()
+            # Event-less follow-ups are human input: the drain discards control interrupts and
+            # carries late steers as text. Only a queued event can supply a background origin.
+            set_turn_origin(turn_origin_for_event(pending_event) if pending_event is not None else "user")
             if pending_event is not None:
-                set_turn_origin(turn_origin_for_event(pending_event))
                 # In-band turns bypass the inbound slot claim. Keep the conversation clock on
                 # the latest actual input, like its terminal goal identity; never restore the head.
                 self._session_state(next_session_key).conversation.last_turn_started_at = time.time()
