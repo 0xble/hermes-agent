@@ -1296,6 +1296,27 @@ async def test_deferred_loop_does_not_probe_topic_on_scan(state, monkeypatch, de
 
 
 @pytest.mark.asyncio
+async def test_goal_continuation_uses_absence_backoff(state, monkeypatch):
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner(state)
+    manager = GoalManager("target")
+    manager.set("finish the requested work")
+    runner._goal_max_turns_from_config = lambda: 50
+    runner._goal_min_continuation_gap_from_config = lambda: 0
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._session_key_for_source = lambda source: runner.target.session_key
+    runner._enqueue_fifo = lambda *args: None
+
+    with patch("gateway.wake.automatic_route_available", new=AsyncMock(return_value=False)) as available:
+        await runner._post_turn_goal_continuation(
+            session_entry=runner.target, source=runner.target.origin, final_response="partial progress",
+        )
+
+    available.assert_awaited_once_with(runner, runner.target.origin, idle_backoff=True)
+
+
+@pytest.mark.asyncio
 async def test_retired_topic_post_turn_preserves_goal_without_judging(state, monkeypatch):
     from hermes_cli.goals import GoalManager
 
@@ -1390,6 +1411,50 @@ async def test_idle_topic_absence_expires_and_is_scoped_to_connector(state, monk
     assert await wake.automatic_route_available(runner, source, idle_backoff=True)
     assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
     assert replacement.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_automatic_topic_absence_backoff_preserves_saved_work_and_live_first_try(state, monkeypatch):
+    from gateway import wake
+
+    runner = _runner(state)
+    source = runner.target.origin
+    lookup = _topic_lookup(runner, monkeypatch, [])
+    now = 100.0
+    monkeypatch.setattr(wake, "monotonic", lambda: now)
+
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    lookup.assert_awaited_once()
+
+    lookup.return_value = []
+    now += wake._TOPIC_ABSENCE_RETRY_SECONDS
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 2
+    now += wake._TOPIC_ABSENCE_RETRY_SECONDS * 2 - 1
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 2
+    now += 1
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 3
+
+    lookup.return_value = [{"id": 42, "closed": False}]
+    now += wake._TOPIC_ABSENCE_RETRY_SECONDS * 4
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_automatic_event_absence_backoff_avoids_repeated_lookup(state, monkeypatch):
+    from gateway import wake
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, "loop", False)
+    lookup = _topic_lookup(runner, monkeypatch, [])
+
+    assert not await wake.automatic_event_is_current(runner, event)
+    assert not await wake.automatic_event_is_current(runner, event)
+    lookup.assert_awaited_once()
 
 
 @pytest.mark.asyncio

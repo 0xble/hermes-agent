@@ -26,7 +26,12 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 # turns are last-writer-wins) but DOES enforce a global max_concurrent_runs cap via HTTP 429, which
 # is worth waiting out.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
-_IDLE_TOPIC_ABSENCE_RETRY_SECONDS = 120.0
+# A confirmed missing topic is unlikely to reappear between consecutive background
+# checks. Keep the absence probe bounded while allowing a newly restored topic to
+# become eligible again without changing its saved goal, loop or session binding.
+_TOPIC_ABSENCE_RETRY_SECONDS = 120.0
+_TOPIC_ABSENCE_MAX_RETRY_SECONDS = 3600.0
+_IDLE_TOPIC_ABSENCE_RETRY_SECONDS = _TOPIC_ABSENCE_RETRY_SECONDS
 _IDLE_TOPIC_ABSENCE_LIMIT = 128
 
 
@@ -115,7 +120,9 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
 
     Topic closure and lookup outages are not deletion. Never probe by sending or
     change the saved goal, loop, session binding or ownership from this check.
-    Only the idle watcher backs off after confirmed absence. Admission rechecks it fresh.
+    Cache confirmed absences for background wakes; a live topic always gets its
+    first exact lookup, and an absent topic is retried after the bounded delay.
+    Pass ``idle_backoff=True`` for callers that can repeat automatic wake checks.
     """
     from gateway.config import Platform
 
@@ -125,7 +132,9 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
     bot = getattr(adapter, "_bot", None)
     if bot is None:
         return True
-    absences = None
+    absences: Optional[dict[tuple[str, str, str, str], tuple[float, float]]] = None
+    route: Optional[tuple[str, str, str, str]] = None
+    previous_absence: Optional[tuple[float, float]] = None
     if idle_backoff:
         from gateway.session_identity import identity_of
 
@@ -133,7 +142,9 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
         profile = identity.runtime_profile if identity is not None else getattr(source, "profile", None)
         route = (profile or "default", source.chat_type, str(source.chat_id), str(source.thread_id))
         absences = _idle_topic_absences(adapter, bot)
-        if absences.get(route, 0) > monotonic():
+        assert absences is not None
+        previous_absence = absences.get(route)
+        if previous_absence is not None and previous_absence[0] > monotonic():
             return False
         absences.pop(route, None)
     try:
@@ -144,10 +155,14 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
         logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
         return True
     if deleted:
-        if absences is not None:
+        if absences is not None and route is not None:
             if len(absences) >= _IDLE_TOPIC_ABSENCE_LIMIT:
                 absences.pop(next(iter(absences)))
-            absences[route] = monotonic() + _IDLE_TOPIC_ABSENCE_RETRY_SECONDS
+            previous = previous_absence
+            retry_seconds = _TOPIC_ABSENCE_RETRY_SECONDS if previous is None else min(
+                previous[1] * 2, _TOPIC_ABSENCE_MAX_RETRY_SECONDS,
+            )
+            absences[route] = (monotonic() + retry_seconds, retry_seconds)
         logger.info(
             "automatic wake: exact lookup found no Telegram topic chat=%s thread=%s; "
             "preserving saved work and skipping wake", source.chat_id, source.thread_id,
@@ -169,7 +184,7 @@ async def automatic_event_is_current(runner: Any, event: Any) -> bool:
     metadata = getattr(event, "metadata", None) or {}
     if not (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)):
         return True
-    return await automatic_route_available(runner, event.source)
+    return await automatic_route_available(runner, event.source, idle_backoff=True)
 
 
 async def admit_internal_event(adapter: Any, event: Any) -> None:
