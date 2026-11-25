@@ -6723,6 +6723,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Send typing indicator. Returns ``_TYPING_SKIPPED_LOCK_BUSY`` when a delivery held the chat lock."""
+        if not getattr(getattr(self, "config", None), "typing_indicator", True):
+            return None
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -7677,6 +7679,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
+            event._lobby_split_owner = self._root_lobby_key(msg)  # type: ignore[attr-defined]
             await self._prepare_text_event(event)
             return
         await self.handle_message(event)
