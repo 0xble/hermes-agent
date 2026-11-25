@@ -26,7 +26,7 @@ import hermes_state_holders
 import hermes_state_schema
 from hermes_state import SessionDB
 from hermes_state_common import FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL, _FTS_TRIGGERS
-from hermes_state_dbfile import _concrete_state_db_holder_pids, _is_inactive_orphan_desktop_holder
+from persistence.sqlite._state.dbfile import _concrete_state_db_holder_pids, _is_inactive_orphan_desktop_holder
 
 
 @pytest.fixture
@@ -758,7 +758,7 @@ class TestRuntimeFtsRebuild:
         monkeypatch.setattr(hermes_state_schema.time, "time", lambda: clock[0])
 
         from hermes_cli.doctor_state import _render_state_db_stats
-        from hermes_state_dbfile import collect_state_db_stats
+        from persistence.sqlite._state.dbfile import collect_state_db_stats
 
         def doctor_blob():
             return " ".join(" ".join(row) for row in _render_state_db_stats(collect_state_db_stats(db_path))).lower()

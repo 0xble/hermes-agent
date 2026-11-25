@@ -23,8 +23,8 @@ import time
 
 import pytest
 
-import hermes_state_dbfile as dbfile
-from hermes_state_dbfile import (
+import persistence.sqlite._state.dbfile as dbfile
+from persistence.sqlite._state.dbfile import (
     _DARWIN_FD_INO_OFFSET,
     _DARWIN_FD_PATH_OFFSET,
     _DARWIN_FD_DEV_OFFSET,

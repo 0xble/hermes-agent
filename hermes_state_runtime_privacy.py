@@ -82,7 +82,7 @@ def require_public(owners):
 
 
 def session_owners(conn, owners):
-    from hermes_state_runtime_workers import runtime_lineage
+    from persistence.sqlite.workers._runtime_workers import runtime_lineage
     found, expanded = set(owners), set()
     for sid in owners:
         if sid in expanded:
@@ -99,7 +99,7 @@ def session_owners(conn, owners):
 
 def resolve_worker_owners(conn, owners, operation, payload, execution_id):
     if operation == 'compression.lineage':
-        from hermes_state_worker_compression import CompressionSnapshot
+        from persistence.sqlite.workers._compression import CompressionSnapshot
         owners += tuple(CompressionSnapshot(None, conn)._session_lineage_root_to_tip(owners[0]))
     # A reserved child's authority belongs to its durable parent execution, whereas
     # an ordinary /branch is a separate conversation, not its parent's private work.
@@ -141,7 +141,7 @@ def _title_owners(conn, session_id, title, *, automatic=False):
 
 
 def _child_worker_owners(conn, execution_id):
-    from hermes_state_runtime_workers import descendant_range
+    from persistence.sqlite.workers._runtime_workers import descendant_range
     return tuple(row[0] for row in conn.execute('SELECT session_id FROM worker_executions '
         "WHERE execution_id>=? AND execution_id<? AND status!='terminal'", descendant_range(execution_id)))
 
@@ -245,7 +245,7 @@ def mutation_owners(db, session_id, operation, payload, prepared=None):
 
 def resolve_mutation_owners(conn, owners, operation, payload):
     if operation == 'delete':
-        from hermes_state_mutation_guards import delete_targets
+        from persistence.sqlite.authority._runtime_guards import delete_targets
         owners += tuple(delete_targets(conn, owners[0]))
     if operation in {'rename', 'sidebar'} and payload.get('title'):
         owners += _title_owners(conn, owners[0], payload['title'])

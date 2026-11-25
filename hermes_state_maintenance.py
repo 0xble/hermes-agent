@@ -426,7 +426,7 @@ class SessionMaintenanceMixin:
         from hermes_state_mutation_retirement import (
             RETIRED_PREFIX, ROUTE_FENCE_PREFIX, prune_retired_tombstones,
         )
-        from hermes_state_terminal import ADMISSION_PREFIX, WORKER_PREFIX
+        from persistence.sqlite.conversation._store.terminal import ADMISSION_PREFIX, WORKER_PREFIX
         tombstone_pacer = PrunePacer(max_size=100)
         tombstone_prefixes = (ADMISSION_PREFIX, WORKER_PREFIX, RETIRED_PREFIX, ROUTE_FENCE_PREFIX)
         while True:

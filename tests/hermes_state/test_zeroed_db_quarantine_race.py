@@ -15,7 +15,7 @@ import pytest
 
 import hermes_state as hs
 import hermes_state_repair
-import hermes_state_dbfile as dbfile
+import persistence.sqlite._state.dbfile as dbfile
 import hermes_state_repair as repair
 
 

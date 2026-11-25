@@ -11,7 +11,7 @@ import random
 import sqlite3
 
 from hermes_state_display_fold import _DISPLAY_FOLD_COLUMNS_SQL, fold_rows
-from hermes_state_identity import display_identity
+from persistence.sqlite.conversation._store.identity import display_identity
 
 
 def _table():

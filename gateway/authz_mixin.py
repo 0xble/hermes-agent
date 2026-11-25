@@ -596,7 +596,7 @@ class GatewayAuthorizationMixin:
         # named namespace may have used a shared bot, so leave it unknown and
         # preserve the existing fail-closed satellite fallback.
         if transport_profile is None and getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            from hermes_state_keys import profile_from_session_key
+            from persistence.sqlite._state.keys import profile_from_session_key
             if profile_from_session_key(getattr(entry, "session_key", None)) == "default":
                 transport_profile = "default"
         restore_identity(source, runner=self, transport_profile=transport_profile)

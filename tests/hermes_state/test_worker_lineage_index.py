@@ -5,7 +5,7 @@ from hermes_state import SessionDB
 
 
 def test_lineage_worker_probe_is_indexed_on_new_and_upgraded_stores(tmp_path):
-    from hermes_state_runtime_workers import worker_states
+    from persistence.sqlite.workers._runtime_workers import worker_states
     path = tmp_path / 'state.db'
     with SessionDB(path) as db:
         db.create_session('root', source='cli')

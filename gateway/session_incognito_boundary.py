@@ -13,7 +13,7 @@ def require_open_database(db):
 def idle_privacy_boundary(db, session_id):
     from agent.incognito import privacy_transition
     from hermes_state_runtime import RuntimeStoreError
-    from hermes_state_runtime_workers import runtime_lineage, worker_states
+    from persistence.sqlite.workers._runtime_workers import runtime_lineage, worker_states
     # A JSONL fallback or closed handle cannot prove the absence of durable work.
     # In particular, do not reopen a closed handle under an assumed privacy fence.
     require_open_database(db)
@@ -39,7 +39,7 @@ def saved_prefix(db, conn, session_id):
     rows = conn.execute(f'SELECT {db._CONVERSATION_ROW_COLUMNS} FROM messages '
                         f'WHERE session_id=? AND {visible_session_sql("session_id")} AND active=1 ORDER BY id',
                         (target,)).fetchall()
-    from hermes_state_identity import _newest_message_uid_rows
+    from persistence.sqlite.conversation._store.identity import _newest_message_uid_rows
     rows = _newest_message_uid_rows(rows)
     return db._rows_to_conversation(rows, session_id=target, include_ancestors=False,
         repair_alternation=True, include_row_ids=False, include_summary_markers=True)

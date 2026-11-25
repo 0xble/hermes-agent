@@ -452,7 +452,7 @@ _E2E_LANES: dict[str, tuple[str, ...]] = {
         # The state.db torture chamber and the compaction/exactly-once
         # suites are the only tests that run real concurrent writers.
         "persistence/sqlite/",
-        # journal mode, WAL fallback and durability barriers; MOVES folds hermes_state_wal into it, so the
+        # journal mode, WAL fallback and durability barriers; MOVES folds sqlite_support into it, so the
         # guards see it under that oldest name
         original_path("sqlite_support.py"),
         # Messaging-gated gateway cases: only the e2e job installs the real

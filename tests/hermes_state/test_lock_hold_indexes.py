@@ -12,8 +12,8 @@ from gateway.session_ingress_media import _held_media_paths
 from gateway.session_api_media import compact_settled_api_payloads
 from hermes_state import SessionDB
 from hermes_state_local import POLICY_PREFIX, moved_receipts
-from hermes_state_worker_context import worker_prompt
-from hermes_state_worker_lifecycle import insert_session_row_in_transaction
+from persistence.sqlite.workers._context import worker_prompt
+from persistence.sqlite.workers._lifecycle import insert_session_row_in_transaction
 
 
 class _RecordingConnection:

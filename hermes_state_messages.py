@@ -1791,7 +1791,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         in-txn before any mutation (presentation-only metadata changes don't invalidate a rewind). A live turn
         lease refuses; expired/dead holders are reclaimed. ``rewind_count`` always increments."""
         def _do(conn):
-            from hermes_state_mutation_transcript import rewind_in_transaction
+            from persistence.sqlite.conversation._store.mutation_transcript import rewind_in_transaction
             target_row, ids, head_id, replacement_id = rewind_in_transaction(
                 self, conn, session_id, target_message_id,
                 preserve_compaction_handoff=preserve_compaction_handoff,

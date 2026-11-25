@@ -104,7 +104,7 @@ def test_a_permanent_marker_an_earlier_release_wrote_for_a_swept_api_session_sta
 def _seed_expired_tombstones(db, count):
     import json
     from hermes_state_mutation_retirement import RETIRED_PREFIX
-    from hermes_state_terminal import WORKER_PREFIX
+    from persistence.sqlite.conversation._store.terminal import WORKER_PREFIX
     old = time.time() - 8 * 86400
     db._execute_write(lambda conn: conn.executemany(
         "INSERT INTO state_meta(key,value) VALUES(?,?)",
@@ -116,7 +116,7 @@ def _seed_expired_tombstones(db, count):
 
 def _tombstone_counts(db):
     from hermes_state_mutation_retirement import RETIRED_PREFIX
-    from hermes_state_terminal import WORKER_PREFIX
+    from persistence.sqlite.conversation._store.terminal import WORKER_PREFIX
     return tuple(db._read_one("SELECT count(*) FROM state_meta WHERE key GLOB ?", (prefix + "*",))[0]
                  for prefix in (WORKER_PREFIX, RETIRED_PREFIX))
 

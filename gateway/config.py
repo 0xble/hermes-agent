@@ -19,7 +19,7 @@ from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
 )
-from hermes_state_guard import _in_test_context
+from persistence.sqlite._state.guard import _in_test_context
 from utils import fast_safe_load, is_truthy_value
 
 logger = logging.getLogger(__name__)

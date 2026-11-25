@@ -13,7 +13,7 @@ from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
-from hermes_state_keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
+from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
 from hermes_state_session_signature import SESSION_SIGNATURE_TABLE_SQL, SESSION_SIGNATURE_TRIGGER_SQL
 from process_identity import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE

@@ -802,12 +802,12 @@ class SessionSessionsMixin:
     def update_conversation_model_config_value(self, session_id: str, key: str,
                                                update: Callable[[Any], Any]) -> Optional[str]:
         """Write ``update(value)`` of a conversation-wide key at the compression tip (one transaction)."""
-        from hermes_state_sessions_model_config import update_conversation_model_config_value
+        from persistence.sqlite.conversation._store.model_config import update_conversation_model_config_value
         return update_conversation_model_config_value(self, session_id, key, update)
 
     def session_ids_with_model_config_key(self, key: str) -> list[str]:
         """Ids of the sessions whose model_config carries ``key``, newest first."""
-        from hermes_state_sessions_model_config import session_ids_with_model_config_key
+        from persistence.sqlite.conversation._store.model_config import session_ids_with_model_config_key
         return session_ids_with_model_config_key(self, key)
 
     def update_session_runtime_lock(
@@ -1451,7 +1451,7 @@ class SessionSessionsMixin:
                     seen_ids.add(s["id"])
                     sessions.append(s)
         if project_compression_tips and not include_children:
-            from hermes_state_session_list import project_compression_tips
+            from persistence.sqlite.conversation._store.session_list import project_compression_tips
             sessions = project_compression_tips(self, sessions, compact_rows)
         if heads:
             from hermes_state_local import annotate_local_lineages

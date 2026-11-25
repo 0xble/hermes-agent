@@ -35,7 +35,7 @@ holds POSIX locks on that inode, so raw descriptor counts lag the real
 connection count and make such assertions flaky.
 """
 
-import hermes_state_readpool
+from persistence.sqlite._state import readpool as hermes_state_readpool
 import queue
 import sqlite3
 import threading
@@ -483,7 +483,7 @@ def test_idle_permits_are_reclaimed_from_a_peer_instance(db):
 def test_peak_is_bounded_across_many_database_files(tmp_path):
     """Read connections must be capped for the PROCESS, not just per file."""
     from hermes_state import SessionDB, _READ_POOL_MAX
-    from hermes_state_readpool import _READ_POOL_PROCESS_MAX
+    from persistence.sqlite._state.readpool import _READ_POOL_PROCESS_MAX
 
     n_files = (_READ_POOL_PROCESS_MAX // _READ_POOL_MAX) + 2
     dbs = []
@@ -533,7 +533,7 @@ def test_peak_is_bounded_across_many_database_files(tmp_path):
 def test_idle_connections_are_reclaimed_across_database_files(tmp_path):
     """A quiet profile's idle connections must not starve the busy one."""
     from hermes_state import SessionDB, _READ_POOL_MAX
-    from hermes_state_readpool import _READ_POOL_PROCESS_MAX
+    from persistence.sqlite._state.readpool import _READ_POOL_PROCESS_MAX
 
     quiet = []
     try:
@@ -567,7 +567,7 @@ def test_no_read_connection_is_opened_without_descriptor_headroom(db, monkeypatc
     subprocess pipes, and EMFILE lands on whoever asks next -- which in the
     report was terminal_tool, not SQLite.
     """
-    import hermes_state_readpool as readpool
+    import persistence.sqlite._state.readpool as readpool
 
     # Drain the pool so the next read must OPEN rather than reuse.
     while True:
@@ -596,7 +596,7 @@ def test_no_read_connection_is_opened_without_descriptor_headroom(db, monkeypatc
 
 def test_fd_headroom_guard_fails_open_where_it_cannot_measure(monkeypatch):
     """No RLIMIT_NOFILE (Windows) means unmeasurable, not tight."""
-    import hermes_state_readpool as readpool
+    import persistence.sqlite._state.readpool as readpool
 
     monkeypatch.setattr(readpool, "_fd_soft_limit", lambda: None)
     assert readpool._fd_headroom_ok() is True
@@ -628,7 +628,7 @@ def test_duplicate_handles_on_one_path_are_reported(db, caplog):
     import re
 
     from hermes_state import SessionDB
-    from hermes_state_readpool import _HANDLES_PER_PATH_WARN
+    from persistence.sqlite._state.readpool import _HANDLES_PER_PATH_WARN
 
     def open_extra_handle():
         return SessionDB(db_path=db.db_path)
@@ -669,7 +669,7 @@ def test_read_only_handles_do_not_count_toward_the_duplicate_writer_warning(db, 
     import logging
 
     from hermes_state import SessionDB
-    from hermes_state_readpool import _HANDLES_PER_PATH_WARN
+    from persistence.sqlite._state.readpool import _HANDLES_PER_PATH_WARN
 
     extra = []
     try:
@@ -691,7 +691,7 @@ def test_handle_diagnostics_do_not_retain_the_creators_frame(tmp_path, monkeypat
 
     # This checks call-site metadata, not host-wide FD scans. A cached native
     # scan error retains its re-raised traceback, including the opening frames.
-    monkeypatch.setattr("hermes_state_dbfile._deleted_sidecar_holders_for_open", lambda _path: [])
+    monkeypatch.setattr("persistence.sqlite._state.dbfile._deleted_sidecar_holders_for_open", lambda _path: [])
 
     class Context:
         pass
@@ -733,7 +733,7 @@ def test_closed_handles_do_not_count_toward_duplicate_writer_warning(db, caplog)
     """Closing a writer releases its duplicate-writer diagnostic membership."""
     import logging
 
-    from hermes_state_readpool import _HANDLES_PER_PATH_WARN
+    from persistence.sqlite._state.readpool import _HANDLES_PER_PATH_WARN
 
     closed = [SessionDB(db_path=db.db_path) for _ in range(_HANDLES_PER_PATH_WARN - 1)]
     for handle in closed:

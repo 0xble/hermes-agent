@@ -6,7 +6,7 @@ from contextlib import ExitStack, closing
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_dbfile import _pread_db_range
+from persistence.sqlite._state.dbfile import _pread_db_range
 from hermes_state_errors import _STATE_DB_GENERATION_KEY
 
 

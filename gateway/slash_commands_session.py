@@ -696,7 +696,7 @@ class GatewaySessionCommandsMixin:
             resend_text = plan.live_text
 
             def write(conn):
-                from hermes_state_mutation_transcript import rewind_in_transaction
+                from persistence.sqlite.conversation._store.mutation_transcript import rewind_in_transaction
                 rewind_in_transaction(db, conn, session_id, plan.target_row_id, preserve_compaction_handoff=True,
                                       expected_active_ids=plan.expected_active_ids,
                                       expected_target_content=plan.expected_target_content)

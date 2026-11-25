@@ -329,7 +329,7 @@ def local_lineage_index(conn):
     transcript to a child, so every segment is one conversation. ``superseded`` holds the listable
     roots of earlier reset segments (filtered in SQL, before paging); ``heads`` maps the latest
     reset segment to ``(owner, lineage)`` for the row that represents the conversation. A delete
-    of that row removes the whole lineage (``hermes_state_mutation_guards.delete_targets``)."""
+    of that row removes the whole lineage (``persistence.sqlite.authority._runtime_guards.delete_targets``)."""
     superseded, heads = set(), {}
     rows = conn.execute("SELECT value FROM state_meta WHERE key GLOB ? AND json_valid(value) "
                         "AND json_array_length(value, '$.lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()

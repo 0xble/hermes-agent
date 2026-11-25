@@ -164,7 +164,7 @@ def test_g1_refused_append_commits_no_renewal(backend, scope_a):
 
 
 def test_g1_refused_append_on_an_absent_id_leaves_it_creatable(backend, scope_a):
-    """A refusal appends nothing and retires nothing: the id an unfenced writer never got to use is still creatable afterwards (the constructor's tombstone check, hermes_state_worker_lifecycle.insert_session_row_in_transaction, only refuses deleted sessions)."""
+    """A refusal appends nothing and retires nothing: the id an unfenced writer never got to use is still creatable afterwards (the constructor's tombstone check, persistence.sqlite.workers._lifecycle.insert_session_row_in_transaction, only refuses deleted sessions)."""
     require_capability(backend, "transactional_claims")
     repo, sessions = backend.open(scope_a).messages, backend.open(scope_a).sessions
     with pytest.raises(TurnLeaseLost):
@@ -357,7 +357,7 @@ def test_g3_compression_continuation_inherits_peer_facets_not_the_prompt(backend
 
 
 def test_g3_late_parent_facets_are_inherited_on_the_next_construction(backend, scope_a):
-    """The legacy constructor runs the compression-fork inheritance after the keep-existing upsert whenever a parent is named (hermes_state_worker_lifecycle.insert_session_row_in_transaction): a continuation constructed before its parent carried the peer facets fills them on the next construction, and never overwrites its own."""
+    """The legacy constructor runs the compression-fork inheritance after the keep-existing upsert whenever a parent is named (persistence.sqlite.workers._lifecycle.insert_session_row_in_transaction): a continuation constructed before its parent carried the peer facets fills them on the next construction, and never overwrites its own."""
     sessions = backend.open(scope_a).sessions
     sessions.create(NewSession(session_id=ROOT, source="telegram", session_key=f"telegram:{ROOT}", chat_id="c9"))
     sessions.end(ROOT, END_REASON_COMPRESSION)

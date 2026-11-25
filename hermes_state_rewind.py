@@ -128,7 +128,7 @@ class SessionRewindMixin:
         # ``content_refused``: ``compacted = 1`` keeps it shown the way compaction-archived rows are,
         # ``active`` stays 0 so the model never sees it again.
         def _do(conn) -> bool:
-            from hermes_state_mutation_transcript import rewind_in_transaction
+            from persistence.sqlite.conversation._store.mutation_transcript import rewind_in_transaction
             rewind_in_transaction(
                 self, conn, session_id, target_row_id,
                 preserve_compaction_handoff=preserve_handoff,

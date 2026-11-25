@@ -449,7 +449,7 @@ def restore_native_source(payload, runner=None):
             if (getattr(getattr(runner, 'config', None), 'multiplex_profiles', False)
                     and 'relay' not in provenance
                     and provenance.get('transport_profile') is None):
-                from hermes_state_keys import profile_from_session_key
+                from persistence.sqlite._state.keys import profile_from_session_key
                 if profile_from_session_key(envelope.get('route')) == 'default':
                     provenance['transport_profile'] = 'default'
             restore_provenance(runner, source, provenance)

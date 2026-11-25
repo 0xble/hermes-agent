@@ -10,7 +10,7 @@ import sqlite3
 from typing import Optional
 
 from hermes_state_common import _placeholders
-from hermes_state_identity import _GIL_HELD_HASH_CHUNK
+from persistence.sqlite.conversation._store.identity import _GIL_HELD_HASH_CHUNK
 from hermes_state_publication import state_lock
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
 

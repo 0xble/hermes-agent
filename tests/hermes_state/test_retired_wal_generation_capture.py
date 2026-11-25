@@ -20,7 +20,7 @@ import pytest
 
 import hermes_state
 from hermes_state import DeletedWalGenerationError, SessionDB
-from hermes_state_dbfile import (
+from persistence.sqlite._state.dbfile import (
     RETIRED_GENERATION_MANIFEST, RetiredGenerationCaptureError, capture_retired_wal_generation,
 )
 from tests.hermes_state._wal_generation_harness import (
