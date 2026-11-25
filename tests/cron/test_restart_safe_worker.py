@@ -639,6 +639,7 @@ def test_external_worker_exit_rechecks_exact_execution_before_failure(monkeypatc
     assert get.call_count == 2
 
 
+
 def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_path):
     from cron import scheduler
 

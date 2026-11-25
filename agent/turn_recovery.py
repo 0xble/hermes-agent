@@ -1290,13 +1290,20 @@ def abort_turn_on_interrupt(
     agent._drop_trailing_empty_response_scaffolding(messages)
     close_interrupted_tool_sequence(messages, interrupt_text, stopped=True)
     agent._persist_session(messages, conversation_history)
-    # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
-    # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
-    agent.clear_interrupt(hard_cancel=True)
-    return {
+    # This helper returns directly from the API-error path, bypassing the normal
+    # finalizer. Stamp the cause before clear_interrupt() drops the pending state;
+    # otherwise a message-less system preemption is indistinguishable from a user
+    # stop to the gateway.
+    result = {
         "final_response": interrupt_text, "messages": messages, "api_calls": api_call_count,
         "completed": False, "interrupted": True,
     }
+    from agent.interrupt_control import stamp_interrupt_result
+    stamp_interrupt_result(agent, result, interrupted=True)
+    # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
+    # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
+    agent.clear_interrupt(hard_cancel=True)
+    return result
 
 
 def interruptible_backoff_sleep(

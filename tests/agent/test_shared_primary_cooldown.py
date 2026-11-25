@@ -605,7 +605,7 @@ def _overload_turns(home, stub, mode="stream"):
     return first, second, first_primary, len(stub.primary_requests()) - len(first_primary)
 
 
-@pytest.mark.parametrize(("status", "retry_after"), [(529, "7200"), (503, None)])
+@pytest.mark.parametrize(("status", "retry_after"), [(529, "7200"), (503, None), (503, "342")])
 def test_overload_arms_the_shared_cooldown_across_processes(tmp_path, status, retry_after):
     home = tmp_path / ".hermes"
     write_home_config(home)
@@ -623,7 +623,8 @@ def test_overload_arms_the_shared_cooldown_across_processes(tmp_path, status, re
     assert entry["reason"] == "overloaded"
     window = entry["reset_at"] - entry["recorded_at"]
     if retry_after:
-        assert window > 7000, entry  # Retry-After on a 529 goes through the provider-reset path
+        expected = float(retry_after)
+        assert expected - 1 <= window <= expected + 1, entry
     else:
         assert 59 <= window <= 61, entry
     notices = first["notices"] + second["notices"]
