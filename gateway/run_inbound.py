@@ -1015,6 +1015,7 @@ class GatewayInboundMixin(
         # storage locks. Keep those read-only operations off the gateway event-loop thread. Mounting
         # then publishes authority state and must remain serialized on the loop.
         sid = None
+        fenced = False
         if authority:
             from gateway.session_store_async import run_store_call
             try:
@@ -1022,6 +1023,7 @@ class GatewayInboundMixin(
             except Exception:
                 logger.debug("Could not probe the owner for %s before stopping it", _quick_key, exc_info=True)
                 authority.fence_route(_quick_key)
+                fenced = True
                 return
             plan = None
             if sid and sid not in authority.sessions:
@@ -1030,7 +1032,9 @@ class GatewayInboundMixin(
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
-                authority.fence_route(_quick_key)
+                if not fenced:
+                    authority.fence_route(_quick_key)
+                    fenced = True
                 # The initial probe can finish before a first admission publishes its durable owner.
                 # Fence first, then take one fresh off-loop snapshot so that input is cancelled rather
                 # than left queued behind /new or /stop.
@@ -1046,6 +1050,8 @@ class GatewayInboundMixin(
                 sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
             if not sid:
                 return
+        if authority is None:
+            return
         from gateway.session_contract import SessionActor, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
@@ -1059,7 +1065,9 @@ class GatewayInboundMixin(
             # Input (and a command's turn) that arrived before this and is not committed yet never
             # commits after it; one that committed before the fence is in the second listing and
             # cancelled below. A paused FIFO keeps both, like its queued followers.
-            authority.fence_route(_quick_key)
+            if not fenced:
+                authority.fence_route(_quick_key)
+                fenced = True
             rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
         for row in [] if paused else rows:
             if row['status'] == 'queued' and row['principal_id'].startswith('messaging:'):

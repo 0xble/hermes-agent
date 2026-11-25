@@ -227,6 +227,7 @@ async def test_stop_reprobes_after_fence_when_first_owner_commits_during_probe(t
     authority, _entered, release_capture, admit, route = await _held_owner(tmp_path, monkeypatch)
     release_capture.set()
     runner = authority.runner
+    before = authority.route_epoch(route(X))
     probe_started, release_probe = threading.Event(), threading.Event()
     real_probe = runner._hm_mounted_owner_probe
     calls = 0
@@ -248,6 +249,7 @@ async def test_stop_reprobes_after_fence_when_first_owner_commits_during_probe(t
         await admit(X, 'x0-text')
         release_probe.set()
         await stop
+        assert authority.route_epoch(route(X)) == before + 1
         rows = list_session_admissions(authority.db, session_id=runner.session_store.peek_session_id(route(X)),
                                        pending_only=False)
         assert calls == 2
