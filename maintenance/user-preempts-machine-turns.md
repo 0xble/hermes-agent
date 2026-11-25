@@ -36,7 +36,7 @@ Preemption happens only when all of these hold:
 
 - The session task is never cancelled. Soft preemption is cooperative: if the machine turn is inside a non-interruptible tool or step, it keeps the lease until that step yields. The user message remains FIFO behind it; the user has already seen the "Interrupting" acknowledgement rather than a second queued acknowledgement.
 
-Contract tests: `tests/gateway/test_turn_lease_queue.py`.
+Contract tests: `tests/gateway/test_turn_lease_queue.py` (including `test_pending_internal_holder_publishes_then_is_preempted_once` and `test_pending_internal_holder_releases_without_publication_and_is_not_preempted`).
 
 ## Interrupt attribution on early returns
 

@@ -32,6 +32,8 @@ class TurnState:
     ``clear()``: ``_release_turn_lease`` owns it (release exactly once)."""
 
     agent: Any = None  # running AIAgent (or _AGENT_PENDING_SENTINEL); None = idle
+    # Set when the pending sentinel's real agent is published; cleared for each new turn.
+    agent_published_event: Any = None
     # The MessageEvent that opened the running turn and the live TurnContext: a successful busy
     # redirect re-anchors both to the redirecting message (#115001).
     event: Any = None
@@ -48,6 +50,12 @@ class TurnState:
     # Agents taken out of the cache while this turn still ran them (a one-turn ``model_override``
     # agent): ``_release_running_agent_state`` releases them once the slot clears.
     retired_agents: list[Any] = field(default_factory=list)
+
+    def publish_agent(self, agent: Any, ctx: Any) -> None:
+        """Publish the usable agent and wake pending lease waiters."""
+        self.agent, self.ctx = agent, ctx
+        if self.agent_published_event is not None:
+            self.agent_published_event.set()
 
     def running_event(self) -> Any:
         """The event whose input the worker is running now: a drained queued follow-up, else the
@@ -68,6 +76,7 @@ class TurnState:
     def clear(self) -> None:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
         self.agent = self.lease = self.event = self.ctx = self.follow_up_event = None
+        self.agent_published_event = None
         self.started_ts = self.busy_ack_ts = 0.0
 
 

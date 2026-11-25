@@ -435,6 +435,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
         state = self._session_state(session_key)
         state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.agent_published_event = asyncio.Event()
         state.turn.event = event
         state.turn.lease = passive_lease
         state.turn.started_ts = time.time()
@@ -2120,6 +2121,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+        _claim_state.turn.agent_published_event = asyncio.Event()
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock

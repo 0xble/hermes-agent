@@ -46,12 +46,14 @@ class TurnLeaseToken:
     """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
     release idempotent."""
 
-    __slots__ = ("event", "generation", "lease", "owner_key", "released", "session_id")
+    __slots__ = ("event", "generation", "lease", "owner_key", "released", "released_event", "session_id")
 
     def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
         self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
         self.event = None
         self.released = False
+        # Contention callbacks can wait for either agent publication or this exact holder's release.
+        self.released_event = asyncio.Event()
         # The concrete lease, so release resolves by identity even after a rotation re-aliases
         # ``session_id`` (both ids map to this same lease).
         self.lease = lease
@@ -240,6 +242,7 @@ class SessionTurnLeaseRegistry:
         if token is None or token.released:
             return False
         token.released = True
+        token.released_event.set()
         lease = token.lease
         if lease.holder is not token:
             logger.debug("turn lease release skipped on session %s: token (key %s gen %s) is not "
