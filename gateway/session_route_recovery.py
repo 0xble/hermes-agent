@@ -145,7 +145,9 @@ def _reconcile_mount_plan(authority, plan):
     if same_snapshot:
         return plan['entry'], plan['moved']
     if current is None:
-        return plan['row_entry'], False
+        # The lane had an entry when the worker read storage and has none now: the row was retired,
+        # deleted or pruned in between. The cached row snapshot no longer proves a mountable session.
+        return None, False
     if current.session_id == plan['sid'] and current.origin is not None and current.session_key == route:
         return current, False
     return plan['row_entry'], True
