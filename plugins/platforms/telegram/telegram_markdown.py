@@ -691,19 +691,17 @@ def _stash_inline_code(text: str, stash) -> str:
     for k in range(len(runs) - 1, -1, -1):  # index of the next run of the same width
         width = len(runs[k].group())
         next_same[k], last[width] = last.get(width), k
-    literal, out, pos, i = set(), [], 0, 0
+    out, pos, i = [], 0, 0
     while i < len(runs):
         opener, width, close = runs[i], len(runs[i].group()), next_same[i]
         if close is not None and runs[close].start() > breaks[bisect.bisect_left(breaks, opener.end())]:
             close = None  # a code span never crosses a line
-        if i in literal or close is None:
+        if close is None:
             i += 1
             continue
         content = text[opener.end():runs[close].start()]
-        if width > 2 or (width == 2 and '`' in content):
-            literal.add(close)
-            i += 1
-            continue
+        if width > 1 and content.startswith(' ') and content.endswith(' ') and content.strip():
+            content = content[1:-1]
         out.append(text[pos:opener.start()])
         out.append(stash('`' + content.replace('\\', '\\\\').replace('`', '\\`') + '`'))
         pos, i = runs[close].end(), close + 1
