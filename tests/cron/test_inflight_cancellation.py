@@ -172,7 +172,7 @@ def test_detached_interrupt_is_idempotent_when_execution_finishes(isolated_store
     cancelled.assert_called_once_with(live)
 
 
-def _detached_live_execution(job_id):
+def _detached_live_row(job_id):
     from cron import executions
 
     live = executions.create_execution(job_id, source="external")
@@ -180,6 +180,12 @@ def _detached_live_execution(job_id):
     with executions._transaction() as conn:
         conn.execute("UPDATE executions SET owner_kind='detached' WHERE id=?", (live["id"],))
     return executions.get_execution(live["id"])
+
+
+def _detached_live_execution(job_id):
+    live = _detached_live_row(job_id)
+    assert live is not None
+    return live
 
 
 def test_detached_run_removing_its_own_job_keeps_result_and_delivery(isolated_store, monkeypatch):
@@ -254,6 +260,61 @@ def test_remove_cancels_detached_run_hidden_by_refused_run_now_row(isolated_stor
     assert receipt["was_running"] is True and receipt["interrupted"] is True
     assert receipt["run_id"] == live["id"]
     assert detached_authority._cancel_path(job["id"], live["id"]).exists()
+
+
+def test_remove_inside_self_removal_scope_never_cancels_detached_row(isolated_store):
+    """The scope marker alone (no worker env var yet) must keep a run from cancelling itself."""
+    from cron import detached_authority
+
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    live = _detached_live_execution(job["id"])
+
+    with jobs.self_removal_delivery_scope(job["id"]):
+        receipt = dispatch("remove", job_id=job["id"])
+
+    assert receipt["success"] is True
+    assert receipt["was_running"] is True and receipt["interrupted"] is False
+    assert not detached_authority._cancel_path(job["id"], live["id"]).exists()
+
+
+def test_list_jobs_reads_live_detached_rows_in_one_query(isolated_store, monkeypatch):
+    """Listing N jobs must not reopen the execution ledger once per job."""
+    from cron import executions
+
+    created = [jobs.create_job(prompt="work", schedule="every 5m", deliver="local") for _ in range(4)]
+    live = _detached_live_execution(created[0]["id"])
+    calls = []
+    real = executions._transaction
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(executions, "_transaction", counting)
+
+    listed = {job["id"]: job for job in jobs.list_jobs()}
+
+    assert listed[created[0]["id"]]["running"] is True
+    assert listed[created[0]["id"]]["live_execution"]["id"] == live["id"]
+    assert all(not listed[job["id"]]["running"] for job in created[1:])
+    assert len(calls) <= 2  # latest_executions + live_executions, independent of job count
+
+
+def test_remove_survives_unreadable_execution_ledger(isolated_store, monkeypatch):
+    """A ledger read error after the removal saved must not skip the rest of removal."""
+    from cron import executions
+
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+
+    def broken(job_id):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(executions, "cancellable_execution", broken)
+
+    receipt = dispatch("remove", job_id=job["id"])
+
+    assert receipt["success"] is True
+    assert jobs.get_job(job["id"]) is None
 
 
 @pytest.mark.parametrize("action", ["remove", "pause"])

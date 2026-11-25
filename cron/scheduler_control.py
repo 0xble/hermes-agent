@@ -1,11 +1,15 @@
 """Reach the existing cancellation path from schedule mutations in this process."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from datetime import UTC, datetime
+from typing import Any
 
 from agent.interrupt_scope import InterruptScope
+
+logger = logging.getLogger(__name__)
 
 
 class RunControl(threading.Event):
@@ -210,7 +214,10 @@ def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
     return jobs._under_fire_fence(job_id, lambda: jobs._with_job(job_id, apply, False))
 
 
-def running_job_state(job: dict) -> dict:
+_UNSET = object()
+
+
+def running_job_state(job: dict, *, detached_execution: Any = _UNSET) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
     from cron.executions import cancellable_execution
@@ -223,7 +230,16 @@ def running_job_state(job: dict) -> dict:
     claim = job.get("fire_claim") or {}
     live_claim = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
     # Not the latest row: a refused Run-now books a newer ``failed`` row that would hide the live run.
-    detached = cancellable_execution(str(job.get("id") or ""))
+    if detached_execution is _UNSET:
+        try:
+            detached = cancellable_execution(str(job.get("id") or ""))
+        except Exception:
+            # An unreadable ledger must not abort a mutation that already saved: removal still has
+            # to clean up output and notes. Fall back to the process-local and claim evidence.
+            logger.warning("Cron execution ledger lookup failed for job %s", job.get("id"), exc_info=True)
+            detached = None
+    else:
+        detached = detached_execution
     if detached is not None and detached.get("owner_kind") == "detached":
         return {
             "was_running": True,
