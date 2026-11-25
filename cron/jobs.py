@@ -2352,12 +2352,15 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def job_running_state(job: dict[str, Any]) -> dict:
-    """Best-effort visibility without booting the scheduler in listing/tool processes."""
+def job_running_state(job: dict[str, Any], **lookup: Any) -> dict:
+    """Best-effort visibility without booting the scheduler in listing/tool processes.
+
+    ``lookup`` forwards a prefetched ``detached_execution`` so listings issue one ledger query.
+    """
     if sys.modules.get("cron.scheduler") is not None:
         try:
             from cron.scheduler_control import running_job_state
-            return running_job_state(job)
+            return running_job_state(job, **lookup)
         except Exception:
             logger.debug("Cron running-state lookup unavailable", exc_info=True)
     claim = job.get("fire_claim") or {}
