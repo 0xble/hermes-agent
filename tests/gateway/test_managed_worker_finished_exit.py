@@ -69,7 +69,7 @@ def test_finished_worker_keeps_its_result_on_slow_or_nonzero_exit(tmp_path, monk
 
         def reserve_then_compress(authority, **kwargs):
             # A worker compression mid-turn: the transcript continues in a child session and the owner's
-            # execution row follows it in the same transaction (persistence.sqlite.workers._compression.py).
+            # execution row follows it in the same transaction (hermes_state_worker_compression.py).
             scope = reserve(authority, **kwargs)
             db.end_session('s', 'compression')
             db.create_session('s-c1', source='test', parent_session_id='s')

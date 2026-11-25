@@ -261,15 +261,15 @@ class TestReadOnlyHolder:
 
 class TestOpenFailureLatch:
     def test_a_failed_open_is_the_last_open_failure_the_notice_names(self, db_path, monkeypatch):
-        from persistence.sqlite._state import guard as persistence.sqlite._state.guard
+        from persistence.sqlite._state import guard as hermes_state_guard
         import storage_user_copy
 
         monkeypatch.setattr(storage_user_copy, "_last_init_error", None)
-        monkeypatch.setattr(persistence.sqlite._state.guard, "_last_init_error", None)
+        monkeypatch.setattr(hermes_state_guard, "_last_init_error", None)
         with pytest.raises(sqlite3.OperationalError) as excinfo:
             StoreHolder(db_path, read_only=True)
         assert storage_user_copy.get_last_init_error() == f"OperationalError: {excinfo.value}"
-        assert persistence.sqlite._state.guard.get_last_init_error() is None
+        assert hermes_state_guard.get_last_init_error() is None
 
 
 class TestReadWithOwnTimeout:

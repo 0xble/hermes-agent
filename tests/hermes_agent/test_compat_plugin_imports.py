@@ -14,10 +14,10 @@ from hermes_agent.compat.moves import MOVES
 # and holographic 0.29.x (plugin-catalog/holographic.yaml).
 # Every MOVES key is checked as well.
 _PLUGIN_IMPORTS = {
-    "session_rules.turns": ("flatten_message_text", "_text_from_part"),
+    "agent.message_content": ("flatten_message_text", "_text_from_part"),
     "agent.skill_commands": ("extract_user_instruction_from_skill_message",),
     "hermes_state_common": ("TITLE_SOURCE_DERIVED", "TITLE_SOURCE_LLM"),
-    "sqlite_support": ("apply_wal_with_fallback",),
+    "hermes_state_wal": ("apply_wal_with_fallback",),
 }
 
 

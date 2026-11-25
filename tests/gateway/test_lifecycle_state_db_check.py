@@ -198,7 +198,7 @@ def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
     child can take the exclusive reset lock.
     """
     import gateway.lifecycle_ledger as ledger
-    from persistence.sqlite._state import dbfile as persistence.sqlite._state.dbfile
+    from persistence.sqlite._state import dbfile as hermes_state_dbfile
     from hermes_state import SessionDB
 
     path = tmp_path / "state.db"
@@ -223,13 +223,13 @@ def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
     # the same held connection when the fixed implementation uses the tracked
     # state-db helper, without weakening that helper's real registration.
     monkeypatch.setattr(ledger, "sqlite3", SimpleNamespace(connect=connect_for_scan))
-    real_tracked_connect = persistence.sqlite._state.dbfile._connect_tracked_db
+    real_tracked_connect = hermes_state_dbfile._connect_tracked_db
 
     def tracked_connect_for_scan(database, *args, **kwargs):
         kwargs["factory"] = HeldQuickCheckConnection
         return real_tracked_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(persistence.sqlite._state.dbfile, "_connect_tracked_db", tracked_connect_for_scan)
+    monkeypatch.setattr(hermes_state_dbfile, "_connect_tracked_db", tracked_connect_for_scan)
 
     worker = threading.Thread(
         target=lambda: result.append(check_state_db_integrity(home=tmp_path)),

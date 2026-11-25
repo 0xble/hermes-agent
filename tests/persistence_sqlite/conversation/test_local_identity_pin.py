@@ -1,10 +1,10 @@
 """The local session id the gateway mints (``persistence.authority.bindings.local_session_id``, called by
 ``gateway/session_local.py``) is the id the SQLite lineage check derives (``validate_local_lineage``) and the
-legacy store's ``persistence.sqlite._state.keys.local_identity``, for the same profile, principal and request id."""
+legacy store's ``hermes_state_keys.local_identity``, for the same profile, principal and request id."""
 
 from __future__ import annotations
 
-from persistence.sqlite._state import keys as persistence.sqlite._state.keys
+from persistence.sqlite._state import keys as hermes_state_keys
 from persistence import SessionId
 from persistence.authority.bindings import local_session_id
 from tests.contracts.authority.test_bindings_contract import assert_refusal, make_binding
@@ -21,7 +21,7 @@ def test_the_gateway_id_is_the_legacy_local_identity():
     assert local_session_id("default", "user-1", "req-1") == (
         "local-0dc04c9dd69cda75e7756e7308553dde80bdd7e25350d0cd1161fbddd03257d4")
     for identity in IDENTITIES:
-        assert local_session_id(*identity) == persistence.sqlite._state.keys.local_identity(*identity)
+        assert local_session_id(*identity) == hermes_state_keys.local_identity(*identity)
 
 
 def test_the_backend_lineage_check_accepts_the_gateway_id_and_no_other(backend, scope_a):
