@@ -1100,7 +1100,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         return None
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
-        preflight = await self._busy_active_preflight(event, session_key)
+        preflight = await GatewayBusySessionMixin._busy_active_preflight(self, event, session_key)
         if preflight is not None:
             return preflight
         passive_fyi = is_passive_fyi_relay_event(

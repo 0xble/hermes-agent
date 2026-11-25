@@ -3901,11 +3901,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor
             builder = Application.builder().token(self.config.token)
             builder.application_class(private_application_class(TelegramApplication), {"adapter": self})
-            custom_base_url = self.config.extra.get("base_url")
-            if custom_base_url:
-                builder = builder.base_url(custom_base_url)
-                builder = builder.base_file_url(self.config.extra.get("base_file_url", custom_base_url))
-                logger.info("[%s] Using custom Telegram base_url: %s", self.name, custom_base_url)
+            if custom_urls := bot_api_urls(self.config.extra):
+                builder = builder.base_url(custom_urls["base_url"]).base_file_url(custom_urls["base_file_url"])
+                logger.info("[%s] Using custom Telegram base_url: %s", self.name, custom_urls["base_url"])
             # Local-mode telegram-bot-api returns absolute server-side file paths; PTB needs local_mode=True
             # so download_*() reads from disk instead of a 404ing HTTP GET.
             if self.config.extra.get("local_mode"):

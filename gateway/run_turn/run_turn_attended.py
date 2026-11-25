@@ -224,8 +224,8 @@ class GatewayAttendedMixin:
         if record_notice:
             self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         model_scope = assignment.get("model_scope", getattr(conversation, "model_override_scope", "session"))
-        reasoning_value, reasoning_scope = self._attended_reasoning_inputs(
-            session_key, conversation, assignment, reasoning_override, reasoning_scope,
+        reasoning_value, reasoning_scope = GatewayAttendedMixin._attended_reasoning_inputs(
+            self, session_key, conversation, assignment, reasoning_override, reasoning_scope,
         )
         reasoning_scope = (getattr(conversation, "reasoning_override_scope", "session")
                            if reasoning_scope is None else reasoning_scope)

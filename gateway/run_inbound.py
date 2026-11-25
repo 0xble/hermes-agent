@@ -407,7 +407,7 @@ class GatewayInboundMixin(
         # Charge each admitted event once, including retries and drained busy follow-ups.
         # Authorization above still checks the live conversation cooldown on every attempt.
         if not getattr(event, "_bot_loop_admitted", False):
-            charge = object() if source.is_bot else None
+            charge = object() if getattr(source, "is_bot", False) else None
             admit_for_source = getattr(self, "_admit_bot_message_for_source")
             admit_chain = getattr(self, "_admit_bot_chain")
             admitted = (admit_for_source(source) if charge is None

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING, cast
 from contextlib import nullcontext, suppress
 import asyncio
 import inspect
@@ -956,8 +956,11 @@ class GatewayTurnExecutionMixin:
             if deferred_result is not None:
                 return deferred_result
 
-        prepared = await self._prepare_queued_followup_inputs(
-            turn_ctx, pending, pending_event, response, result, source, session_id, session_key, history,
+        # This method is owned by the execution mixin, not by every runner double that calls the
+        # facade unbound in tests and compatibility integrations.
+        prepared = await GatewayTurnExecutionMixin._prepare_queued_followup_inputs(
+            self, turn_ctx, pending, pending_event, response, result, source,
+            cast(str, session_id), cast(str, session_key), history,
         )
         if prepared is None:
             return result

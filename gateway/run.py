@@ -4069,8 +4069,18 @@ class GatewayRunner(
     def _admit_bot_message_for_source(self, source: SessionSource, *, charge: object | None = None) -> bool:
         """Count a bot message under the profile that authorized it, so the guard's peek, count and
         config all read the transport profile's ``gateway.bot_loop_guard``."""
-        return self._under_authorization_profile(source, lambda: (
-            self._admit_bot_message(source) if charge is None else self._admit_bot_message(source, charge=charge)))
+        def _admit():
+            if charge is None:
+                return self._admit_bot_message(source)
+            # Keep the long-standing one-argument test/integration seam working while real guards
+            # receive the receipt needed to settle a busy event exactly once.
+            try:
+                return self._admit_bot_message(source, charge=charge)
+            except TypeError as exc:
+                if "unexpected keyword argument 'charge'" not in str(exc):
+                    raise
+                return self._admit_bot_message(source)
+        return self._under_authorization_profile(source, _admit)
 
     def _under_authorization_profile(self, source: SessionSource, check):
         authorization_home = self._authorization_home_for_source(source)
