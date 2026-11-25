@@ -1015,7 +1015,7 @@ class GatewayTurnExecutionMixin:
             from gateway.run_turn import GatewayTurnMixin
             if pending_event is not None and GatewayTurnMixin._is_gateway_wake(cast(Any, pending_event)):
                 next_message = await GatewayTurnMixin._internal_wake_input_at_execution(
-                    cast(Any, self), pending_event, session_id, next_message)
+                    cast(Any, self), pending_event, cast(str, session_id), next_message)
                 if next_message is None:
                     logger.info("Discarding queued wake superseded during preparation for %s", session_key or "?")
                     await _run_followup_processing_hook(
