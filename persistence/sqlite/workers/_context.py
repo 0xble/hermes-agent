@@ -28,10 +28,7 @@ def worker_prompt(holder, conn, session_id, payload):
     if set(payload) != {'system_prompt'} or not (
             payload['system_prompt'] is None or isinstance(payload['system_prompt'], str)):
         raise AuthorityRefusal('invalid_params')
-    conn.execute('UPDATE sessions SET system_prompt_hash=?, system_prompt=NULL WHERE id=?',
-                 (holder._store_system_prompt(conn, payload['system_prompt']), session_id))
-    from ..conversation._store.core import _delete_unreferenced_system_prompts
-    _delete_unreferenced_system_prompts(conn)
+    holder._replace_prompt_reference(conn, session_id, payload['system_prompt'])
     return {'value': None}
 
 
@@ -65,10 +62,7 @@ def worker_tool_names(holder, conn, session_id, payload):
     encoded = None if pin is None else json.dumps(pin)
     if encoded is not None and len(encoded) > 4 * 1024 * 1024:
         raise AuthorityRefusal('invalid_params')
-    conn.execute('UPDATE sessions SET tool_names=? WHERE id=?',
-                 (holder._store_system_prompt(conn, encoded), session_id))
-    from ..conversation._store.core import _delete_unreferenced_system_prompts
-    _delete_unreferenced_system_prompts(conn)
+    holder._replace_prompt_reference(conn, session_id, encoded, tool_names=True)
     return {'value': None}
 
 
