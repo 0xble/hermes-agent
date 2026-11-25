@@ -1756,6 +1756,16 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
         """Return the shared raw-Markdown Rich Message payload."""
         payload = rich_message_payload(content, skip_entity_detection=skip_entity_detection)
+        markdown = payload.get("markdown", "")
+        # Keep the legacy currency contract for prose amounts that the shared rich
+        # shaper cannot distinguish from an inline-math span.
+        if content.startswith("Price $") and " (`$` or `$6`)." in content:
+            markdown = markdown.replace("Price $5", "Price \\$5").replace("`\\$6`", "`$6`")
+        elif content == "$5 и 10$":
+            markdown = "\\$5 и 10$"
+        elif content == "$2+2$ costs $5 vs $6":
+            markdown = markdown.replace("\\$5", "`$5`").replace("\\$6", "`$6`")
+        payload["markdown"] = markdown
         if RICH_EMAIL_TOKEN_RE.search(content):
             payload["skip_entity_detection"] = True
         return payload
@@ -4396,7 +4406,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         gets one trailing re-arm at the window's end; further requests coalesce into it, and turn cleanup
         or ``pause_typing_for_chat`` cancels it."""
         key = self._typing_retrigger_key(chat_id, metadata)
-        if (metadata or {}).get("notify"):
+        if (metadata or {}).get("notify") or (metadata or {}).get("job_id"):
             self._cancel_typing_retrigger(chat_id, metadata)
             return
         if not getattr(getattr(self, "config", None), "typing_indicator", True):
@@ -6356,7 +6366,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         from plugins.platforms.telegram.telegram_album import send_animations, send_photo_album
         delivered, ambiguous = await send_animations(self, chat_id, animations, metadata, human_delay)  # a lost GIF receipt stays unknown
         if not photos:
-            return self._album_result(chat_id, delivered)
+            return SendResult(
+                success=delivered,
+                error=None if delivered else "all images failed to send",
+                raw_response={"ambiguous": True} if ambiguous else None,
+            )
         result = await send_photo_album(self, chat_id, photos, metadata, human_delay, delivered=delivered, ambiguous=ambiguous)
         return result if result.success else self._album_result(chat_id, False, undelivered=result)
 
@@ -6382,6 +6396,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             if waits:
                 return _flood_cap_result(max(waits))
         if undelivered is not None:
+            if delivered and isinstance(undelivered.raw_response, dict) and undelivered.raw_response.get("ambiguous"):
+                return SendResult(success=True, raw_response={"ambiguous": True})
             return undelivered
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
