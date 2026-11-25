@@ -107,7 +107,18 @@ def _quote(kind, operation, owner="user", autonomous=False):
         return f"Stop the {kind} immediately"
     if kind == "loop" and operation == "stop_when":
         return "Remove the loop stop condition"
-    return f"Replace the {kind} immediately"
+    if kind == "loop":
+        field_quotes = {
+            "outcome": "Replace the loop prompt with a release status check",
+            "budget": "Change the loop run budget",
+            "budget_reduce": "Change the loop run limit",
+            "cadence_faster": "Change the loop cadence to faster polling",
+            "cadence_slower": "Change the loop interval to slower polling",
+            "revise": "Change the loop interval to slower polling",
+            "replace": "Replace the loop prompt with a release status check",
+        }
+        if operation in field_quotes:
+            return field_quotes[operation]
 
 
 def _assert_allowed_goal_edit(durable, operation):

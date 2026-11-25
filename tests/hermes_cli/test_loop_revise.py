@@ -125,7 +125,7 @@ def test_replace_keeps_a_user_paused_loop_paused(tmp_path, monkeypatch):
     mgr = _manager(tmp_path, monkeypatch, "replace-paused")
     mgr.set("old", interval_seconds=300)
     mgr.pause(reason="user-paused")
-    quote = "Please reword the loop to check the deploy instead"
+    quote = "Please replace the loop prompt and reword it to check the deploy instead"
     result = mgr.replace(prompt="check the deploy", interval_seconds=300, reason="reworded",
                          user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
     assert result["ok"] is True
@@ -157,9 +157,89 @@ def test_combined_loop_edit_requires_quote_for_each_delta(tmp_path, monkeypatch)
     assert mgr.state.until == "deployment is green"
 
 
+def test_stop_and_end_commands_never_remove_until_or_replace(tmp_path, monkeypatch):
+    for command in ("Stop the loop immediately", "End the loop now"):
+        mgr = _manager(tmp_path, monkeypatch, "stop-" + command.split()[0].lower())
+        mgr.set("watch", interval_seconds=300, until="build green")
+        before = mgr.state.to_json()
+        quote = command
+        result = mgr.revise(reason="stop action is not removal", until="",
+                            user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+        assert result["error_code"] == "user_quote_qualified", result
+        assert mgr.state.to_json() == before
+        result = mgr.replace(prompt="new watch", interval_seconds=600, times=2, until="new condition",
+                             reason="stop action is not replacement", user_quote=quote,
+                             user_messages=_record_quote(mgr.session_id, quote))
+        assert result["error_code"] == "user_quote_qualified", result
+        assert mgr.state.to_json() == before
+
+
+def test_field_quote_binds_interval_only(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "field-cadence")
+    mgr.set("watch", interval_seconds=300)
+    quote = "Change the loop interval to 5 minutes"
+    result = mgr.revise(reason="change cadence", interval_seconds=600,
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"], result
+
+    mgr = _manager(tmp_path, monkeypatch, "field-cadence-combined")
+    mgr.set("watch", interval_seconds=300)
+    result = mgr.revise(reason="change cadence only", prompt="new watch", interval_seconds=600,
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["error_code"] == "user_quote_qualified", result
+
+
+def test_field_quote_binds_stop_condition_only(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "field-until")
+    mgr.set("watch")
+    quote = "Change the loop stop condition to build green"
+    result = mgr.revise(reason="change stop condition", until="build green",
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"], result
+
+    mgr = _manager(tmp_path, monkeypatch, "field-until-combined")
+    mgr.set("watch")
+    result = mgr.revise(reason="change stop condition only", prompt="new watch", until="build green",
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["error_code"] == "user_quote_qualified", result
+
+
+def test_remove_stop_condition_cannot_authorize_replacement(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "remove-replace")
+    mgr.set("watch", interval_seconds=300, until="build green")
+    quote = "Remove the build stop condition"
+    before = mgr.state.to_json()
+    result = mgr.replace(prompt="new watch", interval_seconds=600, times=2, until="new condition",
+                         reason="remove only", user_quote=quote,
+                         user_messages=_record_quote(mgr.session_id, quote))
+    assert result["error_code"] == "user_quote_qualified", result
+    assert mgr.state.to_json() == before
+
+
+def test_positive_field_quotes_and_full_replacement(tmp_path, monkeypatch):
+    field_cases = (
+        ({"prompt": "new watch"}, "Change the loop prompt to new watch"),
+        ({"interval_seconds": 600}, "Change the loop cadence to 10 minutes"),
+        ({"times": 5}, "Increase the loop run budget to 5 times"),
+        ({"until": "build green"}, "Change the loop stop condition to build green"),
+    )
+    for index, (kwargs, quote) in enumerate(field_cases):
+        mgr = _manager(tmp_path, monkeypatch, f"field-positive-{index}")
+        mgr.set("watch", interval_seconds=300, times=1, until="old condition")
+        result = mgr.revise(reason="field-specific change", user_quote=quote,
+                            user_messages=_record_quote(mgr.session_id, quote), **kwargs)
+        assert result["ok"], result
+    mgr = _manager(tmp_path, monkeypatch, "field-positive-replace")
+    mgr.set("watch", interval_seconds=300, times=1, until="old condition")
+    quote = "Please replace the loop prompt, set its interval to 10 minutes, run it 3 times, set the stop condition to green"
+    result = mgr.replace(prompt="deploy verification", interval_seconds=600, times=3, until="green",
+                         reason="full replacement", user_quote=quote,
+                         user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"], result
+
+
 def test_invalid_no_change_and_done_errors(tmp_path, monkeypatch):
     from hermes_cli.loops import LoopManager
-
     mgr = _manager(tmp_path, monkeypatch, "errors")
     assert mgr.revise(reason="nothing")["error_code"] == "no_loop"
     mgr.set("watch", interval_seconds=300)
@@ -175,7 +255,7 @@ def test_replace_requires_quote_and_preserves_route_in_history(tmp_path, monkeyp
     state.ticks_fired = 4
     mgr._save()  # revisions compare against the durable snapshot
     old_created_at = state.created_at
-    quote = "Please replace the loop with the deploy verification task"
+    quote = "Please replace the loop prompt, set its interval to 10 minutes, run it 3 times, set the stop condition to green"
     result = mgr.replace(
         prompt="deploy verification", interval_seconds=600, times=3, until="green",
         reason="the task changed", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote),
@@ -212,7 +292,7 @@ def test_cli_completion_refresh_preserves_mid_wakeup_revision(tmp_path, monkeypa
     mgr.set("watch", interval_seconds=300)
     mgr.state.next_due_at = time.time() - 1
     mgr.fire_tick()
-    quote = "Please change the loop to watch deploy readiness"
+    quote = "Please change the loop prompt to watch deploy readiness"
     external = LoopManager("cli-cache")
     assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))["ok"]
 
@@ -240,7 +320,7 @@ def test_tui_completion_uses_fresh_manager(tmp_path, monkeypatch):
     mgr.set("watch", interval_seconds=300)
     mgr.state.next_due_at = time.time() - 1
     mgr.fire_tick()
-    quote = "Please change the loop to watch deploy readiness"
+    quote = "Please change the loop prompt to watch deploy readiness"
     external = LoopManager("tui-cache")
     assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))["ok"]
     session = {"session_key": "tui-cache"}

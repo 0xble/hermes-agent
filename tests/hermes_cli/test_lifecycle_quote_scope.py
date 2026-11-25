@@ -113,8 +113,9 @@ def test_relay_revision_removal_requires_its_origin_or_a_named_session(
     before = manager.state.to_json()
     relay(state, monkeypatch, tmp_path, quote)
     result = getattr(manager, action)(reason="Brian changed the limit", user_quote=quote, **kwargs)
-    assert result["ok"] is bool(named), result
-    if named:
+    expected = bool(named) and not (kind == "loop" and action == "replace")
+    assert result["ok"] is expected, result
+    if expected:
         assert result["revision"]["relay_receipt"] == "receipt-1"
     else:
         assert manager_for(kind).state.to_json() == before
@@ -197,8 +198,12 @@ def test_quoted_goal_removal_preserves_resolved_authority(state, kind, action, a
     if action == "replace":
         kwargs["goal" if kind == "goal" else "prompt"] = "Watch the verified build"
     result = getattr(manager, action)(reason="User removed the exact limit", user_quote=quote, **kwargs)
-    assert result["ok"], result
-    assert manager_for(kind).state.revisions[-1]["lifecycle_authority"] == ("autonomy" if autonomy else "agent")
+    expected = not (kind == "loop" and action == "replace")
+    assert result["ok"] is expected, result
+    if expected:
+        assert manager_for(kind).state.revisions[-1]["lifecycle_authority"] == ("autonomy" if autonomy else "agent")
+    else:
+        assert manager_for(kind).state.until == "Build settles"
 
 
 @pytest.mark.parametrize("action,kwargs", [("revise", {}), ("replace", {"prompt": ""})])

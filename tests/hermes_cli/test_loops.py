@@ -540,10 +540,10 @@ class TestTickLifecycle:
         state.next_due_at = time.time() - 1
         save_loop("t-prerev", state)
         scheduler = LoopManager(session_id="t-prerev")
-        quote = "Please switch the loop to polling the revised target"
+        quote = "Please change the loop prompt to polling the revised target"
         revised = LoopManager(session_id="t-prerev").revise(
             reason="new target", prompt="poll the revised target",
-            user_quote="switch the loop to polling the revised target", user_messages=_record_quote("t-prerev", quote))
+            user_quote=quote, user_messages=_record_quote("t-prerev", quote))
         assert revised["ok"] is True, revised
         wakeup = scheduler.fire_tick()
         assert wakeup and "poll the revised target" in wakeup
@@ -561,9 +561,9 @@ class TestTickLifecycle:
         state.last_response_digest = "old"
         state.next_due_at = time.time() + 4 * 60 * 60
         mgr._save()
-        quote = "Please switch the loop to watching B"
+        quote = "Please change the loop prompt to watching B"
         result = LoopManager(session_id="t-revise-backoff").revise(
-            reason="new target", prompt="watch B", user_quote="switch the loop to watching B",
+            reason="new target", prompt="watch B", user_quote=quote,
             user_messages=_record_quote("t-revise-backoff", quote))
         assert result["ok"] is True, result
         revised = load_loop("t-revise-backoff")
@@ -747,7 +747,7 @@ class TestTickLifecycle:
         mgr.fire_tick()
 
         def judge(*_args, **_kwargs):
-            quote = "watch the production deploy instead"
+            quote = "Change the loop stop condition to production deploy finishes"
             revised = LoopManager(session_id="t-cond").revise(
                 reason="watch the deploy instead", until="production deploy finishes",
                 user_quote=quote, user_messages=_record_quote("t-cond", quote))

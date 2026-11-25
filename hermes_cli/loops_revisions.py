@@ -19,64 +19,62 @@ if TYPE_CHECKING:
 
 def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, Any],
                             after: dict[str, Any]) -> bool:
-    """Require a supplied quote to describe every protected loop delta it authorizes.
+    """Require field-specific evidence for every loop delta in an authenticated quote.
 
-    Provenance/freshness is checked by ``check_user_quote``. This second check binds the
-    authenticated words to the requested operation, so a quote about prompt wording cannot
-    authorize removing a stop condition (or a combined edit containing both).
+    ``check_user_quote`` authenticates the source and freshness. This predicate only binds those
+    words to the requested deltas. Directionless verbs such as ``change`` are lifecycle actions,
+    not evidence for any particular field. Replacement additionally needs an explicit replacement
+    verb; it may not use a stop/removal phrase as a shortcut.
     """
     import re
 
     words = set(re.findall(r"[a-z0-9']+", str(quote or '').casefold()))
     if not words:
         return False
-    action_words = {"change", "update", "switch", "replace", "revise", "reword", "rewrite",
+    action_words = {"change", "update", "switch", "replace", "redefine", "revise", "reword", "rewrite",
                     "modify", "set", "make", "use", "keep", "slow", "slower", "faster",
                     "speed", "speedup", "increase", "decrease", "reduce", "remove", "drop",
                     "delete", "clear", "stop", "end", "cancel", "extend", "raise", "lower"}
-    # A lifecycle quote must be an instruction about this loop, not a status report or a
-    # generic mention of changing something elsewhere.
     if not words & action_words:
         return False
+
+    field_evidence = {
+        "prompt": {"prompt", "wording", "instruction", "task", "objective", "reword", "rewrite"},
+        "times": {"times", "runs", "run", "budget", "cap", "limit", "retries", "retry",
+                  "forever", "unlimited"},
+        "cadence": {"interval", "cadence", "polling", "frequency", "rate", "often", "frequent",
+                     "slow", "slower", "fast", "faster", "speed", "speedup", "minute", "minutes",
+                     "hour", "hours", "paced", "pace"},
+        "until": {"condition", "stopping", "until", "finish", "finished", "done", "when", "after"},
+    }
+
+    fields = [field for field in changed if field != "replace"]
     if "replace" in changed:
-        # Replacement is the explicitly authorized lifecycle operation. Its quote names the
-        # replacement of the loop as a whole; it is intentionally distinct from a revise
-        # carrying several field-level deltas, which must qualify each field below.
-        replacement = {"replace", "reword", "rewrite", "change", "update", "modify", "revise"}
-        removal = {"remove", "drop", "delete", "clear", "stop", "end", "cancel"}
-        loop_target = {"loop", "task", "watch", "monitor", "check", "poll", "target"}
-        stop_target = {"condition", "stopping", "until", "finish", "finished", "done", "stop", "end"}
-        return (bool(words & replacement) and bool(words & loop_target)) or (
-            bool(words & removal) and bool(words & stop_target))
+        # ``replace`` is an operation, not evidence for prompt, cadence, budget, or stop condition.
+        # In particular, stop/end must never authorize a replacement or condition removal.
+        if not words & {"replace", "redefine"}:
+            return False
     checks: list[bool] = []
-    if "prompt" in changed:
-        # Wording/objective edits need an explicit wording/task change, and must not be
-        # satisfied by a quote that only discusses cadence or stopping.
-        checks.append(bool(words & {"wording", "reword", "rewrite", "prompt", "task", "target",
-                                    "check", "watch", "monitor", "poll", "polling", "change",
-                                    "switch", "replace", "update", "modify"}))
-    if "until" in changed:
-        old = str(before.get("until") or "").strip()
-        new = str(after.get("until") or "").strip()
-        if old and not new:
-            checks.append(bool(words & {"remove", "drop", "delete", "clear", "stop", "end",
-                                        "cancel", "replace"}) and bool(words & {"condition", "stop", "stopping",
-                                                                       "until", "finish", "finished",
-                                                                       "done", "end"}))
+    for field in fields:
+        if field == "until":
+            old = str(before.get("until") or "").strip()
+            new = str(after.get("until") or "").strip()
+            if old and not new:
+                # Keep lifecycle stop words out of the removal verbs: "Stop the loop" and
+                # "End the loop" are stop actions, not instructions to remove ``until``.
+                removal_words = {"remove", "drop", "delete", "clear", "cancel"}
+                checks.append(bool(words & removal_words) and bool(words & field_evidence["until"]))
+            else:
+                checks.append(bool(words & field_evidence["until"]))
+        elif field in {"interval_seconds", "mode", "current_delay"}:
+            checks.append(bool(words & field_evidence["cadence"]))
+        elif field in field_evidence:
+            checks.append(bool(words & field_evidence[field]))
         else:
-            checks.append(bool(words & {"stop", "condition", "until", "finish", "finished",
-                                        "done", "when", "after", "replace"})
-                          or ("instead" in words and bool(words & {"watch", "monitor", "check", "poll",
-                                                                  "change", "switch", "replace"})))
-    if "times" in changed:
-        checks.append(bool(words & {"times", "runs", "run", "budget", "cap", "limit",
-                                    "retries", "retry", "forever", "unlimited", "again", "replace"}))
-    if any(key in changed for key in ("interval_seconds", "mode", "current_delay")):
-        checks.append(bool(words & {"interval", "cadence", "poll", "polling", "frequent",
-                                    "frequency", "often", "slow", "slower", "fast", "faster",
-                                    "speed", "speedup", "minute", "minutes", "hour", "hours",
-                                    "paced", "pace", "replace"}))
-    return bool(checks) and all(checks)
+            checks.append(False)
+    if not fields:
+        return "replace" in changed
+    return all(checks)
 
 
 def _loop_revision_needs_quote(state, changed, caller, *, autonomous, faster, raising_times):
@@ -395,30 +393,10 @@ class LoopRevisionsMixin:
         if state.until != (until or "").strip():
             needs_authority |= decision("loop", "stop_when", state, actor=caller.actor,
                 autonomous=autonomous, owner="user" if user_stop_condition(state) else "agent") != A
-        quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority,
-            stop_condition=(until or "").strip() if until != state.until else "",
-            changed=["replace"],
-            before={"prompt": state.prompt, "until": state.until},
-            after={"prompt": prompt, "until": (until or "").strip()},
-        )
-        if quote_error:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
-            )
-        now = max(time.time(), state.created_at + 1e-6)
         self_paced = interval_seconds is None
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         new_times = max(0, int(times or 0))
         new_until = (until or "").strip()
-        # Without the user's words a replacement is the same loop under new orders, so the
-        # tick budget keeps counting and the cadence floor still holds from the last tick. The
-        # requested run count means that many more runs.
-        carry = not quote
-        carried_ticks = state.ticks_fired if carry else 0
-        if carry and new_times:
-            new_times += carried_ticks
         old_snapshot = {
             "prompt": state.prompt,
             "mode": state.mode,
@@ -435,8 +413,32 @@ class LoopRevisionsMixin:
             "current_delay": float(self_paced_floor_seconds()) if self_paced else interval,
             "times": new_times,
             "until": new_until,
-            "ticks_fired": carried_ticks,
+            "ticks_fired": 0,
         }
+        changed = [key for key in old_snapshot if key != "ticks_fired" and new_snapshot[key] != old_snapshot[key]]
+        quote_changed = ["replace", *changed]
+        quote, quote_error, quote_detail = self._revision_quote(
+            state, user_quote, user_messages, required=needs_authority,
+            stop_condition=new_until if "until" in changed else "",
+            changed=quote_changed,
+            before=old_snapshot,
+            after=new_snapshot,
+        )
+        if quote_error:
+            return self._revision_result(
+                ok=False, revision=None, version=state.version,
+                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
+            )
+        now = max(time.time(), state.created_at + 1e-6)
+        # Without the user's words a replacement is the same loop under new orders, so the
+        # tick budget keeps counting and the cadence floor still holds from the last tick. The
+        # requested run count means that many more runs.
+        carry = not quote
+        carried_ticks = state.ticks_fired if carry else 0
+        if carry and new_times:
+            new_times += carried_ticks
+        new_snapshot["times"] = new_times
+        new_snapshot["ticks_fired"] = carried_ticks
         revision = {
             "at": now,
             "actor": caller.actor,
