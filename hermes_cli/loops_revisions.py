@@ -39,6 +39,16 @@ def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, An
     # generic mention of changing something elsewhere.
     if not words & action_words:
         return False
+    if "replace" in changed:
+        # Replacement is the explicitly authorized lifecycle operation. Its quote names the
+        # replacement of the loop as a whole; it is intentionally distinct from a revise
+        # carrying several field-level deltas, which must qualify each field below.
+        replacement = {"replace", "reword", "rewrite", "change", "update", "modify", "revise"}
+        removal = {"remove", "drop", "delete", "clear", "stop", "end", "cancel"}
+        loop_target = {"loop", "task", "watch", "monitor", "check", "poll", "target"}
+        stop_target = {"condition", "stopping", "until", "finish", "finished", "done", "stop", "end"}
+        return (bool(words & replacement) and bool(words & loop_target)) or (
+            bool(words & removal) and bool(words & stop_target))
     checks: list[bool] = []
     if "prompt" in changed:
         # Wording/objective edits need an explicit wording/task change, and must not be
@@ -51,22 +61,22 @@ def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, An
         new = str(after.get("until") or "").strip()
         if old and not new:
             checks.append(bool(words & {"remove", "drop", "delete", "clear", "stop", "end",
-                                        "cancel"}) and bool(words & {"condition", "stop", "stopping",
+                                        "cancel", "replace"}) and bool(words & {"condition", "stop", "stopping",
                                                                        "until", "finish", "finished",
                                                                        "done", "end"}))
         else:
             checks.append(bool(words & {"stop", "condition", "until", "finish", "finished",
-                                        "done", "when", "after"})
+                                        "done", "when", "after", "replace"})
                           or ("instead" in words and bool(words & {"watch", "monitor", "check", "poll",
                                                                   "change", "switch", "replace"})))
     if "times" in changed:
         checks.append(bool(words & {"times", "runs", "run", "budget", "cap", "limit",
-                                    "retries", "retry", "forever", "unlimited", "again"}))
+                                    "retries", "retry", "forever", "unlimited", "again", "replace"}))
     if any(key in changed for key in ("interval_seconds", "mode", "current_delay")):
         checks.append(bool(words & {"interval", "cadence", "poll", "polling", "frequent",
                                     "frequency", "often", "slow", "slower", "fast", "faster",
                                     "speed", "speedup", "minute", "minutes", "hour", "hours",
-                                    "paced", "pace"}))
+                                    "paced", "pace", "replace"}))
     return bool(checks) and all(checks)
 
 
@@ -380,7 +390,7 @@ class LoopRevisionsMixin:
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority,
             stop_condition=(until or "").strip() if until != state.until else "",
-            changed=["prompt"] + (["until"] if until != state.until else []),
+            changed=["replace"],
             before={"prompt": state.prompt, "until": state.until},
             after={"prompt": prompt, "until": (until or "").strip()},
         )
