@@ -702,10 +702,6 @@ def _try_dispatch_background_run(
         "cron_job_id": job_id, "cron_job_name": job_name,
         "cron_deliver": deliver,
     }
-    if deliver == "local":
-        cron_output_excerpt = _latest_job_output_excerpt(job_id)
-        if cron_output_excerpt:
-            cron_execution["cron_output_excerpt"] = cron_output_excerpt
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
         context=("Triggered via cronjob(action='run'). The job executed in its own "
