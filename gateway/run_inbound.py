@@ -135,7 +135,7 @@ async def _admit_outbox_event(runner, event, source):
     else:
         bind_turn(home, turn_id)
 
-
+_MOUNT_PLAN_FAILED = object()
 
 
 class GatewayInboundMixin(
@@ -153,16 +153,20 @@ class GatewayInboundMixin(
         """
         return authority.logical_owner(authority.runner.session_store.peek_session_id(_quick_key))
 
-    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str):
+    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str, _quick_key: str):
         """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
-        from gateway.session_route_recovery import _mount_plan
+        from gateway.session_route_recovery import _cached_mount_plan, _mount_plan
         try:
             return _mount_plan(authority, sid)
         except Exception:
-            # A transient storage failure must not abort /stop or /new before it fences and settles
-            # the route's already committed rows. The caller keeps sid and skips cold mounting.
+            # Reuse only the route entry already observed by the owner probe. This keeps /stop and
+            # /new able to mount and settle a known owner when its second storage read is transient.
             logger.debug("Could not read the mount plan for %s", sid, exc_info=True)
-            return None
+            try:
+                return _cached_mount_plan(authority, sid, _quick_key) or _MOUNT_PLAN_FAILED
+            except Exception:
+                logger.debug("Could not recover the cached mount plan for %s", sid, exc_info=True)
+                return _MOUNT_PLAN_FAILED
 
     def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan) -> Optional[str]:
         """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
@@ -174,11 +178,11 @@ class GatewayInboundMixin(
         if sid and sid not in authority.sessions:
             from gateway.session_route_recovery import restore_routed_session
             try:
-                if plan is not None:
+                if plan is not None and plan is not _MOUNT_PLAN_FAILED:
                     restore_routed_session(authority, sid, plan=plan)
             except Exception:
                 logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
-        return sid if sid and sid in authority.sessions else None
+        return sid
 
     async def _hm_pre_gateway_dispatch_hook(
         self, event: MessageEvent, source: SessionSource
@@ -1010,10 +1014,15 @@ class GatewayInboundMixin(
         sid = None
         if authority:
             from gateway.session_store_async import run_store_call
-            sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+            try:
+                sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+            except Exception:
+                logger.debug("Could not probe the owner for %s before stopping it", _quick_key, exc_info=True)
+                authority.fence_route(_quick_key)
+                return
             plan = None
             if sid and sid not in authority.sessions:
-                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key)
                 sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
         if not sid:
             if authority is not None:
@@ -1023,10 +1032,14 @@ class GatewayInboundMixin(
                 # Fence first, then take one fresh off-loop snapshot so that input is cancelled rather
                 # than left queued behind /new or /stop.
                 from gateway.session_store_async import run_store_call
-                sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                try:
+                    sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                except Exception:
+                    logger.debug("Could not reprobe the owner for %s after fencing it", _quick_key, exc_info=True)
+                    return
                 plan = None
                 if sid and sid not in authority.sessions:
-                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key)
                 sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
             if not sid:
                 return
@@ -1050,6 +1063,8 @@ class GatewayInboundMixin(
                 # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
                 with suppress(RuntimeStoreError):
                     await authority.cancel_queued(actor, ref, row['admission_id'])
+        if authority is None or sid not in authority.sessions:
+            return
         handle = authority._handle(ref)
         if handle.execution_state == 'running':
             # The claim can settle between the snapshot and this generation-fenced Stop.

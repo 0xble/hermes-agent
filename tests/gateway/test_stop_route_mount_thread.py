@@ -75,5 +75,26 @@ async def test_stop_route_mount_plan_failure_still_fences_and_cancels(monkeypatc
     await runner._hm_stop_owner_turn(route)
 
     assert authority.route_epoch(route) == before + 1
+    assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
+    authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_route_probe_failure_still_fences(monkeypatch):
+    """A durable owner probe failure must not leave the route unfenced."""
+    runner, adapter = _setup(monkeypatch)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    route, owner = await _queue_rows(runner, authority, source, 'A', 'B')
+    before = authority.route_epoch(route)
+
+    def fail_probe(*args):
+        raise RuntimeError('database temporarily unavailable')
+
+    monkeypatch.setattr(runner, '_hm_mounted_owner_probe', fail_probe)
+    await runner._hm_stop_owner_turn(route)
+
+    assert authority.route_epoch(route) == before + 1
     assert _rows(authority, owner) == [('A', 'queued', None), ('B', 'queued', None)]
     authority.db.close()
