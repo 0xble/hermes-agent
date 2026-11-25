@@ -110,6 +110,22 @@ def _quote(kind, operation, owner="user", autonomous=False):
     return f"Replace the {kind} immediately"
 
 
+def _assert_allowed_goal_edit(durable, operation):
+    contract_fields = {"outcome", "verification", "constraints", "boundaries", "stop_when"}
+    if operation in contract_fields:
+        assert getattr(durable.contract, operation) == ""
+    checks = {
+        "max_turns": durable.max_turns == 0,
+        "subgoals": durable.subgoals == [],
+        "objective": durable.goal == "Release v2 safely",
+        "replace": durable.goal == "Release v2 safely",
+        "stop": durable.status == "cleared",
+        "clear": durable.status == "cleared",
+    }
+    if operation in checks:
+        assert checks[operation]
+
+
 @pytest.mark.parametrize("cell,expected", POLICY.items(), ids=lambda value: str(value))
 def test_every_authority_cell(state, cell, expected):
     from hermes_constants import get_hermes_home
@@ -152,16 +168,7 @@ def test_every_authority_cell(state, cell, expected):
             assert durable.max_turns == 20
         assert durable.status != "done"
     elif kind == "goal":
-        if operation in {"outcome", "verification", "constraints", "boundaries", "stop_when"}:
-            assert getattr(durable.contract, operation) == ""
-        elif operation == "max_turns":
-            assert durable.max_turns == 0
-        elif operation == "subgoals":
-            assert durable.subgoals == []
-        elif operation in {"objective", "replace"}:
-            assert durable.goal == "Release v2 safely"
-        elif operation in {"stop", "clear"}:
-            assert durable.status == "cleared"
+        _assert_allowed_goal_edit(durable, operation)
     elif operation in {"stop", "stop_user_condition", "stop_user_pause"}:
         # Explicit user/quote stop clears; autonomous/owned agent stop finishes.
         assert durable.status == ("cleared" if actor == "user" or quoted else "done")

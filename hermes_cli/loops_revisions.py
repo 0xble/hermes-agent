@@ -30,7 +30,6 @@ def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, An
     words = set(re.findall(r"[a-z0-9']+", str(quote or '').casefold()))
     if not words:
         return False
-    loop_words = {"loop", "poll", "polling", "check", "checking", "watch", "monitor", "task", "condition", "until"}
     action_words = {"change", "update", "switch", "replace", "revise", "reword", "rewrite",
                     "modify", "set", "make", "use", "keep", "slow", "slower", "faster",
                     "speed", "speedup", "increase", "decrease", "reduce", "remove", "drop",
@@ -78,6 +77,26 @@ def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, An
                                     "speed", "speedup", "minute", "minutes", "hour", "hours",
                                     "paced", "pace", "replace"}))
     return bool(checks) and all(checks)
+
+
+def _loop_revision_needs_quote(state, changed, caller, *, autonomous, faster, raising_times):
+    from hermes_cli.lifecycle_authority import user_stop_condition
+    from hermes_cli.lifecycle_policy import decision, A
+
+    operations = ["revise"]
+    if "prompt" in changed:
+        operations.append("outcome")
+    if faster:
+        operations.append("cadence_faster")
+    if raising_times:
+        operations.append("budget")
+    required = any(decision("loop", operation, state, actor=caller.actor,
+                            autonomous=autonomous) != A for operation in operations)
+    if "until" in changed:
+        required |= decision("loop", "stop_when", state, actor=caller.actor,
+                             autonomous=autonomous,
+                             owner="user" if user_stop_condition(state) else "agent") != A
+    return required
 
 
 class LoopRevisionsMixin:
@@ -229,7 +248,6 @@ class LoopRevisionsMixin:
                 error_code="no_change", error="the revision changes nothing",
             )
 
-        from hermes_cli.lifecycle_authority import user_stop_condition
         new_effective_delay = (
             after["interval_seconds"] if after["mode"] == "interval"
             else float(self_paced_floor_seconds())
@@ -248,21 +266,11 @@ class LoopRevisionsMixin:
             and state.times > 0
             and (after["times"] == 0 or after["times"] > state.times)
         )
-        from hermes_cli.lifecycle_policy import decision, A
-        actor = caller.actor
         autonomous = caller is LifecycleAuthority.AUTONOMY
-        operations = ["revise"]
-        if "prompt" in changed:
-            operations.append("outcome")
-        if faster:
-            operations.append("cadence_faster")
-        if raising_times:
-            operations.append("budget")
-        needs_authority = any(decision("loop", operation, state, actor=actor,
-                                       autonomous=autonomous) != A for operation in operations)
-        if "until" in changed:
-            needs_authority |= decision("loop", "stop_when", state, actor=actor,
-                autonomous=autonomous, owner="user" if user_stop_condition(state) else "agent") != A
+        needs_authority = _loop_revision_needs_quote(
+            state, changed, caller, autonomous=autonomous, faster=faster,
+            raising_times=raising_times,
+        )
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority,
             stop_condition=after["until"] if "until" in changed else "",
