@@ -100,18 +100,15 @@ def _row_entry(row, platform, route, profile):
                         transport_profile=row.get('transport_profile'))
 
 
-def _cached_mount_plan(authority, sid, route):
-    """Build the same read-only plan from the already loaded routing entry after a cold row read fails.
+def _observed_mount_plan(sid, route, entry):
+    """Build a mount plan from the route entry the owner probe already observed.
 
-    This is a bounded recovery path for /stop and /new. It still runs off-loop and only reuses the
-    route entry that the durable-owner probe already observed, so a transient session-row failure
-    cannot discard a known owner before its queued admissions are settled.
+    Used only when the cold row read fails during /stop or /new. It does no storage read, so a
+    transient failure cannot discard a known owner before its queued admissions are settled. The
+    on-loop reconcile compares *entry* with the live route: if the lane was repointed meanwhile,
+    this entry becomes the detached row entry and the old session mounts detached.
     """
-    store = authority.runner.session_store
-    with store._lock:
-        entry = store._entry_locked(route)
-    if (entry is None or entry.origin is None or entry.session_key != route
-            or authority.logical_owner(entry.session_id) != sid):
+    if entry is None or entry.origin is None or entry.session_key != route:
         return None
     return {
         'sid': sid,

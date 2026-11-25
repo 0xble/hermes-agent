@@ -80,6 +80,43 @@ async def test_stop_route_mount_plan_failure_still_fences_and_cancels(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_stop_route_mount_plan_failure_mounts_repointed_owner_detached(monkeypatch):
+    """A lane repointed during a failed cold read still mounts the observed old owner detached."""
+    import copy
+
+    from gateway import session_route_recovery
+
+    runner, adapter = _setup(monkeypatch)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    route, owner = await _queue_rows(runner, authority, source, 'A', 'B')
+    authority.sessions.pop(owner)
+    real_probe = runner._hm_mounted_owner_probe
+
+    def probe(*args):
+        result = real_probe(*args)
+        store = runner.session_store
+        with store._lock:
+            moved = copy.copy(store._entries[route])
+            moved.session_id = 'newer-conversation'
+            moved._route_version = getattr(moved, '_route_version', 0) + 1
+            store._entries[route] = moved
+        return result
+
+    def fail_plan(*args):
+        raise RuntimeError('database temporarily unavailable')
+
+    monkeypatch.setattr(runner, '_hm_mounted_owner_probe', probe)
+    monkeypatch.setattr(session_route_recovery, '_mount_plan', fail_plan)
+    await runner._hm_stop_owner_turn(route)
+
+    assert owner in authority.sessions
+    assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
+    authority.db.close()
+
+
+@pytest.mark.asyncio
 async def test_stop_route_probe_failure_still_fences(monkeypatch):
     """A durable owner probe failure must not leave the route unfenced."""
     runner, adapter = _setup(monkeypatch)

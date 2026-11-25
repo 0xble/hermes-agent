@@ -137,28 +137,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
 
-    def _hm_mounted_owner_probe(self, authority: Any, _quick_key: str) -> Optional[str]:
-        """Read the route's durable FIFO owner for /stop and /new.
+    def _hm_mounted_owner_probe(self, authority: Any, _quick_key: str):
+        """Read the route's durable FIFO owner for /stop and /new as ``(owner, observed route entry)``.
 
         SessionStore and the authority's lineage lookup take blocking storage locks. This read-only
         probe may run off the gateway event loop; it must not inspect or publish ``authority.sessions``.
         """
-        return authority.logical_owner(authority.runner.session_store.peek_session_id(_quick_key))
+        store = authority.runner.session_store
+        with store._lock:
+            entry = store._entry_locked(_quick_key) if _quick_key else None
+        return authority.logical_owner(entry.session_id if entry else None), entry
 
-    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str, _quick_key: str):
+    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str, _quick_key: str, observed=None):
         """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
-        from gateway.session_route_recovery import _cached_mount_plan, _mount_plan
+        from gateway.session_route_recovery import _mount_plan, _observed_mount_plan
         try:
             return _mount_plan(authority, sid)
         except Exception:
-            # Reuse only the route entry already observed by the owner probe. This keeps /stop and
-            # /new able to mount and settle a known owner when its second storage read is transient.
+            # Fall back to the route entry the owner probe observed, with no further storage read, so
+            # /stop and /new can still mount and settle a known owner (detached if the lane moved).
             logger.debug("Could not read the mount plan for %s", sid, exc_info=True)
-            try:
-                return _cached_mount_plan(authority, sid, _quick_key) or _MOUNT_PLAN_FAILED
-            except Exception:
-                logger.debug("Could not recover the cached mount plan for %s", sid, exc_info=True)
-                return _MOUNT_PLAN_FAILED
+            return _observed_mount_plan(sid, _quick_key, observed) or _MOUNT_PLAN_FAILED
 
     def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan) -> Optional[str]:
         """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
@@ -960,14 +959,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if authority:
             from gateway.session_store_async import run_store_call
             try:
-                sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                sid, observed = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
             except Exception:
                 logger.debug("Could not probe the owner for %s before stopping it", _quick_key, exc_info=True)
                 authority.fence_route(_quick_key)
                 return
             plan = None
             if sid and sid not in authority.sessions:
-                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key)
+                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key, observed)
                 sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
         if not sid:
             if authority is not None:
@@ -978,13 +977,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # than left queued behind /new or /stop.
                 from gateway.session_store_async import run_store_call
                 try:
-                    sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                    sid, observed = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
                 except Exception:
                     logger.debug("Could not reprobe the owner for %s after fencing it", _quick_key, exc_info=True)
                     return
                 plan = None
                 if sid and sid not in authority.sessions:
-                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key)
+                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key, observed)
                 sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
             if not sid:
                 return
