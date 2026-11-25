@@ -112,7 +112,51 @@ async def test_stop_route_mount_plan_failure_mounts_repointed_owner_detached(mon
     await runner._hm_stop_owner_turn(route)
 
     assert owner in authority.sessions
+    assert authority.sessions[owner].detached
     assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
+    authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_route_unmountable_owner_fences_without_on_loop_cold_mount(monkeypatch):
+    """With no usable plan the owner is not settled, so authorize never cold-mounts it on the loop."""
+    from gateway import session_route_recovery
+
+    runner, adapter = _setup(monkeypatch)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    route, owner = await _queue_rows(runner, authority, source, 'A', 'B')
+    authority.sessions.pop(owner)
+    before = authority.route_epoch(route)
+    loop_thread = get_ident()
+    cold_mounts: list[int] = []
+    real_mount_plan = session_route_recovery._mount_plan
+
+    def fail_plan(*args):
+        if get_ident() == loop_thread:
+            cold_mounts.append(get_ident())
+        raise RuntimeError('database temporarily unavailable')
+
+    real_probe = runner._hm_mounted_owner_probe
+
+    def probe(*args):
+        sid, entry = real_probe(*args)
+        if entry is not None:
+            import copy
+            entry = copy.copy(entry)
+            entry.origin = None
+        return sid, entry
+
+    monkeypatch.setattr(runner, '_hm_mounted_owner_probe', probe)
+    monkeypatch.setattr(session_route_recovery, '_mount_plan', fail_plan)
+    await runner._hm_stop_owner_turn(route)
+
+    assert real_mount_plan is not fail_plan
+    assert cold_mounts == []
+    assert owner not in authority.sessions
+    assert authority.route_epoch(route) > before
+    assert _rows(authority, owner) == [('A', 'queued', None), ('B', 'queued', None)]
     authority.db.close()
 
 

@@ -181,6 +181,10 @@ class GatewayInboundMixin(
                     restore_routed_session(authority, sid, plan=plan)
             except Exception:
                 logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
+            if sid not in authority.sessions:
+                # Unmountable: settling its rows would make ``authorize`` cold-mount it on this loop.
+                # The route stays fenced, so nothing new commits behind /stop or /new.
+                return None
         return sid
 
     async def _hm_pre_gateway_dispatch_hook(
