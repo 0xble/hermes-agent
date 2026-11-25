@@ -2371,16 +2371,16 @@ def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
+    ids = [job.get("id", "") for job in jobs]
     try:
         from cron.executions import latest_executions, live_executions
 
-        ids = [job.get("id", "") for job in jobs]
         latest, live = latest_executions(ids), live_executions(ids)
     except Exception:
         latest, live = {}, {}
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
-        running = job_running_state(job)
+        running = job_running_state(job, detached_execution=live.get(job.get("id", "")))
         job["running"] = running["was_running"]
         job["running_since"] = running["run_started_at"]
         job["live_execution"] = live.get(job.get("id", ""))

@@ -1,12 +1,15 @@
 """Reach the existing cancellation path from schedule mutations in this process."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from datetime import UTC, datetime
 from typing import Any
 
 from agent.interrupt_scope import InterruptScope
+
+logger = logging.getLogger(__name__)
 
 
 class RunControl(threading.Event):
@@ -227,8 +230,16 @@ def running_job_state(job: dict, *, detached_execution: Any = _UNSET) -> dict:
     claim = job.get("fire_claim") or {}
     live_claim = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
     # Not the latest row: a refused Run-now books a newer ``failed`` row that would hide the live run.
-    detached = (cancellable_execution(str(job.get("id") or ""))
-                if detached_execution is _UNSET else detached_execution)
+    if detached_execution is _UNSET:
+        try:
+            detached = cancellable_execution(str(job.get("id") or ""))
+        except Exception:
+            # An unreadable ledger must not abort a mutation that already saved: removal still has
+            # to clean up output and notes. Fall back to the process-local and claim evidence.
+            logger.warning("Cron execution ledger lookup failed for job %s", job.get("id"), exc_info=True)
+            detached = None
+    else:
+        detached = detached_execution
     if detached is not None and detached.get("owner_kind") == "detached":
         return {
             "was_running": True,
@@ -258,13 +269,9 @@ def interrupt_job_run(job: dict) -> dict:
     result = running_job_state(job)
     detached = result.pop("_detached_execution", None)
     # A run that removes or disables its own job (agent tool call, or a script it spawned) must
-    # not cancel itself: its result and delivery still belong to it. The durable pid/process
-    # identity covers workers that have not yet published the environment marker.
-    from cron.executions import _PROCESS_ID
+    # not cancel itself: its result and delivery still belong to it.
     own_run = (detached is not None
-               and (os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == str(detached.get("id") or "")
-                    or (detached.get("pid") == os.getpid()
-                        and detached.get("process_id") == _PROCESS_ID)))
+               and os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == str(detached.get("id") or ""))
     if own_run or self_removal_delivery_allowed(job["id"]):
         if result["was_running"]:
             result["warning"] = "The current run changed its own job; it was not interrupted."
