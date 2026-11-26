@@ -39,6 +39,10 @@ def run(*, argv: list[str], cwd: str, env: dict[str, str], sys_path: list[str], 
     os.chdir(cwd)
     os.environ.clear()
     os.environ.update(env)
+    if attempt_dir := env.get("TMPDIR"):
+        from scripts.run_tests_timeout import install_stack_dump
+
+        install_stack_dump(attempt_dir)
     # gettempdir() caches its answer, and a preloaded module may have asked
     # in the server; this file's TMPDIR must win.
     tempfile.tempdir = None

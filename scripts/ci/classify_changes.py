@@ -253,6 +253,7 @@ _PY_TEST_HARNESS = (
     "scripts/run_tests_parallel.py",
     "scripts/run_tests_launch.py",
     "scripts/run_tests_fork_child.py",
+    "scripts/run_tests_timeout.py",
 )
 # Both Desktop suites package the app and share this harness (the update
 # suite imports the core suite's harness and provider).
