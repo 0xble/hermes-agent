@@ -45,9 +45,12 @@ def _assert_timeout_stacks(tmp_path, *, forkserver):
     assert result.returncode == 1, output
     assert "runner_status=124" in output and "signal=SIGKILL" in output, output
     assert ("fork server: on" in output) is forkserver, output
-    threads, section, tasks = output.partition("=== asyncio task stacks ===")
+    # The first report is a truncated preview; inspect the full failure output.
+    _, header, stacks = output.rpartition("=== Python thread stacks before file timeout ===")
+    assert header, output
+    threads, section, tasks = stacks.partition("=== asyncio task stacks ===")
     assert section, output
-    assert "blocked_worker_thread" in threads, output
+    assert "in blocked_worker_thread" in threads, output
     assert "timeout-probe-task" in tasks and "in suspended_probe_task" in tasks, output
     assert "in blocked_await" in tasks, output
 
