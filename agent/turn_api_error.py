@@ -332,6 +332,50 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     return retry_after is not None and retry_after > cap
 
 
+def fast_failover_on_provider_outage(agent: Any, classified: Any, api_error: Any) -> bool:
+    """Whether a pending fallback should get one short retry before activation.
+
+    Provider-capacity and transport failures are unlikely to recover during a provider-declared
+    multi-minute cooldown.  A configured fallback can make progress, so keep one bounded probe of
+    the primary and then move on.  With no pending fallback this is false, preserving the existing
+    Retry-After and recovery-ladder behavior.  Authentication failures are intentionally absent:
+    a real 401/invalid credential must keep its existing refresh/terminal path.
+    """
+    if not agent._has_pending_fallback() or getattr(agent, "_turn_independent_attempt_active", False):
+        return False
+    reason = getattr(classified, "reason", None)
+    context = getattr(classified, "error_context", None) or {}
+    if reason is FailoverReason.overloaded:
+        return True
+    error_text = " ".join(
+        str(value).lower()
+        for value in (api_error, getattr(api_error, "message", None), getattr(api_error, "body", None))
+        if value is not None
+    )
+    if any(
+        marker in error_text
+        for marker in (
+            "unexpected eof", "tls handshake", "ssl handshake", "connection reset", "connection refused",
+            "upstream connect error",
+        )
+    ):
+        return True
+    # CLIProxyAPI uses auth_unavailable while every pooled credential is cooling down. It is
+    # capacity exhaustion, not a bad user key, when it arrives on a transient provider verdict.
+    if "auth_unavailable" in error_text or "no auth available" in error_text:
+        if reason in {FailoverReason.rate_limit, FailoverReason.server_error, FailoverReason.timeout}:
+            return True
+    from agent.retry_utils import provider_retry_after_seconds
+    retry_after = provider_retry_after_seconds(api_error)
+    if reason is FailoverReason.rate_limit and retry_after is not None and retry_after > 5.0:
+        return True
+    if reason is FailoverReason.timeout:
+        return context.get("transport") in {"connection", "timeout"}
+    if reason is FailoverReason.server_error:
+        return context.get("transport") == "connection"
+    return False
+
+
 def _is_local_validation_error(api_error: Any) -> bool:
     """ValueError/TypeError are local bugs, except: UnicodeEncodeError (surrogate recovery
     path), json.JSONDecodeError / provider stream-parse ValueErrors (transient provider/network failure, must retry),
@@ -363,7 +407,7 @@ class UnrecoveredErrorVerdict:
     max_retries: Any = None
 
 
-def settle_unrecovered_error(
+def settle_unrecovered_error(  # health: allow CC -- preserves the ordered recovery gates and fallback handoff in one transaction.
     agent: Any, *, api_error: Any, classified: Any, _retry: Any, status_code: Any, error_msg: Any,
     is_context_length_error: Any, is_rate_limited: Any, _is_zai_coding_overload: Any,
     _provider: Any, _base: Any, _model: Any, messages: Any, api_messages: Any, api_kwargs: Any,
@@ -500,6 +544,20 @@ def settle_unrecovered_error(
         max_retries = retry_count
         hold_noninteractive_transient = False
 
+    # Capacity/transport outages should not spend the provider's long Retry-After when another
+    # configured route can serve the turn. Keep one short same-provider retry for a transient blip,
+    # then let the normal exhaustion path activate the fallback. No pending fallback means the
+    # existing provider cooldown and auto-recovery behavior remain unchanged.
+    fast_failover = not over_wait_cap and fast_failover_on_provider_outage(agent, classified, api_error)
+    if fast_failover:
+        # Keep ``max_retries`` intact: the fallback restart budget also governs the rebuilt
+        # message handoff, including its independent-endpoint allowance. Only the provider's
+        # same-route retry budget is shortened here.
+        if getattr(_retry, "fast_failover_retry_attempted", False):
+            retry_count = max_retries
+        else:
+            _retry.fast_failover_retry_attempted = True
+
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
     attempts_made = min(retry_count, max_retries)
@@ -571,7 +629,7 @@ def settle_unrecovered_error(
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
-        base_url=_base, model=_model,
+        base_url=_base, model=_model, retry_wait_cap=5.0 if fast_failover else None,
     )
     if hold_noninteractive_transient:
         # Never back off past the window: the attempt after it ends must be the one that falls back.
