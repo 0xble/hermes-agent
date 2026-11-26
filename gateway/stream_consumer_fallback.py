@@ -315,7 +315,10 @@ class StreamFallbackMixin:
         if continuation == final_text or getattr(self, "_delivery_uncertain", False):
             mark_final = getattr(self, "_mark_final_delivered", None)
             if callable(mark_final):
-                mark_final(record=final_text)
+                # A tail-only fallback sets the final flags for transport cleanup, but must
+                # not record the complete payload: the preview and tail were separate wire
+                # frames, so reconciliation must still permit the gateway's full final send.
+                mark_final(record=final_text if continuation == final_text else None)
                 result = locals().get("result")
                 if result is not None:
                     from gateway.reply_latency import record_final_reply

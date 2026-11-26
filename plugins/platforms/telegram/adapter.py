@@ -4803,9 +4803,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if finalize:
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
         # A copy quote's wire form is longer than its source, so measure the encoded text too.
-        from gateway.copy_blocks import _has_copy_markers
+        has_copy_wire = any(marker in content for marker in ("[[copy]]", "[[/copy]]", "\x00HERMES_COPY_OPEN\x00", "\x00HERMES_COPY_CLOSE\x00"))
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH or (
-                _has_copy_markers(content)
+                has_copy_wire
                 and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH):
             if finalize:
                 return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
