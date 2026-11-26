@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable
+from typing import Any
 
 logger = logging.getLogger("gateway.run")
 _REASON = "gateway user turn preemption"
@@ -34,6 +34,11 @@ def _eligible_machine_waiter(runner: Any, event: Any, holder: Any) -> bool:
     return bool(getattr(getattr(holder, "event", None), "internal", False))
 
 
+async def _send_queued_ack(runner: Any, event: Any, quick_key: str) -> None:
+    from gateway.run_turn_lease_wait import lease_wait_notice
+    await lease_wait_notice(runner, quick_key, event)
+
+
 async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder: Any, timeout: float) -> None:
     """Cold path: yield an internal lease holder, waiting (bounded by ``timeout``) for a pending agent."""
     from gateway.meeting_lane import busy_input_mode
@@ -56,7 +61,8 @@ async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder
         return
     state, turn, agent = live_agent()
     if agent is None:
-        await _wait_for_events([getattr(turn, "agent_published_event", None), holder.released_event], timeout)
+        if await _wait_for_events([getattr(turn, "agent_published_event", None), holder.released_event], timeout):
+            await _send_queued_ack(runner, event, quick_key)
         if not holds():
             return
         state, turn, agent = live_agent()
