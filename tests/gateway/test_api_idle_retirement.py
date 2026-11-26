@@ -5,6 +5,8 @@ so a ``LiveSession`` kept after the FIFO goes idle only pinned its event stream 
 the life of the process. Retirement must never strand an admission committed around it.
 """
 import asyncio
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,6 +63,68 @@ async def test_api_admission_committed_after_its_session_retired_runs_with_its_o
         result, _ = await asyncio.wait_for(observe_api_turn(admitted), 10)
     assert result['final_response'] == 'ok:hello'
     assert seen == [int(controls)]  # the approval projection is attached to the session the turn runs on
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('watched', [True, False], ids=['watched', 'unwatched'])
+async def test_api_admission_during_idle_retirement_runs_on_the_same_drain(api, owner, monkeypatch, watched):
+    from gateway import session_retirement, session_viewer_close
+
+    replies = []
+    _answer(owner, replies)
+    entered, release = threading.Event(), threading.Event()
+    first = admit_api_turn(api, session_id='conv', user_message='one', conversation_history=[])
+    live = owner.sessions['conv']
+
+    def hold(result):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10), 'the retirement check was not released'
+        return result
+
+    if watched:
+        # On the WebSocket path a viewer prevents eviction, but the off-loop target lookup
+        # happens before the pin check and the current drain can still miss the wakeup.
+        live.subscribers['sub'] = object()
+
+        async def held_to_thread(fn, *args):
+            assert fn == owner.physical_target
+            return await asyncio.to_thread(lambda: hold(fn(*args)))
+
+        monkeypatch.setattr(session_retirement, 'asyncio', SimpleNamespace(
+            to_thread=held_to_thread, current_task=asyncio.current_task))
+    else:
+        # Capture an idle snapshot before admitting the next turn. It is stale when delivered.
+        busy = session_viewer_close._busy
+
+        def held_busy(*args):
+            return hold(busy(*args))
+
+        monkeypatch.setattr(session_viewer_close, '_busy', held_busy)
+
+    try:
+        await asyncio.wait_for(observe_api_turn(first), 10)
+        assert await asyncio.to_thread(entered.wait, 10), 'the drain did not reach idle retirement'
+        drain = live.task
+        late = admit_api_turn(api, session_id='conv', user_message='late', conversation_history=[])
+        assert late[2]['status'] == 'queued'
+        observer = asyncio.create_task(observe_api_turn(late))
+        try:
+            await async_wait_until(lambda: live.rescan, timeout=10, what='the late admission to schedule')
+            assert live.task is drain and not drain.done()
+            release.set()
+            # Wait for the original drain to finish. No third request should be needed to wake it.
+            await asyncio.wait_for(asyncio.shield(drain), 10)
+            assert replies == ['one', 'late']
+            result, _ = await asyncio.wait_for(observer, 10)
+            assert result['final_response'] == 'ok:late'
+        finally:
+            release.set()
+            if not observer.done():
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
