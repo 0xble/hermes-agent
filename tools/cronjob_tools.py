@@ -607,8 +607,16 @@ def _manual_run_completion(
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
     reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
-    excerpt = ((str((execution or {}).get("output") or "")[-4000:] if execution_id else
-                _latest_job_output_excerpt(job_id)) if reached_nobody else None)
+    excerpt = None
+    if reached_nobody:
+        parts = []
+        if execution_id and (own_output := str((execution or {}).get("output") or "")[-4000:]):
+            parts.append(own_output)
+        # The job's newest saved file is this attempt's output only when no durable execution row
+        # names the attempt: with one, a previous run's file must never stand in for its output.
+        if state == "completed" and not (execution or {}).get("id") and (saved := _latest_job_output_excerpt(job_id)) and saved not in parts:
+            parts.append(saved)
+        excerpt = "\n".join(parts)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
