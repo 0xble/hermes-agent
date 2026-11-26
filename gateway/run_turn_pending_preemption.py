@@ -22,7 +22,6 @@ async def _wait_for_events(events: list[Any], timeout: float) -> bool:
             waiter.cancel()
         await asyncio.gather(*waits, return_exceptions=True)
 
-
 def _eligible_machine_waiter(runner: Any, event: Any, holder: Any) -> bool:
     """Keep relay, agent-origin, internal, and non-machine holders on queue semantics."""
     from gateway.response_filters import is_agent_origin_text
@@ -32,7 +31,6 @@ def _eligible_machine_waiter(runner: Any, event: Any, holder: Any) -> bool:
     if (not is_user_turn(event)) if callable(is_user_turn) else getattr(event, "internal", False):
         return False
     return bool(getattr(getattr(holder, "event", None), "internal", False))
-
 
 async def _send_queued_ack(runner: Any, event: Any, quick_key: str) -> None:
     from gateway.run_turn_lease_wait import lease_wait_notice

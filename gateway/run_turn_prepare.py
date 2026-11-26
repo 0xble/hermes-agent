@@ -796,7 +796,7 @@ class GatewayTurnPrepareMixin:
                 max_wait=lease_wait_max_seconds(),
                 on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
                 on_contended=(lambda holder: preempt_machine_holder(
-                    self, event, _quick_key, holder, _lease_wait_timeout
+                    self, event, _quick_key, holder, lease_wait_max_seconds()
                 )) if event is not None else None,
                 event=event,
                 on_timeout=(lambda: preserve_lease_wait_async(
