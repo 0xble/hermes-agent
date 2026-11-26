@@ -77,6 +77,20 @@ class _SessionLease:
         return self.holder is None and not self.lock.locked() and self.pending_acquires == 0
 
 
+def _drop_lock_waiter(waiter: "asyncio.Task", lock: asyncio.Lock) -> None:
+    """Cancel an unneeded ``lock.acquire()`` waiter and give back any lock it already won, now or
+    when it settles, so a second cancel while draining can never leave it detached and locked."""
+    def _give_back(task: "asyncio.Task") -> None:
+        if not task.cancelled() and task.exception() is None and task.result():
+            lock.release()
+
+    if waiter.done():
+        _give_back(waiter)
+        return
+    waiter.add_done_callback(_give_back)
+    waiter.cancel()
+
+
 class SessionTurnLeaseRegistry:
     """Asyncio lease per resolved session_id. Process-local, single-event-loop by design (same
     visibility scope as the routing-key guards it extends); call only from the gateway loop."""
@@ -207,17 +221,20 @@ class SessionTurnLeaseRegistry:
                 await waiter
                 acquired = True
         finally:
-            if contended_task is not None:
-                if not acquired:
-                    contended_task.cancel()
-                # Acquired: the holder is released, so the callback finishes at once (an ack in flight
-                # completes before the turn runs, as when it was awaited inline).
-                await asyncio.gather(contended_task, return_exceptions=True)
+            # No await below may skip the waiter drain or strand an acquired lock on cancellation.
             if not acquired:
-                waiter.cancel()
+                _drop_lock_waiter(waiter, lock)
+                if contended_task is not None:
+                    contended_task.cancel()  # not awaited: a slow cancel must not outlive the drain
                 await asyncio.gather(waiter, return_exceptions=True)
-                if not waiter.cancelled() and waiter.exception() is None and waiter.result():
+            elif contended_task is not None:
+                # Acquired: the holder is released, so the callback finishes at once (an ack in flight
+                # completes before the turn runs). Cancelled here, the caller never publishes a holder.
+                try:
+                    await asyncio.gather(contended_task, return_exceptions=True)
+                except asyncio.CancelledError:
                     lock.release()
+                    raise
 
     def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:
         """Alias a HELD lease onto ``new_session_id`` after mid-turn rotation (compression) so the
