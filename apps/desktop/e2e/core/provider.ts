@@ -78,9 +78,10 @@ export interface ScriptedProvider {
 const MARKER_RE = /\bU\d+-[a-z0-9]+\b/
 
 // An in-place compaction mid-turn appends the todo snapshot (tools/todo_tool.py TODO_INJECTION_HEADER)
-// as a user-role row after the turn's request. It is scaffolding, not a new turn, so the scripted
-// turn is still the request before it. Other user-role rows the runtime adds, such as background
-// process notifications, stay prompts: specs script them with scriptPrompt.
+// as a user-role row after the turn's request. A snapshot whose todos carry a marker is a scripted
+// turn of its own (lineage-compaction-prompt.spec.ts keys on it). One without a marker is scaffolding,
+// so the scripted turn is still the request before it. Other user-role rows the runtime adds, such as
+// background process notifications, stay prompts: specs script them with scriptPrompt.
 const TODO_SNAPSHOT_PREFIX = '[Your active task list was preserved across context compression]'
 
 // An in-place compaction carries the turn's request after this boundary inside the summary row.
@@ -99,8 +100,10 @@ function textOf(content: unknown): string {
   return ''
 }
 
-function isTodoSnapshot(message: any): boolean {
-  return textOf(message?.content).trimStart().startsWith(TODO_SNAPSHOT_PREFIX)
+function isUnscriptedTodoSnapshot(message: any): boolean {
+  const content = textOf(message?.content)
+
+  return content.trimStart().startsWith(TODO_SNAPSHOT_PREFIX) && !MARKER_RE.test(content)
 }
 
 // The first marker keys a prompt (summary requests rely on this). A compaction carrier quotes
@@ -117,7 +120,7 @@ function turnPosition(messages: any[]): { marker: null | string; prompt: string;
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
 
-    if (message?.role === 'user' && !isTodoSnapshot(message)) {
+    if (message?.role === 'user' && !isUnscriptedTodoSnapshot(message)) {
       userIndex = i
 
       break
