@@ -274,3 +274,83 @@ def test_each_fallback_route_gets_its_own_short_retry():
     verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)
     assert verdict.action == "break" and agent.route == "fallback-2"
     assert len(sleeps) == 2
+
+
+# --- unattended same-provider window (platform="subagent"): the window owns the retry cadence ---
+
+def _unattended_run(retry_after=None):
+    from tests.agent.test_noninteractive_fallback_retry import (
+        FALLBACK, PRIMARY, _agent, _drive, _ok, _unavailable,
+    )
+
+    agent = _agent("subagent")
+
+    def behaviour(route, _now):
+        if route == PRIMARY:
+            raise _unavailable(retry_after)
+        return _ok("served by fallback")
+
+    result, calls, sleeps = _drive(agent, behaviour)
+    primary = [t for route, t in calls if route == PRIMARY]
+    fallback = [t for route, t in calls if route == FALLBACK]
+    return agent, result, primary, fallback, sleeps
+
+
+def test_unattended_window_503_keeps_the_ordinary_cadence_not_a_five_second_retry_storm():
+    from tests.agent.test_noninteractive_fallback_retry import WINDOW
+
+    agent, result, primary, fallback, sleeps = _unattended_run(retry_after=None)
+
+    assert result["completed"] is True and result["final_response"] == "served by fallback"
+    assert len(fallback) == 1 and fallback[0] - primary[0] >= WINDOW  # fails over only after the window
+    # The window's own backoff paces the retries (2, 4, 8, 16, 32, then 60s steps); capping every
+    # wait at 5s would multiply the attempts on the overloaded primary (32 vs 8 over 181s).
+    assert max(sleeps) > 5.0, sleeps
+    assert len(primary) == 8, (len(primary), sleeps)
+
+
+def test_unattended_window_with_a_short_retry_after_is_not_capped_to_five_seconds():
+    from tests.agent.test_noninteractive_fallback_retry import WINDOW
+
+    _agent_, result, primary, fallback, sleeps = _unattended_run(retry_after="30")
+
+    assert result["completed"] is True and len(fallback) == 1
+    assert fallback[0] - primary[0] >= WINDOW
+    assert max(sleeps) > 5.0, sleeps
+    assert len(primary) <= 8, (len(primary), sleeps)
+
+
+def test_unattended_retry_after_longer_than_the_window_still_fails_over_fast():
+    agent, result, primary, fallback, sleeps = _unattended_run(retry_after="320")
+
+    assert result["completed"] is True and result["final_response"] == "served by fallback"
+    # No window opens (the provider's cooldown outlasts it): one short capped retry, then fallback.
+    assert len(primary) == 2, (len(primary), sleeps)
+    assert len(sleeps) == 1 and sleeps[0] <= 5.0, sleeps
+    assert len(fallback) == 1 and fallback[0] - primary[0] < 30.0
+    assert agent._fallback_activated is True
+
+
+def test_held_unattended_error_never_enters_the_short_retry_path():
+    error = _Err(503, "server_is_overloaded")
+    agent = _Agent()
+    agent.platform = "subagent"
+    retry = TurnRetryState(primary_recovery_attempted=True)
+    sleeps = []
+    classified = _classified(error)
+    with (
+        patch("agent.conversation_loop._credential_refresh_profile", lambda agent: None),
+        patch("agent.conversation_loop._arm_fallback_restart", lambda *args: None),
+        patch("agent.turn_api_error.max_retries_exhausted_result", lambda *args, **kwargs: {"failed": True}),
+        patch("agent.turn_api_error.interruptible_backoff_sleep", lambda _a, wait, *a, **k: sleeps.append(wait)),
+    ):
+        verdict = settle_unrecovered_error(
+            agent, api_error=error, classified=classified, _retry=retry, status_code=503,
+            error_msg=str(error).lower(), is_context_length_error=False, is_rate_limited=False,
+            _is_zai_coding_overload=False, _provider=agent.provider, _base="http://proxy", _model="primary",
+            messages=[], api_messages=[], api_kwargs={}, active_system_prompt=None,
+            conversation_history=[], approx_tokens=0, retry_count=1, max_retries=3,
+            compression_attempts=0, api_call_count=1, hold_noninteractive_transient=True,
+        )
+    assert verdict.action == "fallthrough"
+    assert retry.fast_failover_retry_visit is None, "the window hold must keep the ordinary retry path"

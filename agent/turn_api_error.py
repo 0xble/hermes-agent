@@ -374,10 +374,11 @@ def fast_failover_on_provider_outage(agent: Any, classified: Any, api_error: Any
     the primary and then move on.  With no pending fallback this is false, preserving the existing
     Retry-After and recovery-ladder behavior.
 
-    The verdict comes from the HTTP status, the exception type and the error classifier's own
-    reason (which already reads a structured proxy ``auth_unavailable``), never from a substring of
-    the error text.  A 4xx other than 429 is never an outage here: a real 401/403 keeps its
-    refresh/terminal path, and a 400 keeps its request-validation path.
+    This layer decides from the HTTP status, the exception type and the error classifier's reason,
+    and does not read error text itself.  The upstream classifier may read the message for
+    status-less errors and for 429 (and for a structured proxy ``auth_unavailable``), so its reason
+    can depend on text there.  A 4xx other than 429 is never an outage here: a real 401/403 keeps
+    its refresh/terminal path, and a 400 keeps its request-validation path.
     """
     if not agent._has_pending_fallback() or getattr(agent, "_turn_independent_attempt_active", False):
         return False
@@ -570,8 +571,16 @@ def settle_unrecovered_error(  # health: allow CC -- preserves the ordered recov
     # Capacity/transport outages should not spend the provider's long Retry-After when another
     # configured route can serve the turn. Keep one short same-provider retry for a transient blip,
     # then let the normal exhaustion path activate the fallback. No pending fallback means the
-    # existing provider cooldown and auto-recovery behavior remain unchanged.
-    fast_failover = not over_wait_cap and fast_failover_on_provider_outage(agent, classified, api_error)
+    # existing provider cooldown and auto-recovery behavior remain unchanged. An unattended
+    # same-provider window in progress owns the retry cadence: it already bounds the wait before the
+    # fallback runs, and a 5s cap on every retry inside it would only multiply the attempts on an
+    # overloaded primary. A Retry-After that outlasts the window never opens it (no hold), so that
+    # case keeps the fast path.
+    fast_failover = (
+        not over_wait_cap
+        and not hold_noninteractive_transient
+        and fast_failover_on_provider_outage(agent, classified, api_error)
+    )
     if fast_failover:
         # Keep ``max_retries`` intact: the fallback restart budget also governs the rebuilt
         # message handoff, including its independent-endpoint allowance. Only the provider's
