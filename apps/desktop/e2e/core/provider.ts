@@ -75,7 +75,22 @@ export interface ScriptedProvider {
   close: () => Promise<void>
 }
 
-const MARKER_RE = /\bU\d+-[a-z0-9]+\b/
+const MARKER_RE = /\bU\d+-[a-z0-9]+\b/g
+
+// Keep this in sync with agent/conversation_compression_scaffolding.py. These
+// user-role rows are runtime scaffolding, not a new model turn. In particular,
+// an in-place compaction can append the todo snapshot after the real request;
+// treating that snapshot as the prompt makes the scripted provider answer its
+// fallback instead of the turn's script.
+const SYNTHETIC_USER_PREFIXES = [
+  '[System: Your previous response was truncated',
+  '[System: The previous response was cut off',
+  '[System: Your previous tool call',
+  '[Your active task list was preserved across context compression]',
+  '[IMPORTANT: Background process '
+]
+
+const SUMMARY_END_MARKER = '--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---'
 
 function textOf(content: unknown): string {
   if (typeof content === 'string') {
@@ -89,24 +104,60 @@ function textOf(content: unknown): string {
   return ''
 }
 
+function isSyntheticUserMessage(message: any): boolean {
+  const content = textOf(message?.content).trim()
+
+  return SYNTHETIC_USER_PREFIXES.some(prefix => content.startsWith(prefix))
+}
+
+function lastMarker(text: string): null | string {
+  let marker: null | string = null
+
+  for (const match of text.matchAll(MARKER_RE)) {
+    marker = match[0]
+  }
+
+  return marker
+}
+
+function promptMarker(text: string): null | string {
+  const summaryBoundary = text.lastIndexOf(SUMMARY_END_MARKER)
+  const activeText = summaryBoundary >= 0 ? text.slice(summaryBoundary + SUMMARY_END_MARKER.length) : text
+
+  // A handoff carrier may quote several historical markers. Only the text after
+  // its final boundary is the active request; an old marker in the summary is
+  // not a new turn.
+  if (summaryBoundary >= 0 && !MARKER_RE.test(activeText)) {
+    MARKER_RE.lastIndex = 0
+
+    return null
+  }
+
+  MARKER_RE.lastIndex = 0
+
+  return lastMarker(activeText)
+}
+
 function turnPosition(messages: any[]): { marker: null | string; prompt: string; step: number } {
-  let lastUser = -1
+  let userIndex = -1
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === 'user') {
-      lastUser = i
+    const message = messages[i]
+
+    if (message?.role === 'user' && !isSyntheticUserMessage(message)) {
+      userIndex = i
 
       break
     }
   }
 
-  if (lastUser < 0) {
+  if (userIndex < 0) {
     return { marker: null, prompt: '', step: 0 }
   }
 
-  const prompt = textOf(messages[lastUser].content)
-  const marker = MARKER_RE.exec(prompt)?.[0] ?? null
-  const step = messages.slice(lastUser + 1).filter(m => m?.role === 'assistant').length
+  const prompt = textOf(messages[userIndex].content)
+  const marker = promptMarker(prompt)
+  const step = messages.slice(userIndex + 1).filter(m => m?.role === 'assistant').length
 
   return { marker, prompt, step }
 }
