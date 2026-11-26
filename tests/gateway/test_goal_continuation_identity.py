@@ -1458,6 +1458,89 @@ async def test_automatic_event_absence_backoff_avoids_repeated_lookup(state, mon
 
 
 @pytest.mark.asyncio
+async def test_automatic_topic_absence_backoff_caps_at_one_hour(state, monkeypatch):
+    from gateway import wake
+
+    runner = _runner(state)
+    source = runner.target.origin
+    lookup = _topic_lookup(runner, monkeypatch, [])
+    now = 100.0
+    monkeypatch.setattr(wake, "monotonic", lambda: now)
+
+    assert wake._TOPIC_ABSENCE_MAX_RETRY_SECONDS == 3600.0
+    for delay in (120.0, 240.0, 480.0, 960.0, 1920.0, 3600.0, 3600.0, 3600.0):
+        before = lookup.await_count
+        assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+        assert lookup.await_count == before + 1
+        now += delay - 1
+        assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+        assert lookup.await_count == before + 1
+        now += 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_topic_lookup_error_keeps_previous_absence_delay(state, monkeypatch):
+    from gateway import wake
+
+    runner = _runner(state)
+    source = runner.target.origin
+    lookup = _topic_lookup(runner, monkeypatch, [])
+    now = 100.0
+    monkeypatch.setattr(wake, "monotonic", lambda: now)
+
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)  # 120s
+    now += 120.0
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)  # 240s
+    now += 240.0
+
+    lookup.side_effect = RuntimeError("telegram unavailable")
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 3
+    # An error is never cached as absence: the next check looks again.
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 4
+
+    lookup.side_effect = None
+    lookup.return_value = []
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 5
+    now += 479.0  # the next delay is 480s, not a reset 120s or 240s
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 5
+    now += 1.0
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 6
+
+
+@pytest.mark.asyncio
+async def test_real_user_ingress_clears_cached_topic_absence(state, monkeypatch):
+    from gateway import wake
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run_inbound import GatewayInboundMixin
+
+    runner = _runner(state)
+    source = runner.target.origin
+    lookup = _topic_lookup(runner, monkeypatch, [])
+    monkeypatch.setattr(wake, "monotonic", lambda: 100.0)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert not await wake.automatic_route_available(runner, source, idle_backoff=True)
+    lookup.assert_awaited_once()
+
+    event = MessageEvent(text="I am here", message_type=MessageType.TEXT, source=source)
+    with patch("gateway.run_inbound._admit_outbox_event", new=AsyncMock()):
+        assert await GatewayInboundMixin._hm_admit_event(runner, event) is not None
+    lookup.return_value = [{"id": 42, "closed": False}]
+    assert await wake.automatic_route_available(runner, source, idle_backoff=True)
+    assert lookup.await_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["goal", "loop"])
 @pytest.mark.parametrize("exists", [False, True], ids=["deleted", "live"])
 async def test_topic_availability_rechecked_at_inbound_without_changing_state(state, monkeypatch, kind, exists):

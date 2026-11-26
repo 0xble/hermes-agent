@@ -115,6 +115,26 @@ def _idle_topic_absences(adapter, bot):
     return absences
 
 
+def _topic_route(source: Any) -> tuple[str, str, str, str]:
+    from gateway.session_identity import identity_of
+
+    identity = identity_of(source)
+    profile = identity.runtime_profile if identity is not None else getattr(source, "profile", None)
+    return (profile or "default", source.chat_type, str(source.chat_id), str(source.thread_id))
+
+
+def note_topic_present(runner: Any, source: Any) -> None:
+    """A real inbound user message proves its Telegram topic exists: drop any cached absence."""
+    from gateway.config import Platform
+
+    if source.platform != Platform.TELEGRAM or not source.thread_id:
+        return
+    adapter = runner._delivery_adapter_for(source)
+    stored = getattr(adapter, "_idle_wake_absences", None)
+    if isinstance(stored, tuple) and stored[0] is getattr(adapter, "_bot", None):
+        stored[1].pop(_topic_route(source), None)
+
+
 async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: bool = False) -> bool:
     """Suppress automatic work only for an exact, read-only deleted-topic result.
 
@@ -136,13 +156,8 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
     route: Optional[tuple[str, str, str, str]] = None
     previous_absence: Optional[tuple[float, float]] = None
     if idle_backoff:
-        from gateway.session_identity import identity_of
-
-        identity = identity_of(source)
-        profile = identity.runtime_profile if identity is not None else getattr(source, "profile", None)
-        route = (profile or "default", source.chat_type, str(source.chat_id), str(source.thread_id))
+        route = _topic_route(source)
         absences = _idle_topic_absences(adapter, bot)
-        assert absences is not None
         previous_absence = absences.get(route)
         if previous_absence is not None and previous_absence[0] > monotonic():
             return False
@@ -153,14 +168,15 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
         deleted = await _probe_deleted(bot, source, runner=runner, read_only=True)
     except Exception:
         logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
+        if previous_absence is not None and absences is not None and route is not None:
+            absences[route] = previous_absence  # an outage does not prove the topic returned
         return True
     if deleted:
         if absences is not None and route is not None:
             if len(absences) >= _IDLE_TOPIC_ABSENCE_LIMIT:
                 absences.pop(next(iter(absences)))
-            previous = previous_absence
-            retry_seconds = _TOPIC_ABSENCE_RETRY_SECONDS if previous is None else min(
-                previous[1] * 2, _TOPIC_ABSENCE_MAX_RETRY_SECONDS,
+            retry_seconds = _TOPIC_ABSENCE_RETRY_SECONDS if previous_absence is None else min(
+                previous_absence[1] * 2, _TOPIC_ABSENCE_MAX_RETRY_SECONDS,
             )
             absences[route] = (monotonic() + retry_seconds, retry_seconds)
         logger.info(
