@@ -1754,6 +1754,7 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=16)
 def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     """Catch gateway-lifecycle verbs spelled with quote splicing.
     Backslash splicing (``kick\\start``) is undone by normalization, but quote splicing is not:
