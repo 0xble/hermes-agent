@@ -67,6 +67,7 @@ def supports_iterm_images() -> bool:
 # without being felt, since the read ends as soon as the DA1 fence arrives.
 _VSCODE_IMAGES: bool | None = None
 _VSCODE_PROBE_TIMEOUT_S = 0.05
+_VSCODE_DRAIN_S = 0.05  # extra wait for a reply that missed the deadline; 0 once DA1 arrived
 _VSCODE_PROBE = "\x1b[?1;1;0S\x1b[c"
 _SIXEL_REPLY = b"\x1b[?1;0;"
 
@@ -110,7 +111,7 @@ def probe_vscode_images() -> bool | None:
         # A reply past the deadline: drain it while still in cbreak (in canonical mode a reply
         # without a newline is invisible to select and would reach the prompt as typed text).
         # Skipped once the DA1 fence arrived, so a normal start pays no extra wait.
-        drain = time.monotonic() + (0 if _DA1_REPLY.search(buf) else 0.05)
+        drain = time.monotonic() + (0 if _DA1_REPLY.search(buf) else _VSCODE_DRAIN_S)
         while (left := drain - time.monotonic()) > 0 and select.select([fd], [], [], left)[0]:
             chunk = os.read(fd, 256)
             buf += chunk
