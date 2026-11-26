@@ -411,6 +411,14 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             release_running_job(job_id, owner=registration_owner)
         execution_id = job.get("execution_id")
         if execution_id:
+            # A synchronous runner normally settles its own execution. If a test/dummy
+            # runner returns without doing so, settle only an untouched claimed row;
+            # never overwrite a live running worker or a terminal exact attempt.
+            from cron.executions import _TERMINAL_STATES, finish_execution, get_execution
+            current_execution = get_execution(str(execution_id))
+            if current_execution is not None and current_execution.get("status") == "claimed":
+                finish_execution(str(execution_id), success=bool(processed),
+                                 error=None if processed else "Cron runner returned without a terminal outcome.")
             with _run_heartbeat(str(job.get("name") or job_id)):
                 execution = _wait_for_manual_execution(str(execution_id)) or {}
             state = execution.get("status") or "unknown"
