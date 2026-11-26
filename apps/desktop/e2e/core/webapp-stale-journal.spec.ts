@@ -254,8 +254,27 @@ async function withWebapp(
     }
 
     await provider.close()
+    keepGatewayLogsOnFailure(sandbox)
     sandbox.cleanup()
   }
+}
+
+// The sandbox is deleted on cleanup, taking the gateway's own account of a stalled turn with it.
+// Copy its logs into the test's output directory, which CI uploads on failure.
+function keepGatewayLogsOnFailure(sandbox: CoreSandbox) {
+  const info = test.info()
+
+  if (info.status === info.expectedStatus) {
+    return
+  }
+
+  const logs = path.join(sandbox.hermesHome, 'logs')
+
+  if (!fs.existsSync(logs)) {
+    return
+  }
+
+  fs.cpSync(logs, info.outputPath('gateway-logs'), { recursive: true })
 }
 
 test('a Webapp tab that died mid-turn does not replay that turn after the newest reply', async () => {
