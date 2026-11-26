@@ -702,8 +702,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 # Native streams deliberately push every delta; yield at the
                 # configured cadence so a fast producer is not hidden behind
-                # the old fixed 50 ms polling quantum.
-                await asyncio.sleep(min(0.05, max(0.001, self.cfg.edit_interval)))
+                # the old fixed 50 ms polling quantum.  The edit transport keeps
+                # the 50 ms quantum: a faster loop splits one burst (tail + done)
+                # into several non-finalize edits, which spend the flood strikes
+                # before the finalize edit and push the tail into fallback.
+                if self._use_native_streaming:
+                    await asyncio.sleep(min(0.05, max(0.001, self.cfg.edit_interval)))
+                else:
+                    await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
             await self._on_cancelled()
