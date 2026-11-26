@@ -238,10 +238,15 @@ async function withWebapp(
     `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
   )
   let browser: Browser | null = null
+  let failed = false
 
   try {
     browser = await chromium.launch({ executablePath: process.env.HERMES_E2E_CHROMIUM || undefined })
     await body(sandbox, provider, browser)
+  } catch (error) {
+    failed = true
+
+    throw error
   } finally {
     await browser?.close().catch(() => undefined)
 
@@ -254,27 +259,26 @@ async function withWebapp(
     }
 
     await provider.close()
-    keepGatewayLogsOnFailure(sandbox)
+    keepGatewayLogsOnFailure(sandbox, failed)
     sandbox.cleanup()
   }
 }
 
 // The sandbox is deleted on cleanup, taking the gateway's own account of a stalled turn with it.
-// Copy its logs into the test's output directory, which CI uploads on failure.
-function keepGatewayLogsOnFailure(sandbox: CoreSandbox) {
-  const info = test.info()
-
-  if (info.status === info.expectedStatus) {
+// Copy its logs into the test's output directory, which CI uploads on failure. test.info().status
+// still reads 'passed' inside the body, so the caller reports the failure.
+function keepGatewayLogsOnFailure(sandbox: CoreSandbox, failed: boolean) {
+  if (!failed) {
     return
   }
+
+  const info = test.info()
 
   const logs = path.join(sandbox.hermesHome, 'logs')
 
-  if (!fs.existsSync(logs)) {
-    return
+  if (fs.existsSync(logs)) {
+    fs.cpSync(logs, info.outputPath('gateway-logs'), { recursive: true })
   }
-
-  fs.cpSync(logs, info.outputPath('gateway-logs'), { recursive: true })
 }
 
 test('a Webapp tab that died mid-turn does not replay that turn after the newest reply', async () => {
