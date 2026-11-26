@@ -1541,6 +1541,32 @@ async def test_real_user_ingress_clears_cached_topic_absence(state, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_topic_presence_note_failure_never_blocks_user_ingress(state, monkeypatch):
+    from gateway import wake
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run_inbound import GatewayInboundMixin
+
+    runner = _runner(state)
+    source = runner.target.origin
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+
+    def broken_route(_source):
+        raise RuntimeError("route lookup failed")
+
+    monkeypatch.setattr(wake, "_topic_route", broken_route)
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda _source: SimpleNamespace(
+        _bot=None, _idle_wake_absences=(None, {}),
+    ), raising=False)
+    event = MessageEvent(text="I am here", message_type=MessageType.TEXT, source=source)
+    with patch("gateway.run_inbound._admit_outbox_event", new=AsyncMock()):
+        assert await GatewayInboundMixin._hm_admit_event(runner, event) is not None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["goal", "loop"])
 @pytest.mark.parametrize("exists", [False, True], ids=["deleted", "live"])
 async def test_topic_availability_rechecked_at_inbound_without_changing_state(state, monkeypatch, kind, exists):

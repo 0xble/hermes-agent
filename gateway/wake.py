@@ -127,12 +127,16 @@ def note_topic_present(runner: Any, source: Any) -> None:
     """A real inbound user message proves its Telegram topic exists: drop any cached absence."""
     from gateway.config import Platform
 
-    if source.platform != Platform.TELEGRAM or not source.thread_id:
-        return
-    adapter = runner._delivery_adapter_for(source)
-    stored = getattr(adapter, "_idle_wake_absences", None)
-    if isinstance(stored, tuple) and stored[0] is getattr(adapter, "_bot", None):
-        stored[1].pop(_topic_route(source), None)
+    # Runs on every real user message: a cache-clearing hint must never fail admission.
+    try:
+        if getattr(source, "platform", None) != Platform.TELEGRAM or not getattr(source, "thread_id", None):
+            return
+        adapter = runner._delivery_adapter_for(source)
+        stored = getattr(adapter, "_idle_wake_absences", None)
+        if isinstance(stored, tuple) and stored[0] is getattr(adapter, "_bot", None):
+            stored[1].pop(_topic_route(source), None)
+    except Exception:
+        logger.debug("automatic wake: topic presence note failed", exc_info=True)
 
 
 async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: bool = False) -> bool:
