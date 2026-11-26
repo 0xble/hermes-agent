@@ -198,18 +198,22 @@ async function phoneDiesMidTurn(browser: Browser, sandbox: CoreSandbox, provider
  *  first newest-page transcript read the reopened renderer makes for the chat. */
 async function phoneReopens(phone: Phone, sandbox: CoreSandbox): Promise<{ tab: Page; newestPage: Promise<string> }> {
   const tab = await phone.context.newPage()
-  await tab.goto(webappLaunchLink(sandbox))
-  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
+  // Listen before the launch: the renderer may restore this chat while it signs in, so a
+  // listener armed afterwards can miss the read (nightly 45874314957). The window now spans
+  // the launch too, so it is the composer's 180 s plus the original 60 s after it.
   const newestPage = tab
     .waitForResponse(
       response =>
         response.url().includes(`/sessions/${encodeURIComponent(phone.sessionId)}/messages?`) &&
         response.url().includes('order=latest'),
-      { timeout: 60_000 }
+      { timeout: 240_000 }
     )
     .then(response => response.text())
     .catch(() => '')
+
+  await tab.goto(webappLaunchLink(sandbox))
+  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
   await tab.evaluate(id => {
     window.location.hash = `#/${encodeURIComponent(id)}`
