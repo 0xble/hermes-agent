@@ -656,6 +656,9 @@ function Get-PinnedGit {
         }
         if (-not (Test-Path (Join-Path $extractDir "cmd\git.exe"))) { Fail "git.exe not found in the downloaded archive" git_extract_failed }
         if (Test-Path -LiteralPath $entry) { Remove-PinnedGitTree $entry }
+        # Extracting in %TEMP% no longer creates the store directory as a side
+        # effect, and Directory.Move needs the destination's parent to exist.
+        New-Item -ItemType Directory -Force -Path $storeParent | Out-Null
         Invoke-WhileHeld { [IO.Directory]::Move($extractDir, $entry) }
         if (-not (Test-PinnedGitHttpsReady $gitExe)) {
             Remove-PinnedGitTree $entry
