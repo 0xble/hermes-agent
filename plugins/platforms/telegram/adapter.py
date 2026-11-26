@@ -6366,11 +6366,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         from plugins.platforms.telegram.telegram_album import send_animations, send_photo_album
         delivered, ambiguous = await send_animations(self, chat_id, animations, metadata, human_delay)  # a lost GIF receipt stays unknown
         if not photos:
-            return SendResult(
-                success=delivered,
-                error=None if delivered else "all images failed to send",
-                raw_response={"ambiguous": True} if ambiguous else None,
-            )
+            if delivered and ambiguous:
+                return SendResult(success=True, raw_response={"ambiguous": True})
+            return self._album_result(chat_id, delivered)
         result = await send_photo_album(self, chat_id, photos, metadata, human_delay, delivered=delivered, ambiguous=ambiguous)
         return result if result.success else self._album_result(chat_id, False, undelivered=result)
 
