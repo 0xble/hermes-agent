@@ -4693,17 +4693,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
-    async def _edit_preview(self, chat_id: str, message_id: str, content: str) -> None:
-        """Ordinary previews stay raw; literal copy context must be formatted on every tick."""
-        from gateway.copy_blocks import _has_copy_markers
-        if _has_copy_markers(content):
-            content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
-            await self._edit_markdown_or_plain(
-                chat_id, message_id, self.format_message(content), _strip_mdv2(content),
-                "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
-        else:
-            await self._edit_text(chat_id, message_id, content)
-
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
         """MarkdownV2 edit, plain fallback on a parse error; True on a "not modified" no-op. Errors propagate."""
         try:
@@ -4821,14 +4810,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Previews edit in the final's parse mode (#49536): a plain -> MarkdownV2 flip on the same message makes
         # clients draw the old layout over the new text. A rejected preview retries as raw text (nothing lost).
         formatted = self.format_message(content)
-        plain = (_strip_mdv2(content) if content else content) if finalize else content
+        from gateway.copy_blocks import _has_copy_markers
+        plain = _strip_mdv2(content) if finalize or _has_copy_markers(content) else content
         warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
         try:
-            if not finalize:
-                await self._edit_preview(chat_id, message_id, content)
-                if _saturated_preview:
-                    self._last_overflow_preview[_preview_key] = content
-                return SendResult(success=True, message_id=message_id)
             await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
             await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
             return SendResult(success=True, message_id=message_id)
@@ -4848,7 +4833,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     return SendResult(success=True, message_id=message_id)
-                await self._edit_text(chat_id, message_id, truncated)
+                await self._edit_text(chat_id, message_id, _strip_mdv2(truncated) if _has_copy_markers(truncated) else truncated)
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
             # Flood control: short waits retry inline; long waits fail immediately so streaming falls back
