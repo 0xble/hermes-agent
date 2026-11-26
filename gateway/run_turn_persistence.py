@@ -484,17 +484,8 @@ class GatewayTurnPersistenceMixin:
             if guidance not in (response or ""):
                 response = f"{response}\n\n{guidance}" if response else guidance
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            # The real platform turn must rotate so the exhausted request can be answered once on
-            # the fresh session; direct/unit callers without an ingress event retain the same-session
-            # hygiene contract and never synthesize a reset.
-            if event is not None:
-                if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
-                    session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)
-                    self._hmwa_replay_exhausted_request(event, agent_result, session_entry, session_key, source)
-                response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
-            else:
-                logger.warning("Keeping session %s after compression exhaustion.", session_entry.session_id)
-                response = (response or "") + "\n\n" + t("gateway.compress.hygiene_failed")
+            logger.warning("Keeping session %s after compression exhaustion.", session_entry.session_id)
+            response = (response or "") + "\n\n" + t("gateway.compress.hygiene_failed")
         return response, session_entry
 
     def _hmwa_replay_exhausted_request(self, event, agent_result, session_entry, session_key, source):
