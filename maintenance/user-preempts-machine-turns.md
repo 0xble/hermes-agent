@@ -1,30 +1,22 @@
-# User messages preempt machine-origin turns on the lease wait
+# User messages preempt machine-origin turns on authority and lease contention
 
 Fork patch identity: `user-preempts-machine-turns`.
 
 ## Required behavior
 
-A user message that arrives while an internal (machine-origin) turn holds the
-session's turn lease must not wait for that turn to finish. Internal turns include
-watch and process notifications, delegation completions, and loop or goal wakes,
-all delivered through `gateway/wake.py` with `internal=True`.
+A typed user message that arrives while an internal (machine-origin) turn owns
+an authority session in `busy_input_mode: queue` must not wait for that turn to
+finish. Internal turns include watch and process notifications, delegation
+completions, and loop or goal wakes, all delivered with `internal=True`.
 
-Such messages take the cold admission path and wait in
-`SessionTurnLeaseRegistry.acquire` (`gateway/turn_lease.py`), so the adapter busy
-path's preemption in `gateway/run_busy.py` never sees them. Their only
-acknowledgement was the lease-wait notice ("Queued for the next turn"). On
-2026-11-23 a watch notification held a Telegram topic for 517 s while 2 user
-messages waited behind it.
-
-The fix:
-
-- Lease tokens carry their originating event, and `acquire()` takes an
-  `on_contended` callback that runs once when the lease is already held.
-- `_preempt_machine_holder` in `gateway/run_turn_prepare.py` soft-interrupts the
-  holder's agent with `interrupt(None, tool_reason="gateway user turn preemption")`
-  (a system-sourced interrupt that carries no user text, so the user's message runs
-  once as the next lease owner), and sends the existing "Interrupting" busy ack,
-  which suppresses the later queued notice.
+There are two contention paths. Authority-owned sessions enter
+`gateway/run_inbound.py::_hm_admit_to_fifo` and `_hm_busy_preempt` before durable
+FIFO admission; cold turns on a resolved session wait in
+`SessionTurnLeaseRegistry.acquire` (`gateway/turn_lease.py`). Both paths preserve
+the user's message as one queued FIFO row, then cooperatively soft-interrupt the
+machine turn with no user text. The adapter remains free to commit the row while
+the interrupt and any pending-agent publication wait run in a tracked background
+task.
 
 Preemption happens only when all of these hold:
 
@@ -34,9 +26,19 @@ Preemption happens only when all of these hold:
 - the holder agent has no active subagents and no compression in flight
 - the holder has a live agent (a pending sentinel or missing agent means wait)
 
-- The session task is never cancelled. Soft preemption is cooperative: if the machine turn is inside a non-interruptible tool or step, it keeps the lease until that step yields. The user message remains FIFO behind it; the user has already seen the "Interrupting" acknowledgement rather than a second queued acknowledgement.
+For the authority path's pending-agent window, wait on the turn's
+`agent_published_event` or `turn_ended_event`, bounded and tracked, then re-check
+the same opener event, turn object, published agent, and run generation. This
+keeps the wait a soft yield and prevents a late publication from interrupting a
+successor turn; a pending-stop latch was not used because it is coupled to hard
+stop attribution and would broaden the control path.
 
-Contract tests: `tests/gateway/test_turn_lease_queue.py` (including `test_pending_internal_holder_publishes_then_is_preempted_once` and `test_pending_internal_holder_releases_without_publication_and_is_not_preempted`).
+The session task is never cancelled. Soft preemption is cooperative: if the
+machine turn is inside a non-interruptible tool or step, it keeps the lease until
+that step yields; the user message remains FIFO behind it and receives the
+existing "Interrupting" acknowledgement instead of a second queued notice.
+
+Contract tests: `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_is_soft_preempted_once`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_with_active_subagents_stays_queued`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_origin_text_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_relay_event_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_a_persons_own_turn_still_queues_silently`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_publishes_then_is_preempted_once`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_releases_without_publication_and_is_not_preempted`.
 
 ## Interrupt attribution on early returns
 

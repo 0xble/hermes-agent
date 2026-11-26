@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable, cast
 
 logger = logging.getLogger("gateway.run")
 
@@ -110,6 +110,140 @@ async def _resolve_published_agent(runner: Any, holder: Any, state: Any, timeout
     return None if agent is None or agent is _AGENT_PENDING_SENTINEL else agent
 
 
+async def _authority_machine_preemption_impl(
+    runner: Any, event: Any, source: Any, quick_key: str, state: Any, turn: Any,
+    generation: int, running_agent: Any,
+) -> None:
+    """Soft-preempt an authority-owned machine turn without delaying FIFO admission.
+
+    The caller schedules this coroutine and immediately admits ``event`` as a durable FIFO row.
+    Every await rechecks the captured turn opener and generation, so a pending publication cannot
+    interrupt a successor turn that reused the session slot.
+    """
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is None:
+        return
+    opener = getattr(turn, "event", None)
+    published_event = getattr(turn, "agent_published_event", None)
+    ended_event = getattr(turn, "turn_ended_event", None)
+    if running_agent is _AGENT_PENDING_SENTINEL:
+        waits = [ev for ev in (published_event, ended_event) if ev is not None]
+        if not waits:
+            return
+        waiter_tasks = [_tracked_wait_task(runner, ev.wait()) for ev in waits]
+        try:
+            await asyncio.wait(
+                set(waiter_tasks), timeout=5.0, return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in waiter_tasks:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiter_tasks, return_exceptions=True)
+
+    current_state = runner._peek_session_state(quick_key)
+    if current_state is not state or getattr(current_state, "turn", None) is not turn:
+        return
+    if getattr(turn, "event", None) is not opener:
+        return
+    current_generation = runner._current_session_run_generation(quick_key)
+    if int(current_generation) != int(generation):
+        return
+    current_agent = getattr(turn, "agent", None)
+    if current_agent is None or current_agent is _AGENT_PENDING_SENTINEL:
+        return
+    published_generation = getattr(turn, "agent_published_generation", None)
+    published_agent = getattr(turn, "agent_published_agent", None)
+    if running_agent is _AGENT_PENDING_SENTINEL:
+        if published_generation is not None and int(published_generation) != int(generation):
+            return
+        if published_agent is not None and published_agent is not current_agent:
+            return
+    elif current_agent is not running_agent:
+        return
+
+    demoted_for_subagents = bool(runner._agent_has_active_subagents(current_agent))
+    compression_check = cast(
+        Callable[[str], Awaitable[bool]] | None,
+        getattr(runner, "_session_has_compression_in_flight", None),
+    )
+    demoted_for_compression = bool(
+        callable(compression_check) and await compression_check(quick_key)
+    )
+    # Compression and subagent checks both await or inspect mutable state; fence the final action.
+    current_state = runner._peek_session_state(quick_key)
+    if (current_state is not state or getattr(current_state, "turn", None) is not turn
+            or getattr(turn, "event", None) is not opener
+            or int(runner._current_session_run_generation(quick_key)) != int(generation)
+            or getattr(turn, "agent", None) is not current_agent):
+        return
+    if demoted_for_subagents or demoted_for_compression:
+        outcome = runner._BusySteerOutcome(
+            effective_mode="queue", demoted_for_subagents=demoted_for_subagents,
+            demoted_for_compression=demoted_for_compression, steered=False, redirected=False,
+        )
+        await runner._busy_interrupt_and_ack(
+            event, quick_key, adapter, state, current_agent, outcome,
+        )
+        return
+    try:
+        current_agent.interrupt(None, tool_reason="gateway user turn preemption")
+    except Exception:
+        logger.debug("Authority machine-turn preemption failed", exc_info=True)
+        return
+    outcome = runner._BusySteerOutcome(
+        effective_mode="interrupt", demoted_for_subagents=False,
+        demoted_for_compression=False, steered=False, redirected=False,
+    )
+    setattr(outcome, "machine_preempted", True)
+    await runner._busy_interrupt_and_ack(event, quick_key, adapter, state, current_agent, outcome)
+
+
+def _tracked_wait_task(runner: Any, awaitable: Any) -> asyncio.Task:
+    """Create a short-lived waiter under the gateway's normal task accounting."""
+    task = asyncio.create_task(awaitable)
+    retain = getattr(runner, "_retain_background_task", None)
+    if callable(retain):
+        return cast(asyncio.Task, retain(task))
+    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return task
+
+
+def schedule_authority_machine_preemption(
+    runner: Any, event: Any, source: Any, quick_key: str, state: Any, turn: Any,
+    generation: int, running_agent: Any,
+) -> asyncio.Task:
+    """Track the authority preemption so adapter admission remains non-blocking."""
+    task = asyncio.create_task(_authority_machine_preemption_impl(
+        runner, event, source, quick_key, state, turn, generation, running_agent,
+    ))
+    retain = getattr(runner, "_retain_background_task", None)
+    if callable(retain):
+        return cast(asyncio.Task, retain(task))
+    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return task
+
+
+def schedule_authority_queued_ack(
+    runner: Any, event: Any, source: Any, quick_key: str, state: Any, running_agent: Any,
+) -> asyncio.Task:
+    """Send queue-mode's existing acknowledgement without delaying FIFO admission."""
+    adapter = runner._delivery_adapter_for(source)
+    outcome = runner._BusySteerOutcome(
+        effective_mode="queue", demoted_for_subagents=False,
+        demoted_for_compression=False, steered=False, redirected=False,
+    )
+    task = asyncio.create_task(runner._busy_interrupt_and_ack(
+        event, quick_key, adapter, state, running_agent, outcome,
+    ))
+    retain = getattr(runner, "_retain_background_task", None)
+    if callable(retain):
+        return cast(asyncio.Task, retain(task))
+    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return task
+
+
 async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder: Any, timeout: float) -> None:
     """Validate a user waiter and wait for a pending internal holder to publish."""
     if not _is_eligible_machine_waiter(runner, event, holder):
@@ -119,14 +253,20 @@ async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder
         return
     if holder.lease.holder is not holder or holder.released:
         return
+    current_generation = getattr(runner, "_current_session_run_generation", lambda _key: holder.generation)(holder.owner_key)
+    if int(holder.generation) != int(current_generation):
+        return
     state = runner._peek_session_state(holder.owner_key)
     running_agent = await _resolve_published_agent(runner, holder, state, timeout)
     if running_agent is None:
         return
     if runner._agent_has_active_subagents(running_agent):
         return
-    compression_check = getattr(runner, "_session_has_compression_in_flight", None)
-    if callable(compression_check) and await compression_check(quick_key):  # type: ignore[reportGeneralTypeIssues]
+    compression_check = cast(
+        Callable[[str], Awaitable[bool]] | None,
+        getattr(runner, "_session_has_compression_in_flight", None),
+    )
+    if callable(compression_check) and await compression_check(quick_key):
         return
     await _interrupt_published_agent(runner, event, quick_key, holder, timeout)
 

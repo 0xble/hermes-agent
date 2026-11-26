@@ -182,13 +182,13 @@ class SessionTurnLeaseRegistry:
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
         acquired = False
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             # Let lock.acquire() register its waiter before an awaited contention hook runs.
             await asyncio.sleep(0)
             if on_contended is not None:
                 await on_contended()
-            loop = asyncio.get_running_loop()
-            started = loop.time()
             deadlines = [(timeout, on_timeout)]
             if on_wait is not None:
                 deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))

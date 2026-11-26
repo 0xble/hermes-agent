@@ -436,6 +436,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         state = self._session_state(session_key)
         state.turn.agent = _AGENT_PENDING_SENTINEL
         state.turn.agent_published_event = asyncio.Event()
+        state.turn.turn_ended_event = asyncio.Event()
         state.turn.event = event
         state.turn.lease = passive_lease
         state.turn.started_ts = time.time()
@@ -1060,13 +1061,21 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
             if self._human_preempts_autonomous_turn(event, state):
-                # A goal, cron-wake or relay turn may run for many minutes. The typed message stays
-                # a queued FIFO row, never a steer: restart recovery replays a queued row, but marks
-                # a steer handed to a lost claim interrupted. Say it was saved instead of nothing.
-                queued = self._BusySteerOutcome(
-                    effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
-                    steered=False, redirected=False)
-                await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, queued)
+                # Keep the user message as a durable FIFO row, but cut the autonomous turn
+                # cooperatively. Admission must not await publication or interruption.
+                from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
+                if getattr(event, "_gateway_machine_preemption_scheduled", False):
+                    return False
+                setattr(event, "_gateway_machine_preemption_scheduled", True)
+                generation = self._current_session_run_generation(_quick_key)
+                schedule_authority_machine_preemption(
+                    self, event, source, _quick_key, state, state.turn, generation, running_agent,
+                )
+            elif event.message_type == MessageType.TEXT and mode == "queue" and not superseded:
+                from gateway.run_turn_pending_preemption import schedule_authority_queued_ack
+                schedule_authority_queued_ack(
+                    self, event, source, _quick_key, state, running_agent,
+                )
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
         note_busy_outcome(event, outcome)
@@ -2122,6 +2131,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.agent_published_event = asyncio.Event()
+        _claim_state.turn.turn_ended_event = asyncio.Event()
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
