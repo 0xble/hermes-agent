@@ -65,27 +65,30 @@ def test_lifecycle_authority_matrix(state, kind, actor, pauser, action):
     agent = actor != "user"
     allowed = True
     if action == "resume":
-        allowed = (bool(pauser) or (kind == "loop" and not agent)) and (not agent or pauser == "agent")
+        # Main: resuming an active goal is an idempotent success; loops still need a pause to lift.
+        if kind == "goal" and not pauser:
+            allowed = True
+        else:
+            allowed = (bool(pauser) or (kind == "loop" and not agent)) and (not agent or pauser == "agent")
     elif action == "pause" and agent:
         allowed = not pauser
     elif action == "stop" and agent:
-        allowed = kind == "loop" and pauser in {"", "agent"}
+        # Main: autonomous clear may retire only an agent-owned paused goal.
+        allowed = (kind == "loop" and pauser in {"", "agent"}) or (
+            kind == "goal" and actor == "autonomy" and pauser == "agent")
     assert ok == allowed, result
     fresh = manager_for(kind).state
     if not allowed:
         assert fresh.status == ("paused" if pauser else "active")
         assert fresh.paused_by == pauser
     elif action == "pause":
-        # Opted-in goal autonomy waits rather than suspending its continuation.
-        if kind == "goal" and actor == "autonomy":
-            assert fresh.status == "active" and fresh.waiting_until
-        else:
-            assert fresh.status == "paused"
-            assert fresh.paused_by == ("agent" if agent else "user")
+        # Main: an autonomous goal pause is a real agent-owned pause the agent may later lift.
+        assert fresh.status == "paused"
+        assert fresh.paused_by == ("agent" if agent else "user")
     elif action == "resume":
         assert fresh.status == "active" and fresh.paused_by == ""
     else:
-        assert fresh.status == ("done" if agent else "cleared")
+        assert fresh.status == ("done" if agent and kind == "loop" else "cleared")
 
 
 @pytest.mark.parametrize("autonomy", [False, True])
