@@ -310,14 +310,14 @@ def test_unattended_window_503_keeps_the_ordinary_cadence_not_a_five_second_retr
 
 
 def test_unattended_window_with_a_short_retry_after_is_not_capped_to_five_seconds():
-    from tests.agent.test_noninteractive_fallback_retry import WINDOW
-
     _agent_, result, primary, fallback, sleeps = _unattended_run(retry_after="30")
 
     assert result["completed"] is True and len(fallback) == 1
-    assert fallback[0] - primary[0] >= WINDOW
-    assert max(sleeps) > 5.0, sleeps
-    assert len(primary) <= 8, (len(primary), sleeps)
+    # Main's cadence inside the window: every wait honours the 30s Retry-After (never the 5s cap),
+    # and the window hands off once the next 30s wait no longer fits, after 6 primary attempts.
+    assert sleeps and all(s == 30.0 for s in sleeps), sleeps
+    assert len(primary) == 6, (len(primary), sleeps)
+    assert fallback[0] - primary[0] >= 5 * 30.0
 
 
 def test_unattended_retry_after_longer_than_the_window_still_fails_over_fast():
