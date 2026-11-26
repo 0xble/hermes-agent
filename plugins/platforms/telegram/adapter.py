@@ -380,7 +380,9 @@ def check_telegram_requirements() -> bool:
 # Fence extraction runs before the shared matching-width inline-code scanner.
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 # MarkdownV2 escaping and the bare-bracket safety net live once, in telegram_markdown.py.
-from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2, to_markdown_v2
+from plugins.platforms.telegram.telegram_markdown import (
+    _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2, _stash_bare_urls,
+)
 
 
 from plugins.platforms.telegram.telegram_chunking import (
@@ -4795,7 +4797,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         _saturated_preview = False
         if finalize:
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
-        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+        from gateway.copy_blocks import _has_copy_markers
+        # A copy quote's wire form is longer than its source, so measure the encoded text too.
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH or (
+                _has_copy_markers(content)
+                and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH):
             if finalize:
                 return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
             content = self._truncate_stream_overflow_preview(content)
@@ -4809,7 +4815,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             self._last_overflow_preview.pop(_preview_key, None)
         # Previews edit in the final's parse mode (#49536): a plain -> MarkdownV2 flip on the same message makes
         # clients draw the old layout over the new text. A rejected preview retries as raw text (nothing lost).
-        from gateway.copy_blocks import _has_copy_markers
         formatted = self.format_message(content)
         plain = _strip_mdv2(content) if finalize or _has_copy_markers(content) else content
         warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
@@ -6825,7 +6830,146 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2."""
-        return to_markdown_v2(content)
+        if not content:
+            return content
+        placeholders: dict = {}
+        counter = [0]
+
+        def _ph(value: str) -> str:
+            """Stash *value* behind a placeholder token that survives escaping."""
+            key = f"\x00PH{counter[0]}\x00"
+            counter[0] += 1
+            placeholders[key] = value
+            return key
+
+        def _ph_wrap(open_: str, close: str):
+            return lambda m: _ph(f"{open_}{_escape_mdv2(m.group(1))}{close}")
+
+        # 0) MarkdownV2 has no math. Render known LaTeX macros in prose before
+        #    the normal escaping pass, while leaving code spans and fences verbatim.
+        from .rich_code_regions import map_outside_code
+        from .telegram_markdown import normalize_latex_macros
+        content = map_outside_code(content, normalize_latex_macros)
+        # A doubled literal backslash is data (for example, an escaped Windows
+        # path or an intentionally escaped macro), not a Markdown escape. The
+        # final MarkdownV2 escape pass doubles each slash once, so double this
+        # input run first to preserve both literal slashes in the delivered text.
+        content = map_outside_code(content, lambda prose: re.sub(r"\\\\(?=[A-Za-z])", r"\\\\\\\\", prose))
+        # Rewrite GFM-style pipe tables into Telegram-friendly row groups.
+        from .copy_quotes import protect_copy_quotes
+        text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
+        # 1) Protect fenced code blocks (``` ... ```)
+        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
+        #    A fence still opens on its own line — the opening ``` must be the
+        #    first triple-backtick run on that line and must end it — but the
+        #    line may carry arbitrary leading whitespace (list/blockquote-
+        #    nested code indents fences by 4+ spaces) or lead-in prose
+        #    ("Here is the code: ```"), both of which the line-start-only
+        #    anchor silently downgraded from <pre> to escaped literal text.
+        #    Requiring the rest of the opening line to be backtick-free is
+        #    what keeps *inline* triple backticks (e.g. "the syntax is
+        #    ```x``` inline") out of the match: a closing run can never sit
+        #    on the same line as the opener, and the tempered prefix cannot
+        #    skip past an earlier run to a later one.  The closing fence must
+        #    sit on its own line (any indent), with optional trailing
+        #    whitespace and an optional ``\r`` so CRLF-terminated fences
+        #    (Windows-authored content) match too.
+        def _protect_fenced(m):
+            prefix = m.group(1)   # lead-in text / indent before the opening fence
+            opening = m.group(2)  # opening ``` (with optional language) and newline
+            body = m.group(3)     # code body (may be empty)
+            closing = m.group(4)   # closing fence (with its indent)
+            body = body.replace('\\', '\\\\').replace('`', '\\`')
+            return prefix + _ph(opening + body + closing)
+
+        text = _MDV2_FENCE_RE.sub(_protect_fenced, text)
+        # Match the outer run first, so inner runs remain literal code content.
+        from .telegram_markdown import _stash_inline_code
+        text = _stash_inline_code(text, _ph)
+        # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
+        text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
+
+        # Validate and emit the parsed destination, not the raw group: a CommonMark title
+        # (``(url "Title")``) or angle-bracket destination (``(<url>)``) is otherwise either
+        # rejected as unsupported or shipped inside the Telegram URL.
+        def _convert_citation(m):
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
+                return _ph(_escape_mdv2(m.group(1)))
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[\\[{_escape_mdv2(m.group(1))}\\]]({url})')
+
+        text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_citation, text)
+
+        def _convert_link(m):
+            display = _escape_mdv2(m.group(1))
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
+                return _ph(display)
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[{display}]({url})')
+
+        text = _MD_LINK_RE.sub(_convert_link, text)
+        url_keys: set = set()
+
+        def _url_ph(value: str) -> str:
+            key = _ph(value)
+            url_keys.add(key)
+            return key
+
+        text = _stash_bare_urls(text, _url_ph)
+        # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
+        def _convert_header(m):
+            inner = re.sub(r'\*\*(.+?)\*\*', r'\1', m.group(1).strip())
+            return _ph(f'*{_escape_mdv2(inner)}*')
+
+        text = re.sub(r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE)
+        text = re.sub(r'(?m)^\*\*(?=>{1,3} )', _EXPANDABLE_QUOTE, text)
+        # Resolve nested/multiline asterisk emphasis before the final escaping pass.
+        from plugins.platforms.telegram.telegram_markdown import _resolve_emphasis
+
+        # Star runs around a bare URL pair by the shared URL-aware pairer (it splits a mixed run the
+        # way the URL scan does); all other text keeps the block-aware CommonMark parser, which
+        # honours ``\\*`` escapes and quote continuation lines.
+        if any(key in text for key in url_keys):
+            text = _resolve_emphasis(text, _ph, _escape_mdv2)
+        else:
+            from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
+            block_source = text
+            for key, value in placeholders.items():
+                if value.startswith(('```', '*')):
+                    block_source = block_source.replace(key, '# protected block')
+            text = protect_asterisk_emphasis(text, _ph, _escape_mdv2, block_source=block_source)
+        # 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
+        text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
+        text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
+        # An expandable quote closes only on the last line of its own quote block.
+        def _convert_blockquote(m):
+            lines = [line.split(' ', 1) for line in m.group(0).split('\n')]
+            expandable = lines[0][0].startswith(_EXPANDABLE_QUOTE)
+            lines[0][0] = lines[0][0].replace(_EXPANDABLE_QUOTE, '**')
+            last = len(lines) - 1 if expandable and lines[-1][1].endswith('||') else -1
+            return '\n'.join(_ph(f'{p} {_escape_mdv2(c[:-2])}||' if i == last else f'{p} {_escape_mdv2(c)}')
+                             for i, (p, c) in enumerate(lines))
+
+        text = re.sub(rf'^(?:{_EXPANDABLE_QUOTE})?>{{1,3}} .+$(?:\n>{{1,3}} .+$)*', _convert_blockquote, text,
+                      flags=re.MULTILINE)
+        text = text.replace(_EXPANDABLE_QUOTE, '**')
+        # 10) Escape remaining special characters in plain text
+        text = _escape_mdv2(text)
+        # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
+        for key in reversed(list(placeholders.keys())):
+            text = text.replace(key, placeholders[key])
+        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans. A span's
+        # own escaped \` does not close it, and an escaped \` in prose does not open one.
+        _safe_parts = []
+        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|(?:(?<!\\)|(?<=\\\\))`(?:[^`\\]|\\[\s\S])+`)', text)):
+            if _idx % 2 == 1:
+                _safe_parts.append(_seg)  # inside code — untouched
+            else:
+                _safe_parts.append(re.sub(r'[(){}]', lambda m, _seg=_seg: _escape_bare_bracket(m, _seg), _seg))
+        return ''.join(_safe_parts)
+
 
     # ── Group mention gating ──────────────────────────────────────────────
 
