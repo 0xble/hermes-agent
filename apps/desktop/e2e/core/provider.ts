@@ -77,17 +77,6 @@ export interface ScriptedProvider {
 
 const MARKER_RE = /\bU\d+-[a-z0-9]+\b/
 
-// An in-place compaction mid-turn appends the todo snapshot (tools/todo_tool.py TODO_INJECTION_HEADER)
-// as a user-role row after the turn's request. A snapshot whose todos carry a marker is a scripted
-// turn of its own (lineage-compaction-prompt.spec.ts keys on it). One without a marker is scaffolding,
-// so the scripted turn is still the request before it. Other user-role rows the runtime adds, such as
-// background process notifications, stay prompts: specs script them with scriptPrompt.
-const TODO_SNAPSHOT_PREFIX = '[Your active task list was preserved across context compression]'
-
-// An in-place compaction carries the turn's request after this boundary inside the summary row.
-const COMPACTION_PREFIX = '[CONTEXT COMPACTION'
-const SUMMARY_END_MARKER = '--- END OF CONTEXT SUMMARY'
-
 function textOf(content: unknown): string {
   if (typeof content === 'string') {
     return content
@@ -100,40 +89,24 @@ function textOf(content: unknown): string {
   return ''
 }
 
-function isUnscriptedTodoSnapshot(message: any): boolean {
-  const content = textOf(message?.content)
-
-  return content.trimStart().startsWith(TODO_SNAPSHOT_PREFIX) && !MARKER_RE.test(content)
-}
-
-// The first marker keys a prompt (summary requests rely on this). A compaction carrier quotes
-// earlier turns in its summary, so its key is the first marker after the summary boundary.
-function promptMarker(prompt: string): null | string {
-  const boundary = prompt.trimStart().startsWith(COMPACTION_PREFIX) ? prompt.lastIndexOf(SUMMARY_END_MARKER) : -1
-
-  return MARKER_RE.exec(boundary >= 0 ? prompt.slice(boundary) : prompt)?.[0] ?? null
-}
-
 function turnPosition(messages: any[]): { marker: null | string; prompt: string; step: number } {
-  let userIndex = -1
+  let lastUser = -1
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]
-
-    if (message?.role === 'user' && !isUnscriptedTodoSnapshot(message)) {
-      userIndex = i
+    if (messages[i]?.role === 'user') {
+      lastUser = i
 
       break
     }
   }
 
-  if (userIndex < 0) {
+  if (lastUser < 0) {
     return { marker: null, prompt: '', step: 0 }
   }
 
-  const prompt = textOf(messages[userIndex].content)
-  const marker = promptMarker(prompt)
-  const step = messages.slice(userIndex + 1).filter(m => m?.role === 'assistant').length
+  const prompt = textOf(messages[lastUser].content)
+  const marker = MARKER_RE.exec(prompt)?.[0] ?? null
+  const step = messages.slice(lastUser + 1).filter(m => m?.role === 'assistant').length
 
   return { marker, prompt, step }
 }

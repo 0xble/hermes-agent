@@ -233,9 +233,13 @@ async function withWebapp(
   const sandbox = createCoreSandbox(label)
   writeProviderHome(sandbox.hermesHome, provider.url)
   // todo_list is deferred behind tool_search by default; the scripted model calls it directly.
+  // The 4 x 32 tool rounds cross the 64k sandbox window's compaction threshold mid-turn, and the
+  // compacted transcript re-keys the scripted turn (run 45783683759). Journal replay is this spec's
+  // contract; lineage-compaction-prompt.spec.ts owns compaction inside a turn.
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
+    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n` +
+      `compression:\n  enabled: false\n`
   )
   let browser: Browser | null = null
   let failed = false
