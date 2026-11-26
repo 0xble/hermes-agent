@@ -142,8 +142,13 @@ def test_revision_quotes_rechecked_inside_commit(state, monkeypatch, tmp_path, k
     manager = manager_for(kind)
     manager.set("Ship build", actor="agent")
     quote = "Stop when the release window closes"
+    if action == "replace" and kind == "loop":
+        quote = "Please replace the loop prompt and set the stop condition to the release window"
     if relayed:
-        quote = f"Add the release-window stop condition to the requester {kind}"
+        if action == "replace" and kind == "loop":
+            quote = "Please replace the loop prompt and set the stop condition to the requester loop"
+        else:
+            quote = f"Add the release-window stop condition to the requester {kind}"
         relay(state, monkeypatch, tmp_path, quote)
     else:
         state.append_message("requester", "user", quote)

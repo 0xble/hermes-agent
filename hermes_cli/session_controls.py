@@ -582,7 +582,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     permission = decision(kind, action, policy_state, actor=caller.actor,
                           autonomous=caller is LifecycleAuthority.AUTONOMY)
     if permission != A and not (
-            kind == "goal" and action == "clear" and caller is LifecycleAuthority.AUTONOMY):
+            kind == "goal" and action == "clear" and caller is LifecycleAuthority.AUTONOMY
+            and policy_state is not None and policy_state.status == "active"):
         if (policy_state is not None and policy_state.status == "paused"
                 and policy_state.paused_by != "agent" and action in {"resume", "stop"}):
             # A /goal or /loop pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
@@ -609,6 +610,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         # Only paused goals need a state transition. Resuming an active goal is an idempotent
         # success, while done/cleared goals remain protected from resurrection.
         if manager.state is not None and manager.state.status == "active":
+            if kind == "goal":
+                code = f"nothing_to_{action}"
+                return {"result": {"ok": False, "error_code": code, "error": code},
+                        "state": manager.state}
             return {"result": {"ok": True, "idempotent": True}, "state": manager.state}
         if manager.state is None or manager.state.status != "paused":
             code = f"nothing_to_{action}"
@@ -1571,6 +1576,11 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     caller = LifecycleAuthority.from_control(authority)
     manager = GoalManager(sid, cursor=cursor)
     # Session controls preserve main's explicit pause prefix and user/agent ownership mapping.
+    # Goal autonomy treats an agent pause as a cooldown: keep the goal active so its
+    # continuation remains schedulable, but do not spend a turn while waiting.
+    if caller is LifecycleAuthority.AUTONOMY and manager.state is not None and manager.state.status == "active":
+        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
+                                        reason="session-control: " + (reason or "paused"))
     return manager.pause(reason="session-control: " + (reason or "paused"),
                          by="agent" if caller is LifecycleAuthority.AUTONOMY else caller.actor)
 

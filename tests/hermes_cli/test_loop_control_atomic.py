@@ -23,7 +23,8 @@ def store(tmp_path, monkeypatch):
     db.close()
 
 
-QUOTE = "Please replace the loop with the deployment readiness check"
+QUOTE = ("Please replace the loop prompt, set the interval to 5 minutes, run it 5 times, "
+         "and set the stop condition to ready")
 
 
 def control(manager, operation) -> Any:

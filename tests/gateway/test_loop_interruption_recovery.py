@@ -571,7 +571,8 @@ _LOOP_NON_CONTROL_API = frozenset({
     "state", "refresh", "is_active", "has_loop", "status_line", "is_due",
     "fire_tick", "complete_tick", "abandon_tick", "recover_tick",
 })
-_REPLACE_REQUEST = "please replace the loop with replacement work now"
+_REPLACE_REQUEST = ("Please replace the loop prompt, set the interval to 1 minute, run it 2 times, "
+                    "and set the stop condition to replacement work")
 
 
 def _public_loop_controls():
@@ -605,7 +606,7 @@ def _replace_with_current_quote(sid):
     _record_quote(sid, _REPLACE_REQUEST)
     return _accepted(loops.LoopManager(sid).replace(
         prompt="replacement work", interval_seconds=60, times=2, reason="user asked to replace it",
-        user_quote="replace the loop with replacement work", user_messages=[_REPLACE_REQUEST]))
+        user_quote=_REPLACE_REQUEST, user_messages=[_REPLACE_REQUEST]))
 
 
 def _pause_then_resume_elsewhere(sid):

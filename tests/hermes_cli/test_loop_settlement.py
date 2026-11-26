@@ -22,9 +22,12 @@ def test_judge_cannot_settle_over_a_newer_loop(hermes_home, monkeypatch, verdict
         elif change == "replace":
             from tests.hermes_cli.test_loop_revise import _record_quote
             source = "Watch the new deployment instead"
-            _record_quote(manager.session_id, source)
-            assert writer.replace(prompt=source, reason="User changed task", user_quote=source,
-                                  user_messages=[source], interval_seconds=600)["ok"]
+            quote = ("Please replace the loop prompt, set the interval to 10 minutes, "
+                     "and set the stop condition to the new deployment")
+            _record_quote(manager.session_id, quote)
+            assert writer.replace(prompt=source, reason="User changed task", user_quote=quote,
+                                  user_messages=[quote], interval_seconds=600,
+                                  until="the new deployment")["ok"]
         elif change == "pause":
             writer.pause()
         else:
