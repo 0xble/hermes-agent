@@ -41,6 +41,13 @@ def _realpath(path) -> str:
     return os.path.realpath(path)
 
 
+def _prefetch_realpaths(paths) -> None:
+    """On a named node, resolve all ``paths`` in one round trip so each ``_realpath`` hits the cache."""
+    if _named_remote():
+        from tools.file_backend_state import prefetch_policy_realpaths
+        prefetch_policy_realpaths(paths)
+
+
 def _constants_path(getter_name: str) -> Path:
     """Call ``hermes_constants.<getter_name>()`` (local import avoids cycles); ``~/.hermes`` on any failure."""
     try:
@@ -338,6 +345,7 @@ def build_write_denied_paths(home: str) -> set[str]:
         *(str(base / f) for base in _credential_store_dirs() for f in hermes_files),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
+    _prefetch_realpaths(paths)
     return {spelling for path in paths for spelling in _write_path_spellings(path)}
 
 
@@ -368,6 +376,7 @@ def build_write_denied_prefixes(home: str) -> list[str]:
         *(os.path.join(home, *d.split("/")) for d in HOME_CREDENTIAL_DIRS),
         "/etc/sudoers.d", "/etc/systemd",
     ]
+    _prefetch_realpaths(paths)
     return [spelling + os.sep for path in paths for spelling in _write_path_spellings(path)]
 
 
@@ -406,6 +415,7 @@ def _approval_paths_by_key(home: str) -> dict[str, str]:
     ``~/.bashrc`` (or vice versa)."""
     # _realpath, not os.path.realpath: on a named node these are the node's paths and resolve there,
     # never on the controller's filesystem. With no node selected the two are the same call.
+    _prefetch_realpaths([os.path.join(home, ".ssh", "config"), *(os.path.join(home, name) for name in SHELL_RC_FILES)])
     paths = {_realpath(os.path.join(home, ".ssh", "config")): "ssh_config_write"}
     paths.update({_realpath(os.path.join(home, name)): "shell_rc_write" for name in SHELL_RC_FILES})
     return paths
@@ -467,6 +477,8 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     ):
         return "credential"
 
+    _prefetch_realpaths(os.path.join(str(base), *sub.split("/"))
+                        for base in _credential_store_dirs() for sub in HERMES_PROTECTED_SUBPATHS)
     for base in _credential_store_dirs():
         for sub in HERMES_PROTECTED_SUBPATHS:
             anchor = os.path.join(str(base), *sub.split("/"))

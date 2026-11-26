@@ -381,7 +381,7 @@ def check_telegram_requirements() -> bool:
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 # MarkdownV2 escaping and the bare-bracket safety net live once, in telegram_markdown.py.
 from plugins.platforms.telegram.telegram_markdown import (
-    _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2, _stash_bare_urls,
+    _EXPANDABLE_QUOTE, _PLACEHOLDER_RE, _escape_bare_bracket, _escape_mdv2, _expand_placeholders, _stash_bare_urls,
 )
 
 
@@ -6922,17 +6922,19 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Resolve nested/multiline asterisk emphasis before the final escaping pass.
         from plugins.platforms.telegram.telegram_markdown import _resolve_emphasis
 
-        # Star runs around a bare URL pair by the shared URL-aware pairer (it splits a mixed run the
-        # way the URL scan does); all other text keeps the block-aware CommonMark parser, which
-        # honours ``\\*`` escapes and quote continuation lines.
-        if any(key in text for key in url_keys):
+        # Star runs around a bare URL, or inside a ``**bold**`` span, pair by the shared pairer: it
+        # splits a mixed run the way the URL scan does and keeps a lone ``*`` inside bold literal
+        # (``**rm -rf *.tmp**``, #151722). Everything else keeps the block-aware CommonMark pairing,
+        # which honours ``\\*`` escapes and quote continuation lines.
+        if '**' in text or any(key in text for key in url_keys):
             text = _resolve_emphasis(text, _ph, _escape_mdv2)
         else:
             from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
             block_source = text
-            for key, value in placeholders.items():
-                if value.startswith(('```', '*')):
-                    block_source = block_source.replace(key, '# protected block')
+            protected = {key for key, value in placeholders.items() if value.startswith(('```', '*'))}
+            if protected:
+                block_source = _PLACEHOLDER_RE.sub(
+                    lambda m: '# protected block' if m.group(0) in protected else m.group(0), text)
             text = protect_asterisk_emphasis(text, _ph, _escape_mdv2, block_source=block_source)
         # 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
         text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
@@ -6951,9 +6953,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         text = text.replace(_EXPANDABLE_QUOTE, '**')
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
-        # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
-        for key in reversed(list(placeholders.keys())):
-            text = text.replace(key, placeholders[key])
+        # 11) Restore placeholders in one pass. A value only nests keys stashed before it, so expanding
+        # values in insertion order resolves every nesting; a str.replace per key rescans the whole
+        # message once per key and is quadratic on a long run of escaped stars (#150997).
+        expanded: dict = {}
+        for key, value in placeholders.items():
+            expanded[key] = _expand_placeholders(value, expanded)
+        text = _expand_placeholders(text, expanded)
         # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans. A span's
         # own escaped \` does not close it, and an escaped \` in prose does not open one.
         _safe_parts = []
