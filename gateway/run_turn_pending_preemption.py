@@ -38,7 +38,7 @@ async def _send_queued_ack(runner: Any, event: Any, quick_key: str) -> None:
 
 
 async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder: Any, timeout: float) -> None:
-    """Cold path: yield an internal lease holder, waiting (bounded by ``timeout``) for a pending agent."""
+    """Yield an internal lease holder, waiting (bounded by ``timeout``) for publication."""
     from gateway.meeting_lane import busy_input_mode
     from gateway.run import _AGENT_PENDING_SENTINEL
     if not _eligible_machine_waiter(runner, event, holder) or await busy_input_mode(runner, event, quick_key) == "steer":
@@ -70,7 +70,6 @@ async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder
     if callable(compression_check) and await compression_check(quick_key):
         return
     adapter = runner._delivery_adapter_for(event.source)
-    # Final identity check; no await separates it from interrupt().
     _, turn, current = live_agent()
     if (adapter is None or not holds() or current is not agent
             or getattr(turn, "agent_published_generation", holder.generation) != holder.generation):
@@ -80,7 +79,6 @@ async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder
     except Exception:
         logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
         return
-    logger.info("User message preempts autonomous turn on lease wait (session=%s)", quick_key)
     if not getattr(event, "_gateway_busy_ack_sent", False):
         from agent.i18n import t
         from agent.notice_style import ContextNotice
@@ -94,7 +92,7 @@ async def _authority_preemption(
     runner: Any, event: Any, source: Any, quick_key: str, state: Any, turn: Any, generation: int,
     running_agent: Any,
 ) -> None:
-    """Authority path: the FIFO row is already admitted; cut the machine turn without delaying it."""
+    """Authority path: the FIFO row is admitted; cut the machine turn without delaying it."""
     from gateway.run import _AGENT_PENDING_SENTINEL
     from gateway.run_turn_lease_wait import lease_wait_max_seconds
     adapter = runner._delivery_adapter_for(source)
@@ -113,7 +111,7 @@ async def _authority_preemption(
         return
 
     def current() -> Any:
-        """The published agent when this exact turn, opener, run generation and agent still hold."""
+        """Return the published agent only while this exact turn still owns the slot."""
         agent = turn.agent
         if (turn.event is not opener or agent is None or agent is _AGENT_PENDING_SENTINEL
                 or int(runner._current_session_run_generation(quick_key)) != int(generation)):
@@ -128,7 +126,7 @@ async def _authority_preemption(
         return
     subagents = bool(runner._agent_has_active_subagents(agent))
     compression = bool(await runner._session_has_compression_in_flight(quick_key))
-    if current() is not agent:  # final identity check; no await before interrupt()
+    if current() is not agent:
         return
     if subagents or compression:
         await runner._busy_interrupt_and_ack(event, quick_key, adapter, state, agent, outcome("queue", subagents, compression))
