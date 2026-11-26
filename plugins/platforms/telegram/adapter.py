@@ -1841,9 +1841,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
         Awaited so the store's read-modify-write + ``os.replace`` runs off the loop."""
         from gateway import rich_sent_store
-        # The store never raises (a failed index write must not fail a send that landed), so its
-        # result is the only signal: a broken index silently degrades every later quote-reply.
-        if not await rich_sent_store.record_async(str(chat_id), str(message_id), content):
+        # The store normally never raises, but test doubles and filesystem errors can; preserve
+        # the send and surface the failed index so quote recovery is diagnosable.
+        try:
+            recorded = await rich_sent_store.record_async(str(chat_id), str(message_id), content)
+        except Exception:
+            logger.warning("[Telegram] failed to index sent message %s for quote-reply recovery", message_id, exc_info=True)
+            return
+        if not recorded:
             logger.warning("[Telegram] failed to index sent message %s for quote-reply recovery", message_id)
 
     async def _try_send_rich(
@@ -4797,8 +4802,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         _saturated_preview = False
         if finalize:
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
-        from gateway.copy_blocks import _has_copy_markers
         # A copy quote's wire form is longer than its source, so measure the encoded text too.
+        from gateway.copy_blocks import _has_copy_markers
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH or (
                 _has_copy_markers(content)
                 and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH):
@@ -4816,12 +4821,16 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Previews edit in the final's parse mode (#49536): a plain -> MarkdownV2 flip on the same message makes
         # clients draw the old layout over the new text. A rejected preview retries as raw text (nothing lost).
         formatted = self.format_message(content)
-        plain = _strip_mdv2(content) if finalize or _has_copy_markers(content) else content
+        plain = (_strip_mdv2(content) if content else content) if finalize else content
         warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
         try:
+            if not finalize:
+                await self._edit_preview(chat_id, message_id, content)
+                if _saturated_preview:
+                    self._last_overflow_preview[_preview_key] = content
+                return SendResult(success=True, message_id=message_id)
             await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
-            if _saturated_preview:
-                self._last_overflow_preview[_preview_key] = content
+            await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
