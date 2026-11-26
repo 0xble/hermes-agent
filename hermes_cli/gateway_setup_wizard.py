@@ -10,9 +10,6 @@ import shutil
 import subprocess
 import sys
 
-from plugins.platforms.weixin.adapter import _WEIXIN_DM_POLICIES, _WEIXIN_GROUP_NOTE
-
-
 def _gw():
     from hermes_cli import gateway  # late: the facade imports this module
     return gateway
