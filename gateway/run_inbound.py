@@ -1061,21 +1061,22 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
             if self._human_preempts_autonomous_turn(event, state):
-                # Keep the user message as a durable FIFO row, but cut the autonomous turn
-                # cooperatively. Admission must not await publication or interruption.
-                from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
-                if getattr(event, "_gateway_machine_preemption_scheduled", False):
-                    return False
-                setattr(event, "_gateway_machine_preemption_scheduled", True)
-                generation = self._current_session_run_generation(_quick_key)
-                schedule_authority_machine_preemption(
-                    self, event, source, _quick_key, state, state.turn, generation, running_agent,
-                )
-            elif event.message_type == MessageType.TEXT and mode == "queue" and not superseded:
-                from gateway.run_turn_pending_preemption import schedule_authority_queued_ack
-                schedule_authority_queued_ack(
-                    self, event, source, _quick_key, state, running_agent,
-                )
+                if mode == "queue" and event.message_type == MessageType.TEXT:
+                    # Keep the user message as a durable FIFO row and cut the machine turn
+                    # cooperatively; admission never awaits publication or the interrupt.
+                    from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
+                    if not getattr(event, "_gateway_machine_preemption_scheduled", False):
+                        setattr(event, "_gateway_machine_preemption_scheduled", True)
+                        schedule_authority_machine_preemption(
+                            self, event, source, _quick_key, state, state.turn,
+                            self._current_session_run_generation(_quick_key), running_agent,
+                        )
+                else:
+                    # Steer mode and media keep queue semantics: saved as a queued row, say so.
+                    queued = self._BusySteerOutcome(
+                        effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
+                        steered=False, redirected=False)
+                    await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, queued)
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
         note_busy_outcome(event, outcome)

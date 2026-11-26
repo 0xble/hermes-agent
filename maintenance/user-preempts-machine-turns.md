@@ -26,9 +26,14 @@ Preemption happens only when all of these hold:
 - the holder agent has no active subagents and no compression in flight
 - the holder has a live agent (a pending sentinel or missing agent means wait)
 
-For the authority path's pending-agent window, wait on the turn's
-`agent_published_event` or `turn_ended_event`, bounded and tracked, then re-check
-the same opener event, turn object, published agent, and run generation. This
+Only typed `TEXT` in `queue` mode preempts; `steer` mode and media keep queue
+semantics. Typed text behind a person's own turn stays silent, as on main.
+
+For the authority path's pending-agent window, wait in the background on the
+turn's `agent_published_event` or `turn_ended_event`, bounded by
+`lease_wait_max_seconds()`, then re-check the same opener event, published agent,
+and run generation. If the bound expires with no publication, the existing
+queued acknowledgement is sent once and nothing is interrupted. This
 keeps the wait a soft yield and prevents a late publication from interrupting a
 successor turn; a pending-stop latch was not used because it is coupled to hard
 stop attribution and would broaden the control path.
@@ -38,7 +43,7 @@ machine turn is inside a non-interruptible tool or step, it keeps the lease unti
 that step yields; the user message remains FIFO behind it and receives the
 existing "Interrupting" acknowledgement instead of a second queued notice.
 
-Contract tests: `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_is_soft_preempted_once`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_with_active_subagents_stays_queued`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_origin_text_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_relay_event_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_a_persons_own_turn_still_queues_silently`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_publishes_then_is_preempted_once`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_releases_without_publication_and_is_not_preempted`.
+Contract tests: `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_is_soft_preempted_once`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_with_active_subagents_stays_queued`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_origin_text_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_relay_event_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_a_persons_own_turn_still_queues_silently`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_publishes_then_is_preempted_once`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_releases_without_publication_and_is_not_preempted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_machine_turn_never_published_gets_one_queued_ack_and_no_interrupt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_turn`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_wait_ending_or_successor_turn_is_never_interrupted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop`.
 
 ## Interrupt attribution on early returns
 

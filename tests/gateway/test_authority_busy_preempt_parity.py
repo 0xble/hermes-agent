@@ -120,12 +120,12 @@ def _goal_turn(runner, source, turn, agent):
 
 
 async def _queued_behind(tmp_path, monkeypatch, opener, message_id, *, publish_pending=False, wait_for_busy=True,
-                    active_subagents=False):
+                    active_subagents=False, after_admit=None, message_type=MessageType.TEXT, mode='queue'):
     """Send a typed queue-mode message behind ``opener`` and return its admitted rows, steers and sends."""
     from tests.waiting import async_wait_until
     from gateway.run import _AGENT_PENDING_SENTINEL
 
-    runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
+    runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, mode)
     monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
     monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
     if active_subagents:
@@ -138,21 +138,22 @@ async def _queued_behind(tmp_path, monkeypatch, opener, message_id, *, publish_p
     try:
         event = MessageEvent(
             text='check now', source=source, message_id=message_id, reply_expected=True,
+            message_type=message_type,
         )
         task = asyncio.ensure_future(runner._hm_admit_to_fifo(
             authority, event, source, runner._session_key_for_source(source), True,
         ))
         await async_wait_until(lambda: _admitted(authority), timeout=10, what='the typed message admitted')
-        if publish_pending:
-            turn.agent_published_generation = runner._current_session_run_generation(runner._session_key_for_source(source))
-            turn.agent_published_agent = agent
-            turn.agent = agent
-            turn.agent_published_event.set()
+        if after_admit is not None:
+            await after_admit(runner, source, turn, agent)
+        elif publish_pending:
+            turn.publish_agent(agent, None, runner._current_session_run_generation(runner._session_key_for_source(source)))
         if wait_for_busy:
             await async_wait_until(
                 lambda: agent.interrupts or any('Queued for the next turn' in str(x) for x in sent),
                 timeout=10, what='the busy result',
             )
+        await asyncio.wait_for(asyncio.gather(*getattr(runner, '_background_tasks', ()), return_exceptions=True), 10)
         task.cancel()
         return _admitted(authority), agent.steers, agent.interrupts, sent
     finally:
@@ -230,8 +231,98 @@ async def test_typed_text_behind_a_persons_own_turn_still_queues_silently(tmp_pa
     def opener(runner, source, turn, agent):
         turn.event = MessageEvent(text='do the thing', source=source, message_id='t1', reply_expected=True)
     rows, steers, interrupts, sent = await _queued_behind(
-        tmp_path, monkeypatch, opener, 'h2',
+        tmp_path, monkeypatch, opener, 'h2', wait_for_busy=False,
     )
     assert [(row['request_id'], row['status']) for row in rows] == [('h2', 'queued')]
-    assert steers == [] and interrupts == []
+    assert steers == [] and interrupts == [] and sent == []
+
+
+@pytest.mark.asyncio
+async def test_pending_machine_turn_never_published_gets_one_queued_ack_and_no_interrupt(tmp_path, monkeypatch):
+    """The bound expires with no publication: no interrupt, exactly one existing queued ack (as on main)."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    monkeypatch.setattr('gateway.run_turn_lease_wait.lease_wait_max_seconds', lambda: 0.01)
+
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
+
+    async def never_publish(runner, source, turn, agent):
+        pass  # the pending sentinel is never replaced and the turn never ends
+
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-never', publish_pending=True, after_admit=never_publish,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-never', 'queued')]
+    assert interrupts == [] and steers == []
     assert len(sent) == 1 and 'Queued for the next turn' in str(sent[0]), sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['steer-mode', 'photo'])
+async def test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_turn(tmp_path, monkeypatch, case):
+    """Only typed text in queue mode preempts, including while the agent is still pending."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
+
+    kwargs = {'mode': 'steer'} if case == 'steer-mode' else {'message_type': MessageType.PHOTO}
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-' + case, publish_pending=True, **kwargs,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-' + case, 'queued')]
+    assert interrupts == [] and steers == []
+    assert len(sent) == 1 and 'Queued for the next turn' in str(sent[0]), sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('successor', ['ended', 'successor-turn'])
+async def test_pending_wait_ending_or_successor_turn_is_never_interrupted(tmp_path, monkeypatch, successor):
+    """The machine turn ends during the pending wait, or a successor reuses the slot: nothing is interrupted."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
+
+    async def end_turn(runner, source, turn, agent):
+        key = runner._session_key_for_source(source)
+        generation = runner._current_session_run_generation(key)
+        if successor == 'successor-turn':
+            turn.event = MessageEvent(text='next', source=source, message_id='succ', reply_expected=True)
+            turn.publish_agent(agent, None, generation)  # the successor's agent, a different opener
+        turn.turn_ended_event.set()
+
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-' + successor, publish_pending=True, wait_for_busy=False,
+        after_admit=end_turn,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-' + successor, 'queued')]
+    assert interrupts == [] and steers == []
+
+
+def test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop(tmp_path, monkeypatch):
+    """A preemption seen in the publish-to-adopt gap survives; a stale earlier-generation Stop is dropped."""
+    from agent.interrupt_control import InterruptControlMixin
+    from tests.gateway.test_session_authority_cancel_settlement import _authority
+
+    class Agent(InterruptControlMixin):
+        def __init__(self):
+            self._interrupt_requested = False
+            self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
+            self._pending_steer = self._pending_redirect = None
+
+        def clear_interrupt(self, **_):
+            self._interrupt_requested = False
+            self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    with db:
+        preempted, stale = Agent(), Agent()
+        preempted._interrupt_requested, preempted._tool_interrupt_reason = True, 'gateway user turn preemption'
+        preempted._interrupt_source = 'system'
+        stale._interrupt_requested, stale._tool_interrupt_reason = True, 'explicit stop requested'
+        for agent in (preempted, stale):
+            authority.delivered_stops['s'] = 1  # a Stop delivered for an earlier generation
+            authority.adopt_agent('s', 2, agent)
+        assert preempted._interrupt_requested is True
+        assert stale._interrupt_requested is False
