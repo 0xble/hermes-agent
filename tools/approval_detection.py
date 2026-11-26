@@ -393,6 +393,26 @@ _FALLBACK_COMMAND_START_RE = re.compile(
     r"\$\(|[;&|(){}`'\"\n]|(?<![\w./-])(?:if|then|else|elif|do|while|until|!)(?=\s)")
 _FALLBACK_UNQUOTED_START_RE = re.compile(
     r"\$\(|[;&|()`\n]|(?<!\$)\{|\}|(?<![\w./-])(?:if|then|else|elif|do|while|until|!)(?=\s)")
+# Hardline matching is intentionally exhaustive, but most commands cannot match any floor. Keep the
+# cheap gate conservative and run it on the same normalized text as the real patterns: shell-spliced
+# spellings such as `r\\m` still reach the floor, while repeated harmless command words do not make
+# every hardline projection walk the whole command.
+_HARDLINE_TRIGGER_RE = re.compile(
+    r"(?:\brm\b|\bmkfs(?:\b|\.)|\bdd\b|\bkill\b|\b(?:shutdown|reboot|halt|poweroff|init|systemctl|telinit)\b|"
+    r"\b(?:restart-computer|stop-computer|format|clear-disk|remove-item|ri|del|erase|rmdir|rd|vssadmin|diskpart|cipher|taskkill|stop-process|"
+    r"stop-service|sc|bcdedit|wbadmin)\b|/dev/(?:sd|nvme|hd|mmcblk|vd|xvd)|>\s*/dev/|:\(\))",
+    re.IGNORECASE,
+)
+
+
+def _hardline_scan_can_skip(command: str, normalized: str) -> bool:
+    """Whether the normalized trigger absence proves the hardline floor cannot match.
+
+    Keep syntax-bearing inputs on the full budgeted path: normalization may turn an escaped or
+    quoted spelling into a floor candidate, and that path also records incomplete scans for the
+    approval gate.
+    """
+    return not any(char in command for char in "\\$'\"") and not _HARDLINE_TRIGGER_RE.search(normalized)
 
 
 def _hardline_fallback(command: str) -> str | None:
@@ -406,7 +426,10 @@ def _hardline_fallback(command: str) -> str | None:
     `"of=/dev/sda"` and `${HOME}` read as the shell reads them). That treats quoted prose as code
     (false refusals) and adds no super-linear pattern. It is not complete: what it misses gets the
     human-only once/deny prompt."""
-    for text in (command, expand_ansi_c_quotes(command), _normalize_command_for_detection(command)):
+    normalized = _normalize_command_for_detection(command)
+    if _hardline_scan_can_skip(command, normalized):
+        return None
+    for text in (command, expand_ansi_c_quotes(command), normalized):
         lowered = text.lower()
         unquoted = lowered.replace("'", "").replace('"', "")
         for variant in (lowered, _FALLBACK_COMMAND_START_RE.sub("\n", lowered),
@@ -429,6 +452,9 @@ def hardline_scan_incomplete(command: str) -> bool:
 def _detect_hardline_command(command: str) -> tuple:
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    normalized = _normalize_command_for_detection(command)
+    if _hardline_scan_can_skip(command, normalized):
+        return (False, None)
     # The malformed-quoting verdict needs the author's quote state. Normalization strips escapes
     # (`\"` -> `"`), so a shell-valid pattern like `grep -o "[^\"]*"` lexed as unterminated and was
     # reported as a hardline block (118 of 125 hardline blocks in one week of real use, every one a
@@ -1678,6 +1704,11 @@ def _single_command_detection_variants(
     marked = _mark_command_starts(grep_safe)
     if marked != grep_safe and fresh(marked):
         yield marked
+    # Plain shell words and separators have no nested payloads, quote-spliced words, or escaped
+    # syntax to recover. The normalized and command-start-marked variants above are complete; avoid
+    # sending every repeated harmless command through the payload/token scanners.
+    if not any(char in command for char in "'\"\\$`(){}"):
+        return
     # Every variant above tracks quotes on NORMALIZED text, where `\"` has already become `"`. That
     # flips quote parity, so in `cat "f\"n.txt"; rm -rf /` the `; rm` start sat "inside" a phantom
     # quote, no start was marked, and the hardline floor let it through. Mark starts on the RAW
