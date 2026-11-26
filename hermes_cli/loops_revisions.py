@@ -16,6 +16,60 @@ if TYPE_CHECKING:
     from hermes_cli.loops import LoopState
 
 
+
+def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, Any],
+                            after: dict[str, Any]) -> bool:
+    """Require a supplied quote to describe every protected loop delta it authorizes.
+
+    Provenance/freshness is checked by ``check_user_quote``. This second check binds the
+    authenticated words to the requested operation, so a quote about prompt wording cannot
+    authorize removing a stop condition (or a combined edit containing both).
+    """
+    import re
+
+    words = set(re.findall(r"[a-z0-9']+", str(quote or '').casefold()))
+    if not words:
+        return False
+    loop_words = {"loop", "poll", "polling", "check", "checking", "watch", "monitor", "task", "condition", "until"}
+    action_words = {"change", "update", "switch", "replace", "revise", "reword", "rewrite",
+                    "modify", "set", "make", "use", "keep", "slow", "slower", "faster",
+                    "speed", "speedup", "increase", "decrease", "reduce", "remove", "drop",
+                    "delete", "clear", "stop", "end", "cancel", "extend", "raise", "lower"}
+    # A lifecycle quote must be an instruction about this loop, not a status report or a
+    # generic mention of changing something elsewhere.
+    if not words & action_words:
+        return False
+    checks: list[bool] = []
+    if "prompt" in changed:
+        # Wording/objective edits need an explicit wording/task change, and must not be
+        # satisfied by a quote that only discusses cadence or stopping.
+        checks.append(bool(words & {"wording", "reword", "rewrite", "prompt", "task", "target",
+                                    "check", "watch", "monitor", "poll", "polling", "change",
+                                    "switch", "replace", "update", "modify"}))
+    if "until" in changed:
+        old = str(before.get("until") or "").strip()
+        new = str(after.get("until") or "").strip()
+        if old and not new:
+            checks.append(bool(words & {"remove", "drop", "delete", "clear", "stop", "end",
+                                        "cancel"}) and bool(words & {"condition", "stop", "stopping",
+                                                                       "until", "finish", "finished",
+                                                                       "done", "end"}))
+        else:
+            checks.append(bool(words & {"stop", "condition", "until", "finish", "finished",
+                                        "done", "when", "after"})
+                          or ("instead" in words and bool(words & {"watch", "monitor", "check", "poll",
+                                                                  "change", "switch", "replace"})))
+    if "times" in changed:
+        checks.append(bool(words & {"times", "runs", "run", "budget", "cap", "limit",
+                                    "retries", "retry", "forever", "unlimited", "again"}))
+    if any(key in changed for key in ("interval_seconds", "mode", "current_delay")):
+        checks.append(bool(words & {"interval", "cadence", "poll", "polling", "frequent",
+                                    "frequency", "often", "slow", "slower", "fast", "faster",
+                                    "speed", "speedup", "minute", "minutes", "hour", "hours",
+                                    "paced", "pace"}))
+    return bool(checks) and all(checks)
+
+
 class LoopRevisionsMixin:
     @staticmethod
     def _revision_result(*, ok: bool, revision: Optional[dict[str, Any]], version: int,
@@ -29,7 +83,9 @@ class LoopRevisionsMixin:
         }
 
     def _revision_quote(self, state: LoopState, user_quote: str,
-                        user_messages: Optional[list[str]], *, required: bool, stop_condition: str = "") -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
+                        user_messages: Optional[list[str]], *, required: bool, stop_condition: str = "",
+                        changed: Optional[list[str]] = None, before: Optional[dict[str, Any]] = None,
+                        after: Optional[dict[str, Any]] = None) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
         """Validate a verbatim user quote using the goal lifecycle's shared source rules."""
         from hermes_cli.goals import _REVISION_QUOTE_MIN_CHARS
 
@@ -54,6 +110,10 @@ class LoopRevisionsMixin:
                                    stop_condition=stop_condition)
         if isinstance(checked, str):
             return None, checked, {"error": "user_quote has no current authenticated source"}
+        if changed and not _quote_authorizes_delta(checked[1], changed, before or {}, after or {}):
+            return None, "user_quote_qualified", {
+                "error": "user_quote does not authorize every requested loop change"
+            }
         return checked[0], None, {
             "user_message": checked[1],
             "source_session_id": checked.source_session_id,
@@ -196,6 +256,7 @@ class LoopRevisionsMixin:
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority,
             stop_condition=after["until"] if "until" in changed else "",
+            changed=changed, before=before, after=after,
         )
         if quote_error:
             return self._revision_result(
@@ -319,6 +380,9 @@ class LoopRevisionsMixin:
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority,
             stop_condition=(until or "").strip() if until != state.until else "",
+            changed=["prompt"] + (["until"] if until != state.until else []),
+            before={"prompt": state.prompt, "until": state.until},
+            after={"prompt": prompt, "until": (until or "").strip()},
         )
         if quote_error:
             return self._revision_result(

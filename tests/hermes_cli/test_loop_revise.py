@@ -134,6 +134,29 @@ def test_replace_keeps_a_user_paused_loop_paused(tmp_path, monkeypatch):
     assert mgr.is_due() is False
 
 
+def test_unrelated_quote_cannot_authorize_stop_condition_removal(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "delta-scope")
+    mgr.set("watch the deployment", interval_seconds=300, until="deployment is green")
+    quote = "Please change the loop wording to the new deployment check"
+    result = mgr.revise(reason="remove old stop condition", until="", user_quote=quote,
+                        user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"] is False
+    assert result["error_code"] == "user_quote_qualified"
+    assert mgr.state.until == "deployment is green"
+
+
+def test_combined_loop_edit_requires_quote_for_each_delta(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "delta-combined")
+    mgr.set("watch the deployment", interval_seconds=300, until="deployment is green")
+    quote = "Please remove the loop stop condition"
+    result = mgr.revise(reason="remove condition and reword", prompt="check the release", until="",
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"] is False
+    assert result["error_code"] == "user_quote_qualified"
+    assert mgr.state.prompt == "watch the deployment"
+    assert mgr.state.until == "deployment is green"
+
+
 def test_invalid_no_change_and_done_errors(tmp_path, monkeypatch):
     from hermes_cli.loops import LoopManager
 
