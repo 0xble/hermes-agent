@@ -330,6 +330,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # counting internal/system events would keep a genuinely idle gateway awake.
         if not getattr(event, "_gateway_compression_deferred", False):
             self._scale_to_zero_note_real_inbound()
+            from gateway.wake import note_topic_present
+            note_topic_present(self, source)
             original_event = event
             event = await self._hm_pre_gateway_dispatch_hook(event, source)
             if event is None:
