@@ -475,7 +475,8 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize, raw_text=pre_fence_text)
+                return await self._first_send(text, finalize=finalize, raw_text=pre_fence_text,
+                                              is_turn_final=is_turn_final)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -603,7 +604,8 @@ class StreamTransportMixin:
         await self._journal_preview("", force=True)
         self._split_delivery_journal_pending = False
 
-    async def _first_send(self, text: str, *, finalize: bool, raw_text: Optional[str] = None) -> bool:
+    async def _first_send(self, text: str, *, finalize: bool, raw_text: Optional[str] = None,
+                          is_turn_final: bool = True) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -624,13 +626,15 @@ class StreamTransportMixin:
         except Exception as exc:
             logger.error("Stream first send error: %s", exc, exc_info=True)
             if await self._uncertain_send_fully_shown(exc):
-                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize)
+                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize,
+                                                       is_turn_final=is_turn_final)
             await self._journal_preview("")
             self._edit_supported = False
             return False
         if not result.success:
             if await self._uncertain_send_fully_shown(result):
-                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize)
+                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize,
+                                                       is_turn_final=is_turn_final)
             await self._journal_preview("")
             self._edit_supported = False
             return False
@@ -712,7 +716,7 @@ class StreamTransportMixin:
         return True
 
     def _hold_ambiguous_first_send(self, text: str, raw_text: Optional[str], *, finalize: bool,
-                                   ) -> bool:
+                                   is_turn_final: bool = True) -> bool:
         """A first send failed in a way that may still have landed: count ``text`` as shown and
         never open a second message with it. A preview leaves only its unseen tail for got_done;
         a final is the turn's delivery, and ``_delivery_ambiguous`` keeps the gateway's normal
@@ -724,7 +728,10 @@ class StreamTransportMixin:
         self._delivery_uncertain = True
         if finalize:
             self._delivery_ambiguous = True
-            self._mark_final_delivered(record=text)
+            # A segment-break finalize is an interim preamble: sealing the turn-final flags on it
+            # would suppress the real final that follows the tool call.
+            if is_turn_final:
+                self._mark_final_delivered(record=text)
         else:
             self._preview_uncertain = True
             # The seen prefix is the RAW stream: a fence closed only for display is not in the
