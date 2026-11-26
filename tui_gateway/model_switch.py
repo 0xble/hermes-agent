@@ -21,10 +21,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
             "reasoning_override": copy.deepcopy(getattr(agent, "reasoning_override", None)),
-            "primary_runtime": primary_runtime_for_restore(agent),
-            "pinned_fallback_model": getattr(agent, "_pinned_fallback_model", None),
-            "fallback_chain": copy.deepcopy(getattr(agent, "_fallback_chain", None)),
-            "fallback_index": getattr(agent, "_fallback_index", 0)}
+            "primary_runtime": primary_runtime_for_restore(agent)}
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
@@ -42,11 +39,6 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
     _restore_reasoning()
-    if "pinned_fallback_model" in snapshot:
-        agent._pinned_fallback_model = snapshot["pinned_fallback_model"]
-        agent._fallback_chain = copy.deepcopy(snapshot.get("fallback_chain") or [])
-        agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
-        agent._fallback_index = snapshot.get("fallback_index", 0)
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -266,9 +258,9 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
 
 
 def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
-    """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts.
-    The transcript claim is held for the whole commit so the idle reaper cannot release the lease between
-    the ownership check and the marker."""
+    """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts. The transcript
+    claim is held for the whole commit (the marker writes the chat's transcript), so the idle reaper cannot
+    release the lease between the ownership check and the marker."""
     with _transcript_claim(session):
         try:
             agent.switch_model(
@@ -276,19 +268,15 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
                 base_url=result.base_url, api_mode=result.api_mode,
                 capabilities=getattr(result, "runtime_capabilities", None))
         except Exception as exc:
+            # The in-place swap rolled the agent back and re-raised. Abort the whole commit (worker
+            # restart, persist, marker, override, config write) or the session pins a broken model.
+            # Abort the commit: do NOT restart the slash worker, persist runtime, append the switch marker, set
+            # a session model_override, or persist to config — all of which would otherwise leave the session
+            # pinned to a broken model and kill the conversation on the next turn (#50163). A failed switch is a
+            # no-op; surface a clean error to the client.
             logger.warning("In-place model switch failed for TUI agent: %s", exc)
             raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                              f"staying on {getattr(agent, 'model', current_model)}.") from exc
-        from agent.agent_init_fallback import _fallback_entries
-        from hermes_cli.fallback_config import same_model_fallbacks
-        agent._pinned_fallback_model = result.new_model
-        agent._fallback_chain = same_model_fallbacks(
-            _fallback_entries(_load_fallback_model()), result.new_model)
-        agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
-        agent._fallback_index = 0
-        if snapshot is None:
-            session["model_pinned"] = True
-        agent._preflight_fallback = None
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
@@ -372,7 +360,6 @@ def _apply_model_switch(
     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
     # every same-profile session in one process, so os.environ would leak the switch to all.
     if pin_session_override and isinstance(session, dict) and not one_turn:
-        session["model_pinned"] = True
         session["model_override"] = {
             "model": result.new_model, "provider": result.target_provider,
             "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}

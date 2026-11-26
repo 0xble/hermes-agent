@@ -109,12 +109,6 @@ launchd reload from an external kill.
 
 ## Verification and retirement
 
-Commit `d389ff3baa` (a sync regression-batch repair that landed with the v0.22.5 sync, #776, on 2026-10-26) restored upstream's
-single-window verifier body and deleted the three drain-window tests while keeping the
-`shutdown_timeout` parameter and its docstring, so a drain longer than the respawn window
-would again report a healthy restart as unsupervised. The logic and tests were restored
-together; the pinned contract tests keep a later sync from dropping them unseen.
-
 Run scripts/run_tests.sh for
 tests/hermes_cli/test_launchd_reload_exit_budget.py,
 tests/hermes_cli/test_update_launchd_restart_verification.py,
@@ -127,5 +121,3 @@ and that an old PID which never exits still fails within the shutdown budget.
 Retire when the selected upstream release verifies a slow-draining restart
 without the local change, whether through PR #94768 revised as suggested or an
 equivalent. Roll back by reverting the change.
-
-Contract tests: `tests/hermes_cli/test_launchd_reload_exit_budget.py`, `tests/hermes_cli/test_launchd_reload_handoff.py`, `tests/gateway/test_planned_restart_signal.py`, `tests/hermes_cli/test_update_launchd_restart_verification.py`, `tests/hermes_cli/test_update_launchd_fleet_restart.py`, `tests/hermes_cli/test_gateway_service.py`.

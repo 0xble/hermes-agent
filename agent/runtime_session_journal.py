@@ -3,7 +3,6 @@ import gzip
 import io
 import json
 import zlib
-import contextlib
 
 from agent.runtime_session_store import WorkerPersistenceError
 
@@ -63,13 +62,10 @@ def check_worker_frame(scope, entry):
         raise OutboxCapacityError('outbox_full')
 
 
-def save_journal(store, journal, *, skip_privacy=False):
+def save_journal(store, journal):
     if store._outbox_owner.closed:
         raise WorkerPersistenceError('outbox_closed')
-    from agent.runtime_session_privacy import journal_admission
-    admission = journal_admission(store.scope, journal)
-    with (contextlib.nullcontext() if skip_privacy else admission):
-        encoded = encode_journal(journal, store.max_bytes)
-        from utils import atomic_write_bytes
-        # Owner-only journal (the directory is 0700 too); rename and directory entry are durable.
-        atomic_write_bytes(store.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
+    encoded = encode_journal(journal, store.max_bytes)
+    from utils import atomic_write_bytes
+    # Owner-only journal (the directory is 0700 too); rename and directory entry are durable.
+    atomic_write_bytes(store.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)

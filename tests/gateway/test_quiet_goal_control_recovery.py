@@ -1,4 +1,5 @@
 """Quiet cosmetic outcomes must not change durable control admission or recovery."""
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -23,10 +24,7 @@ async def test_failed_autonomy_outcome_uses_visibility_policy(state, notices):
     from hermes_cli import session_controls as controls
     from hermes_cli.goals import GoalManager
     _policy(notices=notices)
-    # Resuming a finished goal fails (an active one is an idempotent success since #676).
-    manager = GoalManager("target")
-    manager.set("already finished")
-    manager.mark_done("finished")
+    GoalManager("target").set("already active")
     result = controls.apply_control("goal", "resume", "target", requester_sid="requester")
     assert result["status"] == "failed"
     runner = _runner(state)
@@ -101,11 +99,10 @@ async def test_quiet_offline_control_recovers_progress_without_cosmetic_retries(
     assert admit.await_count == int(action != "pause")
     assert online.adapter.sends == online.injections == []
     assert controls.pending_outbox() == []
-    # Quiet/offline delivery cannot turn an explicit pause into an automatic wake.
+    # An autonomous pause parks the goal on a timed wake instead of stopping it.
     final = load_goal("target")
-    assert final.status == ("paused" if action == "pause" else "active")
-    assert final.waiting_until == 0
-    assert final.waiting_seconds == 0
+    assert final.status == "active"
+    assert (final.waiting_until > time.time()) is (action == "pause")
     assert controls._load_record(result["record"]["id"])["continuations_cleared"]
 
 

@@ -88,69 +88,6 @@ def pinned_backend(agent: Any) -> str:
     return pinned if isinstance(pinned, str) else ""
 
 
-def refresh_gateway_delegation_mode(agent: Any, *, apply: bool = True) -> bool:
-    """Re-derive a gateway session's joined/background schema from current config.
-
-    A restored ``tools[]`` pin remains authoritative during ordinary turns. The
-    prompt-refresh and compaction boundaries deliberately break that prefix,
-    however, so they are the safe points where a changed ``gateway_mode`` can
-    converge. Keep the decision on the agent before rebuilding tools so the
-    schema and dispatch path change together.
-    """
-    if getattr(agent, "_oneshot_session", None) is True:
-        return False
-
-    # Only a gateway-owned messaging session may change this mode. The stable
-    # gateway key is positive wiring evidence. ACP and unknown non-gateway
-    # agents stay on their existing contract.
-    from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
-    platform = str(getattr(agent, "platform", "") or "").strip().lower()
-    if (platform in NON_MESSAGING_SESSION_SURFACES or platform in {"acp", "cron", "subagent"}
-            or not getattr(agent, "_gateway_session_key", None)):
-        return False
-
-    user_config = getattr(agent, "_notification_config", None)
-    from hermes_cli.config import get_config_path, read_user_config_raw
-
-    try:
-        raw_config = read_user_config_raw(get_config_path())
-    except Exception:  # health: allow BLE001 -- malformed profile config must preserve the live pinned mode
-        return False
-    raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
-    # An absent key means the agent's original surface decision remains the
-    # contract. Check the raw file so a merged default ``auto`` does not look
-    # like an explicit operator change.
-    if not isinstance(raw_delegation, dict) or "gateway_mode" not in raw_delegation:
-        return False
-    if not isinstance(user_config, dict):
-        user_config = raw_config
-    delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
-    if not isinstance(delegation, dict):
-        return False
-    configured_mode = str(delegation.get("gateway_mode") or "").strip().lower()
-    if configured_mode not in {"auto", "inline", "background", "async"}:
-        return False
-    interim_enabled = getattr(agent, "_session_interim_assistant_messages_enabled", None)
-    if interim_enabled is None:
-        interim_enabled = getattr(agent, "_gateway_interim_messages_enabled", None)
-    if interim_enabled is None:
-        interim_enabled = getattr(agent, "interim_assistant_callback", None) is not None
-
-    from tools.delegate_tool_config import gateway_delegation_inline
-
-    desired = gateway_delegation_inline(
-        user_config,
-        str(getattr(agent, "platform", "") or ""),
-        interim_enabled=bool(interim_enabled),
-    )
-    previous = getattr(agent, "_delegation_inline", None)
-    if apply:
-        agent._delegation_inline = desired
-    else:
-        agent._pending_delegation_inline = desired
-    return previous != desired
-
-
 def set_global_backend(name: str, *, session_key: str = "", apply_now: bool = False) -> None:
     """Persist ``delegation.backend`` to the active profile's config.yaml (raw user config, never merged
     defaults). Running sessions keep routing on the backend their tools were built from; ``apply_now`` rebuilds

@@ -1605,32 +1605,25 @@ def test_concurrent_model_call_updates_are_transactional(tmp_path):
     outbox_directory = tmp_path / "outbox"
     SharedMetricsStore(database_path, outbox_directory)
 
-    def record_calls(store: SharedMetricsStore, count: int) -> SharedMetricsStore:
+    def record_calls(count: int) -> int:
+        store = SharedMetricsStore(database_path, outbox_directory)
+        busy_calls = 0
         for _ in range(count):
-            # A contended write is kept on this store for its next write or exit drain (never
-            # raised to the caller, never lost); an uncontended one commits now.
-            assert store.record_model_call(_dimensions(), _resource()) is None
-        return store
+            try:
+                store.record_model_call(_dimensions(), _resource())
+            except sqlite3.OperationalError as exc:
+                assert exc.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                busy_calls += 1
+        return busy_calls
 
-    writers = [SharedMetricsStore(database_path, outbox_directory) for _ in range(2)]
-    # Another writer holds the store for the whole burst, so every increment is contended.
-    holder = sqlite3.connect(database_path, isolation_level=None)
-    holder.execute("BEGIN IMMEDIATE")
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(record_calls, writer, 10) for writer in writers]
-        assert [future.result() for future in futures] == writers
-    finally:
-        holder.execute("COMMIT")
-        holder.close()
-    assert sum(len(writer._deferred) for writer in writers) == 20  # deferred, not dropped or raised
-    assert SharedMetricsStore(database_path, outbox_directory).counter_snapshot() == []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(record_calls, 10) for _ in range(2)]
 
-    # The exit drain each writer registers when it defers: lossless and counted exactly once.
-    for writer in writers:
-        writer.drain_deferred()
-        assert writer._deferred == []
-    assert SharedMetricsStore(database_path, outbox_directory).counter_snapshot()[0]["value"] == 20
+    restarted = SharedMetricsStore(database_path, outbox_directory)
+    # Check lossless increments without requiring contended writes to block.
+    for _ in range(sum(future.result() for future in futures)):
+        restarted.record_model_call(_dimensions(), _resource())
+    assert restarted.counter_snapshot()[0]["value"] == 20
 
 
 def test_cross_process_model_call_updates_are_transactional(tmp_path):
@@ -1671,57 +1664,6 @@ def test_a_write_the_busy_store_cannot_take_is_deferred_not_lost(tmp_path):
     assert store.counter_snapshot() == []
     store.record_model_call(_dimensions(), _resource())
     assert store.counter_snapshot()[0]["value"] == 2
-
-
-def test_a_busy_store_leaves_packaging_to_the_next_export(tmp_path, monkeypatch):
-    """Export follows the counters' contention contract: a store another writer holds returns from
-    the export instead of raising, and the next export packages what the busy one could not."""
-    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
-    store.record_model_call(_dimensions(), _resource())
-    tomorrow = datetime.now(UTC) + timedelta(days=1)
-    monkeypatch.setattr("hermes_cli.observability.shared_metrics._utc_now", lambda: tomorrow)
-    blocker = sqlite3.connect(tmp_path / "metrics.sqlite3")
-    blocker.execute("BEGIN IMMEDIATE")
-    try:
-        assert store.create_and_export_package_if_due() == []
-    finally:
-        blocker.rollback()
-        blocker.close()
-    assert len(store.create_and_export_package_if_due()) == 1
-
-
-def test_a_store_keeps_its_wal_open_between_short_connections(tmp_path):
-    """Each store call opens and closes its own connection. Were each the last one, every write would
-    rebuild the WAL index on BEGIN and checkpoint and delete the WAL on close, several disk syncs per
-    counter that stalled Relay flushes on slow disks; the store's idle connection keeps the WAL."""
-    database_path = tmp_path / "metrics.sqlite3"
-    store = SharedMetricsStore(database_path, tmp_path / "outbox")
-    store.record_model_call(_dimensions(), _resource())
-    store.record_model_call(_dimensions(), _resource())
-    # Header bytes 18-19 are 2 in WAL mode (a WAL-reset-vulnerable SQLite keeps the store in DELETE).
-    if os.name != "nt" and database_path.read_bytes()[18:20] == b"\x02\x02":
-        assert database_path.with_name(database_path.name + "-wal").exists()
-    assert store.counter_snapshot()[0]["value"] == 2
-
-
-def test_a_latch_the_busy_store_cannot_take_is_deferred_not_raised(tmp_path):
-    """The compare-and-set latches share the counters' contention contract: another process holding
-    the store past the short busy timeout defers the latch, which re-runs its compare-and-set with the
-    next write instead of raising ``database is locked`` into the subscriber."""
-    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
-    blocker = sqlite3.connect(tmp_path / "metrics.sqlite3")
-    blocker.execute("BEGIN IMMEDIATE")
-    try:
-        assert store.record_client_active(_resource()) is False
-        assert store.record_feature_adoption("memory", "same_day", _resource()) is False
-    finally:
-        blocker.rollback()
-        blocker.close()
-    assert store.counter_snapshot() == []
-    store.drain_deferred()
-    assert sorted(row["value"] for row in store.counter_snapshot()) == [1, 1]
-    assert store.recorded_features() == frozenset({"memory"})
-    assert store.record_client_active(_resource()) is False
 
 
 def test_cross_process_client_active_attempts_record_one_install(tmp_path):

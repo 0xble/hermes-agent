@@ -524,7 +524,7 @@ def _script_error_output(
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
-    cron_job_id: Optional[str] = None, priority: str = "production",
+    cron_job_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -577,8 +577,6 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
-        from cron.constants import job_priority
-        env["HERMES_WORK_PRIORITY"] = job_priority({"priority": priority})
         strip_session_context_env(env)
         if cron_job_id:
             env["HERMES_SESSION_ID"] = f"cron_{cron_job_id}"
@@ -673,10 +671,8 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
-        from cron.constants import job_priority
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"), cron_job_id=str(job.get("id") or ""),
-                               priority=job_priority(job))
+                               interpreter=job.get("interpreter"), cron_job_id=str(job.get("id") or ""))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

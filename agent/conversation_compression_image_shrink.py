@@ -43,7 +43,7 @@ def _decode_pixels(data_url: str) -> Optional[tuple]:
         from PIL import Image
         with Image.open(io.BytesIO(base64.b64decode(data_d))) as _img:
             return _img.size
-    except Exception:  # health: allow BLE001 -- image decoding treats any malformed payload as non-shrinkable
+    except Exception:
         return None
 
 
@@ -96,7 +96,7 @@ def _shrink_data_url(url: str, *, max_dimension: int, resize_fn: Any) -> tuple:
             ok = len(resized) < len(url)
         return (resized, False) if ok else (None, True)
     except Exception as exc:
-        logger.warning("image-shrink recovery: re-encode failed — %s", exc, exc_info=True)
+        logger.warning("image-shrink recovery: re-encode failed — %s", exc)
         return None, triggered_by is not None
 
 
@@ -119,28 +119,6 @@ def _write_data_url_to_source(source: dict, data_url: str) -> dict:
     return {**source, "type": "base64", "media_type": _data_url_mime(header), "data": data}
 
 
-def _shrink_part(part: dict, shrink) -> tuple[Any, bool]:
-    """Return a replacement image part and whether its source could not be shrunk."""
-    ptype = part.get("type")
-    if ptype == "image":
-        source = part.get("source")
-        resized, unshrinkable = shrink(_source_to_data_url(source) or "")
-        replacement = ({**part, "source": _write_data_url_to_source(source, resized)}
-                       if resized and isinstance(source, dict) else None)
-        return replacement, unshrinkable
-    if ptype not in {"image_url", "input_image"}:
-        return None, False
-    image_value = part.get("image_url")
-    if isinstance(image_value, dict):
-        resized, unshrinkable = shrink(image_value.get("url", ""))
-        replacement = ({**part, "image_url": {**image_value, "url": resized}} if resized else None)
-        return replacement, unshrinkable
-    if isinstance(image_value, str):
-        resized, unshrinkable = shrink(image_value)
-        return ({**part, "image_url": resized} if resized else None), unshrinkable
-    return None, False
-
-
 def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int = 8000) -> bool:
     """Re-encode oversized native image parts to recover from image-too-large errors.
     Mutates ``api_messages`` in place. Returns True if any part was replaced, False if nothing to shrink or
@@ -151,7 +129,7 @@ def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int
     try:
         from tools.vision_tools import _resize_image_for_vision
     except Exception as exc:
-        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc, exc_info=True)
+        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
         return False
     changed_count = 0
     # Track over-target parts that could not be shrunk: if any remain, a retry
@@ -173,7 +151,29 @@ def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int
         for part_idx, part in enumerate(content):
             if not isinstance(part, dict):
                 continue
-            replacement, unshrinkable = _shrink_part(part, _shrink)
+            ptype = part.get("type")
+            replacement = None
+            if ptype == "image":
+                source = part.get("source")
+                resized, unshrinkable = _shrink(_source_to_data_url(source) or "")
+                if resized and isinstance(source, dict):
+                    replacement = {**part, "source": _write_data_url_to_source(source, resized)}
+            elif ptype in {"image_url", "input_image"}:
+                image_value = part.get("image_url")
+                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
+                # OpenAI Responses: {"image_url": "data:..."}
+                if isinstance(image_value, dict):
+                    resized, unshrinkable = _shrink(image_value.get("url", ""))
+                    if resized:
+                        replacement = {**part, "image_url": {**image_value, "url": resized}}
+                elif isinstance(image_value, str):
+                    resized, unshrinkable = _shrink(image_value)
+                    if resized:
+                        replacement = {**part, "image_url": resized}
+                else:
+                    continue
+            else:
+                continue
             if replacement is not None:
                 if new_content is None:
                     new_content = list(content)

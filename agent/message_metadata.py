@@ -205,12 +205,6 @@ def stamp_message_uid(msg: MutableMapping[str, Any]) -> str:
     return uid
 
 
-def uid_list(value: Any) -> list[str]:
-    """Normalize a live UID list to unique non-empty strings in order."""
-    return list(dict.fromkeys(item for item in (value if isinstance(value, list) else ())
-                            if isinstance(item, str) and item))
-
-
 # Producer-owned provenance for the compressor's standalone in-flight-task restatement. It rides in
 # display_metadata (persisted by the session store, popped from every wire copy) so gateway replay can send the
 # row unstamped, as the compaction turn did; a human pasting the header text carries no flag.
@@ -245,26 +239,6 @@ def replay_metadata_fields(msg: Mapping[str, Any]) -> dict:
     if (typed := typed_ask_text(msg)) is not None:
         fields["display_metadata"] = {**fields.get("display_metadata", {}), TYPED_ASK: typed}
     return fields
-
-
-def unstamped_replay_fields(msg: Mapping[str, Any]) -> dict:
-    """Producer provenance for user rows sent unstamped, retained through replay and re-persist."""
-    fields = scaffolding_replay_fields(msg)
-    from agent.plugin_live_notes import RUNTIME_NOTICE, is_runtime_notice
-    if is_runtime_notice(msg):
-        fields["display_metadata"] = {**fields.get("display_metadata", {}), RUNTIME_NOTICE: True}
-        if msg.get("display_kind"):
-            fields["display_kind"] = msg["display_kind"]
-    return fields
-
-
-def apply_unstamped_replay_fields(msg: Mapping[str, Any], entry: MutableMapping[str, Any]) -> None:
-    """Carry ``msg``'s unstamped provenance onto replay ``entry``, merging into (never replacing) the
-    display metadata ``entry`` already holds, such as its typed-ask stamp."""
-    unstamped = unstamped_replay_fields(msg)
-    if "display_metadata" in unstamped:
-        unstamped["display_metadata"] = {**(entry.get("display_metadata") or {}), **unstamped["display_metadata"]}
-    entry.update(unstamped)
 
 
 def is_compaction_scaffolding(msg: Mapping[str, Any]) -> bool:

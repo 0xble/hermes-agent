@@ -397,21 +397,6 @@ def _update_fenced(homes) -> bool:
     return False
 
 
-def _fence_homes(home: Path) -> set[Path]:
-    """The homes whose marker fences *home*: its own, this process's, and the install root's
-    (the install-root marker also covers profiles)."""
-    from hermes_constants import get_default_hermes_root, get_process_hermes_home
-
-    return {home, get_process_hermes_home(), get_default_hermes_root()}
-
-
-def update_fence_held(profile_home: str | Path) -> bool:
-    """True while an update owns the install serving *profile_home*: ``ensure_gateway_runtime``
-    then answers ``update_paused`` (or the update's own drain) instead of a ready owner, so a
-    client must not start gateway work. Read-only, like the check ``ensure`` makes."""
-    return _update_fenced(_fence_homes(_overlay_owner_home(Path(_canonical_home(profile_home)))))
-
-
 def _fenced_verdict(home: Path, timeout: float) -> GatewayDiscovery:
     """What ensure answers while an update owns the install. The update's own drain
     (``pause-for-update``) is a restart's after-turn wait whose owner may hold a turn parked on
@@ -476,6 +461,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
         RuntimeStartError, discover_existing_gateway_service, remaining,
         start_existing_gateway_service,
     )
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+
     from hermes_cli.gateway_launchd_runtime import GatewayJob
     from hermes_cli.gateway_runtime_progress import StartRunway
     runway = StartRunway(timeout, DEFAULT_ENSURE_TIMEOUT)
@@ -495,7 +482,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     try:
         while True:
             # The install-root marker also covers profiles.
-            if _update_fenced(_fence_homes(home)):
+            if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
                 return _fenced_verdict(home, remaining(deadline))
             # Sampled before every probe, for the starts this call awaits (``waiting``: one it saw
             # pending, joined or started, multiplexer root included), so a probe that spent its whole
@@ -513,7 +500,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             observed = _observe_replacing_stale(home, deadline, replaced, **own_child)
             if observed.reason_code == "control_timeout":
                 continue
-            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner, retiring=retiring)
+            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner)
             if wait_for_exit:
                 retiring, requested, child = True, False, None
                 waiting.clear()

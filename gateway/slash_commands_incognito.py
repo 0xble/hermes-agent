@@ -5,36 +5,6 @@ import logging
 
 
 class GatewayIncognitoCommandsMixin:
-    def _incognito_busy(self, key, adapter):
-        """Include admitted work before its agent slot exists, but not this command's guard."""
-        if (getattr(self, "_running_agents", {}).get(key) is not None
-                or self._queue_depth(key, adapter=adapter) or self._background_admission_pending(key)):
-            return True
-        current = asyncio.current_task()
-        if (key in getattr(adapter, "_active_sessions", {})
-                and getattr(adapter, "_session_tasks", {}).get(key) is not current):
-            return True
-        from gateway.session_authorities import active_authority
-        authority = active_authority(self)
-        return any(live.route == key and not live.superseded and live.task is not None
-                   and live.task is not current and not live.task.done()
-                   for live in authority.sessions.values()) if authority is not None else False
-
-    async def _incognito_pending(self, key):
-        """A paused authority FIFO can hold committed work without a live drain task."""
-        from gateway.session_authorities import active_authority
-        from gateway.session_contract import SessionRef
-        authority = active_authority(self)
-        if authority is not None:
-            for sid, live in list(authority.sessions.items()):
-                if live.route == key and not live.superseded:
-                    def pending():
-                        with live.event_stream.lock:
-                            return authority._pending_rows(SessionRef(authority.profile_id, sid))
-                    if await asyncio.to_thread(pending):
-                        return True
-        return False
-
     def _incognito_model_label(self, key):
         from gateway.run import _resolve_gateway_model
         agent = self._cached_agent_for(key)
@@ -63,26 +33,24 @@ class GatewayIncognitoCommandsMixin:
         key = self._session_key_for_source(source)
         # No await between reading the active-turn slot and taking the switch lock.
         # /status is safe mid-turn, toggles never mutate an in-flight agent.
-        if action != "status" and self._incognito_busy(key, adapter):
+        if action != "status" and getattr(self, "_running_agents", {}).get(key) is not None:
             return "Incognito was not changed. Wait for the active turn to finish, then retry."
         async with self._model_switch_lock():
             async with self._session_model_override_lock(key):
-                if action != "status" and self._incognito_busy(key, adapter):
+                if action != "status" and getattr(self, "_running_agents", {}).get(key) is not None:
                     return "Incognito was not changed. Wait for the active turn to finish, then retry."
                 from contextvars import Context
                 entry = await asyncio.to_thread(Context().run, self.session_store.get_or_create_session, source)
-                await self._rehydrate_session_model_override_locked_async(key)
+                self._rehydrate_session_model_override(key)
                 if action == "status":
                     return self._incognito_reply(entry)
                 enabled = not entry.incognito if not action else action == "on"
                 if enabled == entry.incognito:
                     return self._incognito_reply(entry)
-                if self._incognito_busy(key, adapter):
+                if getattr(self, "_running_agents", {}).get(key) is not None or self._queue_depth(key, adapter=adapter):
                     return "Incognito was not changed. Wait for the active turn and queued messages to finish, then retry."
                 from gateway.incognito import transition_scope
                 with transition_scope(key):
-                    if await self._incognito_pending(key) or self._incognito_busy(key, adapter):
-                        return "Incognito was not changed. Wait for the active turn and queued messages to finish, then retry."
                     if enabled:
                         return await self._enter_incognito(event, entry)
                     return await self._leave_incognito(entry)
@@ -98,15 +66,7 @@ class GatewayIncognitoCommandsMixin:
             await asyncio.to_thread(shared_worker_context().run, flush)
         # The durable flag must land before any private input can be admitted. On failure
         # propagate the exception, never acknowledge privacy that was not persisted.
-        from hermes_state_runtime import RuntimeStoreError
-        try:
-            await asyncio.to_thread(self.session_store.set_incognito, key, True)
-        except RuntimeStoreError as exc:
-            if exc.reason == 'session_busy':
-                return "Incognito was not changed. Wait for the active turn and queued messages to finish, then retry."
-            if exc.reason == 'storage_unavailable':
-                return "Incognito was not changed. The session store is unavailable. Retry when it recovers."
-            raise
+        await asyncio.to_thread(self.session_store.set_incognito, key, True)
         from copy import copy
         from gateway.run import _CONVERSATION_SCOPED_STATE
         conversation = copy(self._session_state(key).conversation)
@@ -142,8 +102,7 @@ class GatewayIncognitoCommandsMixin:
             profile_home = None
             if getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 profile_home = self._resolve_profile_home_for_source(event.source)
-            ctx = self._model_switch_context(event.source, key, profile_home=profile_home,
-                                             rehydrate=False, persist_global=False)
+            ctx = self._model_switch_context(event.source, key, profile_home=profile_home, persist_global=False)
             result, error = await self._perform_model_switch(ctx, request, "", event.source)
             if error is not None:
                 return self._incognito_reply(entry, error)

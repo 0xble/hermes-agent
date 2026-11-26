@@ -1,4 +1,4 @@
-"""Regression for #103363 — reading pre-v3 telegram topic tables self-heals to v3.
+"""Regression for #103363: reading pre-v3 telegram topic tables self-heals to v3.
 
 Upgrades that enabled DM topic mode before #76423 keep v2 tables (no
 ``profile_name`` column). Reads used to swallow ``no such column`` as an empty
@@ -8,13 +8,26 @@ migration was never reached. Reads now heal the table once and retry.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
-from hermes_state import SessionDB
+from persistence import ProfileScope
+from persistence.sqlite import SQLiteBackend
 
 
 CHAT = "208214988"
+
+
+@contextlib.contextmanager
+def _store(db_path: Path):
+    """A writable SQLite store on *db_path*, closed on exit."""
+    scope = ProfileScope(profile_dir=db_path.parent, name=db_path.parent.name)
+    backend = SQLiteBackend({scope.hermes_home_key: db_path})
+    try:
+        yield backend.open(scope)
+    finally:
+        backend.close()
 
 
 def _create_v2_state(db_path: Path) -> None:
@@ -65,39 +78,39 @@ def _create_v2_state(db_path: Path) -> None:
 def test_topic_reads_selfheal_pre_v3_tables(tmp_path: Path):
     db_path = tmp_path / "v2-upgrade.db"
     _create_v2_state(db_path)
-    db = SessionDB(db_path=db_path)
+    with _store(db_path) as store:
+        routing = store.routing
 
-    # Reads on the un-migrated v2 tables return the legacy rows instead of
-    # silently reading as empty, and land them in the 'default' namespace.
-    assert db.is_telegram_topic_mode_enabled(
-        chat_id=CHAT, user_id=CHAT, profile_name="default",
-    )
-    binding = db.get_telegram_topic_binding(chat_id=CHAT, thread_id="99", profile_name="default")
-    assert binding is not None
-    assert binding["session_id"] == "legacy-sess"
-    # The orphan row is dropped (a v2/v3 CASCADE would have removed it) and the stranded scratch table is gone.
-    rows = db.list_telegram_topic_bindings_for_chat(chat_id=CHAT, profile_name="default")
-    assert [row["session_id"] for row in rows] == ["legacy-sess"]
-    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="7", profile_name="default") is None
-    assert db.get_meta("telegram_dm_topic_schema_version") == "4"
-    # Profile isolation still holds after the heal.
-    assert not db.is_telegram_topic_mode_enabled(
-        chat_id=CHAT, user_id=CHAT, profile_name="coder",
-    )
-    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="99", profile_name="coder") is None
-    db.close()
+        # Reads on the un-migrated v2 tables return the legacy rows instead of
+        # silently reading as empty, and land them in the 'default' namespace.
+        assert routing.is_topic_mode_enabled(
+            chat_id=CHAT, user_id=CHAT, profile_name="default",
+        )
+        binding = routing.get_topic_binding(chat_id=CHAT, thread_id="99", profile_name="default")
+        assert binding is not None
+        assert binding.session_id == "legacy-sess"
+        # The orphan row is dropped (a v2/v3 CASCADE would have removed it) and the stranded scratch table is gone.
+        rows = routing.list_topic_bindings_for_chat(chat_id=CHAT, profile_name="default")
+        assert [row.session_id for row in rows] == ["legacy-sess"]
+        assert routing.get_topic_binding(chat_id=CHAT, thread_id="7", profile_name="default") is None
+        assert store.holder().get_meta("telegram_dm_topic_schema_version") == "3"
+        # Profile isolation still holds after the heal.
+        assert not routing.is_topic_mode_enabled(
+            chat_id=CHAT, user_id=CHAT, profile_name="coder",
+        )
+        assert routing.get_topic_binding(chat_id=CHAT, thread_id="99", profile_name="coder") is None
 
 
 def test_absent_tables_still_read_empty_and_are_not_created(tmp_path: Path):
-    db = SessionDB(db_path=tmp_path / "fresh.db")
+    with _store(tmp_path / "fresh.db") as store:
+        routing = store.routing
 
-    assert not db.is_telegram_topic_mode_enabled(chat_id=CHAT, user_id=CHAT)
-    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="99") is None
-    assert db.list_telegram_topic_bindings_for_chat(chat_id=CHAT) == []
-    # The deliberate "reads never create the tables" contract is preserved: the migration is the only
-    # creator and always stamps the schema version in the same transaction.
-    assert db.get_meta("telegram_dm_topic_schema_version") is None
-    db.close()
+        assert not routing.is_topic_mode_enabled(chat_id=CHAT, user_id=CHAT)
+        assert routing.get_topic_binding(chat_id=CHAT, thread_id="99") is None
+        assert list(routing.list_topic_bindings_for_chat(chat_id=CHAT)) == []
+        # The deliberate "reads never create the tables" contract is preserved: the migration is the only
+        # creator and always stamps the schema version in the same transaction.
+        assert store.holder().get_meta("telegram_dm_topic_schema_version") is None
 
 
 def test_heal_rebuild_rolls_back_atomically(tmp_path: Path):
@@ -106,30 +119,30 @@ def test_heal_rebuild_rolls_back_atomically(tmp_path: Path):
     never a half-built v3 table the retry would mistake for a finished one (#42004)."""
     db_path = tmp_path / "v2-upgrade.db"
     _create_v2_state(db_path)
-    db = SessionDB(db_path=db_path)
+    with _store(db_path) as store:
+        holder = store.holder()
 
-    def deny_topic_rebuild_copy(action, arg1, arg2, db_name, trigger):
-        # Fail the copy into the fresh table, after the live table was renamed away: a
-        # non-transactional rebuild leaves an empty v3 table behind and the retry skips it.
-        if action == sqlite3.SQLITE_INSERT and arg1 == "telegram_dm_topic_mode":
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
+        def deny_topic_rebuild_copy(action, arg1, arg2, db_name, trigger):
+            # Fail the copy into the fresh table, after the live table was renamed away: a
+            # non-transactional rebuild leaves an empty v3 table behind and the retry skips it.
+            if action == sqlite3.SQLITE_INSERT and arg1 == "telegram_dm_topic_mode":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
 
-    db._conn.set_authorizer(deny_topic_rebuild_copy)
-    try:
-        # The guarded read degrades to "off" instead of raising...
-        assert not db.is_telegram_topic_mode_enabled(
+        holder._conn.set_authorizer(deny_topic_rebuild_copy)
+        try:
+            # The guarded read degrades to "off" instead of raising...
+            assert not store.routing.is_topic_mode_enabled(
+                chat_id=CHAT, user_id=CHAT, profile_name="default",
+            )
+        finally:
+            holder._conn.set_authorizer(None)
+
+        # ...and the interrupted rebuild rolled back completely: the renamed-away original is back
+        # (otherwise the retry below finds no legacy table, builds an empty v3 one and reads as off).
+        assert holder.get_meta("telegram_dm_topic_schema_version") == "2"
+        # Idempotent under retry (the _execute_write contract): the next clean
+        # read heals and keeps the legacy rows.
+        assert store.routing.is_topic_mode_enabled(
             chat_id=CHAT, user_id=CHAT, profile_name="default",
         )
-    finally:
-        db._conn.set_authorizer(None)
-
-    # ...and the interrupted rebuild rolled back completely: the renamed-away original is back
-    # (otherwise the retry below finds no legacy table, builds an empty v3 one and reads as off).
-    assert db.get_meta("telegram_dm_topic_schema_version") == "2"
-    # Idempotent under retry (the _execute_write contract): the next clean
-    # read heals and keeps the legacy rows.
-    assert db.is_telegram_topic_mode_enabled(
-        chat_id=CHAT, user_id=CHAT, profile_name="default",
-    )
-    db.close()

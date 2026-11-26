@@ -192,18 +192,6 @@ def test_owner_interrupt_before_any_wait_does_not_blame_another_process():
     assert "another Hermes process" in _admit(agent).early_result["final_response"]
 
 
-def test_message_less_system_interrupt_keeps_its_source():
-    """A gateway preemption carries no message; the early return must still name its source."""
-    agent = _agent(_Db(acquired=False), _interrupt_requested=True,
-                   _tool_interrupt_reason="gateway user turn preemption", _interrupt_source="system")
-    agent.clear_interrupt = lambda: None
-    result = _admit(agent).early_result
-    assert result is not None
-    assert result["interrupted"] is True
-    assert "interrupt_message" not in result
-    assert result["interrupt_source"] == "gateway_user_turn_preemption"
-
-
 def _active_lease(db, kind="client"):
     agent = _wired(db, kind)
     calls = []
@@ -327,7 +315,7 @@ def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkey
 
     # A real takeover past expiry stops the turn: a successor claims the expired row, and the
     # next locked tick's ownership read sees it.
-    assert coordination.try_acquire_turn_lease(session_id="s1", holder="successor")
+    assert db.try_acquire_session_turn_lease("s1", "successor")
     blocker = write_lock()
     try:
         assert lease.refresh_tick() is False
@@ -343,7 +331,6 @@ def test_delayed_renewal_after_expiry_keeps_an_unclaimed_row_and_fences_a_claime
     claimed, and a row a successor claimed in the meantime fails it and stops the turn."""
     import hermes_state
     import hermes_state_compression
-    import sqlite_support
     from agent import turn_facade_lease
 
     clock = _MovingClock(1000.0)

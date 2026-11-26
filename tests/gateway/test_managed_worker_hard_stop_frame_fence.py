@@ -10,6 +10,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 from gateway.session_contract import SessionActor, SessionRef
 from tests.gateway.test_managed_turn_contract import assignment
@@ -17,7 +18,6 @@ from tests.gateway.test_managed_turn_contract import assignment
 
 class _Agent:
     calls = []
-    interrupt_kwargs = []
 
     def __init__(self, **kwargs):
         self.session_prompt_tokens = self.session_completion_tokens = 0
@@ -27,7 +27,6 @@ class _Agent:
 
     def hard_interrupt(self, message=None, **kwargs):
         self.calls.append('hard')
-        self.interrupt_kwargs.append(kwargs)
 
     def run_conversation(self, text, **kwargs):
         return {'final_response': '', 'interrupted': True}
@@ -36,7 +35,6 @@ class _Agent:
 def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_path, monkeypatch):
     from agent import managed_worker as worker
     _Agent.calls = []
-    _Agent.interrupt_kwargs = []
     controls = worker.WorkerControls.__new__(worker.WorkerControls)  # no stdin reader thread
     controls.agent, controls.stopped, controls.lock, controls.clarifications = _Agent(), threading.Event(), threading.Lock(), {}
     controls.stop()
@@ -68,7 +66,6 @@ def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_pa
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
     worker.execute(frame, SimpleNamespace(send=lambda kind, **payload: None))
     assert _Agent.calls == ['hard', 'hard'], 'a managed worker Stop must hard-cancel like the canonical Stop'
-    assert _Agent.interrupt_kwargs == [{}, {}]
 
 
 CHILD = """import json, os, sys, psutil
@@ -88,20 +85,19 @@ for line in sys.stdin.buffer:
 @pytest.mark.platforms("linux")
 def test_worker_frames_read_no_ledger_per_frame(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
-    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_authority import LiveSession, SessionAuthority, admission_row
     from gateway.session_contract import Submission
     from gateway.session_policy import build_policy
-    from hermes_state import SessionDB
-    from hermes_state_runtime import claim_session_input
-    from tests.fakes.runtime_owner import begin_runtime_epoch
+    from persistence_assembly import open_persistence, profile_scope
+    from tests.fixtures.storage_seed import seed_session
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(db_path=tmp_path / 'state.db')
-    db.create_session('s', source='test')
+    db = open_persistence(profile_scope(home=tmp_path))
+    seed_session(db, 's', 'test')
     runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
                              _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
-                                 epoch=begin_runtime_epoch(db, instance_id='i'))
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='i',
+                                 epoch=db.runtime.begin_epoch(instance_id='i'), persistence=storage_handle(tmp_path))
     live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
     actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
@@ -119,7 +115,7 @@ def test_worker_frames_read_no_ledger_per_frame(tmp_path, monkeypatch):
 
     async def scenario():
         await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
-        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
+        row = admission_row(db.admissions.claim(epoch=authority.epoch, session_id='s'))
         authority._stamp_claim(ref, live, row)  # the drain's claim stamp
         log.clear()
         with pytest.raises(managed.ManagedExecutionUnknown):  # the closing bogus frame revokes the worker

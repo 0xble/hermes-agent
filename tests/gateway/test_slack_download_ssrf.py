@@ -64,7 +64,7 @@ class _RecordingClient:
     async def __aexit__(self, *exc):
         return False
 
-    def stream(self, *args, **kwargs):
+    async def get(self, *args, **kwargs):
         raise _NetworkTouched("network access attempted")
 
 
@@ -115,7 +115,7 @@ def test_redirect_guard_is_wired(monkeypatch, method_name):
         if method_name == "_download_slack_file" \
         else ("https://files.slack.com/x.jpg",)
 
-    # The fake client raises when .stream() is called; we only care that the
+    # The fake client raises when .get() is called; we only care that the
     # client was constructed with the redirect guard hook.
     with pytest.raises(_NetworkTouched):
         asyncio.run(method(*args))
@@ -127,7 +127,6 @@ def test_redirect_guard_is_wired(monkeypatch, method_name):
         "AsyncClient must register ssrf_redirect_guard to block "
         "redirect-based SSRF"
     )
-    assert kwargs.get("follow_redirects") is False
 
 
 # ---------------------------------------------------------------------------

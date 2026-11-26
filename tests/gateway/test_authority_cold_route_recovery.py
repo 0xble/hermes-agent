@@ -10,7 +10,6 @@ source; a row the route no longer names (``/new``, a pruned entry) is rebuilt fr
 a foreign profile, an origin that contradicts the row, a draining gateway.
 """
 import json
-import threading
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -134,31 +133,6 @@ async def test_a_routed_messaging_session_mounts_on_a_cold_authority(tmp_path):
     live = cold.authority.sessions[ref.session_id]
     assert (live.route, live.source.platform, live.source.chat_id) == (
         cold.store._generate_session_key(_source()), Platform.TELEGRAM, '4242')
-
-
-@pytest.mark.asyncio
-async def test_cold_messaging_resume_does_not_lock_the_gateway_loop(tmp_path):
-    from gateway.session_controls import AuthorityConnection
-    from hermes_loop_guard import set_loop_thread
-
-    source = _source()
-    route = _seed(tmp_path, 'lane-cold', source)
-    cold = await _cold(tmp_path)
-    connection = AuthorityConnection(cold.authority, object(), {
-        'provider': 'local', 'user_id': 'viewer', 'profile_id': 'fixture', 'instance_id': 'cold',
-        'capabilities': ['session:read'],
-    })
-
-    set_loop_thread(threading.get_ident())
-    try:
-        response = await connection.dispatch({
-            'id': 1, 'method': 'session.resume', 'params': {'session_id': 'lane-cold'},
-        })
-    finally:
-        set_loop_thread(None)
-
-    assert response.get('result', {}).get('session_id') == 'lane-cold', response
-    assert cold.authority.sessions['lane-cold'].route == route
 
 
 @pytest.mark.asyncio

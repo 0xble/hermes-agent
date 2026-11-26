@@ -10,9 +10,6 @@ import logging
 import sys
 from typing import Any, List, Optional
 
-from gateway.session_context import bound_turn_origin
-from tools.terminal_tool_result import _cwd_fallback_note
-
 logger = logging.getLogger("tools.terminal_tool")
 
 # A silent background process (no notify_on_complete / watch_patterns) is right
@@ -77,65 +74,6 @@ _ROUTING_FIELDS = (
 )
 
 
-_PROMOTED_NOTE = (
-    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process with notify_on_complete=true instead of being refused. Do NOT re-run it. "
-    "Its completion (exit code + output tail) arrives as a notification; poll with "
-    "process_manage(action=\"poll\", session_id=...) if you need it sooner."
-)
-
-
-_PROMOTED_NOTE_POLL_ONLY = (
-    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process instead of being refused. Do NOT re-run it. This session cannot receive "
-    "completion notifications, so poll it with process_manage(action=\"poll\", session_id=...) until it exits."
-)
-
-
-_PTY_DISABLED_REASON = (
-    "PTY disabled for this command because it expects piped stdin/EOF "
-    "(for example gh auth login --with-token). For local background "
-    "processes, call process_manage(action='close') after writing so it receives "
-    "EOF."
-)
-
-
-def _with_promoted_note(result_json: str, requested_timeout: int, *, cap: int) -> str:
-    """Attach the foreground->background promotion note to a spawn result (unchanged on error). The
-    note only promises a notification when the spawn actually kept notify_on_complete (finite sessions
-    such as one-shot runners cannot route one back; the spawn already said so and cleared the flag)."""
-    try:
-        data = json.loads(result_json)
-    except (TypeError, ValueError):
-        return result_json
-    if not isinstance(data, dict) or data.get("error"):
-        return result_json
-    template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
-    data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=cap)
-    return json.dumps(data, ensure_ascii=False)
-
-
-def _command_requires_pipe_stdin(command: str) -> bool:
-    """True when PTY mode would break a stdin-driven command: `gh auth login
-    --with-token` waits for EOF on piped stdin, and under a PTY
-    `process.submit()` only sends a newline, so it hangs forever."""
-    normalized = " ".join(command.lower().split())
-    return normalized.startswith("gh auth login") and "--with-token" in normalized
-
-
-def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patterns, background: bool) -> tuple:
-    """Resolve notify_on_complete + watch_patterns both set: drop watch_patterns
-    (combined they produce duplicate async notifications — one per match plus
-    one on exit — that can spam the user long after the process ends).
-    Returns ``(watch_patterns_to_use, conflict_note)``; note is "" without conflict."""
-    if background and notify_on_complete and watch_patterns:
-        return None, (
-            "watch_patterns ignored because notify_on_complete=True; "
-            "these two flags produce duplicate notifications when combined"
-        )
-    return watch_patterns, ""
-
-
 def _looks_like_homebrew_ci_poller(command: str) -> bool:
     has_gh = "gh pr view" in command or "gh pr checks" in command
     has_jq = " jq " in command or "| jq" in command or "$(jq" in command
@@ -143,7 +81,7 @@ def _looks_like_homebrew_ci_poller(command: str) -> bool:
     return "statusCheckRollup" in command or (has_gh and has_jq)
 
 
-def _stamp_gateway_routing(proc_session, get_session_env, *, parent_session_id="") -> None:
+def _stamp_gateway_routing(proc_session, get_session_env) -> None:
     """Copy the spawning chat's routing metadata onto the process session so
     completion / watch notifications reach the right chat/thread."""
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -151,26 +89,19 @@ def _stamp_gateway_routing(proc_session, get_session_env, *, parent_session_id="
         return
     proc_session.watcher_platform = platform
     for attr, var in _ROUTING_FIELDS:
-        value = parent_session_id if attr == "parent_session_id" and parent_session_id else get_session_env(var, "")
-        setattr(proc_session, attr, value)
+        setattr(proc_session, attr, get_session_env(var, ""))
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty, persist_on_release: bool = False,
-           survive_restart: bool = False):
+           session_key, effective_pty, persist_on_release: bool = False, allow_cwd_fallback: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
-            survive_restart=survive_restart,
             restore_login_path=True, **common)
-    from tools.process_registry_ssh import SSHLaunchUncertain
-    try:
-        return process_registry.spawn_via_env(env=env, **common)
-    except SSHLaunchUncertain as exc:
-        return exc.session  # Reconcile this handle, never launch the command again.
+    return process_registry.spawn_via_env(env=env, allow_cwd_fallback=allow_cwd_fallback, **common)
 
 
 def _apply_async_support(proc_session, result_data, notify_on_complete, watch_patterns):
@@ -192,60 +123,6 @@ def _apply_async_support(proc_session, result_data, notify_on_complete, watch_pa
     logger.info("background proc %s: async delivery unsupported on this "
                 "session; notify_on_complete/watch_patterns disabled", proc_session.id)
     return False, None
-
-
-def handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dict:
-    """Subagent-only: transfer a running background process to the parent agent so its completion is delivered THERE
-    (child-owned process notices are suppressed and child teardown kills what it owns). Validated against the live spawn
-    tree: the caller must be a registered child and must own the process; anything else is an error, never a silent
-    no-op, so a PID mentioned in prose can't masquerade as a transfer.
-
-    The completion moves with the owner: the chat's gateway key (not the parent's session-db id) stays the route,
-    the parent's session id becomes the spawning session the gateway pre-flight checks, notify is forced on (the
-    parent was promised the result even if the child launched it silently) and a gateway watcher is armed when the
-    process has none."""
-    from gateway.session_context import async_delivery_supported, get_session_env
-    from tools.process_registry import process_registry, _MAX_HANDOFFS_PER_CHILD
-    from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
-    from tools.terminal_tool import _resolve_container_task_id
-    with _active_subagents_lock:
-        record = _active_subagents.get(str(task_id or ""))
-    child = record.get("agent") if record else None
-    parent_ref = getattr(child, "_delegate_parent_ref", None)
-    parent = parent_ref() if callable(parent_ref) else None
-    if parent is None:
-        return {"error": "handoff is only available to a running subagent with a live parent; you are not one."}
-    parent_owner = str(getattr(parent, "_current_task_id", "") or getattr(parent, "session_id", "") or "")
-    parent_session_id = str(getattr(parent, "session_id", "") or "")
-    if not parent_owner or not parent_session_id:
-        return {"error": "parent has no process owner id yet; retry after the parent's turn has started."}
-    handed = getattr(child, "_handed_off_processes", None)
-    if handed is None:
-        handed = child._handed_off_processes = []
-    if len(handed) >= _MAX_HANDOFFS_PER_CHILD:
-        return {"error": f"handoff cap reached ({_MAX_HANDOFFS_PER_CHILD} per subagent); wait on or kill the rest yourself."}
-    note = str(args.get("data") or "").strip()
-    if not note:
-        return {"error": "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
-    session = process_registry.transfer_ownership(
-        session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
-        to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=get_session_env("HERMES_SESSION_KEY") or parent_session_id,
-        to_parent_session_id=parent_session_id, notify=True, note=note)
-    if session is None:
-        return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
-                         "with poll/log and report it instead)."}
-    if async_delivery_supported():
-        if not session.watcher_platform:
-            _stamp_gateway_routing(session, get_session_env, parent_session_id=parent_session_id)
-        # watcher_interval is set only by _register_completion_watcher: an armed watcher follows the new route.
-        if session.watcher_platform and not session.watcher_interval:
-            _register_completion_watcher(process_registry, session, session.session_key)
-        process_registry._write_checkpoint()
-    handed.append({"session_id": session.id, "command": session.command, "note": note})
-    return {"status": "handed_off", "session_id": session.id, "command": session.command,
-            "note": "Your parent now owns this process and will receive its completion; you will not. Mention the handoff "
-                    "in your final answer."}
 
 
 def _register_completion_watcher(process_registry, proc_session, session_key) -> None:
@@ -272,29 +149,6 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     process_registry.pending_watchers.append(watcher)
 
 
-def _annotate_launch_hint(
-    result_data: dict, command: str, *, auto_backgrounded: bool, notify_on_complete: bool, watch_patterns,
-) -> None:
-    """Explain how to follow the process without re-launching a converted command."""
-    if auto_backgrounded:
-        result_data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
-    elif not notify_on_complete and not watch_patterns:
-        result_data["hint"] = _SILENT_BACKGROUND_HINT
-    if command and _looks_like_homebrew_ci_poller(command):
-        existing = result_data.get("hint", "")
-        result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
-                               else _HOMEBREW_CI_POLLER_HINT)
-
-
-def _annotate_local_cwd_fallback(proc_session, result_data: dict, requested_cwd: str) -> None:
-    """Report when the local spawner substituted a fallback for a dead cwd."""
-    from tools.environments.local import _msys_to_windows_path
-
-    used = getattr(proc_session, "cwd", None)
-    if used and used not in (requested_cwd, _msys_to_windows_path(requested_cwd)):
-        result_data["cwd_fallback"] = _cwd_fallback_note({"requested": requested_cwd, "used": used})
-
-
 def spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
@@ -304,7 +158,6 @@ def spawn_background_process(
     pty_disabled_reason: Optional[str],
     heartbeat_seconds: int = 0,
     persist_on_release: bool = False,
-    survive_restart: bool = False,
     mounted_host: Optional[str] = None,
     auto_backgrounded: bool = False,
 ) -> str:
@@ -317,13 +170,6 @@ def spawn_background_process(
     exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
     """
     from tools.process_registry import process_registry
-    from agent.delegation_context import is_delegated_child_context
-
-    if survive_restart and is_delegated_child_context():
-        return json.dumps({"output": "", "exit_code": -1, "status": "error",
-                           "error": "survive_restart is unavailable in delegated child contexts: "
-                                    "the child cannot receive the completion after restart. "
-                                    "Ask the parent to launch this command."})
     from tools.terminal_tool import (
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
@@ -338,24 +184,31 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
-            survive_restart=survive_restart,
+            allow_cwd_fallback=not workdir,  # a named workdir is refused, never swapped for a parent
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:
             result_data["persist_on_release"] = True
-        if survive_restart:
-            result_data["survive_restart"] = True
-        if env_type == "local" and effective_cwd:
-            _annotate_local_cwd_fallback(proc_session, result_data, effective_cwd)
+        if effective_cwd:
+            from tools.environments.local import _msys_to_windows_path
+            from tools.terminal_tool_result import _cwd_fallback_note
+            # spawn_local resolves a dead cwd itself; spawn_via_env records where the sandbox fell back.
+            used = getattr(proc_session, "cwd", None)
+            if used and used not in (effective_cwd, _msys_to_windows_path(effective_cwd)):
+                result_data["cwd_fallback"] = _cwd_fallback_note({"requested": effective_cwd, "used": used})
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        _annotate_launch_hint(
-            result_data, command, auto_backgrounded=auto_backgrounded,
-            notify_on_complete=notify_on_complete, watch_patterns=watch_patterns,
-        )
+        if auto_backgrounded:
+            result_data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
+        elif not notify_on_complete and not watch_patterns:
+            result_data["hint"] = _SILENT_BACKGROUND_HINT
+        if command and _looks_like_homebrew_ci_poller(command):
+            existing = result_data.get("hint", "")
+            result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
+                                   else _HOMEBREW_CI_POLLER_HINT)
 
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
@@ -372,6 +225,7 @@ def spawn_background_process(
                 proc_session.completion_output_chars = int(completion_output_chars)
             if proc_session.watcher_platform:
                 _register_completion_watcher(process_registry, proc_session, session_key)
+            from agent.delegation_context import is_delegated_child_context
             if is_delegated_child_context():
                 result_data["notify_on_complete"] = False
                 result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
@@ -384,15 +238,6 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
-        if survive_restart or getattr(proc_session, "ssh_binding", None) is not None:
-            # Spawn checkpoints before notification routing is available. Persist the final
-            # owner/route/notify metadata before returning the restart-survival contract.
-            process_registry._write_checkpoint()
-        if getattr(proc_session, "ssh_binding", None) is not None and proc_session.remote_error:
-            result_data.update(output="", exit_code=-1, status="unknown", remote_status="unavailable",
-                               error=_redact_terminal_error_text(proc_session.remote_error),
-                               hint="Launch outcome is unknown. Do not re-run the command. Poll this session_id to reconcile it.")
-            result_data.pop("notify_unsupported", None)
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({
@@ -414,34 +259,6 @@ _YIELDED_NOTE = (
     "exits (notify_on_complete). Read the user's message and respond to it now; use "
     "process_manage(action='poll'|'wait'|'log', session_id=...) to check on this command."
 )
-
-
-_SEMAPHORE_YIELDED_NOTE = (
-    "This command is still queued for semaphore admission and has moved to the background "
-    "with the same shell and ticket. You will be notified when it exits "
-    "(notify_on_complete). Do NOT re-run it."
-)
-
-
-def _yield_kwargs(command: str, make_yield_handler, **ctx) -> dict:
-    """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
-    from agent.incognito import is_incognito
-    # Neither private sessions nor scheduled turns can persist an adopted command.
-    if is_incognito() or bound_turn_origin() == "cron":
-        return {}
-    handler = make_yield_handler(command=command, **ctx)
-    return {"yield_handler": handler} if handler is not None else {}
-
-
-def _yielded_result_json(result: dict) -> str:
-    """Build the foreground handoff result, which has no exit status yet."""
-    return json.dumps({
-        "output": result.get("output", ""), "exit_code": None, "error": None,
-        "status": "yielded_to_background", "session_id": result["yielded_session_id"],
-        "pid": result.get("pid"), "notify_on_complete": True,
-        "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
-        **({"cwd_fallback": note} if (note := _cwd_fallback_note(result.get("cwd_fallback"))) else {}),
-    }, ensure_ascii=False)
 
 
 def yield_to_background_handler(

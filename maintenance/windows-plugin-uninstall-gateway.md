@@ -35,7 +35,7 @@ traceback-confirmed attribution. Never claim the original crash was conclusively
 root-caused from a diagnostic run that did not reproduce it.
 
 Contract tests: `tests/hermes_cli/test_plugin_startup_reload_barrier.py`,
-  `tests/hermes_cli/test_plugin_uninstall_windows_live.py`.
+`tests/hermes_cli/test_plugin_uninstall_windows_live.py`.
 
 Retire the patch when the accepted upstream baseline protects the same strict
 startup/readiness boundary and the native Windows survival contract passes.

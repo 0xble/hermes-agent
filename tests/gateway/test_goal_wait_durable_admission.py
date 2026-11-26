@@ -335,7 +335,7 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
     from gateway.session_settlement_recovery import recover_failed_settlement
     from gateway.session_unattended_unknown import settle_unattended_unknown
     from hermes_state_runtime import claim_session_input
-    from gateway.session_unattended_unknown import interrupted_notice
+    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
     runner, _adapter, authority, _source, sid, _key, _manager, rows, _ = parked
     await runner._goal_wakeup_fire_one(sid)
     claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=sid)
@@ -350,8 +350,7 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
     assert await settle_unattended_unknown(authority, ref) is False
     notices = [m['content'] for m in authority.db.get_messages(sid)
                if m.get('display_kind') == 'failed_turn']
-    assert notices == [interrupted_notice(claimed)]
-    assert notices[0].startswith('The goal continuation for "'), notices
+    assert notices == [AUTOMATION_INTERRUPTED_NOTICE]
 
 
 @pytest.mark.asyncio
@@ -632,59 +631,7 @@ async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_private_topic_suspends_wait_without_refusal_and_resumes_after_off(parked, caplog):
-    # A private interval suspends the goal (#1033): no terminal refusal, no retry, no FIFO row.
-    runner, _adapter, _authority, _source, sid, key, _manager, rows, adapter_calls = parked
-    store = runner.session_store
-    before = goals.load_goal(sid).to_json()
-    store.set_incognito(key, True)
-    try:
-        with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
-            for _ in range(3):
-                await runner._goal_wakeup_fire_one(sid)
-    finally:
-        store.set_incognito(key, False)
-    assert not [r for r in caplog.records if r.name == 'gateway.run_goal_wait' and r.levelname == 'WARNING']
-    assert sid not in getattr(runner, '_goal_wait_retries', {})
-    assert sid not in getattr(runner, '_goal_wait_terminal', {})
-    assert rows() == []
-    assert goals.load_goal(sid).to_json() == before
-    assert runner._get_replay_scheduler().gate.load() == 0
-    adapter_calls.assert_not_called()
-    await runner._goal_wakeup_fire_one(sid)
-    assert len(rows()) == 1, 'the suspended wait resumes once the topic is public again'
-
-
-@pytest.mark.asyncio
-async def test_private_switch_racing_the_suspend_check_retries_instead_of_parking(parked, monkeypatch, caplog):
-    # /incognito landing after the watcher's suspend check: the durable route snapshot still
-    # refuses the private topic, but #1033 only suspends goals while private. The wait retries
-    # and resumes once the topic is public, instead of being parked until a restart.
-    runner, _adapter, _authority, _source, sid, key, _manager, rows, adapter_calls = parked
-    store = runner.session_store
-    from itertools import count
-    clock = count(1e12, 1000)
-    monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: next(clock))
-    store.set_incognito(key, True)
-    try:
-        with monkeypatch.context() as raced:
-            raced.setattr('gateway.run_goals._goal_suspended_while_private', lambda _entry: False)
-            with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
-                await runner._goal_wakeup_fire_one(sid)
-    finally:
-        store.set_incognito(key, False)
-    assert not [r for r in caplog.records if r.name == 'gateway.run_goal_wait' and r.levelname == 'WARNING']
-    assert sid not in getattr(runner, '_goal_wait_terminal', {})
-    assert sid in getattr(runner, '_goal_wait_retries', {})
-    assert rows() == []
-    assert runner._get_replay_scheduler().gate.load() == 0
-    adapter_calls.assert_not_called()
-    await runner._goal_wakeup_fire_one(sid)
-    assert len(rows()) == 1, 'the raced wait resumes once the topic is public again'
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('route', ['missing_durable_route'])
+@pytest.mark.parametrize('route', ['incognito', 'missing_durable_route'])
 async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked, monkeypatch, caplog, route):
     runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
     store = runner.session_store
@@ -694,9 +641,15 @@ async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked
     from itertools import count
     clock = count(1e12, 1000)
     monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: next(clock))
-    with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
-        for _ in range(3):
-            await runner._goal_wakeup_fire_one(sid)
+    try:
+        if route == 'incognito':
+            store.set_incognito(key, True)
+        with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
+            for _ in range(3):
+                await runner._goal_wakeup_fire_one(sid)
+    finally:
+        if route == 'incognito':
+            store.set_incognito(key, False)
     assert sid not in getattr(runner, '_goal_wait_retries', {}), 'permanent refusal kept retrying'
     warnings = [r for r in caplog.records if r.name == 'gateway.run_goal_wait' and r.levelname == 'WARNING']
     assert len(warnings) == 1

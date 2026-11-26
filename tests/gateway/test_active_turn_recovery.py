@@ -52,11 +52,6 @@ def _close_store_handles(store: SessionStore) -> None:
     store.close_all_db_handles()
 
 
-def _close_store_db(store: SessionStore) -> None:
-    """Compatibility helper for tests that predate the storage-handle migration."""
-    _close_store_handles(store)
-
-
 def _entry_for(store: SessionStore, source: SessionSource) -> SessionEntry:
     key = store._generate_session_key(source)
     with store._lock:

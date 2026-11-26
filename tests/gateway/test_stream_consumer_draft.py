@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -48,7 +48,6 @@ def _make_draft_capable_adapter(
 
     # Track every send_draft call for assertions.
     adapter.draft_calls = []
-    adapter.abandon_calls = []
 
     def _supports(chat_type=None, metadata=None):
         return bool(supports_draft) and (chat_type or "").lower() == "dm"
@@ -65,14 +64,6 @@ def _make_draft_capable_adapter(
             return SendResult(success=True, message_id=None)
         return SendResult(success=False, error="draft_rejected")
     adapter.send_draft = _send_draft
-
-    async def _abandon_open_draft(chat_id, content, *, metadata=None):
-        adapter.abandon_calls.append({
-            "chat_id": chat_id, "content": content, "metadata": metadata,
-        })
-        return SimpleNamespace(success=True, message_id="abandoned")
-
-    DraftCapableAdapter.abandon_open_draft = staticmethod(_abandon_open_draft)
 
     # send / edit_message: count and return canned successes so the
     # consumer's first-send + finalize paths work when drafts fall back
@@ -233,35 +224,6 @@ class TestDraftFallbackOnFailure:
         assert consumer._use_draft_streaming is False
         # Final message delivered via the regular send path.
         adapter.send.assert_awaited()
-
-
-class TestDraftTransportCleanup:
-    @pytest.mark.asyncio
-    async def test_cancelled_draft_cleanup_wakes_flush_waiters(self):
-        adapter = _make_draft_capable_adapter()
-        consumer = GatewayStreamConsumer(
-            adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm", cursor=""),
-        )
-        consumer._use_draft_streaming = True
-        consumer._abandon_native_stream = AsyncMock(side_effect=asyncio.CancelledError)
-        consumer._wake_flush_waiters = Mock()
-
-        with pytest.raises(asyncio.CancelledError):
-            await consumer._finish_transports()
-
-        consumer._wake_flush_waiters.assert_called_once_with()
-
-    @pytest.mark.asyncio
-    async def test_cancelled_turn_abandons_a_draft_only_once(self):
-        adapter = _make_draft_capable_adapter()
-        consumer = GatewayStreamConsumer(
-            adapter, "12345", StreamConsumerConfig(transport="auto", chat_type="dm", cursor=""),
-        )
-        consumer._use_draft_streaming = True
-        await consumer._on_cancelled()
-        await consumer._finish_transports()
-
-        assert len(adapter.abandon_calls) == 1
 
 
 class TestDraftIdLifecycle:

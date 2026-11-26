@@ -20,22 +20,6 @@ CLAIM_TTL_INACTIVITY_HEADROOM = 3
 PROTECTED_INTERVAL_MAX_SECONDS = 120
 PROTECTED_INTERVAL_HEADROOM_SECONDS = 30
 
-WORK_PRIORITIES = ("live", "production", "background")
-_WORK_PRIORITY_RANKS = {name: rank for rank, name in enumerate(WORK_PRIORITIES)}
-
-
-def job_priority(job: dict) -> str:
-    """Return the effective business-impact lane; unset, legacy or malformed values are production.
-
-    Runs inside admission sorting, so a hand-edited record must never raise here."""
-    value = job.get("priority")
-    return value if isinstance(value, str) and value in _WORK_PRIORITY_RANKS else "production"
-
-
-def job_priority_rank(job: dict) -> int:
-    """Return the stable admission rank for a cron job (lower starts first)."""
-    return _WORK_PRIORITY_RANKS[job_priority(job)]
-
 
 def is_protected_interval(job: dict) -> bool:
     """Short interval schedules share one reserved worker, independent of job names or IDs."""

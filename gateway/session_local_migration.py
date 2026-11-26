@@ -70,16 +70,13 @@ def legacy_launch_params(row):
     their workspace only there. ``api_mode`` is no create field, so it is
     returned apart.
     """
-    from agent.fallback_session_route import fallback_restored_row
-    row_values = fallback_restored_row(asdict(row)) or asdict(row)
-    source = row.source
-    params = {key: row_values[key] for key in ('cwd', 'model') if row_values.get(key)}
-    from hermes_state_sessions import _parse_model_config
-    saved = _parse_model_config(row_values.get('model_config'))
-    from hermes_state_gateway import SessionGatewayMixin
-    route = SessionGatewayMixin.session_gateway_runtime(row_values)
-    route = {key: value.strip() for key, value in route.items() if isinstance(value, str) and value.strip()}
-    billing_base_url = row_values.get('billing_base_url')
+    params = {key: getattr(row, key) for key in ('cwd', 'model') if getattr(row, key)}
+    saved = parse_model_config(row.model_config)
+    from persistence.gateway.routing import gateway_runtime
+    route = gateway_runtime(row.model_config, billing_provider=row.billing_provider, billing_base_url=row.billing_base_url)
+    route = {key: value.strip() for key in ('provider', 'base_url', 'api_mode')
+             if isinstance(value := getattr(route, key), str) and value.strip()}
+    billing_base_url = row.billing_base_url
     if 'base_url' not in route and isinstance(billing_base_url, str) and billing_base_url.strip():
         route['base_url'] = billing_base_url.strip()
         # The reader returns a bare ``custom`` billing provider with its endpoint and drops ``auto``:
@@ -98,7 +95,7 @@ def legacy_launch_params(row):
         # Without a provider, adoption below heals it to the entry serving the model, else the profile.
         route.pop('provider')
         route.pop('api_mode', None)
-    if source == 'acp' and 'cwd' not in params and Path(str(saved.get('cwd') or '')).is_absolute():
+    if row.source == 'acp' and 'cwd' not in params and Path(str(saved.get('cwd') or '')).is_absolute():
         params['cwd'] = saved['cwd']
     params.update({key: route[key] for key in ('provider', 'base_url') if key in route})
     reasoning = saved.get('reasoning_config')

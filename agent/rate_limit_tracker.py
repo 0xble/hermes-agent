@@ -63,23 +63,6 @@ class RateLimitState:
         return time.time() - self.captured_at if self.has_data else float("inf")
 
 
-def tpm_admission_delay(state: Optional[RateLimitState], estimated_tokens: Any) -> float:
-    """Return the wait needed for an estimated request to fit the current TPM bucket.
-
-    Missing headers and missing estimates fail open; a known bucket that cannot fit the
-    request returns its adjusted reset time so dispatch can switch route or defer.
-    """
-    if state is None or not state.has_data:
-        return 0.0
-    try:
-        estimate = int(estimated_tokens)
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
-    if estimate <= 0 or state.tokens_min.limit <= 0 or state.tokens_min.remaining >= estimate:
-        return 0.0
-    return state.tokens_min.remaining_seconds_now
-
-
 def _safe_float(value: Any, default: Any = 0.0) -> Any:
     try:
         return float(value)

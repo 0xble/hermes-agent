@@ -319,42 +319,6 @@ def _ensure_generation(
     return python
 
 
-def collect_environment_generations(root: Path, *, keep_previous: int = 1) -> list[Path]:
-    """Collect superseded side-environment generations without a reader lease.
-
-    Side environments publish ``active.json`` under an install-state lock, but
-    their consumers do not hold generation leases. Keep the selected generation
-    and one newest predecessor so a concurrent CI reader cannot lose its tree.
-    """
-    from pm.environments import install_state_lock
-
-    root = Path(root).absolute()
-    if keep_previous < 0:
-        raise ValueError("keep_previous must be non-negative")
-    if not root.is_dir():
-        return []
-    removed: list[Path] = []
-    with install_state_lock(root.parent, timeout=None) as held:
-        if not held:
-            return removed
-        selected = _selection(root).get("generation")
-        generations = [path for path in root.iterdir()
-                       if path.is_dir() and not path.is_symlink()
-                       and path.name.startswith("gen-")]
-        current = next((path for path in generations if path.name == selected), None)
-        if current is None:
-            return removed
-        predecessors = sorted((path for path in generations if path != current),
-                              key=lambda path: path.stat().st_mtime_ns, reverse=True)
-        keep = {path for path in (current, *predecessors[:keep_previous]) if path is not None}
-        for generation in generations:
-            if generation in keep:
-                continue
-            shutil.rmtree(generation)
-            removed.append(generation)
-    return removed
-
-
 def ensure_python_tool(
     name: str, requirements: Sequence[str], executable: str, *,
     root: Path | None = None, explicit: bool = False, timeout: int = UV_STEP_TIMEOUT,

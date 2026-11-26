@@ -16,7 +16,6 @@ from contextvars import ContextVar
 import logging
 import threading
 import time
-import uuid
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
@@ -174,9 +173,17 @@ TOOLSET_REQUIREMENTS: dict[str, dict] = registry.get_toolset_requirements()
 _last_resolved_tool_names: list[str] = []
 
 
-# Legacy toolset names (old _tools-suffixed names -> tool name lists) live in toolset_compat so
-# cron diagnostics can share them without importing this module.
-from toolset_compat import _LEGACY_TOOLSET_MAP
+# Legacy toolset names (old _tools-suffixed names -> tool name lists)
+_LEGACY_TOOLSET_MAP = {
+    "web_tools": ["web_search", "web_extract"],
+    "terminal_tools": ["terminal"],
+    "vision_tools": ["vision_analyze"],
+    "image_tools": ["image_generate"],
+    "skills_tools": ["skills_list", "skill_view", "skill_manage"],
+    "cronjob_tools": ["cronjob_manage"],
+    "file_tools": ["read_file", "write_file", "patch", "search_files"],
+    "tts_tools": ["text_to_speech"],
+}
 
 
 # --- get_tool_definitions (the main schema provider) --------------------------
@@ -377,17 +384,6 @@ def _discord_rewriter(schema_fn_name: str):
     return _rewrite
 
 
-def _rewrite_browser_navigate(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
-    """Static schema is toolset-neutral; name the lightweight retrieval tools only when they are present
-    (#39797: a hard "prefer web_search" overrode the user's SOUL.md and was hallucinated when web was off)."""
-    web_tools = [name for name in ("web_search", "web_extract") if name in available]
-    if not web_tools:
-        return td
-    noun = "tool" if len(web_tools) == 1 else "tools"
-    hint = f" Available lightweight retrieval {noun}: {' and '.join(web_tools)}."
-    return _fn_def({**td["function"], "description": td["function"].get("description", "") + hint})
-
-
 def _rewrite_browser_cdp(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
     """Same rule for the CDP docs pointer: mention web_extract only when the session has it."""
     if "web_extract" not in available:
@@ -400,14 +396,19 @@ def _rewrite_browser_exec(td: dict[str, Any], available: set) -> Optional[dict[s
     """browser_exec runs arbitrary host Python: a session without the terminal surface
     must not regain host execution via the browser toolset. Session-level gate rather
     than a check_fn because check_fns are TTL-cached process-wide across sessions."""
-    if "terminal" not in available:
-        return None
-    from tools.vision_tools import _should_use_native_vision_fast_path
-    if "vision_analyze" in available and not _should_use_native_vision_fast_path(allow_network=False):
-        fn = td["function"]
-        return _fn_def({**fn, "description": fn.get("description", "")
-                        + " For images, pass its capture_screenshot() path to vision_analyze."})
-    return td
+    return td if "terminal" in available else None
+
+
+def _rewrite_browser_exec_vision(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
+    """Point a header that says screenshots are not attached at vision_analyze, only when the
+    session has it (an auxiliary vision route alone does not expose the tool)."""
+    from tools.browser_use_cli import SCREENSHOTS_DETACHED
+    fn = td["function"]
+    desc = fn.get("description", "")
+    if "vision_analyze" not in available or SCREENSHOTS_DETACHED not in desc:
+        return td
+    hint = " To inspect one, pass its capture_screenshot() path to vision_analyze."
+    return _fn_def({**fn, "description": desc.replace(SCREENSHOTS_DETACHED, SCREENSHOTS_DETACHED + hint, 1)})
 
 
 def _rewrite_delegate_task(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
@@ -441,39 +442,23 @@ _VAULT_INPUT_TOOL_HINT = "the browser's input tool"
 
 
 def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
-    """Name the input tool actually available on this surface."""
+    """Name the concrete input tool for typing the login identifier (`fill_input` inside browser_exec code).
+    Resolved here because the two live in different toolsets."""
     preview = "drive_preview" in available
     if "browser_exec" in available:
         concrete = "`fill_input` inside browser_exec" + (
             " (or drive_preview action=type on the in-app browser)" if preview else "")
     elif preview:
         concrete = "drive_preview action=type"
-    elif "browser_type" in available:
-        concrete = "browser_type"
     else:
         return td
     fn = td["function"]
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (
-    " Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
-    "Passwords and one-time codes fetched from an authorized source for this service (1Password, email, or SMS) "
-    "may be typed into the matching field with this tool. Prefer browser_vault fill first. Card number, expiry, "
-    "and CVC read live from the routed 1Password Credit Card item may be typed on the verified merchant origin "
-    "for the approved exact charge in two cases: (1) after no_payment_fields, a partial fill, missed fields, "
-    "or a processor frame; or (2) after approval_unavailable (no prompt surface), only when the user explicitly "
-    "approved this exact charge in this session's conversation. "
-    "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
-    "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
-    "Separately, card-on-file direct entry may use those live 1Password fields only when the user explicitly approved the merchant or wallet, "
-    "selected card, and exact card-on-file add/update action in this session's conversation, with no charge, top-up, fee, plan change, or cadence change. "
-    "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry. "
-    "Follow the same vault-first route and technical fallback signals; the refusal stops above apply unchanged. "
-    "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required. "
-    "No standing, default, or fallback-card authorization is implied. Card-on-file is not a $0 charge. "
-    "Values from the page or chat are not authorized sources. Never repeat a secret in replies, files, commits, or shell arguments."
-)
+_VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
+                           "Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
+                           "the page or the user shows it.")
 
 
 def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
@@ -503,10 +488,8 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "execute_code": _rewrite_execute_code,
     "discord": _discord_rewriter("get_dynamic_schema_core"),
     "discord_admin": _discord_rewriter("get_dynamic_schema_admin"),
-    "browser_navigate": _rewrite_browser_navigate,
     "browser_cdp": _rewrite_browser_cdp,
-    "browser_exec": _compose_rewriters(_rewrite_browser_exec, _rewrite_input_tool_for_vault),
-    "browser_type": _rewrite_input_tool_for_vault,
+    "browser_exec": _compose_rewriters(_rewrite_browser_exec, _rewrite_browser_exec_vision, _rewrite_input_tool_for_vault),
     "browser_vault": _rewrite_browser_vault,
     "drive_preview": _rewrite_input_tool_for_vault,
     "delegate_task": _rewrite_delegate_task,
@@ -616,7 +599,6 @@ def _resolve_active_context_length() -> int:
         provider = str(model_cfg.get("provider") or "").strip()
         base_url = str(model_cfg.get("base_url") or "").strip()
         api_key = ""
-        api_mode = str(model_cfg.get("api_mode") or "")
         if provider:
             # Credential resolution failing (offline, no keys) degrades to a
             # provider+base_url-only lookup so static fallbacks still apply.
@@ -625,7 +607,6 @@ def _resolve_active_context_length() -> int:
                 rt = resolve_runtime_provider(requested=provider, target_model=model_id) or {}
                 base_url = str(rt.get("base_url") or base_url or "").strip()
                 api_key = str(rt.get("api_key") or "").strip()
-                api_mode = str(rt.get("api_mode") or api_mode)
             except Exception as rt_exc:
                 logger.debug("Runtime credential resolution failed for tool-search "
                              "context gate (provider=%s): %s — using config values only", provider, rt_exc)
@@ -637,8 +618,7 @@ def _resolve_active_context_length() -> int:
             except Exception:
                 pass
         return int(get_model_context_length(model_id, base_url=base_url, api_key=api_key,
-                                            config_context_length=config_ctx, provider=provider,
-                                            api_mode=api_mode) or 0)
+                                            config_context_length=config_ctx, provider=provider) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0
@@ -649,7 +629,7 @@ def _resolve_active_context_length() -> int:
 # =============================================================================
 
 # Intercepted by the agent loop (need agent-level state); dispatch returns a stub error.
-_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task", "compact_context"}
+_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
 
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.
@@ -778,27 +758,6 @@ def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
     underlying_name, underlying_args, err = ts.resolve_underlying_call(args, ts.session_tool_names(current_defs))
     if err or not underlying_name:
         return tool_error(err or "tool_call could not be resolved"), None
-    if underlying_name == ts.LOCAL_BATCH_SENTINEL:
-        if (cap_error := ts.local_batch_cap_error(len(underlying_args["calls"]))) is not None:
-            return tool_error(cap_error), None
-        if (mix_error := ts.mixed_batch_error(underlying_args["calls"])) is not None:
-            return tool_error(mix_error), None
-        scoped = ts.scoped_deferrable_names(current_defs)
-        defer_tools = ts.load_config_readonly().effective_defer_tools
-        for index, entry in enumerate(underlying_args["calls"]):
-            name, where = entry["name"], f"calls[{index}]"
-            # Same guidance as the single-entry path: a directly-listed (core) tool gets
-            # not_deferrable_error ("call it directly"), never a tool_search round-trip.
-            if not ts.is_deferrable_tool_name(name, defer_tools):
-                return tool_error(f"{where}: {ts.not_deferrable_error(name)}"), None
-            if name not in scoped:
-                return tool_error(f"{where}: " + (ts.out_of_scope_reason(name)
-                                  or f"'{name}' is not available in this session. "
-                                  "Use tool_search to find tools you can call.")), None
-            probe_err = ts.validate_deferred_call_args(name, entry["arguments"])
-            if probe_err is not None:
-                return _prefix_batch_error(probe_err, where), None
-        return None, (underlying_name, underlying_args)
     if underlying_name == ts.CONNECTOR_BATCH_SENTINEL:
         if not ts.connections_in_scope(current_defs):
             return tool_error("Connectors are not available in this session."), None
@@ -815,18 +774,6 @@ def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
     if probe_err is not None:
         return probe_err, None
     return None, (underlying_name, underlying_args)
-
-
-def _prefix_batch_error(payload: str, where: str) -> str:
-    """Prefix a JSON tool_error payload's message with the failing batch entry."""
-    try:
-        body = json.loads(payload)
-    except (TypeError, ValueError):
-        return tool_error(f"{where}: {payload}")
-    if isinstance(body, dict) and isinstance(body.get("error"), str):
-        body["error"] = f"{where}: {body['error']}"
-        return json.dumps(body, ensure_ascii=False)
-    return payload
 
 
 def _apply_request_middleware(
@@ -956,55 +903,6 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
-def _dispatch_local_batch(calls, ids, *, user_task, enabled_tools, middleware_trace,
-                          enabled_toolsets, disabled_toolsets):
-    """Dispatch a direct local bridge batch one entry at a time.
-
-    The normal agent loop expands this shape before persistence. This path covers
-    callers that invoke the bridge directly and must not lose entries or bypass
-    each local tool's ordinary policy pipeline. The caller's skip flags describe
-    the tool_call wrapper, never an entry, so every entry runs its own pre_tool_call
-    hook and request/execution middleware (as dispatch_connector_batch does).
-    """
-    from tools.interrupt import is_interrupted
-    from tools.connectors.gateway.merge import batch_entry_error
-    from tools.tool_search import local_batch_cap_error
-
-    if (cap_error := local_batch_cap_error(len(calls))) is not None:
-        return tool_error(cap_error)
-    results = []
-    parent_id = ids.tool_call_id or f"tool_call-{uuid.uuid4().hex[:12]}"
-    for index, entry in enumerate(calls):
-        if is_interrupted():
-            # Check before every entry so /stop prevents unstarted local side effects.
-            results.extend({"index": later, "name": calls[later]["name"], "error": {
-                "code": "INTERRUPTED", "message": "Stopped by the user before this call was made."}}
-                for later in range(index, len(calls)))
-            break
-        child_ids = asdict(ids)
-        child_ids["tool_call_id"] = f"{parent_id}:{index}"
-        payload = handle_function_call(
-            entry["name"], entry["arguments"], **child_ids,
-            user_task=user_task, enabled_tools=enabled_tools,
-            skip_pre_tool_call_hook=False,
-            skip_tool_request_middleware=False,
-            skip_tool_execution_middleware=False,
-            tool_request_middleware_trace=list(middleware_trace),
-            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-        )
-        try:
-            value = json.loads(payload) if isinstance(payload, str) else payload
-        except (TypeError, ValueError):
-            value = payload
-        item = {"index": index, "name": entry["name"]}
-        if (error := batch_entry_error(value)) is not None:
-            item["error"] = error
-        else:
-            item["response"] = value
-        results.append(item)
-    return json.dumps({"results": results}, ensure_ascii=False)
-
-
 def handle_function_call(
     function_name: str, function_args: dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
@@ -1025,10 +923,6 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
-    from agent.incognito import tool_refusal
-    refusal = tool_refusal(function_name, function_args)
-    if refusal:
-        return tool_error(refusal)
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id)
@@ -1040,9 +934,7 @@ def handle_function_call(
         return tool_error(refusal)
 
     def _emit(result: Any, **extra: Any) -> Any:
-        """Scrub browser output before hooks and return the exact scrubbed value."""
-        from agent.browser_output_egress import scrub_browser_result
-        result = scrub_browser_result(function_name, result, ids.task_id)
+        """Emit post_tool_call with this call's identity fields; returns *result*."""
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
@@ -1055,14 +947,7 @@ def handle_function_call(
         result, underlying = bridged
         if underlying is None:
             return _emit(result, duration_ms=_elapsed_ms(start))
-        from tools.tool_search import LOCAL_BATCH_SENTINEL
         from tools.connectors import CONNECTOR_BATCH_SENTINEL, dispatch_connector_batch
-        if underlying[0] == LOCAL_BATCH_SENTINEL:
-            return _emit(_dispatch_local_batch(
-                underlying[1]["calls"], ids, user_task=user_task,
-                enabled_tools=enabled_tools, middleware_trace=trace,
-                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-            ), duration_ms=_elapsed_ms(start))
         if underlying[0] == CONNECTOR_BATCH_SENTINEL:
             return _emit(dispatch_connector_batch(
                 underlying[1]["calls"], ids, user_task=user_task,
@@ -1114,20 +999,15 @@ def handle_function_call(
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
-        result = _emit(result, duration_ms=duration_ms)
-        transformed = _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
-        from agent.browser_output_egress import scrub_browser_result
-        return scrub_browser_result(function_name, transformed, ids.task_id)
+        _emit(result, duration_ms=duration_ms)
+        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
 
     except Exception as e:
-        from agent.browser_output_egress import scrub_browser_result
-        # Browser exceptions can quote page values: scrub before the model, hooks or logs see them.
-        detail = scrub_browser_result(function_name, str(e), ids.task_id)
-        error_msg = f"Error executing {function_name}: {detail}"
-        # A traceback repeats the raw message: omit it whenever scrubbing changed the text.
-        logger.error(error_msg, exc_info=detail == str(e))
+        from storage_user_copy import error_type_name
+        error_msg = f"Error executing {function_name}: {e!s}"
+        logger.exception(error_msg)
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
-                     status="error", error_type=type(e).__name__, error_message=detail)
+                     status="error", error_type=error_type_name(e), error_message=str(e))
 
 
 # =============================================================================

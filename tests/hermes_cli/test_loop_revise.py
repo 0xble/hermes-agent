@@ -15,7 +15,7 @@ def _manager(tmp_path, monkeypatch, sid="rev"):
     from pathlib import Path
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     from hermes_cli import goals
-    monkeypatch.setattr("persistence.sqlite._state.dbfile._iter_darwin_fd_targets", lambda: iter(()))
+    monkeypatch.setattr("hermes_state_dbfile._iter_darwin_fd_targets", lambda: iter(()))
     goals._DB_CACHE.clear()
     from hermes_cli.loops import LoopManager
     return LoopManager(sid)

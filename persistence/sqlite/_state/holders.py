@@ -63,7 +63,7 @@ def describe_holder_pid(pid: int) -> str:
     if argv is None and psutil is not None:
         try:
             argv = psutil.Process(pid).cmdline() or None
-        except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
+        except Exception:
             argv = None
     who = " ".join(" ".join([os.path.basename(argv[0]), *argv[1:]]).split())[:80] if argv else "command line unavailable"
     return f"PID {pid} ({who})"
@@ -422,7 +422,6 @@ def _windows_restart_manager_holders(db_path: Path) -> list[tuple[int, str]]:
         end(session)
 
 
-# health: allow CC, NESTING -- platform-specific fail-closed holder scan keeps one authority path
 def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     """Return foreign holders of the DB or one of its WAL sidecars.
 
@@ -433,7 +432,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     if _IS_WINDOWS:
         try:
             return _windows_restart_manager_holders(db_path)
-        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
+        except Exception as exc:
             logger.warning(
                 "Could not prove state.db has no Windows holders; deferring structural maintenance: %s",
                 exc,
@@ -534,7 +533,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                         and fd_stat.st_dev == db_dev
                     ):
                         holders.append((pid, target))
-        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
+        except Exception as exc:
             logger.warning(
                 "Could not prove state.db has no foreign holders; "
                 "deferring structural maintenance: %s",
@@ -547,7 +546,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
         # Match kernel identities without stat-ing unrelated descriptor paths,
         # including hardlink aliases and a retired SQLite generation.
         try:
-            from persistence.sqlite._state.dbfile import _iter_darwin_fd_targets
+            from hermes_state_dbfile import _iter_darwin_fd_targets
 
             for pid, _fd, target, identity in _iter_darwin_fd_targets():
                 if pid == os.getpid():
@@ -557,7 +556,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                     and db_dev is not None and identity[0] == db_dev
                 ):
                     holders.append((pid, target))
-        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
+        except Exception as exc:
             logger.warning(
                 "Could not prove state.db has no foreign holders; "
                 "deferring structural maintenance: %s", exc,
@@ -577,7 +576,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 path = getattr(opened, "path", "")
                 if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
                     holders.append((pid, path))
-    except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
+    except Exception as exc:
         logger.warning(
             "Could not prove state.db has no foreign holders; "
             "deferring structural maintenance: %s",
@@ -673,9 +672,9 @@ def live_writer_holds_db(
         if probe is not None:
             try:
                 probe.execute("PRAGMA locking_mode=NORMAL")
-            except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
+            except Exception:
                 pass
             try:
                 probe.close()
-            except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
+            except Exception:
                 pass

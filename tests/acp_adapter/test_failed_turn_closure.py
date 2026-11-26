@@ -366,21 +366,6 @@ def test_failed_turn_boundary_is_idempotent_on_the_durable_tail_and_skips_contex
     assert len(written) == 1
     assert (messages[-1]["role"], messages[-1]["content"]) == ("assistant", PARTIAL_FAILED_TURN_NOTICE)  # a tool ran: hedge
     assert db.messages.latest_conversation_role(sid) == "assistant"
-
-    sid2 = "s2"
-    db.create_session(session_id=sid2, source="cli", model="m")
-    db.append_message(sid2, "user", "continue the build")
-    automatic_messages = [{"role": "user", "content": "continue the build"}]
-    automatic_agent = SimpleNamespace(
-        _session_db=db, session_id=sid2, _turn_provenance="goal_loop",
-        _flush_messages_to_session_db=lambda rows: db.append_message(
-            sid2, rows[-1]["role"], rows[-1]["content"]),
-    )
-    _close_durable_failed_turn(automatic_agent, {
-        "completed": False, "failed": True, "failure_reason": "server_error",
-        "messages": automatic_messages, "current_turn_user_idx": 0,
-    })
-    assert automatic_messages[-1]["content"] == ""
     db.close()
 
 

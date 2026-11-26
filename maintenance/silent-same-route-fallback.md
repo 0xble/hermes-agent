@@ -47,7 +47,7 @@ removing the successful alias retry.
 ## Verification
 
 Contract tests: `tests/agent/test_silent_same_route_fallback.py` and
-  `tests/agent/test_fallback_notice_backend_identity.py`. The latter pins the
+`tests/agent/test_fallback_notice_backend_identity.py`. The latter pins the
 real first-class billing fallback plus verified recovery notices, silent-flag
 lifecycle (including temporary voice restoration), and same-label skip versus
 different-label allowed retry at the deployment-skip call site.

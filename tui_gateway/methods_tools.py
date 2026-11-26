@@ -5,15 +5,10 @@ bodies reference server globals bare (``_ok``, ``_err``, ``_sessions``, ...).
 Helper names must not collide with server.py's own (``_cmd_`` / ``_toolset_`` / ``_mcp_`` prefixes).
 """
 
-from tui_gateway.methods_tools_plugin_settings import (
-    _plugins_onboarding, _plugins_presence, _plugins_settings
-)
-
 import contextlib
 import sys
 from pathlib import Path
 
-from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -164,7 +159,7 @@ def _session_key_or_err(rid, session, module: str, label: str):
 
 def _user_turn_indices(session):
     """(history, indices of user-originated turns) minus ephemeral scaffolding. Call under history_lock."""
-    is_user = _tools_mod("agent.context_compressor").user_originated_turn_view
+    is_user = _tools_mod("session_rules.turns").user_originated_turn_view
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
     return history, [i for i, m in enumerate(history) if is_user(m) is not None]
 
@@ -686,29 +681,13 @@ def _cmd_moa(rid, params, session, name, arg):
         if not session:
             return _err(rid, 4001, "no active session")
         preset = moa.normalize_moa_config(_load_cfg().get("moa") or {})["default_preset"]
-        # A running turn owns the live agent. Queue the one-shot state alongside the
-        # prompt instead of switching that agent under its worker thread (#moa-busy-defer).
+        # Record the live identity for post-turn restore, then swap the agent's client in
+        # place: session["model_override"] alone never switches an already-built agent.
         agent = session.get("agent")
-        if session.get("running"):
-            # The token is the only MoA state a client may carry. Preset and restore data remain
-            # in the session-owned record so edits, retries, and isolated turns cannot choose a model.
-            # The restore snapshot is intentionally empty here: claim-time capture runs after a
-            # preceding /model --once turn has restored its temporary model.
-            record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
-            queue_token = record["token"]
-            notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
-            return _ok(rid, {"type": "send", "display": f"/moa {arg}", "queued": True,
-                             "moa_token": queue_token, "notice": notice, "message": arg})
-        # Record the live identity for post-turn restore in the same session-owned record used
-        # by busy turns. Clients never receive the preset or restore snapshot. Claim-time capture
-        # is after any completed one-turn restore and before applying the MoA model.
-        record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
-        queue_token = record["token"]
-        pending_moa.claim(
-            session, queue_token,
-            restore=pending_moa.restore_snapshot(session, agent=agent),
-        )
-        session["_active_moa_token"] = queue_token
+        # See #53444.
+        session["moa_one_shot_restore"] = {
+            "override": session.get("model_override"), "model": getattr(agent, "model", None),
+            "provider": getattr(agent, "provider", None)}
         if agent is not None:
             try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml
                 _apply_model_switch(
@@ -716,8 +695,7 @@ def _cmd_moa(rid, params, session, name, arg):
                     confirm_expensive_model=False, pin_session_override=True, persist_override=False,
                     count_switch=False)
             except Exception:
-                pending_moa.cancel(session, queue_token)
-                session.pop("_active_moa_token", None)
+                session.pop("moa_one_shot_restore", None)
                 raise
         else:  # lazy/fresh session: the override is consumed by the first build
             session["model_override"] = {
@@ -755,8 +733,7 @@ def _cmd_retry(rid, params, session, name, arg):
         return _err(rid, 4001, "no active session to retry")
     if busy := _busy_error(rid, session, "retry"):
         return busy
-    cc = _tools_mod("agent.context_compressor")
-    from session_rules.turns import retryable_user_text
+    cc = _tools_mod("session_rules.turns")
     with session["history_lock"]:
         if busy := _busy_error(rid, session, "retry"):
             return busy
@@ -767,15 +744,14 @@ def _cmd_retry(rid, params, session, name, arg):
             return err
         _prefix, live_view = cc.history_before_user_originated_turn(history, user_indices[-1])
         try:
-            content = retryable_user_text(live_view.get("content"))
+            content = cc.retryable_user_text(live_view.get("content"))
         except ValueError as exc:
             return _err(rid, 4018, str(exc))
         rewound, err = _rewind_or_err(
             rid, session, len(user_indices) - 1, (4018, ""), "retry: failed to persist history: ", require_retryable=True)
         if err:
             return err
-        assert rewound is not None
-        content = retryable_user_text(rewound[1].get("content"))
+        content = cc.retryable_user_text(rewound[1].get("content"))
     _tui_model_friction("retry", session)
     return _ok(rid, {"type": "send", "message": content})
 
@@ -791,7 +767,7 @@ def _cmd_steer(rid, params, session, name, arg):
     agent = session.get("agent")
     if agent and hasattr(agent, "steer"):
         with contextlib.suppress(Exception):
-            if agent.steer(arg, human=True):
+            if agent.steer(arg):
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
     return _ok(rid, {"type": "send", "message": arg})  # turn still building / steer refused: next-turn message
 
@@ -802,18 +778,15 @@ def _cmd_goal(rid, params, session, name, arg):
         if err:
             return err
         try:
-            value = (_load_cfg().get("goals") or {}).get("max_turns", 20)
-            max_turns = goals.normalize_goal_max_turns(value)
+            max_turns = int((_load_cfg().get("goals") or {}).get("max_turns", 20) or 20)
         except Exception:
             max_turns = 20
         mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
         from hermes_cli.goal_command import dispatch_goal_command
-        from gateway.session_context import scoped_current_session_id
-        with scoped_current_session_id(sid_key):
-            result = dispatch_goal_command(
-                mgr, arg, authorize_gate=lambda: None,
-                last_user_message=goals.last_user_message_from_db(sid_key),
-            )
+        result = dispatch_goal_command(
+            mgr, arg, authorize_gate=lambda: None,
+            last_user_message=goals.last_user_message_from_db(sid_key),
+        )
         if result.error:
             return _err(rid, 4004, result.output)
         if not result.prompt:
@@ -831,6 +804,11 @@ def _cmd_loop(rid, params, session, name, arg):
         return err
     result = loops.dispatch_loop_command(loops.LoopManager(session_id=sid_key), arg)
     output = result.get("output") or ""
+    if result.get("created"):
+        with contextlib.suppress(Exception):
+            if loops.goal_blocks_loop_tick(sid_key):
+                output += ("\nNote: an active /goal is driving this session — loop "
+                           "wakeups defer until the goal finishes, pauses, or parks.")
     return _exec_out(rid, output)
 
 
@@ -1130,12 +1108,14 @@ def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
     # ``profile`` selects that profile's store; the launch handle is never the fallback for a
     # scoped call (a foreign first touch used to pin the process-wide handle, #102526).
-    with _profile_db(params) as db:
-        if db is None:
+    from persistence.conversation.sessions import SessionQuery, SessionWindow
+    with _profile_db(params) as db, _persistence_for(db) as persistence:
+        if persistence is None:
             return _db_unavailable_error(rid, code=5017)
         cutoff = time.time() - days * 86400
-        rows = [s for s in db.list_sessions_rich(limit=500, compact_rows=True) if (s.get("started_at") or 0) >= cutoff]
-    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.get("message_count", 0) for s in rows)})
+        entries = persistence.sessions.list_sessions(SessionQuery(), SessionWindow(limit=500), compact_rows=True)
+        rows = [e.session for e in entries if (e.session.started_at or 0) >= cutoff]
+    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.message_count for s in rows)})
 
 
 @_rpc("rollback.list", live_session=True, fail_code=5020)
@@ -1168,7 +1148,7 @@ def _(rid, params: dict, session) -> dict:
             return {"success": False, "error": reason}
         # A whole-tree restore keeps the user's hand-edits unless ``all`` (main's --all), as on the owner.
         commit = _resolve_checkpoint_hash(mgr, cwd, target)
-        taken = _tools_mod("tools.checkpoint_undo_hint").checkpoint_taken_at(cwd, commit)
+        taken = _tools_mod("agent.checkpoints.undo_hint").checkpoint_taken_at(cwd, commit)
         result = mgr.restore(cwd, commit, file_path=file_path or None,
                              safe=not file_path and params.get("all") is not True)
         if result.get("success") and not file_path:
@@ -1176,7 +1156,7 @@ def _(rid, params: dict, session) -> dict:
             with session["history_lock"]:
                 history, user_indices = _user_turn_indices(session)
                 # Not a turn /undo kept: only one that made or followed this checkpoint.
-                if _tools_mod("tools.checkpoint_undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
+                if _tools_mod("agent.checkpoints.undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
                     try:
                         removed = _rewind_active_session_history(session, len(user_indices) - 1)[2]
                     except SessionNotOwned:
@@ -1229,12 +1209,9 @@ def _container_checkpoint_refusal(session, mgr, cwd) -> str | None:
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     action = params.get("action", "status")
-    if action in {"status", "use"}:
-        from tools.browser_use_cli import is_browser_use_cli_mode, set_browser_use_mode
-        if action == "use":
-            set_browser_use_mode(params.get("enabled", True) is not False)
+    if action == "status":
         url = _resolve_browser_cdp_url()
-        return _ok(rid, {"connected": bool(url), "url": url, "browser_use": is_browser_use_cli_mode()})
+        return _ok(rid, {"connected": bool(url), "url": url})
     if action == "disconnect":
         return _browser_disconnect(rid)
     if action == "connect":
@@ -1883,6 +1860,38 @@ def _plugins_remove(rid, params):
     return _ok(rid, result) if result.get("ok") else _err(rid, 5026, result.get("error") or "remove failed")
 
 
+def _plugins_settings(rid, params):
+    """Write manifest-declared settings (``values`` = ``{key: value}``) through the same writer as
+    ``ctx.set_config``; secrets are refused here (the client stores them via the ``.env`` route)."""
+    key = (params.get("key") or params.get("name") or "").strip()
+    values = params.get("values")
+    if not key or not isinstance(values, dict):
+        return _err(rid, 4019, "plugins.settings requires a 'key' and a 'values' mapping")
+    pc = _tools_mod("hermes_cli.plugins_cmd")
+    found = pc._find_plugin_entry(key)
+    if found is None:
+        return _err(rid, 4020, f"plugin '{key}' not found")
+    _name, _version, _desc, _source, plugin_dir, canonical = found
+    try:
+        written = _tools_mod("hermes_cli.plugins_settings").save_plugin_settings(
+            canonical, Path(str(plugin_dir)) if plugin_dir else None, values)
+    except (ValueError, PermissionError) as e:
+        return _err(rid, 4021, str(e))
+    row = next((r for r in _plugin_rows() if r["key"] == canonical), None)
+    # A Desktop half applies its own preferences (a status-bar chip on/off) without polling.
+    events = _tools_mod("hermes_cli.plugin_events")
+    if events._PLUGIN_ID_RE.match(canonical):  # category keys (``image_gen/fal``) form no event name
+        events.broadcast_plugin_event(canonical, "settings.changed", {"written": written})
+    # A secret the form just stored may feed the plugin's MCP server env (``${MESHY_API_KEY}``): bounce
+    # only servers whose resolved launch inputs changed, off the RPC thread (an npx start takes seconds).
+    if plugin_dir and pc._is_portable_plugin_dir(plugin_dir):
+        servers = _portable_server_names(Path(str(plugin_dir)), canonical)
+        if servers:
+            from agent.memory_provider import spawn_context_thread  # keeps this request's profile scope
+            discovery = _tools_mod("tools.mcp_tool_discovery")
+            spawn_context_thread(discovery.restart_mcp_servers_with_new_inputs, args=(servers,),
+                                 name=f"plugin-settings-mcp-{canonical}").start()
+    return _ok(rid, {"ok": True, "name": canonical, "written": written, "plugin": row})
 
 
 def _portable_server_names(plugin_dir: Path, key: str) -> set[str]:
@@ -1910,8 +1919,14 @@ def _plugins_auto_update(rid, params):
         return _err(rid, 4021, str(e))
 
 
+def _plugins_onboarding(rid, params):
+    """Catalog plugins curated for the onboarding card that this OS runs, each with its app state."""
+    return _ok(rid, {"onboarding": _tools_mod("hermes_cli.plugin_catalog_presence").onboarding_entries()})
 
 
+def _plugins_presence(rid, params):
+    """Named catalog plugins this OS runs, in the order asked, each with its app state and disclosure."""
+    return _ok(rid, {"presence": _tools_mod("hermes_cli.plugin_catalog_presence").presence_for(params.get("names") or [])})
 
 
 _PLUGINS_ACTIONS = {"list": _plugins_list, "onboarding": _plugins_onboarding, "presence": _plugins_presence,

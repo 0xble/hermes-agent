@@ -47,7 +47,7 @@ def owns_detached_execution(job_id, execution_id):
 
 def _request(row):
     """The admitted identity is durable before the firer receives its submit answer."""
-    from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
+    from hermes_state_keys import CRON_PRINCIPAL_ID
     request = row.get('request_id', '').split(':', 2)
     if (row.get('principal_id') != CRON_PRINCIPAL_ID
             or len(request) != 3 or request[0] != 'cron'):
@@ -81,11 +81,6 @@ def _cancel_path(job_id, execution_id):
 
 def cancel_detached(row):
     request = _request(row)
-    if request is None and row.get('owner_kind') == 'detached':
-        job_id = row.get('job_id')
-        execution_id = row.get('id')
-        if job_id and execution_id:
-            request = ('cron', str(job_id), str(execution_id))
     if request is not None:
         from utils import atomic_json_write
         # The owner can accept Stop after claim but before the submit answer is
@@ -112,7 +107,7 @@ def detached_result(row):
 
 def defer_detached(db, row):
     """Boot must not discard an admission whose actual executor is still live."""
-    from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
+    from hermes_state_keys import CRON_PRINCIPAL_ID
     if row.get('principal_id') != CRON_PRINCIPAL_ID:
         return False
     with db._read_ctx() as conn:
@@ -177,7 +172,7 @@ def recover_detached(db, epoch, row):
         _epoch(conn, epoch)
         current = _admission(conn, row['admission_id'])
         if current['status'] == 'terminal':
-            from persistence.sqlite.authority._runtime import RESULT_PREFIX, load_result
+            from hermes_state_terminal import RESULT_PREFIX, load_result
             saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                                  (RESULT_PREFIX + row['admission_id'],)).fetchone()
             if saved is None or load_result(saved[0])['result'].get('cron_result') != _redacted(result['result']):
@@ -216,7 +211,7 @@ def recover_detached(db, epoch, row):
 async def register_detached(connection, ref, params, claim):
     """Only the durable detached PID can attach to its already-started cron admission."""
     from hermes_state_runtime import register_worker_execution
-    from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID, cron_request_id
+    from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
     from cron.executions import get_execution
     authority = connection.authority
     eid = params['execution_id'].removeprefix(PREFIX)
@@ -240,7 +235,7 @@ async def register_detached(connection, ref, params, claim):
 def _attach_worker(rpc, scope):
     """Registration is idempotent only with this exact fenced scope, including its secret."""
     from agent.runtime_session_store import WorkerPersistenceError
-    from persistence.sqlite._state.errors import GatewayOwnerRestartError
+    from hermes_state_errors import GatewayOwnerRestartError
     from websockets.exceptions import ConnectionClosed
 
     ambiguous = False
@@ -295,7 +290,7 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     from gateway.session_cron import bind_execution, _execution
     from hermes_cli.process_identity import process_birth
     from hermes_constants import get_hermes_home
-    from persistence.sqlite._state.errors import GatewayOwnerRestartError
+    from hermes_state_errors import GatewayOwnerRestartError
     from websockets.exceptions import ConnectionClosed
     import psutil
 

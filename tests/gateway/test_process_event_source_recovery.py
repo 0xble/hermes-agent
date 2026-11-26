@@ -71,39 +71,6 @@ async def test_recovered_bare_session_key_delivers_to_stored_origin(runner, monk
     adapter.send.assert_not_awaited()
 
 
-def test_stored_origin_adopts_completion_thread_from_event(runner):
-    entry = runner.session_store.get_or_create_session(SessionSource(
-        platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread"))
-    source = runner._build_process_event_source({
-        "session_id": "proc_thread", "session_key": entry.session_key,
-        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "new-thread",
-    })
-    assert source is not None
-    assert source.thread_id == "new-thread"
-
-
-def test_stored_origin_clears_stale_thread_for_top_level_event(runner):
-    entry = runner.session_store.get_or_create_session(SessionSource(
-        platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread"))
-    source = runner._build_process_event_source({
-        "session_id": "proc_top_level", "session_key": entry.session_key,
-        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
-    })
-    assert source is not None
-    assert source.thread_id is None
-
-
-def test_cached_origin_clears_stale_thread_for_top_level_event(runner, monkeypatch):
-    cached = SessionSource(platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread")
-    monkeypatch.setattr(runner, "_get_cached_session_source", lambda _session_key: cached)
-    source = runner._build_process_event_source({
-        "session_id": "proc_cached_top_level", "session_key": "missing",
-        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
-    })
-    assert source is not None
-    assert source.thread_id is None
-
-
 @pytest.mark.parametrize("thread_id", ["", "17"])
 def test_unknown_bare_key_uses_chat_type_but_never_another_topic(runner, thread_id):
     runner.session_store.get_or_create_session(SessionSource(

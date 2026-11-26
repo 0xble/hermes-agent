@@ -46,11 +46,10 @@ class TurnLeaseToken:
     """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
     release idempotent."""
 
-    __slots__ = ("event", "generation", "lease", "owner_key", "released", "session_id")
+    __slots__ = ("generation", "lease", "owner_key", "released", "session_id")
 
     def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
         self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
-        self.event = None
         self.released = False
         # The concrete lease, so release resolves by identity even after a rotation re-aliases
         # ``session_id`` (both ids map to this same lease).
@@ -104,8 +103,6 @@ class SessionTurnLeaseRegistry:
         on_timeout: Callable[[], Awaitable[None]] | None = None,
         max_wait: float = DEFAULT_MAX_LEASE_WAIT,
         on_wait: Callable[[], Awaitable[None]] | None = None,
-        event=None,
-        on_contended: Callable[["TurnLeaseToken"], Awaitable[None]] | None = None,
     ) -> Optional[TurnLeaseToken]:
         """Acquire the lease for ``session_id``; None for a falsy id.
 
@@ -118,45 +115,26 @@ class SessionTurnLeaseRegistry:
         wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
         lease = self._get_or_create(session_id)
         token = TurnLeaseToken(session_id, owner_key, int(generation), lease=lease)
-        token.event = event
-        was_contended = lease.lock.locked()
-        contended_holder = lease.holder if was_contended else None
-        # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
-        # in-progress acquire across that handoff (including the preemption callback below) so
-        # eviction cannot orphan the old lock and create a second lock for the same session.
-        lease.pending_acquires += 1
-        overlap = "previous turn is handing off the lease"
-        if contended_holder is not None:
-            overlap = ("same-key generation overlap" if owner_key == contended_holder.owner_key
-                       else "two routing keys are mapped to one session_id (#64934)")
-        if was_contended:
+        if lease.lock.locked():
+            overlap = "previous turn is handing off the lease"
+            if lease.holder is not None:
+                overlap = ("same-key generation overlap" if owner_key == lease.holder.owner_key
+                           else "two routing keys are mapped to one session_id (#64934)")
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) waiting behind "
                 "in-flight turn held by routing key %s (gen %s, held %.0fs) — %s; "
                 "serializing this turn behind the previous turn's flush",
-                session_id, owner_key, generation, *_holder_desc(contended_holder),
+                session_id, owner_key, generation, *_holder_desc(lease.holder),
                 time.time() - lease.acquired_at if lease.acquired_at else -1.0,
                 overlap)
+        # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
+        # in-progress acquire across that handoff (even apparently-uncontended ones — wait_for()
+        # may schedule them before the lock coroutine runs) so eviction cannot orphan the old
+        # lock and create a second lock for the same session.
+        lease.pending_acquires += 1
         started = time.monotonic()
         try:
-            safe_contended_callback = None
-            if on_contended is not None and contended_holder is not None:
-                callback = on_contended
-                holder = contended_holder
-
-                async def _safe_contended_callback():
-                    try:
-                        await callback(holder)
-                    except Exception:
-                        logger.warning(
-                            "turn lease contention callback failed on session %s; continuing to wait",
-                            session_id, exc_info=True)
-
-                safe_contended_callback = _safe_contended_callback
-            await self._wait_for_lock(
-                lease.lock, wait, on_timeout, max_wait, on_wait,
-                on_contended=safe_contended_callback,
-            )
+            await self._wait_for_lock(lease.lock, wait, on_timeout, max_wait, on_wait)
         except TimeoutError:
             elapsed = time.monotonic() - started
             logger.error(
@@ -175,21 +153,17 @@ class SessionTurnLeaseRegistry:
         return token
 
     @staticmethod
-    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait, on_contended=None):
+    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait):
         # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
         acquired = False
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadlines = [(timeout, on_timeout)]
+        if on_wait is not None:
+            deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
         try:
-            # Let lock.acquire() register its waiter before an awaited contention hook runs.
-            await asyncio.sleep(0)
-            if on_contended is not None:
-                await on_contended()
-            loop = asyncio.get_running_loop()
-            started = loop.time()
-            deadlines = [(timeout, on_timeout)]
-            if on_wait is not None:
-                deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
             async with asyncio.timeout(max_wait):
                 for delay, callback in sorted(deadlines, key=lambda item: item[0]):
                     remaining = max(0, started + delay - loop.time())

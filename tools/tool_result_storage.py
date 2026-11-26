@@ -103,7 +103,6 @@ def referenced_archive_refs(home) -> set | None:
     and keep the files; a read-only handle is enough, the write path owns the locks."""
     from persistence.core.errors import STORE_FAILURES
     from persistence_assembly import open_persistence_reader
-    from hermes_state_prune_budget import check_prune_budget
 
     db_path = home / "state.db"
     if not db_path.exists():
@@ -112,7 +111,6 @@ def referenced_archive_refs(home) -> set | None:
         refs: set = set()
         with open_persistence_reader(db_path) as store:
             for content, api_content in store.messages.spillover_reference_rows():
-                check_prune_budget()
                 refs.update(archive_refs_in_text(content, api_content))
     except (OSError, *STORE_FAILURES):
         return None

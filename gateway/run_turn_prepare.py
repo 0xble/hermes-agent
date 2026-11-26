@@ -23,7 +23,6 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
-from gateway.response_filters import display_kind_for_event
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
@@ -42,7 +41,7 @@ logger = logging.getLogger("gateway.run")
 _TIER_FROM_RUNNER = object()
 
 
-def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=None) -> tuple[str, dict]:
+def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, record_notice=True) -> tuple[str, dict]:
     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
     config and launch credential, walking its own fallback chain on an AuthError unless
     ``fallback=False`` (a session control asking which route the session itself runs). Module-level
@@ -50,7 +49,7 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
     leaves the runner's one-shot fallback notice alone (see ``_resolve_session_agent_runtime``)."""
     from gateway.run import _runtime_agent_kwargs
     from gateway.session_policy import route_launch_key
-    from gateway.session_worker_construct import policy_pins_model, route_runtime
+    from gateway.session_worker_construct import route_runtime
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     # A follow_profile_config session's route is the profile's current one, model and endpoint from one read.
@@ -58,26 +57,18 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
     provider = (frozen.get('model') or {}).get('provider')
     runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
                                             fallback=fallback)
-    notice = None
     if fallback_entry is not None:
         from hermes_cli.fallback_config import pre_agent_fallback_notice
+        from agent.primary_auth_fallback import RUNTIME_KEY, set_pending_primary_auth_failure
+        set_pending_primary_auth_failure(runtime.get(RUNTIME_KEY))
         notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
             fallback_entry.get('model') or 'default')
-        model = fallback_entry['model']
-    kwargs = _runtime_agent_kwargs(runtime)
-    if runtime.get("_preflight_fallback"):
-        kwargs["_preflight_fallback"] = runtime["_preflight_fallback"]
-    if policy_pins_model(policy, frozen):
-        kwargs["model_pinned"] = True
-    if session_key:
-        # Use the same session-scoped publication as ordinary resolution. The turn consumes this
-        # notice before choosing its model, so a runner-global notice would reapply the primary model
-        # to the fallback endpoint. Do not update the frozen policy or the last-good-model cache.
-        return runner._commit_session_agent_runtime(session_key, (model, kwargs, notice, False))
-    runner._pre_agent_fallback_notice = notice
-    return model, kwargs
+        if record_notice:
+            runner._pre_agent_fallback_notice = notice
+        return fallback_entry['model'], _runtime_agent_kwargs(runtime)
+    return model, _runtime_agent_kwargs(runtime)
 
 
 def _recover_or_remember_model(runner, skey, model):
@@ -174,46 +165,13 @@ def _session_override_snapshot(override: dict) -> dict:
     return runtime
 
 
-def resolve_stored_override(override: Optional[dict], model: str):
-    """Keep an explicit route intact while its owning OAuth store refreshes credentials."""
-    if not override:
-        return None
-    from gateway.run import _credential_pool_for_provider
-
-    runtime = _session_override_snapshot(override)
-    if _session_override_uses_managed_oauth(override):
-        try:
-            _resolve_session_override_runtime(override, managed_oauth=True)
-        except RuntimeError as exc:
-            logger.debug("Managed session credential refresh unavailable; retaining selected route: %s",
-                         type(exc).__name__)
-        else:
-            runtime.update(api_key=override["api_key"], credential_pool=override.get("credential_pool"))
-    elif runtime.get("api_key") and runtime.get("credential_pool") is None and not override.get("owns_credentials"):
-        runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
-    return (override.get("model", model), runtime) if runtime.get("api_key") else None
-
-
-def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> None:
-    """Publish refreshed credentials only after the caller accepts the route's snapshot epoch."""
-    if (_session_override_uses_managed_oauth(override)
-            and runtime.get("provider") == override["provider"]
-            and (runtime.get("base_url") or "").rstrip("/") == override["base_url"].rstrip("/")
-            and runtime.get("api_key")):
-        override.update(api_key=runtime["api_key"], credential_pool=runtime.get("credential_pool"))
-
-
-def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str, dict]:
+def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
-    # Keep the helper compatible with older internal callers that passed the runner
-    # while the turn setup path passes its config snapshot directly.
-    if (config is not None and not hasattr(config, "platforms")
-            and hasattr(config, "config")):
-        config = getattr(config, "config", None)
-    if config and source is not None:
+    cfg = runner._serving_channel_config(source) if source is not None else None
+    if cfg:
         ch = _get_channel_override(
-            config, source.platform, str(source.chat_id) if source.chat_id else "",
+            cfg, source.platform, str(source.chat_id) if source.chat_id else "",
             thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
             parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
         )
@@ -229,184 +187,131 @@ def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str
     return model, runtime_kwargs
 
 
-def _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice):
-    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
-    from agent.notice_style import ContextNotice
-    if attended_route and attended_route.get("active"):
-        attended_model = attended_route.get("model") or model
-        attended_provider = attended_route.get("provider") or ""
-        if attended_provider:
-            try:
-                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                    attended_provider, target_model=attended_model or None,
-                )
-                provider_model = runtime_kwargs.pop("model", None)
-                if provider_model and not attended_route.get("model"):
-                    attended_model = provider_model
-                model = attended_model
-            except Exception as exc:  # health: allow BLE001 -- preserve the attended fallback boundary for every provider-resolution failure
-                logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
-                notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
-        else:
-            model = attended_model
-    return model, runtime_kwargs, notice
-
-
-def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route):
-    """Resolve a detached route snapshot; the caller owns the session-state commit."""
-    from gateway.run import (
-        _resolve_gateway_model,
-        _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
-    )
-    from gateway.run_agent_cache import GatewayAgentCacheMixin
-
-    model = _resolve_gateway_model(user_config)
-    selected = resolve_stored_override(override, model)
-    if selected is not None:
-        if override.get("model"):
-            selected[1]["model_pinned"] = True
-        return *selected, None, False
-
-    runtime_kwargs, unavailable_override = None, None
-    if override and override.get("provider"):
-        try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                override["provider"], target_model=override.get("model") or None)
-        except Exception as exc:
-            # A provider-only override may fall back to the whole default route with a notice.
-            # Never pair an explicitly picked model with the default provider's credentials.
-            logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
-            if override.get("model"):
-                from hermes_cli.fallback_config import get_fallback_chain, same_model_fallbacks
-                from hermes_cli.fallback_config import (
-                    effective_runtime_provider, pre_agent_fallback_notice, resolve_entry_api_key,
-                )
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                from gateway.run import _runtime_agent_kwargs
-                for fallback in same_model_fallbacks(get_fallback_chain(user_config), override["model"]):
-                    try:
-                        fallback_kwargs = {
-                            "requested": fallback["provider"], "target_model": fallback["model"],
-                        }
-                        if fallback.get("base_url"):
-                            fallback_kwargs["explicit_base_url"] = fallback["base_url"]
-                        if fallback_key := resolve_entry_api_key(fallback):
-                            fallback_kwargs["explicit_api_key"] = fallback_key
-                        resolved_fallback = resolve_runtime_provider(**fallback_kwargs)
-                        resolved_fallback["provider"] = effective_runtime_provider(fallback, resolved_fallback)
-                        fallback_runtime = {
-                            **_runtime_agent_kwargs(resolved_fallback),
-                            "capabilities": dict(resolved_fallback.get("capabilities") or {}),
-                        }
-                    except Exception as exc:  # health: allow BLE001 -- malformed or unavailable fallback entries are skipped
-                        logger.debug("Pinned same-model fallback entry unavailable: %s", exc)
-                        continue
-                    fallback_runtime["model_pinned"] = True
-                    fallback_runtime["_preflight_fallback"] = {
-                        "requested_model": override["model"],
-                        "fallback_model": fallback["model"],
-                        "fallback_reason": "credentials_unavailable",
-                    }
-                    notice = pre_agent_fallback_notice(
-                        override.get("provider"), override["model"],
-                        fallback.get("provider"), fallback["model"])
-                    return fallback["model"], fallback_runtime, notice, False
-                raise  # An explicit model has no eligible same-model route.
-            unavailable_override, override = override, None
-    if runtime_kwargs is None:
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-    # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
-    # runner surfaces it through the agent's one-shot fallback notice (#74349).
-    notice = runtime_kwargs.pop("_fallback_notice", None)
-    runtime_model = runtime_kwargs.pop("model", None)
-    if runtime_model:
-        logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
-        model = runtime_model
-    if unavailable_override and not notice:
-        from hermes_cli.fallback_config import pre_agent_fallback_notice
-        notice = pre_agent_fallback_notice(
-            unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
-
-    model, runtime_kwargs = _resolve_channel_runtime(config, source, model, runtime_kwargs)
-    model, runtime_kwargs, notice = _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice)
-
-    if override and skey:
-        model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
-        if override.get("model"):
-            runtime_kwargs["model_pinned"] = True
-
-    # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
-    # provider's first catalog model.
-    if not model and runtime_kwargs.get("provider"):
-        with suppress(Exception):
-            from hermes_cli.models import get_default_model_for_provider
-            model = get_default_model_for_provider(runtime_kwargs["provider"])
-            if model:
-                logger.info(
-                    "No model configured — defaulting to %s for provider %s", model, runtime_kwargs["provider"],
-                )
-
-    # Final safety net: an empty model (transient config-cache miss) makes every API call 400 and
-    # the session goes silent — reuse the last model resolved for this session, else process-wide.
-    cache_model = bool(model and not runtime_kwargs.get("_preflight_fallback"))
-    if not model:
-        if last_model:
-            logger.warning(
-                "Empty model resolved for session=%s — recovering "
-                "last-known-good model %s (config read likely returned "
-                "empty; see #35314)", skey or "", last_model,
-            )
-            model = last_model
-
-    return model, runtime_kwargs, notice, cache_model
-
-
 class GatewayTurnPrepareMixin:
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        user_config: Optional[dict] = None, fallback: bool = True, assignment=None,
+        user_config: Optional[dict] = None, fallback: bool = True, record_notice: bool = True,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): launch policy → session ``/model`` → ``channel_overrides`` → global
-        config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
-        ``fallback=False`` keeps a launch-policy session on its own route (see
-        ``_resolve_policy_agent_runtime``)."""
-        from gateway.attended_model import parse_attended_config
+        Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider resolution). ``fallback=False``
+        keeps a launch-policy session on its own route (see ``_resolve_policy_agent_runtime``).
+
+        ``record_notice=False`` is for read-only lookups (``/status``) from any thread: the runner-wide
+        ``_pre_agent_fallback_notice`` is one turn's one-shot slot, so such a lookup must neither clear
+        another chat's pending notice nor leave one of its own for the next turn to consume."""
+        from gateway.run import (
+            _credential_pool_for_provider, _resolve_gateway_model, _resolve_runtime_agent_kwargs,
+        )
         from gateway.session_policy import policy_for_source
-        self._pre_agent_fallback_notice = None
+        # Every exit path starts clean: a stale notice must never attach to another session's next
+        # turn (#74349). Set again below only when THIS resolution fell back.
+        if record_notice:
+            self._pre_agent_fallback_notice = None
+        # This turn's context only (each gateway turn runs in its own context copy), so no record_notice gate.
+        from agent.primary_auth_fallback import set_pending_primary_auth_failure
+        set_pending_primary_auth_failure(None)
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
-            from gateway.run_turn_prepare import _resolve_policy_agent_runtime
-            return _resolve_policy_agent_runtime(
-                self, policy, fallback=fallback,
-                session_key=self._resolve_session_key_or_none(source, session_key))
+            return _resolve_policy_agent_runtime(self, policy, fallback=fallback, record_notice=record_notice)
         skey = self._resolve_session_key_or_none(source, session_key)
-        self._last_attended_decision = None
-        self._pre_agent_fallback_notice = None
-        if skey and assignment is None:
+        model = _resolve_gateway_model(user_config)
+        if skey:
             self._rehydrate_session_model_override(skey)
-            self._expire_attended_temporary_picks(skey, user_config)
-            if parse_attended_config(user_config or {}).enabled:
-                state = self._session_state(skey)
-                state.conversation.pre_agent_fallback_notice = None
-        override, last_model, _ = self._snapshot_session_runtime_state(skey)
-        if assignment is not None:
-            override = assignment.get("override")
-        attended_route = self._attended_route_for_session(
-            source=source, session_key=skey, user_config=user_config, override=override,
-            last_model=last_model, assignment=assignment,
-        )
-        resolved = self._load_session_agent_runtime(
-            source=source, skey=skey, user_config=user_config, config=getattr(self, "config", None),
-            override=override, last_model=last_model, attended_route=attended_route,
-        )
-        return self._commit_session_agent_runtime(skey, resolved)
+        _override_state = self._peek_session_state(skey) if skey else None
+        override = _override_state.conversation.model_override if _override_state else None
+        managed_oauth = _session_override_uses_managed_oauth(override)
+        if override:
+            override_model = override.get("model", model)
+            override_runtime = _session_override_snapshot(override)
+            if override_runtime.get("api_key") and not managed_oauth:
+                if override_runtime.get("credential_pool") is None:
+                    override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
+                logger.debug(
+                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    skey or "", model, override_model, override_runtime.get("provider"),
+                )
+                return override_model, override_runtime
+            # Managed OAuth keys are snapshots, not authority. Resolve them (and keyless
+            # rehydrated overrides) for this provider, never over the default route.
+            logger.debug(
+                "Session model override (provider resolution): session=%s config_model=%s override_model=%s",
+                skey or "", model, override_model,
+            )
+        else:
+            _log_missing_session_override(self, skey, model)
+
+        runtime_kwargs, unavailable_override = None, None
+        if override and override.get("provider"):
+            try:
+                runtime_kwargs = _resolve_session_override_runtime(override, managed_oauth=managed_oauth)
+            except Exception as exc:
+                if managed_oauth and override_runtime.get("api_key"):
+                    # The auth store cannot vouch for a newer bearer: keep the session's last-known one
+                    # (pre-refresh behaviour) rather than silently moving the session off its route.
+                    logger.warning("Session /model override %s: auth store did not resolve (%s); keeping the "
+                                   "session's last-known credential", override["provider"], exc)
+                    if override_runtime.get("credential_pool") is None:
+                        override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
+                    return _recover_or_remember_model(self, skey, override_model), override_runtime
+                # Layering the override on the default runtime sent its model to the default provider's
+                # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
+                # so; the persisted override is kept, so the next turn retries it.
+                logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc,
+                               exc_info=True)
+                unavailable_override, override = override, None
+            else:
+                if managed_oauth:
+                    # A validated session route outranks the channel entirely. Only auth rotates;
+                    # retain the user's selected transport/options and clear an absent pool.
+                    override_runtime.update(
+                        api_key=override["api_key"], credential_pool=override["credential_pool"])
+                    return _recover_or_remember_model(self, skey, override_model), override_runtime
+        if runtime_kwargs is None:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
+        # runner surfaces it through the agent's one-shot fallback notice (#74349).
+        notice = runtime_kwargs.pop("_fallback_notice", None)
+        from agent.primary_auth_fallback import RUNTIME_KEY, failure_for_route, route_snapshot
+        primary_auth_failure, resolved_route = runtime_kwargs.pop(RUNTIME_KEY, None), route_snapshot(runtime_kwargs)
+        runtime_model = runtime_kwargs.pop("model", None)
+        if runtime_model:
+            logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
+            model = runtime_model
+        if unavailable_override and not notice:
+            from hermes_cli.fallback_config import pre_agent_fallback_notice
+            notice = pre_agent_fallback_notice(
+                unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
+        if record_notice:
+            self._pre_agent_fallback_notice = notice
+
+        model, runtime_kwargs = _resolve_channel_runtime(self, source, model, runtime_kwargs)
+
+        if override and skey:
+            model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
+        # A channel's own provider or the session's /model replaced the route resolution fell back to.
+        set_pending_primary_auth_failure(failure_for_route(primary_auth_failure, resolved_route, runtime_kwargs))
+
+        # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
+        # provider's first catalog model.
+        if not model and runtime_kwargs.get("provider"):
+            with suppress(Exception):
+                from hermes_cli.models import get_default_model_for_provider
+                model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if model:
+                    logger.info(
+                        "No model configured — defaulting to %s for provider %s", model, runtime_kwargs["provider"],
+                    )
+
+        return _recover_or_remember_model(self, skey, model), runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *,
                                    tier: Any = _TIER_FROM_RUNNER) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
-        ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
+        ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model.
+        ``tier`` defaults to the runner's per-turn ``_service_tier``; an off-turn builder (a cold
+        ``/review``) passes the session's own instead of writing that shared slot."""
         from gateway.run import _deep_merge_request_overrides
         from agent.fast_mode import STATIC_TIERS
         from hermes_cli.models import resolve_fast_mode_overrides
@@ -417,13 +322,10 @@ class GatewayTurnPrepareMixin:
                 "credential_pool", "max_tokens", "capabilities",
             )
         }
-        if runtime_kwargs.get("model_pinned") is True:
-            runtime["model_pinned"] = True
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
         route = {
-            "base_request_overrides": base_request_overrides,
             "model": model,
             "runtime": runtime,
             "signature": (
@@ -451,21 +353,27 @@ class GatewayTurnPrepareMixin:
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
         """Persist the runtime model/provider a gateway turn actually used (provider fallback can
         switch them after the row was created). Runs in the ``run_sync`` executor thread, so it
-        uses the sync ``SessionDB`` (``_db``), not the AsyncSessionDB forwarder."""
-        if not session_id or agent is None or self._session_db is None:
+        calls the plain verbs, not their awaitable view."""
+        store = self.persistence
+        if not session_id or agent is None or store is None:
             return
         model = getattr(agent, "model", None)
         if not model:
             return
-        runtime = {k: getattr(agent, k, None) for k in ("provider", "base_url", "api_mode")}
         from hermes_cli.runtime_provider_custom import session_provider_identity
-        runtime["provider"] = session_provider_identity(
-            runtime.get("provider"), getattr(agent, "requested_provider", None), runtime.get("base_url"), model)
+        from persistence.conversation.sessions import ReplaceSessionConfig
+        runtime = {
+            "provider": session_provider_identity(getattr(agent, "provider", None),
+                                                  getattr(agent, "requested_provider", None),
+                                                  getattr(agent, "base_url", None), model),
+            "base_url": getattr(agent, "base_url", None),
+            "api_mode": getattr(agent, "api_mode", None),
+            "model": model,
+        }
         runtime["fallback_active"] = bool(getattr(agent, "_fallback_activated", False))
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
         try:
-            db = self._session_db._db
-            row = db.get_session(session_id)
+            row = store.sessions.get(session_id)
             if not row:
                 return
             # Legacy backfill: canonical Bot Chats created BEFORE the follow_profile_config contract existed
@@ -474,20 +382,12 @@ class GatewayTurnPrepareMixin:
             # registry, and pre-policy rows may be visible OR hidden), so mirror that rule here. Without
             # this, every Bot Chat that already exists in the field stays pinned to its stale stored
             # provider until the user deletes it — the exact live-report shape (#89497 / #94818).
-            raw_config = row.get("model_config")
-            config = {}
-            with suppress(Exception):
-                config = json.loads(raw_config) if raw_config else {}
-            if not isinstance(config, dict):
-                config = {}
+            config = dict(row.model_config)
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            # Off a fallback, the route is the session's own: a stale fallback marker must not undo it (#152333).
-            stale_marker = not runtime["fallback_active"] and config.pop("_fallback_route", None) is not None
-            if (row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items())
-                    and not stale_marker):
+            if row.model == model and all(gateway_runtime.get(k) == v for k, v in runtime.items()):
                 return
             config["gateway_runtime"] = runtime
-            db.update_session_meta(session_id, json.dumps(config), model=model)
+            store.sessions.replace_session_config(session_id, ReplaceSessionConfig(model_config=config, model=model))
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 
@@ -495,13 +395,14 @@ class GatewayTurnPrepareMixin:
         """Resolve ``source`` to its session entry (topic recovery, internal-route guards, Telegram
         topic-binding heal). Returns ``(source, session_entry, session_key)`` or ``None`` to drop
         the event."""
-        from gateway.run_turn import GatewayTurnMixin
-
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's last-active topic so a
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        # Plain lobby recovery here even with ``dm_topic_auto_transfer`` on: the opt-in topic transfer
+        # already ran at adapter ingress (``apply_root_dm_topic_transfer`` -> runner hook
+        # ``_transfer_telegram_root_dm``), before session keying.
+        recovered = (await asyncio.to_thread(self._recover_telegram_lobby_thread_id, source)
                      if not expected_session_key else None)
         if recovered is not None:
             logger.info(
@@ -525,14 +426,12 @@ class GatewayTurnPrepareMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or not await GatewayTurnMixin._wake_pin_matches(
-                    self, event, pinned_session_id, session_entry.session_id):
+            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
-            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
@@ -540,63 +439,39 @@ class GatewayTurnPrepareMixin:
                 source, touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
+        claim = getattr(event, "_claimed_owner", None)
+        if claim is not None:
+            from gateway.session_authorities import active_authority
+            from gateway.session_persistence import authority_persistence
+            from persistence.core.errors import StoreUnavailable
+            authority, (owner, generation) = active_authority(self), claim
+            # /new and /reset latch a Stop for the claimed generation before they move the route;
+            # /resume, /branch and compression don't, so those turns run where the route points.
+            stopped = generation in (authority.pending_stops.get(owner), authority.delivered_stops.get(owner))
+            if stopped and (store := authority_persistence(authority)) is None:
+                raise StoreUnavailable(f"no storage handle for {authority.profile_id}")
+            if stopped and session_entry.session_id not in await asyncio.to_thread(
+                    store.lineage.chain, owner):  # preflight's continuation walk
+                # It settles interrupted, as that Stop would have, and never runs on the fresh one.
+                logger.warning("Dropping a stopped claimed turn: its route moved from %s to %s before it ran",
+                               owner, session_entry.session_id)
+                from gateway.session_results import execution_result
+                captured = execution_result.get()
+                if captured is not None:
+                    captured['result'] = {'final_response': '', 'messages': [], 'interrupted': True}
+                return
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(session_entry, pinned_session_id, event_metadata.get("gateway_proven_session_id") or "", event_metadata.get("gateway_completion_ids") or ())
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
-        if await asyncio.to_thread(self._claimed_turn_route_was_stopped, event, session_entry.session_id):
-            return
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
-            if strict_session and not await GatewayTurnMixin._wake_pin_matches(
-                    self, event, pinned_session_id, session_entry.session_id):
-                # Topic-binding recovery may switch conversations; a pinned event belongs only to
-                # the session it was admitted for, never to whatever the topic now points at.
-                logger.warning(
-                    "Dropping internally routed event: topic binding moved pinned session=%s to %s",
-                    pinned_session_id, session_entry.session_id,
-                )
-                return
-        from gateway.platforms.event import is_goal_continuation_event
-        if is_goal_continuation_event(event):
-            from hermes_cli.session_controls import refresh_goal_continuation
-            if await self._run_in_executor_with_context(
-                refresh_goal_continuation, event, session_entry.session_id,
-            ) is None:
-                return
-        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY, loop_wake_is_current
-        if (getattr(event, "metadata", None) or {}).get(LOOP_WAKE_METADATA_KEY) and not await (
-                self._run_in_executor_with_context(
-                    loop_wake_is_current, event.metadata, session_entry.session_id)):
-            logger.info("Discarding superseded loop wake for session %s", session_entry.session_id)
-            return
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
-        from gateway.meeting_lane import apply_reasoning_default
-        await apply_reasoning_default(self, event, session_key)
         return source, session_entry, session_key
-
-    def _claimed_turn_route_was_stopped(self, event, resolved_session_id):
-        """A /new stops the claimed owner, never the fresh session its route now selects."""
-        claimed = getattr(event, "_claimed_owner", None)
-        if not claimed or claimed[0] == resolved_session_id:
-            return False
-        from gateway.session_authorities import active_authority
-        authority = active_authority(self)
-        if authority is None:
-            return False
-        if claimed[1] not in (authority.pending_stops.get(claimed[0]), authority.delivered_stops.get(claimed[0])):
-            return False
-        if resolved_session_id in authority.db.get_compression_chain(claimed[0]):
-            return False
-        from gateway.session_results import execution_result
-        result = execution_result.get()
-        if result is not None:
-            result["result"] = {"interrupted": True, "completed": False, "final_response": "", "messages": []}
-        return True
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
@@ -604,8 +479,8 @@ class GatewayTurnPrepareMixin:
         publication = self._telegram_topic_publication_token(source)
         binding = None
         try:
-            if self._session_db:
-                binding = await self._session_db.get_telegram_topic_binding(
+            if (store := self.persistence) is not None:
+                binding = await store.aio.routing.get_topic_binding(
                     chat_id=str(source.chat_id), thread_id=str(source.thread_id),
                     profile_name=self._telegram_topic_profile_name(source),
                 )
@@ -619,15 +494,15 @@ class GatewayTurnPrepareMixin:
             except Exception:
                 logger.debug("Failed to record Telegram topic binding", exc_info=True)
             return session_entry
-        stored_session_id = str(binding.get("session_id") or "")
+        stored_session_id = str(binding.session_id or "")
         bound_session_id = stored_session_id
         # A binding pointing at a pre-compression parent is walked forward to the tip so the next
         # message resumes the compressed child instead of reloading the oversized parent.
         # Returns the input unchanged when the session isn't a compression parent, so this is cheap and
         # safe. See #20470, #29712, #33414.
-        if bound_session_id and self._session_db is not None:
+        if bound_session_id and (store := self.persistence) is not None:
             try:
-                canonical_session_id = await self._session_db.get_compression_tip(bound_session_id)
+                canonical_session_id = await store.aio.lineage.tip(bound_session_id)
             except Exception:
                 logger.debug("compression-tip lookup failed for %s", bound_session_id, exc_info=True)
                 canonical_session_id = bound_session_id
@@ -639,9 +514,10 @@ class GatewayTurnPrepareMixin:
             # re-create the row and the topic silently re-adopts an old transcript (#139283).
             # A binding naming a delegate subagent's row (written while the route was captured by it,
             # #138210) is not the topic's conversation either: following it hands the user to the worker.
-            bound_row = await self._session_db.get_session(bound_session_id) if self._session_db is not None else None
+            store = self.persistence
+            bound_row = await store.aio.sessions.get(bound_session_id) if store is not None else None
             from gateway.session_lifecycle import is_delegate_child_row
-            if self._session_db is not None and (not bound_row or is_delegate_child_row(bound_row)):
+            if store is not None and (not bound_row or is_delegate_child_row(bound_row.as_session_row())):
                 logger.warning("Telegram topic binding for %s points at session %s with %s; keeping the "
                                "current session and rebinding", session_key, bound_session_id,
                                "a delegate subagent's row" if bound_row else "no sessions row")
@@ -686,30 +562,17 @@ class GatewayTurnPrepareMixin:
             # dict in one funnel call so the fresh session does not inherit the previous conversation's
             # model/reasoning overrides, a queued "/model switched" note, or a stale resolved-model cache
             # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
-            await self._clear_conversation_scope_async(session_key, reason="auto_reset")
+            self._clear_conversation_scope(session_key, reason="auto_reset")
             self._evict_cached_agent(session_key)
             session_entry.was_auto_reset = False
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
-        attended_enabled = False
-        with suppress(Exception):
-            from gateway.run import _load_gateway_config
-            from gateway.attended_model import parse_attended_config
-            attended_enabled = parse_attended_config(_load_gateway_config()).enabled
-        attended_new_session = getattr(
-            self._session_state(session_key).conversation, "attended_new_session", False,
-        )
-        from gateway.session_state import session_opening_pending
-        _is_new_session = _was_auto_reset or session_opening_pending(
-            session_entry, attended_new_session=attended_enabled and attended_new_session,
-        )
+        _is_new_session = session_entry.created_at == session_entry.updated_at or _was_auto_reset or _is_fresh_reset
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
         if _is_fresh_reset:
             # See #6508.
             session_entry.is_fresh_reset = False
         if _is_new_session:
-            if attended_enabled:
-                self._session_state(session_key).conversation.attended_new_session = True
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -755,7 +618,8 @@ class GatewayTurnPrepareMixin:
         """Prepend topic/channel-bound skill payload(s) to ``event.text`` on a new session."""
         _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
         try:
-            from agent.skill_commands import _load_skill_payload, _build_skill_message, register_auto_load_scaffold
+            from agent.skill_commands import _load_skill_payload, _build_skill_message
+            from session_rules.turns import register_auto_load_scaffold
             _combined_parts: list[str] = []
             _loaded_names: list[str] = []
             for _sname in _skill_names:
@@ -782,100 +646,22 @@ class GatewayTurnPrepareMixin:
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
-        a resend notice for callers without an inbound event). Inbound messages retain their FIFO
-        waiter beyond the deadline, backed by the recovery spool. Released in _handle_message's
-        finally, granted per (routing key, run generation) so a stale unwind can't
-        release a newer turn's."""
+        a resend notice). Released in _handle_message's finally, granted per (routing key, run
+        generation) so a stale unwind can't release a newer turn's."""
         from gateway.run import _float_env
-        from gateway.run_turn_lease_wait import lease_wait_max_seconds, lease_wait_notice, preserve_lease_wait_async
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
-        async def _preempt_machine_holder(holder):
-            """A genuine user waiter may yield an internal holder before waiting on the lease.
-
-            This is deliberately narrower than adapter busy dispatch: relays, agent-origin text,
-            internal events, steer mode, active subagents, and compression all retain queue semantics.
-            """
-            if event is None:
-                return
-            is_user_turn = getattr(self, "_is_user_turn_event", None)
-            if callable(is_user_turn) and not is_user_turn(event):
-                return
-            if not callable(is_user_turn) and getattr(event, "internal", False):
-                return
-            from gateway.response_filters import is_agent_origin_text
-            if is_agent_origin_text(getattr(event, "text", None)):
-                return
-            holder_event = getattr(holder, "event", None)
-            if holder_event is None or not getattr(holder_event, "internal", False):
-                return
-            from gateway.meeting_lane import busy_input_mode
-            if await busy_input_mode(self, event, _quick_key) == "steer":
-                return
-            state = self._peek_session_state(holder.owner_key)
-            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
-            from gateway.run import _AGENT_PENDING_SENTINEL
-            # A pending sentinel/None means the machine turn has not exposed an interruptible agent yet.
-            # Do not cancel its task: admission waits for the ordinary lease release path.
-            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
-                return
-            if self._agent_has_active_subagents(running_agent):
-                return
-            compression_check = getattr(self, "_session_has_compression_in_flight", None)
-            if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
-                return
-            adapter = self._delivery_adapter_for(event.source)
-            if adapter is None:
-                return
-            # The callback above can yield while the holder releases and a different turn starts.
-            # Never interrupt a stale token or the newly published agent.
-            if holder.lease.holder is not holder or holder.released:
-                return
-            state = self._peek_session_state(holder.owner_key)
-            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
-            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
-                return
-            if self._agent_has_active_subagents(running_agent):
-                return
-            # A system-sourced soft interrupt with no message: the user's event is not in the adapter
-            # FIFO yet and runs as the next lease owner, so carrying its text would process it twice.
-            try:
-                running_agent.interrupt(None, tool_reason="gateway user turn preemption")
-            except Exception:
-                logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
-                return
-            logger.info("User message preempts autonomous turn on lease wait (session=%s)", _quick_key)
-            # Use the same busy-ack channel as warm-path preemption. The flag prevents the
-            # later lease-wait notice from sending a second (queued) acknowledgement.
-            if not getattr(event, "_gateway_busy_ack_sent", False):
-                from agent.i18n import t
-                from agent.notice_style import ContextNotice
-                notice = ContextNotice(t(
-                    "gateway.busy.ack", head=t("gateway.busy.interrupting_head"), detail="",
-                    tail=t("gateway.busy.interrupting_tail")))
-                notice._temporary = True  # type: ignore[attr-defined]
-                send_ack = getattr(self, "_send_busy_ack_reply", None)
-                if callable(send_ack):
-                    await send_ack(event, adapter, notice)  # type: ignore[reportGeneralTypeIssues]
-
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
-                max_wait=lease_wait_max_seconds(),
-                on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
-                on_contended=_preempt_machine_holder if event is not None else None,
-                event=event,
-                on_timeout=(lambda: preserve_lease_wait_async(
-                    self, _quick_key, session_entry.session_id, event,
-                )) if event is not None else None,
             )
-        except BaseException:
-            # The cleanup finally starts later; cancellation and spool failures restore identity too.
+        except TurnLeaseTimeoutError:
+            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
             self._clear_session_env(_session_env_tokens)
             raise
         if _lease_token is not None:
@@ -888,6 +674,9 @@ class GatewayTurnPrepareMixin:
         from gateway.run import _gateway_config_home, _home_target_env_var, _load_gateway_config
         if history or internal:  # internal = plugin/system turn: no human made first contact
             return
+        # LOCAL sessions (one-shot, chat -q, ACP, TUI attach) are the classic in-process CLI's
+        # surfaces: it never appended this note, and mark_seen would rewrite config.yaml under
+        # an ordinary launch that promises to leave the profile's files untouched.
         human_platform = bool(source.platform) and source.platform not in (Platform.LOCAL, Platform.WEBHOOK)
         if human_platform and source.chat_type == "dm" and not await self.async_session_store.has_any_sessions():
             # Same branch logic as the TUI (profile-build offer once when "ask", else plain intro);
@@ -913,10 +702,16 @@ class GatewayTurnPrepareMixin:
         # Multiplex: the home channel may live only in the profile secret scope, not os.environ.
         home_env = ""
         if env_key:
-            with suppress(Exception):
-                from agent.secret_scope import get_secret
+            # A secondary with no home channel must not borrow the default profile's from
+            # os.environ; only an UNSCOPED single-profile read may fall back to the process env.
+            from agent.secret_scope import UnscopedSecretError, get_secret
+            try:
                 home_env = (get_secret(env_key) or "").strip()
-            home_env = home_env or (os.getenv(env_key) or "").strip()
+            except UnscopedSecretError:
+                home_env = (os.getenv(env_key) or "").strip()
+            except Exception:
+                logger.debug("Home-channel secret %s unreadable; treating it as unset", env_key, exc_info=True)
+                home_env = ""
         # Also honor in-memory / yaml home_channel on this platform.
         with suppress(Exception):
             if not home_env and self.config.get_home_channel(source.platform):
@@ -979,25 +774,22 @@ class GatewayTurnPrepareMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
-        # Deferred hygiene adoptions seen before the agent ran; persist compares it to drop a stale count.
-        hygiene_adoption_epoch: int = 0
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
-        running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
+        running (history unreadable, a local turn's refused ``@`` references); ``None`` drops the turn
+        (inbound text rejected)."""
         from gateway.run import _load_gateway_config
         from tools.approval_yolo import restore_gateway_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
-        restore_gateway_yolo(session_key, session_entry.yolo)
+        restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
         context = build_session_context(source, self.config, session_entry, event)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
-        from gateway.session_context import set_turn_origin
-        from gateway.platforms.event import turn_origin_for_event
-        set_turn_origin(turn_origin_for_event(event))
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
+        from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
         with suppress(Exception):
@@ -1005,6 +797,13 @@ class GatewayTurnPrepareMixin:
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
+        # A LOCAL session (CLI one-shot, ACP, cron run-now, TUI attach) is the operator's own machine:
+        # the messaging block ("Source: Local", connected platforms, cron delivery targets) was never
+        # part of the classic in-process prompt, and the TUI gateway still builds that prompt in-process.
+        # Rendering it here would make every surface hop of one durable session a system-prompt
+        # (and prompt-cache) break.
+        # Synthetic goal/heartbeat/resume turns carry no prompt inputs of their own, so they reuse the
+        # pins exactly like internal events do (and still pass authorization, unlike internal ones).
         _reuse_pins = event.internal or getattr(event, "inherit_channel_pin", False)
         if source.platform != Platform.LOCAL and _reuse_pins and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
@@ -1026,7 +825,7 @@ class GatewayTurnPrepareMixin:
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
@@ -1041,19 +840,8 @@ class GatewayTurnPrepareMixin:
             )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
-            return t("gateway.errors.history_unavailable"), _session_env_tokens
-
-        # Hygiene may have started its worker during this very turn and released
-        # the inline wait without releasing the compression lock. Do not enter
-        # preflight on the old transcript or consume the input as a retry notice.
-        if await self._defer_compression_locked_event(session_key, event, prepend=True):
-            self._clear_session_env(_session_env_tokens)
-            return None, _session_env_tokens
-
-        # A detached hygiene worker still owns the old transcript until its compression lock clears.
-        if await self._defer_compression_locked_event(session_key, event, prepend=True):
-            self._clear_session_env(_session_env_tokens)
-            return None, _session_env_tokens
+            from gateway.session_results import record_unexecuted_failure
+            return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
 
         await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
 
@@ -1074,15 +862,6 @@ class GatewayTurnPrepareMixin:
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
         )
-
-        # Resolve once after preparation so expiry behaves like /fast off and its notice rides this turn.
-        if session_key:
-            transition = self._resolve_session_service_tier(
-                session_key=session_key, report_transition=True,
-            )
-            expiry_notice = transition[1] if isinstance(transition, tuple) else None
-            if expiry_notice:
-                turn_sidecar_notes.append(expiry_notice)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -1106,5 +885,4 @@ class GatewayTurnPrepareMixin:
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
-            hygiene_adoption_epoch=self._hygiene_deferred_adoption_epoch(session_key),
         ), _session_env_tokens

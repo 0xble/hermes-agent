@@ -262,18 +262,6 @@ providers:
 
 Header values routinely carry credentials — Hermes never logs them. `extra_headers` applies to OpenAI-compatible routes and to `anthropic_messages` routes (the main client, `/model` switches, rebuilds and auxiliary clients alike); `bedrock_converse` does not use it. A relay behind a WAF that rejects the SDK's default `User-Agent` (403 "Your request was blocked" or a browser-challenge page) is the typical reason to set one — Hermes reports such a 403 as a firewall/CDN block rather than an API-key rejection.
 
-**`hermes_request_class`** — set to `true` only on a named provider entry that points to your CLIProxyAPI URL. Hermes then sends `X-Hermes-Request-Class: interactive` on primary human turns (including retries and tool follow-ups) and `X-Hermes-Request-Class: background` on unattended turns, delegated work, and known background inference such as standalone compression, titles, and goal judging. A human steer or redirect makes the rest of an unattended turn interactive; if carried over as a new turn, it is also interactive. In-turn compression, MoA slots, and inbound image analysis follow the parent turn’s class. Titles remain background even when started from a human turn. Unknown provenance is interactive. This is a scheduling hint, not authorization, and does not change Hermes' admission or retry policy. Leave it unset on all direct providers. Do not also set this header in `extra_headers` or `model.default_headers`.
-
-```yaml
-providers:
-  openai-proxy:
-    api: https://proxy.example.com/v1
-    key_env: CPA_API_KEY
-    hermes_request_class: true
-```
-
-Use the named route (for example, `custom:openai-proxy`) for main and auxiliary inference. The setting only applies to Chat Completions, Responses, and Anthropic Messages on that configured route; it does not follow another route or a redirect. Configure the proxy separately if it should act on the hint.
-
 **`session_affinity_header`** — the NAME of a header that carries Hermes' conversation id on every request to that provider (main turn on `chat_completions`, `anthropic_messages` and `codex_responses`, plus auxiliary calls such as compression and titles). Off unless set — Hermes never sends a session identifier to an endpoint that did not ask for one. Session-aware proxies fronting a stateful backend (LiteLLM's `x-litellm-session-id`, self-hosted Claude/OpenAI gateways) otherwise have nothing to correlate an agent loop on and treat nearly every request as a new conversation, re-sending the whole history upstream on each turn. The value is opaque, stable across the turns of one conversation (including compaction), and different for every conversation:
 
 ```yaml

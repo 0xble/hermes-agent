@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.auxiliary_client import call_llm
-from agent.auxiliary_hooks import _AuxCallHooks
 from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -74,31 +73,3 @@ def test_raising_subscriber_does_not_break_the_auxiliary_call(manager, aux_clien
     response = call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
 
     assert response is aux_client.chat.completions.create.return_value
-
-
-def test_auxiliary_post_ledger_uses_real_canonical_summary(manager, monkeypatch):
-    manager.register_hook("post_auxiliary_call", lambda **_kw: None)
-    captured = []
-    monkeypatch.setattr(
-        "hermes_cli.observability.request_usage_ledger.note_auxiliary",
-        lambda payload: captured.append(payload) or True,
-    )
-    hooks = _AuxCallHooks(
-        aux_task="title_generation", metadata={"api_request_id": "aux-1"},
-        client=SimpleNamespace(base_url="https://openrouter.ai/api/v1"),
-        kwargs={"messages": [{"role": "user", "content": "hello"}]},
-        provider="openrouter", model="mock-model", api_mode="chat_completions", streaming=False,
-    )
-    response = SimpleNamespace(
-        model="mock-model",
-        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="title", tool_calls=[]),
-                                 finish_reason="stop")],
-        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-    )
-    hooks.post(response)
-    usage = captured[0]["usage"]
-    assert usage["input_tokens"] == 10
-    assert usage["output_tokens"] == 5
-    assert usage["prompt_tokens"] == 10
-    assert usage["total_tokens"] == 15
-    assert "completion_tokens" not in usage

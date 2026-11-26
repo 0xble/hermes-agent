@@ -31,7 +31,7 @@ async def probe():
         def __init__(self):
             self.steered, self.stopped = [], []
 
-        def steer(self, text, *, human=True):
+        def steer(self, text):
             self.steered.append(text)
             return True
 

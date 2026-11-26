@@ -93,8 +93,6 @@ def _side_agent(authority, policy, live, task_id, **overrides):
     from run_agent import AIAgent
     runner = authority.runner
     model, runtime = _resolve_runtime(authority, policy)
-    runtime.pop("_preflight_fallback", None)
-    runtime.pop("_fallback_notice", None)
     config = policy.config(authority)
     from gateway.session_worker_construct import session_routing
     pr = session_routing(authority, policy)
@@ -240,15 +238,15 @@ class _SideQuestionStop:
         with self._lock:
             self._fork = fork
         if fork is not None and self.stopped.is_set():
-            self.hard_interrupt('Profile runtime is stopping', interrupt_source="system")
+            self.hard_interrupt('Profile runtime is stopping')
 
-    def hard_interrupt(self, message=None, *, interrupt_source=None):
+    def hard_interrupt(self, message=None):
         self.stopped.set()
         with self._lock:
             fork = self._fork
         if fork is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(fork, message, interrupt_source=interrupt_source)
+            request_hard_interrupt(fork, message)
 
     def abandoned(self):
         """Stopped with no fork running: what is left publishes nothing and writes nothing."""

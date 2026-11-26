@@ -10,8 +10,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.vault_backends.local import LocalLoginBackend
-import pytest
-
 from agent.vault_origin_aliases import _configured_aliases
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
@@ -75,7 +73,7 @@ def test_saved_origin_refuses_extra_signin_origin_without_alias(monkeypatch):
     assert result["error_type"] == "origin_mismatch"
     assert result["error"] == (
         "Refused: current page origin (https://login.gusto.com) does not match the vault item's bound origin(s) "
-        "(https://gusto.com). Login fills allow only the same-host/port HTTP-to-HTTPS upgrade; other kinds require exact-origin matching. Add the exact "
+        "(https://gusto.com). Vault fills only run on the exact origin(s) the credential was saved for. Add the exact "
         "origin with `hermes config set vault.origin_aliases.op:gusto-id '[\"https://login.gusto.com\"]'`, including any "
         "existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may "
         "write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite "
@@ -369,14 +367,6 @@ def test_alias_warning_is_advisory_for_unlisted_public_suffixes(monkeypatch):
         assert "registrable domain differs" not in prompts[-1][1]
 
 
-def _run_config_command(command, *, cwd, env):
-    # CalledProcessError omits captured output from pytest's default failure report.
-    completed = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False)
-    assert completed.returncode == 0, (
-        f"{completed.args!r} exited {completed.returncode}\n"
-        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-    )
-    return completed
 
 
 def test_multi_account_handle_round_trips_and_unions_with_raw_item_id(tmp_path, monkeypatch):
@@ -394,8 +384,8 @@ def test_multi_account_handle_round_trips_and_unions_with_raw_item_id(tmp_path, 
         sys.executable, "hermes", "config", "get",
         f"vault.origin_aliases.{handle}", "--json",
     ]
-    _run_config_command(set_command, cwd=repo, env=env)
-    readback = _run_config_command(get_command, cwd=repo, env=env)
+    subprocess.run(set_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
+    readback = subprocess.run(get_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
     assert json.loads(readback.stdout) == ["https://login.planetfitness.com"]
 
     from agent.vault_origin_aliases import apply_origin_aliases
@@ -425,39 +415,13 @@ def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monk
     ]
     monkeypatch.setenv("HERMES_HOME", str(home))
     assert _configured_aliases() == {}
-    completed = _run_config_command(command, cwd=repo, env=env)
+    completed = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True, check=True)
     assert "Set vault.origin_aliases.example-item" in completed.stdout
     assert _configured_aliases()["example-item"] == ("https://signin.example.com",)
     backend = _Backend(_meta(handle="example-item"))
     _fill_patches(monkeypatch, backend, page_origin="https://signin.example.com")
     result = json.loads(vault.browser_vault_fill("example-item", task_id="config-set"))
     assert result["success"] is True
-
-
-@pytest.mark.parametrize("test_case, failure_index", [
-    (test_multi_account_handle_round_trips_and_unions_with_raw_item_id, 0),
-    (test_multi_account_handle_round_trips_and_unions_with_raw_item_id, 1),
-    (test_agent_written_config_set_form_is_honored_without_restart, 0),
-])
-def test_config_command_failure_reports_child_output(tmp_path, monkeypatch, test_case, failure_index):
-    calls = []
-
-    def run(command, **kwargs):
-        calls.append(command)
-        result = subprocess.CompletedProcess(
-            command, 2 if len(calls) == failure_index + 1 else 0,
-            stdout="synthetic child stdout", stderr="synthetic child stderr",
-        )
-        if kwargs.get("check"):
-            result.check_returncode()
-        return result
-
-    monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(AssertionError, match="synthetic child stderr") as failure:
-        test_case(tmp_path, monkeypatch)
-    assert "synthetic child stdout" in str(failure.value)
-    assert repr(calls[-1]) in str(failure.value)
-    assert "exited 2" in str(failure.value)
 
 
 def test_alias_removed_during_confirmation_refuses_fill(monkeypatch):

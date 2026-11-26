@@ -181,16 +181,6 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     )
 
 
-def _quiet_query_origin_kwargs(run_conversation, author):
-    from agent.interrupt_compat import _accepts_keyword
-    from agent.kanban_turn_recovery import kanban_task_id
-
-    # Only the explicit query is user input, not a worker's dispatch or later completion follow-ups.
-    if author is None and kanban_task_id() is None and _accepts_keyword(run_conversation, "turn_origin"):
-        return {"turn_origin": "user"}
-    return {}
-
-
 def _run_quiet_single_query(cli, effective_query, emitter=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
@@ -210,11 +200,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
     turn_report_path = take_turn_report_path()
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
-    origin_kwargs = _quiet_query_origin_kwargs(cli.agent.run_conversation, author)
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
-                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs, **origin_kwargs,
+                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
             )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")

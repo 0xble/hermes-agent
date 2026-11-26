@@ -872,28 +872,6 @@ try {
             self.assertEqual(ci.main(), 1)
             self.assertEqual(seen, ['setup', 'static', ('tests',), 'e2e', 'node', 'docs', 'rust', 'container_lint'])
 
-    def test_setup_collects_dependency_generations_after_publish(self):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
-            stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
-            stack.enter_context(patch.object(ci, 'volume_free_bytes',
-                                             return_value=ci.free_space_floor_bytes() + 1))
-            stack.enter_context(patch.object(ci, 'require_checkout_venv_isolation'))
-            stack.enter_context(patch.object(ci, 'require_tools'))
-            stack.enter_context(patch.object(ci, 'provision_npm'))
-            stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
-            stack.enter_context(patch.object(ci, 'provision_rg'))
-            stack.enter_context(patch.object(ci, 'python', return_value=sys.executable))
-            stack.enter_context(patch.object(ci, 'run'))
-            events = []
-            stack.enter_context(patch.object(
-                ci, 'pm_setup_phase', side_effect=lambda phase, env, *args: events.append(phase)))
-            stack.enter_context(patch.object(
-                ci, 'collect_ci_dependency_generations', side_effect=lambda env: events.append('gc')))
-
-            ci.setup({})
-
-            self.assertEqual(events, ['install', 'dependencies', 'gc'])
-
     def test_exact_gate_runs_the_bounded_partition_locally_and_hosted(self):
         for hosted in ('', 'true'):
             with self.subTest(hosted=hosted), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

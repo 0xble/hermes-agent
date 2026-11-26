@@ -8,9 +8,7 @@ import logging
 import os
 import shutil
 import threading
-import time
 from contextlib import ExitStack, contextmanager, nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,27 +20,15 @@ from pm.lock import Facts, Lockfile
 from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
-from pm.worker_budget import unbounded
 from pm.store import (Store, current_target, digest_matches, entry_component, fetch_entry_name, merge_tree,
                       tree_digest)
 
 LOG = logging.getLogger(__name__)
-_active_install_store: ContextVar[Store | None] = ContextVar("pm_active_install_store", default=None)
 
 # ``progress(stage, done, total, label)`` reports download/unpack/verify;
 # multi-archive labels follow lockfile order.
 
 
-@contextmanager
-def _using_install_store(store: Store):
-    token = _active_install_store.set(store)
-    try:
-        yield
-    finally:
-        _active_install_store.reset(token)
-
-
-@unbounded()
 def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
                        progress=None, pause_event=None, download_progress=None):
     def tick(done, total, ranges):
@@ -101,17 +87,20 @@ def _heal_exec_bit(binary: Path, *, heal: bool = True) -> bool:
 
 def _installed_location(package: Package, lockfile: Lockfile, target: str, *,
                         verify: bool = False, allow_outdated: bool = False,
-                        roots: tuple[Path, ...] | None = None, heal: bool = True):
+                        roots: tuple[Path, ...] | None = None, heal: bool = True,
+                        root_facts: dict[Path, Facts] | None = None):
     """Prefer the current pin. An explicit read may retain a prior PM install. ``heal=False``
-    keeps the lookup read-only (scripts/tool_store_pins.py asks it about a store it must not touch)."""
-    if roots is None:
-        active = _active_install_store.get()
-        roots = ((active.root,) if active is not None else ()) + (paths.store_root(), paths.writable_store_root())
-    search_roots = dict.fromkeys(roots)
+    keeps the lookup read-only (scripts/tool_store_pins.py asks it about a store it must not touch).
+    ``root_facts`` maps each root to its already-read facts, for a caller looking up many packages."""
+    search_roots = dict.fromkeys(roots if roots is not None else (paths.store_root(), paths.writable_store_root()))
+    primary = paths.store_root() if root_facts is None else None
     fallback = None
     for root in search_roots:
         store = Store(root)
-        facts = _facts() if root == paths.store_root() else Facts(root / "facts.json")
+        if root_facts is not None:
+            facts = root_facts[root]
+        else:
+            facts = _facts() if root == primary else Facts(root / "facts.json")
         # Every row may hold the exact pin, but only the selected (first) row may be the outdated
         # fallback, never an older pin another install keeps; a later root's fallback still
         # replaces it, as before.
@@ -150,6 +139,8 @@ def installed_package(name: str, *, allow_outdated: bool = False) -> InstalledPa
     if package.internal:
         raise ValueError(f"{name} is internal PM tooling, not an application package")
     target = current_target()
+    if package.native_abi_reason(target):
+        return None
     location = _installed_location(package, _lockfile(), target, allow_outdated=allow_outdated)
     if location is None:
         return None
@@ -228,7 +219,8 @@ def enabled_extras() -> list[str]:
 
 
 def is_installed(name: str) -> bool:
-    return _installed_location(get_package(name), _lockfile(), current_target()) is not None
+    package, target = get_package(name), current_target()
+    return package.native_abi_reason(target) is None and _installed_location(package, _lockfile(), target) is not None
 
 
 def sealed() -> bool:
@@ -495,7 +487,7 @@ def _install(
             package.name, "not in the lockfile", "add it with `hermes pm lock --bump`"
         )
 
-    reason = package.missing_reason(target)
+    reason = package.missing_reason(target) or package.native_abi_reason(target)
     if reason is not None:
         raise InstallError(package.name, f"unavailable on {target}: {reason}", "none")
 
@@ -507,7 +499,7 @@ def _install(
     artifacts = lockfile.artifacts(package.name, target)
     pin = json.dumps({"target": target, "sha256": [a["sha256"] for a in artifacts]})
 
-    with _using_install_store(store), (nullcontext() if _lock_held else store.install_lock()):
+    with nullcontext() if _lock_held else store.install_lock():
         if pause_event is not None and pause_event.is_set():
             raise DownloadPaused("install paused")
         if facts is not None:
@@ -651,6 +643,8 @@ def ensure(
         _operation.lock()
     missing = []
     for package in chain:
+        if reason := package.native_abi_reason(target):
+            raise InstallError(package.name, reason, "select a compatible package")
         identity = (package.name, lockfile.version(package.name), target,
                     json.dumps(_identity(lockfile, package.name, target), sort_keys=True))
         if identity in checked:
@@ -878,11 +872,7 @@ def _target_selection(package, fact: dict, *, extras, inputs: dict, repair: bool
         return enabled, stamp, {"repair": True}
     # The first writable generation replaces, rather than layers on,
     # the payload. Retain its extras until a recorded selection owns them.
-    baseline = shipped
-    if not fact and shipped is None:
-        from pm.extras import installed_selection
-        baseline = installed_selection(package.project_root())
-    enabled = sorted(set(_carried(package, fact.get("extras", baseline or []))) | set(extras or []))
+    enabled = sorted(set(_carried(package, fact.get("extras", shipped or []))) | set(extras or []))
     return enabled, package.expected_stamp(enabled, **inputs), inputs
 
 
@@ -1138,54 +1128,6 @@ def _dependents_first(names: list[str]) -> list[str]:
     return order
 
 
-# Every terminal command composes its PATH through ``pm.user_facing``. One composition resolves
-# the store root, reads each root's facts and probes each package's binary (Chromium's is an
-# rglob of its whole tree): on the live gateway that was 23% of all GIL-held time (2026-10-25),
-# which also stretched SQLite writer-lock holds queued behind the GIL. The key carries every
-# root's facts.json stat, so an install by any process shows on the next command; a PM write in
-# this process also invalidates it, and the TTL bounds out-of-band damage. Activation
-# (``store_first_path``) stays uncached: it reports live damage.
-_STORE_PATH_DIRS_TTL_S = 30.0
-_store_path_dirs_cache: dict[tuple, list[str]] = {}
-_store_roots_cache: dict[tuple, tuple[Path, ...]] = {}
-_store_path_dirs_lock = threading.Lock()
-_clock = time.monotonic
-
-
-def _facts_stamp(root: Path) -> tuple[int, int] | None:
-    try:
-        stat = (root / "facts.json").stat()
-    except OSError:
-        return None
-    return stat.st_mtime_ns, stat.st_size
-
-
-def cached_store_path_dirs() -> list[str]:
-    """:func:`_store_path_dirs`, cached per process for the terminal's PATH composition."""
-    from pm import filesystem
-
-    active = _active_install_store.get()
-    bucket = _clock() // _STORE_PATH_DIRS_TTL_S
-    env_key = (bucket, os.environ.get("HERMES_RUNTIME_DIR"), os.environ.get("HERMES_HOME"),
-               os.environ.get("HOME"), None if active is None else str(active.root))
-    roots = _store_roots_cache.get(env_key)
-    if roots is None:
-        roots = tuple(dict.fromkeys(((active.root,) if active is not None else ())
-                                    + (paths.store_root(), paths.writable_store_root())))
-        _store_roots_cache.clear()
-        _store_roots_cache[env_key] = roots
-    key = (filesystem.write_generation, env_key, tuple(_facts_stamp(root) for root in roots))
-    dirs = _store_path_dirs_cache.get(key)
-    if dirs is None:
-        with _store_path_dirs_lock:  # one recompose when concurrent commands all miss at a rollover
-            dirs = _store_path_dirs_cache.get(key)
-            if dirs is None:
-                dirs = _store_path_dirs()
-                _store_path_dirs_cache.clear()
-                _store_path_dirs_cache[key] = dirs
-    return list(dirs)
-
-
 def _store_path_dirs() -> list[str]:
     """Composed PATH dirs of all installed (non-internal, on_path) store
     packages, each package ahead of its dependencies (``_dependents_first``),
@@ -1197,11 +1139,18 @@ def _store_path_dirs() -> list[str]:
 
     lockfile = _lockfile()
     target = current_target()
+    # Resolved once per call, not once per package: each resolution walks the install stamp and
+    # payload manifest from disk and re-reads facts.json, and every terminal command composes this
+    # PATH (~11 ms -> <1 ms).
+    primary = paths.store_root()
+    roots = tuple(dict.fromkeys((primary, paths.writable_store_root())))
+    root_facts = {root: _facts() if root == primary else Facts(root / "facts.json") for root in roots}
     locations: dict[str, object] = {}
 
     def located(package):
         if package.name not in locations:
-            locations[package.name] = _installed_location(package, lockfile, target)
+            locations[package.name] = _installed_location(
+                package, lockfile, target, roots=roots, root_facts=root_facts)
         return locations[package.name]
 
     dirs: list[str] = []

@@ -1,7 +1,6 @@
 """Gateway drain admission remains silent and its pending turns survive shutdown."""
 
 import asyncio
-import json
 from datetime import datetime
 from functools import partial
 from types import SimpleNamespace
@@ -11,50 +10,9 @@ import pytest
 
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.run_runtime import drain_gateway_runtime
 from gateway.session import SessionEntry
 from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
-
-
-@pytest.mark.asyncio
-async def test_shutdown_preserves_event_accepted_before_handler_withdrawal(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
-    adapter.gateway_runner = runner
-    runner.session_runtime_descriptor = {}
-    handler = AsyncMock(return_value="processed")
-    adapter.set_message_handler(handler)
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    async def processing_start(event):
-        entered.set()
-        await release.wait()
-
-    monkeypatch.setattr(adapter, "on_processing_start", processing_start)
-    source = make_restart_source(thread_id="900")
-    accepted = MessageEvent(text="accepted before drain", source=source, message_id="901")
-    later = MessageEvent(text="arrived after drain", source=source, message_id="902")
-    await adapter.handle_message(accepted)
-    try:
-        await asyncio.wait_for(entered.wait(), 5)
-        assert accepted._gateway_accepted
-        await drain_gateway_runtime(runner)
-        await adapter.handle_message(later)
-        assert not later._gateway_accepted
-    finally:
-        tasks = list(adapter._background_tasks)
-        release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), 5)
-
-    handler.assert_not_awaited()
-    assert adapter.sent == []
-    assert runner._persist_shutdown_pending_messages() == 1
-    spool, = (tmp_path / "pending_messages").glob("*.json")
-    pending = json.loads(spool.read_text(encoding="utf-8"))["data"]
-    assert pending["text"] == accepted.text
-    assert pending["message_id"] == accepted.message_id
-    assert pending["drain_deferred"] is True
 
 
 @pytest.mark.asyncio
@@ -645,6 +603,7 @@ def test_ordinary_queued_head_precedes_later_drain_spool(tmp_path, monkeypatch):
     drain = MessageEvent(text="drain", source=source, user_id="u1",
                          timestamp=datetime.now() - timedelta(seconds=5))
     assert flush_pending_to_file({key: head}) == 1
+    import json
     head_spool, = (tmp_path / "pending_messages").glob("*.json")
     assert json.loads(head_spool.read_text())["ts"] == head.timestamp.timestamp()
     runner._BUSY_QUEUE_MAX_PENDING = 0

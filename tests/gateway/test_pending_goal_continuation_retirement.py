@@ -340,33 +340,6 @@ def test_superseded_active_wake_has_durable_polling_owner_before_retirement(tmp_
     assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
-def test_superseded_wake_owner_resumes_at_boot_not_after_the_continuation_floor(tmp_path, monkeypatch):
-    """The evaluator that superseded the spooled wake stamped the automatic-chain floor for a
-    successor the restart lost. The re-armed owner is that successor, so the idle watcher must
-    resume the goal on its next scan, not one ``min_continuation_gap_seconds`` later."""
-    import time
-
-    from hermes_cli.goals import GoalManager, GoalState, load_goal, save_goal
-
-    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
-    now = time.time()
-    save_goal(entry.session_id, GoalState(
-        goal="old goal", created_at=now - 600, last_turn_at=now - 10,
-        last_automatic_continuation_at=now - 10,
-    ))
-    event = runner._synthetic_prompt_event(
-        source, "old wake", reply_expected=False, goal_continuation=True,
-        goal_session_id=entry.session_id, goal_instance=now - 600,
-    )
-    event.metadata["goal_continuation_created_at"] = now - 60
-    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
-    assert recover_pending_shutdown_flush(runner, candidates=[]) == 0
-    assert load_goal(entry.session_id).waiting_until > 0
-    watcher_view = GoalManager(session_id=entry.session_id, min_continuation_gap_seconds=1800)
-    assert watcher_view.automatic_continuation_floor_remaining() == 0
-    assert watcher_view.lifted_barrier_prompt(), "the restart-recovery owner waits out the continuation floor"
-
-
 def test_goal_owner_failure_keeps_spool(tmp_path, monkeypatch):
     from hermes_cli.goals import GoalState, _get_session_db, save_goal
 

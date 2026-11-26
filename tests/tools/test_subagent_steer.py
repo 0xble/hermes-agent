@@ -24,7 +24,7 @@ class _StubAgent:
         self.boom = boom
         self.steered: list[str] = []
 
-    def steer(self, text: str, *, human: bool = True) -> bool:
+    def steer(self, text: str) -> bool:
         if self.boom:
             raise RuntimeError("steer exploded")
         self.steered.append(text)
@@ -485,7 +485,7 @@ class TestSubagentSteerRPC:
             clear_session_vars(tokens)
 
         assert observed == {"owner": True, "foreign": False}
-        child.steer.assert_called_once_with("owned steer", human=False)
+        child.steer.assert_called_once_with("owned steer")
 
     def test_unknown_child_is_rejected_not_an_error(self):
         envelope = self._call(

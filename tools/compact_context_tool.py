@@ -1,6 +1,5 @@
 """Schema for the agent-owned context compaction request tool."""
 
-from agent.compact_context import MAX_COMPACTION_FOCUS_CHARS
 from tools.registry import registry
 
 COMPACT_CONTEXT_SCHEMA = {
@@ -20,8 +19,7 @@ COMPACT_CONTEXT_SCHEMA = {
         "properties": {
             "focus": {
                 "type": "string",
-                "maxLength": MAX_COMPACTION_FOCUS_CHARS,
-                "description": "Optional decisions, open items, paths, and IDs to preserve, at most 1500 characters. Keep identifiers exact and omit narration. Oversized focus is refused, never silently truncated.",
+                "description": "Optional decisions, open items, paths, and IDs the summary must preserve.",
             },
             "reason": {
                 "type": "string",

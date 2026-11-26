@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from gateway.runtime_ownership import exclusive_maintenance, process_ownership
-from gateway.session_authority import admission_row, initialize_session_authority as _initialize
+from gateway.session_authority import initialize_session_authority as _initialize
 from hermes_state import _ensure_test_isolation
 from hermes_state_runtime import begin_runtime_epoch as _begin
 

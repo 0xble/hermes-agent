@@ -61,15 +61,9 @@ def _flush_session_messages(session: dict | None) -> bool:
         return False
 
 
-def _reaper_session_items() -> list[tuple[str, dict]]:
-    from tui_gateway import server
-
-    with server._sessions_lock:
-        return list(server._sessions.items())
-
-
 def _reaper_session_snapshot() -> list:
-    return [session for _, session in _reaper_session_items()]
+    with _sessions_lock:
+        return list(_sessions.values())
 
 
 def _flush_dirty_sessions(now: float | None = None) -> int:
@@ -320,12 +314,9 @@ def _repair_missing_ws_orphan_reaps() -> None:
     # Reuse that cleanup (including surviving viewers), never revoke a fence from
     # a stale liveness snapshot.
     with _sessions_lock:
-        closed_transports = [
-            peer for session in _sessions.values()
-            for peer in (session["transport"].transports()
-                         if isinstance(session.get("transport"), FanoutTransport)
-                         else [session.get("transport")])
-            if peer is not _detached_ws_transport and _transport_is_dead(peer)]
+        closed_transports = [session.get("transport") for session in _sessions.values()
+                             if session.get("transport") is not _detached_ws_transport
+                             and _transport_is_dead(session.get("transport"))]
     for transport in closed_transports:
         _close_sessions_for_transport(transport)
     with _sessions_lock:
@@ -365,7 +356,8 @@ def _session_lease_is_idle(sid: str, session: dict, now: float) -> bool:
 def _release_idle_session_leases(now: float | None = None) -> int:
     """Release the active-session lease of every idle resident Desktop record; returns the count."""
     now = time.time() if now is None else now
-    candidates = [(sid, s) for sid, s in _reaper_session_items() if s.get("active_session_lease") is not None]
+    with _sessions_lock:
+        candidates = [(sid, s) for sid, s in _sessions.items() if s.get("active_session_lease") is not None]
     released = 0
     for sid, session in candidates:
         if not _session_lease_is_idle(sid, session, now):
@@ -489,7 +481,7 @@ def _sweep_orphaned_session_rows() -> list[str]:
     conservatively: the row must have been created AND last messaged at least the session TTL ago (a fresh row
     that copied an old transcript is protected by its own ``started_at``). Rows held in memory (e.g. a
     ``session.resume`` in the startup grace window) are excluded. Cross-backend: the sweep refuses to close a
-    row any live backend (heartbeat within ``2 * TTL``) could own — see ``SessionDB.sweep_orphaned_sessions``."""
+    row any live backend (heartbeat within ``2 * TTL``) could own — see ``maintenance.sweep_orphaned_sessions``."""
     db = _get_db()
     if db is None or _SESSION_TTL_S <= 0:
         return []
@@ -500,9 +492,10 @@ def _sweep_orphaned_session_rows() -> list[str]:
             if isinstance(session, dict):
                 candidates += [getattr(session.get("agent"), "session_id", None), session.get("session_key")]
             live_ids.update(str(c) for c in candidates if c)
-    swept = db.sweep_orphaned_sessions(
-        max_idle_seconds=_SESSION_TTL_S, sources=_ORPHAN_SWEEP_SOURCES,
-        exclude_ids=tuple(sorted(live_ids)), exclude_pinned=True)
+    with _persistence_for(db) as persistence:
+        swept = list(persistence.maintenance.sweep_orphaned_sessions(
+            max_idle_seconds=_SESSION_TTL_S, sources=_ORPHAN_SWEEP_SOURCES,
+            exclude_ids=tuple(sorted(live_ids)), exclude_pinned=True))
     if swept:
         logger.info(
             "Closed %d orphaned session row(s) from a previous gateway process (startup_orphan_reap): %s",
@@ -545,9 +538,10 @@ def _refresh_backend_heartbeat() -> None:
     if db is None:
         return
     try:
-        db.register_backend_heartbeat(
-            backend_id=_backend_id_for_this_process(), pid=os.getpid(), started_at=_gateway_started_at(),
-            profile=_current_profile_name(), host=_reaper_hostname())
+        with _persistence_for(db) as persistence:
+            persistence.maintenance.register_backend_heartbeat(
+                backend_id=_backend_id_for_this_process(), pid=os.getpid(), started_at=_gateway_started_at(),
+                profile=_current_profile_name(), host=_reaper_hostname())
     except Exception:
         logger.debug("backend heartbeat refresh failed", exc_info=True)
 
@@ -581,7 +575,8 @@ def _start_backend_heartbeat_refresher() -> None:
         stop_event.set()
         with contextlib.suppress(Exception):
             if (db := _get_db()) is not None:
-                db.clear_backend_heartbeat(_backend_id_for_this_process())
+                with _persistence_for(db) as persistence:
+                    persistence.maintenance.clear_backend_heartbeat(_backend_id_for_this_process())
 
     atexit.register(_atexit_clear)
     threading.Thread(target=_loop, name="hermes-gateway-heartbeat", daemon=True).start()
@@ -603,7 +598,6 @@ def _schedule_startup_orphan_sweep() -> None:
         _startup_orphan_sweep_ran = True
     _reaper_daemon_timer(
         _WS_ORPHAN_REAP_GRACE_S, _sweep_orphaned_session_rows, "startup orphan session sweep failed", level="warning")
-
 
 # ── Cache-edge compaction and offload (steps 2-3 of agent.prompt_cache_lifecycle) ──
 # A daemon ticker compacts an idle TUI / Desktop session at the end of its keep-alive budget (nothing is
@@ -765,7 +759,7 @@ def _compact_then_close(sid: str, session: dict, *, end_reason: str, still_due=N
     afterwards if the session is still reapable then and ``still_due()`` (the session cap: other closes
     may have brought it under) still holds. Returns that job's future, or None when the caller closes
     the session now as before. A ticker job already queued for *sid* is waited for, never pre-empted:
-    closing first would make it see ``_closing`` and drop its compaction or offload it claimed."""
+    closing first would make it see ``_closing`` and drop the compaction or offload it claimed."""
     warmer = getattr(session.get("agent"), "_prompt_cache_warmer", None)
     if warmer is None or _session_uses_compute_host(session):
         return None
@@ -832,22 +826,6 @@ def _start_cache_expiry_compactor() -> None:
                 logger.debug("cache-expiry tick failed", exc_info=True)
     from agent.memory_provider import spawn_context_thread
     spawn_context_thread(_loop, name="cache-expiry-compactor").start()
-
-
-def _shutdown_live_sessions() -> None:
-    # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
-        with contextlib.suppress(Exception):
-            step()
-    with _sessions_lock:
-        sessions = list(_sessions.items())
-    for sid, _session in sessions:
-        _close_session_by_id(sid, end_reason="tui_shutdown")
-    # Session events now use daemon mailbox writers even on stdio. A graceful
-    # exit must wait for final admitted frames rather than lose them at exit.
-    for _sid, session in sessions:
-        if isinstance(publisher := session.get("transport"), FanoutTransport):
-            publisher.flush()
 
 
 def register(server) -> None:

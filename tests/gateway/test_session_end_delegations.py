@@ -7,7 +7,6 @@ the delegations kept running after it left and their completions (and background
 started turns nobody watched.
 """
 import json
-from concurrent.futures import wait
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -19,21 +18,10 @@ from tests.fixtures.storage_seed import seed_messages, seed_session
 
 
 @pytest.fixture(autouse=True)
-def _no_delegations(monkeypatch):
+def _no_delegations():
     delegation._reset_for_tests()
     yield
-    # Dispatch marks a record terminal before its worker finishes persistence.
-    # Drain these finite fake runners before monkeypatch restores HERMES_HOME;
-    # _reset_for_tests deliberately uses wait=False for other suites' blocked fakes.
-    with delegation._records_lock:
-        futures = [r['_future'] for r in delegation._records.values() if r.get('_future') is not None]
-    if delegation._executor is not None:
-        delegation._executor.shutdown(wait=False)
-    try:
-        _, pending = wait(futures, timeout=10)
-        assert not pending, "session-end delegation workers did not finish persistence"
-    finally:
-        delegation._reset_for_tests()
+    delegation._reset_for_tests()
 
 
 async def _owner(tmp_path, monkeypatch):

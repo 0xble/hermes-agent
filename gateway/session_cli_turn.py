@@ -12,7 +12,7 @@ from contextvars import ContextVar
 
 from persistence.core.errors import AuthorityRefusal
 
-_SUBMIT_FIELDS = ('turn_author', 'turn_origin', 'api_text', 'model_override', 'clarify_batch')
+_SUBMIT_FIELDS = ('turn_author', 'api_text', 'model_override', 'clarify_batch')
 _API_TEXT_LIMIT = 1_000_000
 _cli_turn: ContextVar[tuple | None] = ContextVar('cli_turn', default=None)
 
@@ -31,11 +31,6 @@ def admit_cli_turn(params):
         if author is None:
             raise AuthorityRefusal('invalid_params')
         committed['turn_author'] = author
-    if (origin := params.get('turn_origin')) is not None:
-        # Only the classic CLI's scheduler origins may override human prompt ingress.
-        committed['turn_origin'] = (
-            origin if isinstance(origin, str) and origin in {'user', 'goal_loop', 'process'} else 'user'
-        )
     api_text = params.get('api_text')
     if api_text is not None:
         if not isinstance(api_text, str) or len(api_text) > _API_TEXT_LIMIT:
@@ -158,8 +153,7 @@ def one_turn_runtime(override, model, runtime_kwargs, config):
                        api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode or None,
                        request_overrides=dict(result.request_overrides or {}),
                        capabilities=dict(result.runtime_capabilities or {}))
-    runtime.update(provider=result.target_provider, requested_provider=result.target_provider, model_pinned=True)
-    runtime.pop("_preflight_fallback", None)
+    runtime.update(provider=result.target_provider, requested_provider=result.target_provider)
     return result.new_model, runtime
 
 

@@ -25,14 +25,14 @@ class TestRecordNousRateLimit:
     def test_records_with_header_reset(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 
-        headers = {"x-ratelimit-reset-requests-1h": "480"}
+        headers = {"x-ratelimit-reset-requests-1h": "1800"}
         record_nous_rate_limit(headers=headers)
 
         path = _state_path()
         assert os.path.exists(path)
         with open(path, encoding="utf-8-sig") as f:
             state = json.load(f)
-        assert state["reset_seconds"] == pytest.approx(480, abs=2)
+        assert state["reset_seconds"] == pytest.approx(1800, abs=2)
         assert state["reset_at"] > time.time()
 
 
@@ -41,7 +41,7 @@ class TestRecordNousRateLimit:
     def test_falls_back_to_error_context_reset_at(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 
-        future_reset = time.time() + 500
+        future_reset = time.time() + 900
         record_nous_rate_limit(
             headers=None,
             error_context={"reset_at": future_reset},
@@ -66,74 +66,6 @@ class TestRecordNousRateLimit:
         with open(_state_path(anonymous=True), encoding="utf-8-sig") as f:
             state = json.load(f)
         assert state["reset_seconds"] == pytest.approx(410, abs=2)
-
-    def test_days_long_retry_after_on_a_minute_bucket_is_clamped_before_persisting(self, rate_guard_env):
-        # A gateway answered a per-minute limit with "retry after 138 h". Persisted as-is, that
-        # blocked every session on this home for days; the minute bucket's headers bound it.
-        from agent.nous_rate_guard import nous_rate_limit_remaining, record_nous_rate_limit, _state_path
-        from agent.retry_utils import MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
-
-        record_nous_rate_limit(
-            headers={"retry-after": str(138 * 3600), "x-ratelimit-remaining-requests": "0",
-                     "x-ratelimit-reset-requests": "60"},
-            error_context={"reset_at": time.time() + 138 * 3600},
-        )
-
-        with open(_state_path(), encoding="utf-8-sig") as f:
-            state = json.load(f)
-        assert state["reset_seconds"] == pytest.approx(MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, abs=2)
-        remaining = nous_rate_limit_remaining()
-        assert remaining is not None and 0 < remaining <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
-
-    def test_a_long_wait_is_persisted_at_the_overall_cap_unless_the_welcome_tier_states_it(self, rate_guard_env):
-        from agent.nous_rate_guard import record_nous_rate_limit, _state_path
-        from agent.retry_utils import RETRY_AFTER_CAP_S
-
-        def recorded(**kwargs):
-            record_nous_rate_limit(**kwargs)
-            with open(_state_path(), encoding="utf-8-sig") as f:
-                return json.load(f)["reset_seconds"]
-
-        # Outside a minute window a wait keeps its length up to the cap the retry path uses.
-        assert recorded(
-            headers={"x-ratelimit-remaining-requests-1h": "0", "x-ratelimit-reset-requests-1h": "480",
-                     "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
-        ) == pytest.approx(480, abs=2)
-        # Past it, every header- or prose-derived wait is persisted at the cap: an exhausted
-        # hourly bucket, a bare Retry-After and a reset parsed from the error text alike.
-        assert recorded(
-            headers={"x-ratelimit-remaining-requests-1h": "0", "x-ratelimit-reset-requests-1h": "1800",
-                     "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
-        ) == pytest.approx(RETRY_AFTER_CAP_S, abs=2)
-        assert recorded(headers={"retry-after": "7200"}) == pytest.approx(RETRY_AFTER_CAP_S, abs=2)
-        assert recorded(headers=None, error_context={"reset_at": time.time() + 900}) == pytest.approx(RETRY_AFTER_CAP_S, abs=2)
-        assert recorded(headers=None, default_cooldown=3600.0) == pytest.approx(RETRY_AFTER_CAP_S, abs=2)
-        # The structured welcome-tier refusal states when the free allowance refreshes; that
-        # wait is kept whole, hours included.
-        assert recorded(
-            headers={"retry-after": "7200"},
-            error_context={"reset_at": time.time() + 7200,
-                           "welcome_refusal": {"reason": "rate_limited", "retry_after": 7200}},
-        ) == pytest.approx(7200, abs=2)
-        # A capacity refusal is not a stated allowance wait, so it is capped like any other.
-        assert recorded(
-            headers={"retry-after": "7200"},
-            error_context={"reset_at": time.time() + 7200,
-                           "welcome_refusal": {"reason": "at_capacity", "retry_after": 7200}},
-        ) == pytest.approx(RETRY_AFTER_CAP_S, abs=2)
-        # The body's own wait fits inside the hourly window the response describes, so a healthy
-        # minute bucket riding along does not shorten it.
-        assert recorded(
-            headers={"x-ratelimit-remaining-requests-1h": "37", "x-ratelimit-reset-requests-1h": "3594",
-                     "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
-            error_context={"reset_at": time.time() + 410},
-        ) == pytest.approx(410, abs=2)
-        # A structured welcome-tier refusal names its own wait; minute-only headers do not cut it.
-        assert recorded(
-            headers={"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "60"},
-            error_context={"reset_at": time.time() + 410,
-                           "welcome_refusal": {"reason": "rate_limited", "retry_after": 410}},
-        ) == pytest.approx(410, abs=2)
 
     def test_custom_default_cooldown(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path

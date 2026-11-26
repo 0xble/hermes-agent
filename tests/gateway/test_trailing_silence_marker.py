@@ -90,29 +90,6 @@ async def test_non_streaming_gateway_delivery_strips_trailing_marker(monkeypatch
     assert "NO_REPLY" not in response
 
 
-
-
-@pytest.mark.asyncio
-async def test_internal_preemption_shape_suppresses_partial_and_retry_copy(monkeypatch):
-    _stub_gateway_run(monkeypatch)
-    runner = _ShapeRunner()
-    source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
-    response, intentional, messages = await runner._hmwa_shape_agent_response(
-        {
-            "final_response": "partial junk; send it again",
-            "messages": [{"role": "assistant", "content": "partial junk"}],
-            "api_calls": 0,
-            "interrupted": True,
-            "interrupt_source": "gateway_user_turn_preemption",
-        },
-        source, history=[], session_entry=SimpleNamespace(session_id="session-1", incognito=False),
-        session_key=None, _quick_key=None, run_generation=0, _run_start_session_id="session-1",
-        _platform_name="telegram", _msg_start_time=0.0, internal=True,
-    )
-    assert response == ""
-    assert intentional is True
-    assert messages == [{"role": "assistant", "content": "partial junk"}]
-
 class _PersistenceAgent:
     platform = "telegram"
     valid_tool_names = set()

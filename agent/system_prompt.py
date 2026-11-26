@@ -857,7 +857,6 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     only rebuilt after compression.  Tiers are ordered stable -> context ->
     volatile so implicit longest-prefix caches keep the unchanged scaffold."""
     parts = build_system_prompt_parts(agent, system_message=system_message)
-    agent._cached_system_prompt_parts = dict(parts)
     agent._cached_system_prompt_static = parts["stable"]
     # Surface context-file truncation warnings in chat, not only in logs.
     for warning in drain_truncation_warnings():
@@ -879,7 +878,6 @@ def invalidate_system_prompt(agent: Any) -> None:
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
-    agent._cached_system_prompt_parts = None
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         agent._plugin_system_prompt_sections_previous = agent._plugin_system_prompt_sections_snapshot
         del agent._plugin_system_prompt_sections_snapshot
@@ -908,7 +906,6 @@ def reconstruct_static_prefix(agent: Any, system_message: Optional[str] = None, 
         static = build_system_prompt_parts(agent, system_message=system_message)["stable"]
         if static and stored.startswith(static):
             agent._cached_system_prompt_static = static
-            agent._cached_system_prompt_parts = None
             agent._static_rebuild_failed_for = None
             return
     except Exception:

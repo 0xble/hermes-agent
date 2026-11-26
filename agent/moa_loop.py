@@ -21,7 +21,6 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
-from agent.proxy_request_class import bind_aux_request_turn
 from session_rules.turns import flatten_message_text
 from agent.message_metadata import DATA_USE
 from agent.moa_alternation import destination_key, is_role_alternation_rejection, merge_same_role_messages
@@ -401,11 +400,6 @@ def _price_reference_response(
         return usage, None, None, None
 
 
-def _call_slot(agent: Any, **kwargs: Any) -> Any:
-    with bind_aux_request_turn(agent):
-        return call_llm(**kwargs)
-
-
 def _slot_request_headers(runtime: dict[str, Any], agent: Any = None) -> dict[str, str] | None:
     """User-initiated request headers of the slot's provider, attributed at that provider's own endpoint
     (MoA attributes by slot provider, whatever account host the slot resolved to). Asked like every
@@ -456,14 +450,14 @@ def _run_reference(
             from agent.auxiliary_client import aux_progress_hook
 
             with aux_progress_hook(_reference_liveness_hook(agent, label)):
-                response = _call_slot(agent,
+                response = call_llm(
                     task="moa_reference", messages=trimmed, temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
                     extra_headers=initiator_headers, **runtime,
                 )
         else:
-            response = _call_slot(agent,
+            response = call_llm(
                 task="moa_reference", messages=trimmed, temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
@@ -984,7 +978,7 @@ def aggregate_moa_context(
     try:
         # Undecorated: the prompt embeds this call's reference outputs, so no later call
         # reads it back and a marker would only pay a cache write (is_one_shot_request).
-        synthesis = _extract_text(_call_slot(agent,
+        synthesis = _extract_text(call_llm(
             task="moa_aggregator", messages=[{"role": "user", "content": synth_prompt}], temperature=aggregator_temperature,
             reasoning_config=_aggregator_reasoning_config(aggregator), **agg_runtime,
         ))
@@ -1257,7 +1251,7 @@ class MoAChatCompletions:
         if merged:
             agg_messages = merge_same_role_messages(agg_messages)
         send = functools.partial(
-            _call_slot, getattr(self, "_agent", None), task="moa_aggregator", temperature=prepared["aggregator_temperature"],
+            call_llm, task="moa_aggregator", temperature=prepared["aggregator_temperature"],
             max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,

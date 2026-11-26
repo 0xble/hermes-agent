@@ -56,8 +56,6 @@ def stored_session_route(session_meta, *, current_model, current_provider):
     canonical row reader is ``gateway_runtime`` (``model_config.gateway_runtime``,
     else the TUI's top-level keys). Bare ``custom`` is healed because the CLI resolve path
     hard-fails on it (the TUI gateway keeps it when a base_url exists)."""
-    from agent.fallback_session_route import fallback_restored_row
-    session_meta = fallback_restored_row(session_meta)
     from persistence.conversation.sessions import parse_model_config
     from persistence.gateway.routing import resume_route
     stored_model, runtime = resume_route(parse_model_config(session_meta.get("model_config")),
@@ -899,18 +897,6 @@ class CLIModelSwitchMixin:
                 return False
             finally:
                 self._confirmed_switch_warning = None  # this switch's confirmation only
-        if not getattr(self, "_model_switch_one_turn", False):
-            self._explicit_model_override = True
-            if self.agent is not None:
-                from agent.agent_init_fallback import _fallback_entries
-                from hermes_cli.fallback_config import same_model_fallbacks
-                self.agent._pinned_fallback_model = self.model
-                self.agent._fallback_chain = same_model_fallbacks(
-                    _fallback_entries(getattr(self, "_fallback_model", None)), self.model)
-                self.agent._fallback_model = self.agent._fallback_chain[0] if self.agent._fallback_chain else None
-                self.agent._fallback_index = 0
-                self.agent._preflight_fallback = None
-            self._preflight_fallback = None
         return True
 
     def _apply_model_switch_result(

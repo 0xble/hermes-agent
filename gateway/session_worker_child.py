@@ -12,10 +12,6 @@ from persistence.core.errors import AuthorityRefusal
 from persistence.workers.delegations import WorkerDelegationPayload
 from persistence.workers.vocabulary import CHILD_SEPARATOR
 
-import secrets
-
-from hermes_state_runtime import RuntimeStoreError
-
 _DEFAULTS = {'max_concurrent_children': 10, 'max_spawn_depth': 1}
 
 
@@ -41,46 +37,16 @@ def delegation_limits(authority, execution_id, session_id):
     return _limit(section, 'max_concurrent_children'), _limit(section, 'max_spawn_depth')
 
 
-def reserve_child_execution(db, conn, session_id, payload, *, epoch, execution_id, identity, principal, limits, refused):
-    from session_rules.session_ids import new_session_id
-    from persistence.sqlite._state.keys import admission_fingerprint
-    from persistence.sqlite.authority._runtime import _secret_digest
-    from persistence.sqlite.conversation._store.worker_lifecycle import insert_session_row_in_transaction
-    secret = payload.get('secret') if isinstance(payload, dict) else None
-    if set(payload) != {'secret'} or not isinstance(secret, str) or not 16 <= len(secret) <= 256:
-        raise RuntimeStoreError('invalid_params')
-    max_children, max_depth = limits
-    prefix = execution_id + CHILD_SEPARATOR
-    live = conn.execute("SELECT COUNT(*) FROM worker_executions WHERE substr(execution_id,1,?)=? "
-                        "AND instr(substr(execution_id,?),'/')=0 AND status!='terminal'",
-                        (len(prefix), prefix, len(prefix) + 1)).fetchone()[0]
-    if refused is None and prefix.count(CHILD_SEPARATOR) > max_depth:
-        refused = 'delegation_depth_exceeded'
-    if refused is None and live >= max_children:
-        refused = 'delegation_capacity'
-    if refused is not None:
-        return {'refused': refused}
-    parent = conn.execute('SELECT profile_name FROM sessions WHERE id=?', (session_id,)).fetchone()
-    child_sid, child_eid = new_session_id(), prefix + secrets.token_hex(8)
-    insert_session_row_in_transaction(db, conn, child_sid, 'subagent', model_config={'_delegate_from': session_id},
-                                      parent_session_id=session_id, profile_name=parent['profile_name'])
-    scope = dict(identity, session_id=child_sid, execution_id=child_eid, generation=0, secret=secret)
-    claim = admission_fingerprint(canonical_target=child_sid, payload=scope | {'principal': principal})
-    conn.execute("INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
-                 "VALUES(?,?,'child',?,0,'running',?)", (child_eid, child_sid, epoch, _secret_digest(claim)))
-    return {'child': {'session_id': child_sid, 'execution_id': child_eid, 'generation': 0}}
-
-
 async def worker_child_request(connection, ref, params):
     """worker.persist ``child.reserve``: the parent's full claim and assignment are verified first."""
     import asyncio
     from gateway.session_worker import _SCOPE, _claim, _verify
     if set(params) != _SCOPE | {'epoch', 'sequence', 'operation', 'payload'}:
         raise AuthorityRefusal('invalid_params')
-    claim = await _claim(connection, params)
+    claim = _claim(connection, ref, params)
     if 'worker:adopt' not in connection.actor.capabilities:
         raise AuthorityRefusal('permission_denied')
-    await _verify(connection, params, claim)
+    _verify(connection, ref, params, claim)
     authority = connection.authority
     workers = authority_persistence(authority).worker_executions
 

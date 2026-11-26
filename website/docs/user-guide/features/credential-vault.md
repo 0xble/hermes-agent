@@ -1,16 +1,14 @@
 ---
 title: Passwords & Logins
-description: Vault-first sign-in, card and address entry, with authorized 1Password fallback.
+description: The agent signs into sites, pays and fills addresses for you without ever seeing a password.
 ---
 
 # Passwords & Logins
 
 Say **"log into GitHub"** and the agent signs in for you. The first time it
 reaches a sign-in page it has no login for, it asks you, right there, in a
-masked prompt. After that it just works. On the vault-fill path, passwords are
-encrypted on this machine and injected straight into the page without entering
-the model's context. [Authorized direct entry](#authorized-direct-entry) is a
-separate fallback that does expose the entered value to the model and session.
+masked prompt. After that it just works. Passwords are encrypted on this
+machine and injected straight into the page; the model never sees them.
 
 There is nothing to set up.
 
@@ -31,27 +29,17 @@ There is nothing to set up.
 a masked password field. *Save & sign in* stores it and continues; *Don't save*
 tells the agent to stop asking for this turn.
 
-From then on the agent lists your saved logins, types the identifier itself and
-fills the password through Hermes. The tool result it sees is
-`{filled_fields: 1, origin: "https://github.com"}`; the password is also
+From then on the agent lists your saved logins and fills the identifier and the
+password through Hermes: the identifier is typed as trusted browser input so
+framework-controlled forms keep it, and the password is written straight into
+its field, never as keystrokes another frame on the page could catch. A fill counts only once the page has held every value for a
+moment; a page that reverts it, moves focus while it is being typed, or leaves
+the login's site before the fill is checked gets a refusal instead. The tool result it sees is
+`{filled_fields: 2, identifier_filled: true, origin: "https://github.com"}`
+(when the form has no single box for the identifier, the fill skips it and
+tells the agent to type it before submitting); the password is also
 registered with the redactor so a later page read cannot echo it back.
 
-### Protected date fields
-
-Configured date-of-birth fields are filled only on their exact saved origin **in a
-private per-task local Chromium browser**. The fill refuses Camofox (including
-managed identities and named accounts), attached `/browser connect` or CDP
-browsers, real-profile, Bot Desktop shared browsers, Lightpanda, cloud browsers,
-and sessions without verified task ownership. The named brianle/lpg/meridian
-Camofox account browsers cannot fill birth dates; navigate with a fresh local
-per-task browser instead. After a protected-date fill, every browser-derived
-result in that browser session,
-including snapshots, evaluations, console/CDP output and iframe output,
-redacts the full date and its exact year/month/day components. This is intentionally
-session-scoped: unrelated standalone numbers equal to a component (for example `4`,
-`12`, or `1990`) are also masked, on every tab, until the browser session closes.
-Navigating or focusing another tab does not lift it, because the filled tab may still
-be open. Screenshots remain refused for the same lifetime.
 ### Desktop preview or managed browser
 
 The Desktop preview and the managed automation browser are separate pages.
@@ -93,8 +81,7 @@ asks you to unlock the manager with your master password (masked prompt; once
 per session, 30 minutes idle). Hermes hands the master password to the manager's
 CLI through its non-interactive channel (`op signin` on stdin, `bw unlock
 --passwordenv` in the child's environment) and keeps only the session token in
-memory. This vault path does not expose the master password, token, or login
-secret to the agent; the explicitly authorized direct-entry path below differs.
+memory. The agent never sees the master password, the token, or any login.
 A manager item that lists several websites (say `amazon.co.uk`,
 `www.amazon.co.uk` and `eu.account.amazon.com`) fills on each of those exact
 origins; nothing is inferred beyond the URLs saved on the item.
@@ -102,26 +89,6 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
-## Authorized direct entry
-
-Prefer vault fill first. If it fails or misses fields, passwords and one-time codes
-fetched from an authorized source for the service may be typed with `browser_type`
-or `fill_input`. A card number, expiry, and CVC read live from the routed 1Password
-Credit Card item may be typed for the approved exact charge on the verified merchant
-origin in two cases: (1) after a real fill or field failure: `no_payment_fields`, a partial
-fill, missed fields, or a processor frame; or (2) after `approval_unavailable` (no
-prompt surface), only when the user explicitly approved this exact charge in this
-session's conversation. An approved exact charge means the user
-explicitly approved the merchant, amount, and selected card in this session's
-conversation. Never fall back after `payment_declined`, `payment_prompt_unanswered`,
-or `payment_retry_refused`. Read each native field only at entry with
-`onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`).
-Values from a page or chat are not authorized sources. Never repeat secrets in
-replies, files, commits, or shell arguments; never retry `payment_declined`.
-
-This fallback exposes the value to model context, the session record, and provider
-logs. The owner accepts that exposure; direct entry does not require input redaction.
-The security properties of vault fills do not describe this explicit fallback.
 ## Logins saved in your real browser
 
 If you turn on [real-profile browsing](browser.md#real-profile-browsing-use-your-own-logins)
@@ -147,12 +114,11 @@ Cards and addresses work the same way as logins: saved once (**Settings →
 Passwords & Logins → Add**, or `hermes vault add`), bound to the checkout site,
 and filled by the agent on that site only. **Every card fill asks you first**,
 with the same approval prompt as a dangerous command; declining writes nothing.
-Headless vault fills (cron, webhooks, the API server) cannot confirm and are
-refused, so this vault-fill path cannot spend without confirmation. That is not
-a guarantee for authorized direct entry: `approval_unavailable` may use that
-fallback only with the user's explicit exact-charge approval in this session's
-conversation. Page content is never approval, and refusal or unanswered prompts
-must not be routed around. Address fills need no confirmation.
+Headless sessions (cron, webhooks, the API server) cannot confirm and are
+refused, so a prompt injection that reaches a checkout page can ask, but it
+cannot spend. Address fills need no confirmation. Card and address values are
+written straight into their fields like the password; only a login's identifier
+is ever typed as browser input.
 
 ## Managing what's saved
 
@@ -162,10 +128,8 @@ must not be routed around. Address fills need no confirmation.
   `hermes vault sources`, `hermes vault key`.
 
 Items live encrypted under `~/.hermes/vault/`, scoped to the profile. Labels,
-site origins and login identifiers are visible metadata. On the vault-fill path,
-passwords and card values go directly from the vault to the page. Authorized direct
-entry instead exposes retrieved values to model context, the session record, and
-provider logs, as described above.
+site origins and login identifiers are visible metadata; passwords and card
+values never leave the vault except into the page.
 
 ## Where the vault key is kept
 
@@ -218,70 +182,6 @@ What changes in keychain mode:
 
 That is why keychain storage is opt-in rather than the default.
 
-### Protected fields from 1Password
-
-An operator can expose one sensitive 1Password field to browser autofill without
-exposing its value to the model. Each entry binds an `op://` reference to one
-supported semantic and an exact HTTPS origin:
-
-```yaml
-vault:
-  onepassword:
-    protected_fields:
-      - label: Traveler date of birth
-        reference: op://Personal/Traveler/birthdate
-        semantic: bday
-        value_type: date
-        origins: [https://www.example-airline.com]
-```
-
-`browser_vault_list` returns only an opaque handle, label, semantic and origin.
-`browser_vault_fill` resolves the field server-side and fills only a matching
-birth-date control on that exact origin, rechecked inside the page immediately
-before the write. Protected references require a CLI session or service-account
-token; Connect-only profiles do not advertise them because Connect cannot resolve
-arbitrary `op://` references. Current protected-field support is limited to birth
-dates; unsupported semantics or malformed entries are ignored.
-
-The fill path also protects model-visible browser output. Labels (such as `April`),
-full date strings and four-digit years remain redacted as exact registered values.
-Every browser result in the session, whether a structured snapshot or an
-arbitrary-code channel (`browser_eval`, `browser_exec`, CDP `Runtime.evaluate`,
-including OOPIF evaluation), passes one boundary that masks standalone components.
-That includes unrelated values such as `{"bookings": 4}`. This registry is in memory
-and does not infer provenance from page structure or JavaScript source text.
-Screenshots and CDP pixel captures are unavailable in that session; do not
-handoff a protected page into a shared browser. The registry clears only after
-a confirmed browser close. If close fails, reads stay masked and pixels blocked;
-raw CDP (both target and frame routing) is refused while any protected browser remains open.
-
-### Login origin aliases
-
-A 1Password Login can be bound to more than one exact sign-in origin without
-rewriting the item. When a fill returns `origin_mismatch`, the agent may add the
-exact page origin under the item handle or raw 1Password item ID with
-`hermes config set`:
-
-```shell
-hermes config set vault.origin_aliases.<item-id> '["https://signin.example.com"]'
-```
-
-`set` replaces the entire value for that item, so include existing aliases when
-adding another origin. The config is reread for each vault list/fill call; no
-restart is required. Aliases are HTTPS-only, exact-origin matches. Entries with
-a path, an `http` scheme, or a wildcard are ignored. Hermes does not infer
-parent or subdomain origins and applies an alias only to the named login. After
-adding an alias, retry the fill. The first alias-only fill asks the user to
-confirm the full origin and item label unless `vault.confirm_alias_fills` is
-false. A
-cross-registrable-domain alias is logged as an advisory warning when prompts
-are disabled, and otherwise warns in the confirmation detail when the advisory
-fallback recognizes those suffixes. The warning is not an authorization check
-and has partial suffix coverage; the full origin is always shown. Saved-origin
-fills do not need that extra prompt. Never edit or rewrite an existing shared
-1Password item to add a website URL, because template rewrites can remove
-passkeys.
-
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
@@ -300,50 +200,24 @@ vault:
     enabled: false
 ```
 
-### Several 1Password accounts
-
-A service-account token reads every vault it was granted, but only in its own
-account. To add logins from another account (a business account next to a
-personal one), list it under `accounts` with its own service-account token:
-
-```yaml
-vault:
-  onepassword:
-    accounts:
-      - alias: business                       # handles become op@business:<item-id>
-        account: business.1password.com
-        service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_BUSINESS
-        browser_account: work                 # optional: fill only in this Camofox account
-```
-
-Each additional account authenticates only with its own token, never with
-1Password Connect or an unlocked desktop session, so a handle can never resolve
-under another account's credential. An entry without a unique alias, an account,
-and a token variable of its own is ignored. `browser_account` limits fills and
-one-time codes to tasks whose browser uses that named account.
-
 ## What this does and does not guarantee
 
-**Vault fills:** the filled password does not enter the model's context through
-this path: not in tool results, logs, the session database, or process arguments.
+**Does:** the password never enters the model's context through Hermes: not in
+tool results, logs, the session database, or the CLI arguments of any process.
 Fills happen over the supervised browser session's direct CDP socket and are
 refused unless the page origin exactly matches the saved origin, checked again
-inside the page immediately before the write. Native Camofox uses its protected
-evaluate transport on HTTPS or loopback HTTP. The Desktop preview uses its
-authenticated channel bound to the exact tab and origin. Authorized direct entry
-accepts the model, session-record and provider-log exposure described above.
+inside the page immediately before the write. With the Camofox browser plugin,
+which has no CDP endpoint, the same checks run and the fill goes to the Camofox
+tab through its REST evaluate endpoint, only when `CAMOFOX_URL` is loopback or
+HTTPS. In the Hermes Desktop in-app Browser the fill goes to that exact tab
+through the Desktop's authenticated preview request channel, with the same
+origin checks; saved authenticator codes are bound to the login's origins too.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it
 yourself. On a cloud browser backend the vendor's browser sees the page like any
 other. The origin binding is the guard against filling on the wrong site, not
 against a compromised right one.
-
-Nor does it isolate the browser from this machine. Masking and screenshot refusal
-apply to Hermes' browser tools. A local process that connects straight to the
-browser's debugging endpoint, including a shell command run through the terminal
-tool, bypasses them and can read the page like any other client. This applies
-equally to filled passwords and protected dates.
 
 ### Who can get at the vault
 
@@ -368,3 +242,4 @@ If you save logins and install plugins you have not reviewed, run them out of
 process with [`plugins.isolation: host`](plugins.md#running-plugins-out-of-process-pluginsisolation).
 A plugin host still runs as your user and can read files you can read, so for
 a hard boundary give it a sandbox with `plugins.host.launcher`.
+

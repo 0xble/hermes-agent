@@ -233,25 +233,3 @@ async def test_draining_drops_queued_gated_items_without_starting_them():
     # The drop callback releases the resume's preclaim so the drain does not wait on it.
     assert dropped == ["s"] and started == []
     await scheduler.close()
-
-
-def test_admitting_restores_a_reservation_pruned_before_its_first_step():
-    """A goal wake reserves, then its task enters ``admitting`` a loop step later. A turn claimed
-    on that key in between prunes the reservation; the admission must still hold its fence."""
-    from gateway.replay_scheduler import BackgroundTurnGate
-
-    claimed = {"key": False}
-    gate = BackgroundTurnGate(2, lambda: (), claimed_since=lambda _key, _since: claimed["key"])
-    token = gate.try_reserve("route")
-    claimed["key"] = True
-    assert gate.load() == 0  # pruned: the claim on the key "used" the reservation
-    with gate.admitting(token):
-        assert gate.admission_pending("route")
-        assert gate.load() == 1
-    assert not gate.admission_pending("route")
-
-    released = gate.try_reserve("other")
-    gate.release(released)
-    with gate.admitting(released):
-        assert not gate.admission_pending("other")  # a returned reservation is never resurrected
-    assert gate.load() == 0

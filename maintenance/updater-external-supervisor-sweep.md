@@ -77,5 +77,3 @@ No live Hermes update, launchd restart, or `~/.hermes` state was touched.
 Retire when an upstream release excludes only post-snapshot externally
 supervised gateways from the manual sweep, while still handing back pre-existing
 ones, and this regression file passes without this fork patch.
-
-Contract tests: `tests/hermes_cli/test_update_external_supervisor_sweep.py`.

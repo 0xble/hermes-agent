@@ -12,7 +12,7 @@ the root on a child's behalf, and updates the root journal only for a root recon
 reports `child execution retired or superseded (stale_generation)` through the ordinary
 failed-delegation result. Closing the parent store cannot poison that verdict as `outbox_closed`.
 
-Contract tests: `tests/cron/test_detached_child_restart.py`, `tests/persistence_sqlite/workers/test_runtime_worker_children.py`.
+Contract tests: `tests/cron/test_detached_child_restart.py`, `tests/hermes_state/test_runtime_worker_children.py`.
 The detached-parent regression uses the real child store, receipt ledger, epoch retirement,
 and delegation runner with an in-process transport and a five-second Event deadline; it also
 covers a lost response and a parent store closing during the child's reconnect.
@@ -253,25 +253,3 @@ also named in retention INSERT/SELECT and defaults safely for old rows.
 
 
 Related upstream PRs [#123893](https://github.com/NousResearch/hermes-agent/pull/123893) and [#123878](https://github.com/NousResearch/hermes-agent/pull/123878) concern restart identity and drain waiting; neither isolates a macOS cron worker. Roll back by reverting this patch's launchd dispatch branch and associated docs/tests, without removing the upstream Linux handoff or execution ledger.
-
-## Delivery Queue Schema Convergence
-
-The delivery queue rebuilds `deliveries` and `delivery_tombstones` to admit new statuses,
-because SQLite cannot widen a CHECK in place. A rebuild that changes nothing leaves its own
-trigger true and repeats on every open, rewriting the file each time, which is how the execution
-ledger failed on its first v0.23.1 night. The queue therefore rebuilds only when the widened
-table definition differs from the stored one.
-
-Contract tests: `tests/cron/test_delivery_queue.py::test_an_older_queue_is_migrated_once_not_on_every_open`.
-
-## Update fence holds agent jobs
-
-An update's install fence can outlive the gateway restart it drives. While it is held,
-`ensure_gateway_runtime` answers `update_paused` to every agent fire, so the restarted gateway's
-ticker booked a failed "Not started; occurrence deferred" run, restored the slot and re-fired it on
-every tick (2026-11-14 08:57-08:59 AM PT: 141 failed and 50 missed rows, one occurrence restored 49
-times). The due scan now skips agent jobs while `update_fence_held` is true, leaving their due
-instant and pending slot untouched and stamping the drain hold, so each occurrence fires (or is
-restored) once after the update ends. Script jobs never reach the gateway and keep running.
-
-Contract tests: `tests/cron/test_update_fence_holds_agent_jobs.py`.

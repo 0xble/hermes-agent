@@ -19,7 +19,7 @@ from tests.waiting import wait_until
 def test_private_worker_discovery_verifies_the_reserved_adoption_claim(tmp_path, tamper):
     import psutil
     from gateway.session_worker_discovery import worker_discovery_handler
-    from persistence.sqlite._state.keys import admission_fingerprint
+    from gateway.session_admission import admission_fingerprint
     from gateway.session_authorities import SessionAuthorities
     from hermes_cli.process_identity import worker_birth
     from hermes_state import SessionDB

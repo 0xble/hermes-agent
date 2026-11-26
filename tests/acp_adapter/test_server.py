@@ -384,7 +384,6 @@ class TestPrompt:
         def _run(*args, **kwargs):
             # Runs inside the session context copy set up by prompt().
             captured["child"] = _make_run_env({}).get("HERMES_SESSION_ID")
-            captured["origin"] = kwargs.get("turn_origin")
             return {"final_response": "ok", "messages": []}
 
         state.agent.run_conversation = _run
@@ -401,7 +400,6 @@ class TestPrompt:
         )
 
         assert captured.get("child") == resp.session_id
-        assert captured.get("origin") == "user"
 
     @pytest.mark.asyncio
     async def test_empty_messages_list_replaces_stale_history(self, agent, mock_manager):

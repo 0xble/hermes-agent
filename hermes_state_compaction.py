@@ -222,7 +222,7 @@ def _run_pending_compaction(db_path: Path) -> dict[str, Any]:
                        "acknowledgement; the request stays pending for the next start")
         return {"status": "deferred_release"}
 
-    from persistence.sqlite._state.holders import foreign_state_db_holders, in_process_state_db_holders
+    from hermes_state_holders import foreign_state_db_holders, in_process_state_db_holders
 
     holders = foreign_state_db_holders(db_path)
     if holders:

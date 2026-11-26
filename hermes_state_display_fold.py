@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import logging
 import sqlite3
 from typing import Optional
 
 from hermes_state_common import _placeholders
-from persistence.sqlite.conversation._store.identity import _GIL_HELD_HASH_CHUNK
 from hermes_state_publication import state_lock
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
 
@@ -78,33 +76,6 @@ _DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM 
                               "AND (display_order IS NULL OR display_identity IS NULL)" + _VISIBLE)
 
 
-def _display_prefix_signature(conn, session_id: str, anchor: int) -> bytes | None:
-    """Fingerprint the stored display rows at or below the snapshot's high-water mark."""
-    signature = hashlib.blake2b(digest_size=16)
-    for query, order in (
-        (_DISPLAY_IDENTITY_INDEX_SQL, "display_identity, display_order, id"),
-        (_DISPLAY_BACKFILL_INDEX_SQL, "id"),
-    ):
-        # A payload edit can leave a missing identity NULL, so such a row
-        # cannot certify the snapshot. Unexpected storage classes also fall back.
-        invalid, encoded = conn.execute(
-            "SELECT count(*) != count(cell), group_concat(cell, '|') FROM ("
-            "SELECT CASE WHEN typeof(display_identity) = 'blob' "
-            "AND typeof(display_order) IN ('integer', 'null') THEN "
-            "id || ':' || hex(display_identity) || ':' || coalesce(display_order, 'n') END AS cell "
-            f"FROM ({query} AND id <= ? ORDER BY {order}))",
-            (session_id, anchor),
-        ).fetchone()
-        if invalid:
-            return None
-        payload = memoryview((encoded or "").encode("ascii"))
-        # Retaking the GIL under load would extend the writer hold after SQL returns.
-        for start in range(0, len(payload), _GIL_HELD_HASH_CHUNK):
-            signature.update(payload[start:start + _GIL_HELD_HASH_CHUNK])
-        signature.update(b"\0")
-    return signature.digest()
-
-
 _PAYLOAD_PAGE_BYTES = 1024 * 1024
 _PAYLOAD_SIZE_SQL = " + ".join(
     f"COALESCE(length(CAST(m.{column} AS BLOB)), 0)" for column in _CARRIER_FOLD_COLUMNS)
@@ -165,11 +136,9 @@ def _apply_display_updates(conn, updates):
 class _FoldPlan(dict[int, tuple[bytes | None, bytes, int | None]]):
     """Snapshot rows: (stored identity, canonical identity, stored order)."""
 
-    def __init__(self, session_id: str, freshness: _Freshness | None = None):
+    def __init__(self, freshness: _Freshness | None = None):
         super().__init__()
-        self.session_id = session_id
         self.freshness = freshness
-        self.prefix_signature: tuple[int, bytes] | None = None
         self.aliases: dict[bytes, set[bytes]] = {}
         self.repair_keys: set[bytes] = set()
 
@@ -214,9 +183,9 @@ class DisplayFoldMixin:
         nulls the stored identity (``messages_display_identity_update``). User handoff keys use
         only the live view's content, not its presentation metadata. Metadata-only edits do
         not invalidate that identity, and display visibility is filtered separately on read.
-        Changed rows and summary carriers outside the snapshot are recomputed under the lock.
-        Alias/repair discovery is also off-lock. The writer token or an unchanged indexed
-        prefix gates affected-group enumeration. Unproven snapshots retain the whole-index fold.
+        Every changed row and every row the snapshot did not see is recomputed under the lock.
+        Alias/repair discovery is also off-lock. A writer freshness token gates affected-group
+        enumeration, but generic/stale-plan callers retain the whole-index fold.
         ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
         if not session_id or getattr(self, "read_only", False) or not getattr(self, "_wal_active", False):
             return None
@@ -224,7 +193,7 @@ class DisplayFoldMixin:
             # Capture BEFORE the reader snapshot. Capturing after it could bless a write
             # that the snapshot cannot see. Use the same publication admission guard.
             with state_lock(self._lock, db_path=self.db_path):
-                plan = _FoldPlan(session_id, _freshness(self._conn))
+                plan = _FoldPlan(_freshness(self._conn))
             with self._read_ctx() as conn:
                 if conn is self._conn:  # degraded read path runs on the writer under its lock
                     return None
@@ -242,14 +211,6 @@ class DisplayFoldMixin:
                                     row, self._display_identity(self._display_dedupe_key(row)), uid_identity),
                                 row["display_order"])
                         last_id = rows[-1]["id"]
-                    try:
-                        anchor = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-                        signature = _display_prefix_signature(conn, session_id, anchor)
-                    except sqlite3.Error as exc:
-                        logger.debug("display prefix proof unavailable for %s: %s", session_id, exc)
-                    else:
-                        if signature is not None:
-                            plan.prefix_signature = (anchor, signature)
                 finally:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
@@ -332,18 +293,8 @@ class DisplayFoldMixin:
 
     def _resolve_display_identities(self, conn, visible, plan):
         """Stored equality validates payload reuse, not membership or presentation metadata."""
-        # Ordinary inserts already carry their canonical identity. A summary carrier with a
-        # message UID may instead inherit an earlier reply's identity. Check only new row IDs
-        # for that marker, without reading their payloads under the writer lock.
         stale = [row_id for row_id, stored, _order in visible
-                 if stored is None or (row_id in plan and plan[row_id][0] != stored)]
-        new_ids = [row_id for row_id, stored, _order in visible
-                   if stored is not None and row_id not in plan]
-        for start in range(0, len(new_ids), 500):
-            batch = new_ids[start:start + 500]
-            stale.extend(row[0] for row in conn.execute(
-                f"SELECT id FROM messages WHERE id IN ({_placeholders(batch)}) "
-                "AND _compressed_summary = 1 AND message_uid IS NOT NULL", batch))
+                 if stored is None or plan.get(row_id, (None,))[0] != stored]
         fresh: dict[int, bytes] = {}
         add_write_rows("display_stale", len(stale))
         with write_phase("display_stale_decode"):
@@ -358,9 +309,8 @@ class DisplayFoldMixin:
                     if original is not None:
                         identity = self._display_identity(self._display_dedupe_key(original))
                 fresh[row["id"]] = identity
-        return {row_id: fresh[row_id] if row_id in fresh else
-                (plan[row_id][1] if row_id in plan else stored)
-                for row_id, stored, _order in visible}
+        return {row_id: fresh[row_id] if row_id in fresh else plan[row_id][1]
+                for row_id, _stored, _order in visible}
 
     @timed_write_phase("display_planned_fold")
     def _fold_display_orders(self, conn, visible, plan, identities=None) -> None:
@@ -388,23 +338,14 @@ class DisplayFoldMixin:
             return plan
         try:
             current = _freshness(conn)
-            if current is None or current[0] is not plan.freshness[0]:
+            if (current is None or current[0] is not plan.freshness[0]
+                    or current[1:] != plan.freshness[1:]):
                 return plan
-            if current[1:] == plan.freshness[1:]:
-                anchor = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-            elif plan.prefix_signature is None:
-                return plan
-            else:
-                # A write in another session, an append, or a rollback can
-                # invalidate the connection token without changing this prefix.
-                anchor, expected = plan.prefix_signature
-                if _display_prefix_signature(conn, plan.session_id, anchor) != expected:
-                    return plan
-                add_write_rows("display_prefix_revalidated", 1)
         except sqlite3.Error as exc:
             logger.debug("display freshness check unavailable, full index: %s", exc)
             return plan
-        return _AffectedFold(plan, set(plan.repair_keys), anchor)
+        return _AffectedFold(plan, set(plan.repair_keys),
+                             conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0])
 
     @timed_write_phase("display_preimages")
     def _seed_display_removals(self, conn, session_id, selection, row_ids):

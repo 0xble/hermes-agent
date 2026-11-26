@@ -13,17 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
-    from typing import Protocol
-
-    class _ReadBudgetMember(Protocol):
-        """The holder shape needed by the shared read-budget bookkeeping."""
-
-        db_path: Path
-        read_only: bool
-        _conn: object | None
-        _creation_site: str
-
-        def _evict_one_idle_read_conn(self) -> bool: ...
+    from persistence.sqlite._holder import StoreHolder
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -163,10 +153,10 @@ class _PathReadBudget:
         self.permits = threading.BoundedSemaphore(_READ_POOL_MAX)
         self._lock = threading.Lock()
         # Weak: a holder dropped without close() must not pin peers' budget.
-        self._members: weakref.WeakSet[_ReadBudgetMember] = weakref.WeakSet()
+        self._members: weakref.WeakSet[StoreHolder] = weakref.WeakSet()
         self._duplicate_handles_warned = False
 
-    def register(self, db: "_ReadBudgetMember") -> None:
+    def register(self, db: "StoreHolder") -> None:
         with self._lock:
             self._members.add(db)
             # Only writable handles carry the cost the warning names (writer connection, write
@@ -199,12 +189,12 @@ class _PathReadBudget:
                 handles, db.db_path, _READ_POOL_MAX, creation_sites,
             )
 
-    def unregister(self, db: "_ReadBudgetMember") -> None:
+    def unregister(self, db: "StoreHolder") -> None:
         """Remove a closed writer from duplicate-handle diagnostics immediately."""
         with self._lock:
             self._members.discard(db)
 
-    def acquire(self, requester: "_ReadBudgetMember") -> bool:
+    def acquire(self, requester: "StoreHolder") -> bool:
         """Take a permit for a new read connection, or refuse (caller degrades to the
         locked writer connection). Gates, broadest first: fd headroom, process
         ceiling, this file's ceiling."""
@@ -231,12 +221,12 @@ class _PathReadBudget:
             _reclaim_idle_read_conn_anywhere() and _process_read_permits.acquire(blocking=False)
         )
 
-    def _acquire_path_permit(self, requester: "_ReadBudgetMember") -> bool:
+    def _acquire_path_permit(self, requester: "StoreHolder") -> bool:
         return self.permits.acquire(blocking=False) or (
             self.reclaim_idle(exclude=requester) and self.permits.acquire(blocking=False)
         )
 
-    def reclaim_idle(self, exclude: "Optional[_ReadBudgetMember]" = None) -> bool:
+    def reclaim_idle(self, exclude: "Optional[StoreHolder]" = None) -> bool:
         """Close one idle pooled connection held by a member; True if one went.
         Its release() returns both permits, so both ceilings reclaim through here."""
         with self._lock:

@@ -13,7 +13,6 @@ _PASSTHROUGH_PARAMS = (
     # Model response configuration (None = provider/model default)
     "max_tokens", "reasoning_config", "service_tier",
     "side_agent", "memory_agent_context",
-    "allow_billing_fallback",
 )
 # Gateway identity params stored as ``agent._<name>``. gateway_session_key is the stable
 # per-chat key (e.g. agent:main:telegram:dm:123).

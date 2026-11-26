@@ -24,8 +24,7 @@ from typing import Any, Dict, List, Optional
 def _user_turn_indices(history: list) -> list[int]:
     """Indices of *real* user turns: excludes ephemeral scaffolding, display_kind timeline
     rows and compaction handoffs — the same predicate as resume turn counting."""
-    from agent.context_compressor import user_originated_turn_view
-    from agent.session_persistence import _is_ephemeral_scaffolding
+    from session_rules.turns import user_originated_turn_view, _is_ephemeral_scaffolding
 
     return [
         i for i, m in enumerate(history)
@@ -65,23 +64,13 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
     Best-effort — an unreachable default must never block /new. Module-level helper (like
     ``_apply_new_session_title``): tests drive ``new_session`` unbound on a SimpleNamespace."""
     from cli import CLI_CONFIG, _cprint, _split_model_config_default, logger
-    from hermes_cli.model_alias_runtime import resolve_default_route
-    from hermes_cli.model_alias_runtime import ModelAliasError
-    try:
-        _route = resolve_default_route(CLI_CONFIG)
-    except ModelAliasError:
-        logger.debug("Config default is unavailable during /new", exc_info=True)
-        return
-    if _route.name and _route.model:
-        _config_model, _config_provider = _route.model, _route.provider
+    _model_config = CLI_CONFIG.get("model", {})
+    if isinstance(_model_config, dict):
+        _raw_default = _model_config.get("default") or _model_config.get("model") or ""
+        _config_provider = _model_config.get("provider", "")
     else:
-        _model_config = CLI_CONFIG.get("model", {})
-        if isinstance(_model_config, dict):
-            _raw_default = _model_config.get("default") or _model_config.get("model") or ""
-            _config_provider = _model_config.get("provider", "")
-        else:
-            _raw_default, _config_provider = (_model_config or ""), ""
-        _config_model, _ = _split_model_config_default(_raw_default)
+        _raw_default, _config_provider = (_model_config or ""), ""
+    _config_model, _ = _split_model_config_default(_raw_default)
     if not _config_model or _config_model == getattr(cli, "model", None):
         return
     try:
@@ -124,9 +113,9 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
 def _apply_new_session_title(cli, title: str) -> Optional[str]:
     """Sanitize + persist a /new title; returns the stored title or None (untitled)."""
     from cli import _cprint
-    from hermes_state import SessionDB
+    from persistence.conversation.sessions import sanitize_title
     try:
-        sanitized = SessionDB.sanitize_title(title)
+        sanitized = sanitize_title(title)
     except ValueError as e:
         _cprint(f"  {t('cli.session.title_rejected', error=e)}")
         return None
@@ -255,9 +244,9 @@ class CLISessionMixin:
 
     def _restore_session_yolo(self, session_meta: dict, *, quiet: bool = False) -> None:
         """Re-arm the session row's persisted /yolo on every resume path (``tools.approval_yolo``)."""
-        from hermes_state import SessionDB
+        from persistence.conversation.sessions import session_yolo_enabled
         from tools.approval_yolo import restore_session_yolo
-        if restore_session_yolo(self.session_id or "default", SessionDB.session_yolo_enabled(session_meta)):
+        if restore_session_yolo(self.session_id or "default", session_yolo_enabled((session_meta or {}).get("model_config"))):
             _dim_notice(self, t("cli.session.yolo_restored"), quiet)
 
     def _render_resume_history_panel_lines(self, panel) -> list[str]:
@@ -274,7 +263,7 @@ class CLISessionMixin:
         return buf.getvalue().rstrip("\n").splitlines()
 
     def _resolve_checkpoint_ref(self, ref: str, checkpoints: list) -> str | None:
-        """A 1-indexed checkpoint number or a hash (``tools/checkpoint_refs.py``, every surface's rule)."""
+        """A 1-indexed checkpoint number or a hash (``agent/checkpoints/refs.py``, every surface's rule)."""
         from agent.checkpoints.refs import resolve_checkpoint_ref
         try:
             return resolve_checkpoint_ref(checkpoints, ref)
@@ -389,7 +378,7 @@ class CLISessionMixin:
             return []
         try:
             from hermes_cli.session_listing import query_session_listing
-            from hermes_state_sessions import INTERNAL_LISTING_SOURCES
+            from persistence.conversation.sessions import INTERNAL_LISTING_SOURCES
 
             return query_session_listing(
                 self._session_db, source="cli", current_session_id=self.session_id,
@@ -743,10 +732,10 @@ class CLISessionMixin:
         _db = getattr(self, "_session_db", None)
         _sid = getattr(self, "session_id", None)
         if _db and _sid:
-            from hermes_state import SessionExportTooLargeError
+            from persistence.core.errors import ExportTooLarge
             try:
-                session_data = load_save_snapshot(_db, _sid, fmt)
-            except SessionExportTooLargeError as e:
+                session_data = load_save_snapshot(_db, _sid, fmt, persistence=getattr(_db, "persistence", None))
+            except ExportTooLarge as e:
                 print(f"(._.) {e}")
                 return
             except Exception:
@@ -789,9 +778,9 @@ class CLISessionMixin:
             print(t("cli.session.retry_no_messages"))
             return None
 
-        from agent.context_compressor import history_before_user_originated_turn
-        from session_rules.turns import retryable_user_text
-        from agent.memory_context import sanitize_context
+        from session_rules.turns import (
+            history_before_user_originated_turn, retryable_user_text, sanitize_context,
+        )
 
         warm_history = list(self.conversation_history)
         user_indices = _user_turn_indices(warm_history)
@@ -870,7 +859,7 @@ class CLISessionMixin:
         or None after printing ``failure_key`` when the durable rewind refused (history untouched).
         """
         from cli import logger
-        from agent.context_compressor import history_before_user_originated_turn
+        from session_rules.turns import history_before_user_originated_turn
 
         warm_history = list(self.conversation_history)
         cut_idx = _user_turn_indices(warm_history)[target_ordinal]

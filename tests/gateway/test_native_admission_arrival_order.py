@@ -200,29 +200,6 @@ async def test_stop_fences_inputs_still_capturing_or_waiting(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stop_owner_session_probe_runs_off_gateway_loop(tmp_path, monkeypatch):
-    """A busy Telegram stop must not wait on SessionStore's blocking routing lock on the loop."""
-    authority, _entered, release, admit, route = await _held_owner(tmp_path, monkeypatch)
-    release.set()
-    runner = authority.runner
-    loop_thread = threading.get_ident()
-    probed_on: list[int] = []
-    real_probe = runner._hm_mounted_owner
-
-    def probe(*args):
-        probed_on.append(threading.get_ident())
-        return real_probe(*args)
-
-    runner._hm_mounted_owner = probe
-    try:
-        await admit(X, 'x0-text')
-        await runner._hm_stop_owner_turn(route(X))
-        assert probed_on and loop_thread not in probed_on
-    finally:
-        authority.db.close()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize('chat', ['existing', 'first-message', 'paused'])
 async def test_one_stop_epoch_per_route_fences_inputs_and_command_turns(tmp_path, monkeypatch, chat):
     """/stop and /new bump ONE per-route epoch on the authority. A slash command's turn (``_stop_epoch``)

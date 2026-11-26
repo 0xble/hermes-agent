@@ -11,16 +11,11 @@ import pytest
 def _cache_runner(tmp_path):
     source = Path(__file__).resolve().parents[2]
     root = tmp_path / "repo"
-    # run_tests.sh sources the live-home guard library beside it, and that library runs
-    # setup_guard.py, which imports hermes_constants and pm.environments.
-    for relative in ("scripts/run_tests.sh", "scripts/run_tests_parallel.py", "scripts/run_tests_launch.py",
-                     "scripts/_activation.sh",
-                     "scripts/_setup_guard.sh", "scripts/setup_guard.py", "hermes_constants.py",
+    for relative in ("scripts/run_tests.sh", "scripts/run_tests_parallel.py", "scripts/_activation.sh",
                      "scripts/ci/list_os_marked_tests.py"):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / relative, target)
-    shutil.copytree(source / "pm", root / "pm", ignore=shutil.ignore_patterns("__pycache__"))
     subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(root), "add", "scripts"], check=True, capture_output=True)
     return root

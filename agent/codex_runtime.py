@@ -509,14 +509,14 @@ def _close_codex_session(agent) -> None:
     agent._codex_session = None
 
 
-def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any, Any]:
-    """(interrupted, interrupt_message, interrupt_source); clears the agent-level interrupt."""
+def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
+    """(user_interrupted, interrupt_message); clears the agent-level interrupt so a hard
+    stop cannot poison the next turn (mirrors the conversation-loop finalizer)."""
     interrupted = bool(active and getattr(agent, "_interrupt_requested", False))
     message = getattr(agent, "_interrupt_message", None) if interrupted else None
-    source = getattr(agent, "_interrupt_source", None) if interrupted else None
     if interrupted:
         agent.clear_interrupt()
-    return interrupted, message, source
+    return interrupted, message
 
 
 def _codex_developer_instructions(agent) -> str:
@@ -840,15 +840,14 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     )
 
 
-def _turn_result(interrupt: tuple[bool, Any, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
+def _turn_result(interrupt: tuple[bool, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
                  error: Any, final_response: Any, **extra: Any) -> dict[str, Any]:
     """Result shape shared with the chat_completions path (``partial`` == ``not completed``)."""
-    user_interrupted, interrupt_message, interrupt_source = interrupt
+    user_interrupted, interrupt_message = interrupt
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_calls,
         "completed": completed, "partial": not completed, "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
-        **({"interrupt_source": interrupt_source} if interrupt_source else {}),
         "error": error, **extra,
     }
 
@@ -1244,8 +1243,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 0 if getattr(agent, "_turn_independent_attempt_active", False) is True else 1
-    model = api_kwargs.get("model")
+    max_stream_retries, model = 1, api_kwargs.get("model")
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
     # Retirement token for THIS request (installed by ``interruptible_api_call``). A watchdog that kills the

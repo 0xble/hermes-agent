@@ -692,7 +692,7 @@ def test_handle_diagnostics_do_not_retain_the_creators_frame(tmp_path, monkeypat
 
     # This checks call-site metadata, not host-wide FD scans. A cached native
     # scan error retains its re-raised traceback, including the opening frames.
-    monkeypatch.setattr("persistence.sqlite._state.dbfile._deleted_sidecar_holders_for_open", lambda _path: [])
+    monkeypatch.setattr("hermes_state_dbfile._deleted_sidecar_holders_for_open", lambda _path: [])
 
     class Context:
         pass

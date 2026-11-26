@@ -4,9 +4,8 @@ When FTS5 corruption blocks ``INSERT INTO messages``, ``_pending_messages`` and 
 ``agent._session_messages`` are the only surviving copies; shutdown ``.clear()`` would drop them.
 All hooks write atomic JSON payloads under ``<hermes_home>/pending_messages/``:
 ``flush_pending_to_file`` / ``flush_overflow_to_file`` (queue head / FIFO tail, before clear),
-``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``;
-claimed follow-ups remain spooled until their adapter accepts replay; other files delete
-on success), ``flush_agent_history_to_file`` (DB flush raised),
+``recover_pending_to_db`` (at startup, before resume turns; replays via ``messages.append``,
+deletes each file on success), ``flush_agent_history_to_file`` (DB flush raised),
 ``spool_dropped_transcript_message`` / ``drain_transcript_spool``.
 """
 
@@ -22,12 +21,11 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from hermes_dir_acl import make_user_dir
+from persistence.core.errors import PersistenceError
 
 logger = logging.getLogger(__name__)
-outcome_logger = logging.getLogger("gateway.run")
 
 # Reason tag for transcript messages dropped by the in-memory pending cap during live
 # operation. Payloads carry the full transcript message dict for verbatim replay.
@@ -56,13 +54,10 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: dict[str, Any], file_id: Optional[str] = None) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path.
-
-    ``file_id`` lets a caller that already drew the file's uuid reuse it (see ``_flush_value``).
-    """
+def _write_payload(flush_dir: Path, payload: dict[str, Any]) -> Path:
+    """Atomically write one private, uniquely named recovery payload; return its path."""
     from utils import atomic_json_write
-    final_path = flush_dir / f"pending-{file_id or uuid.uuid4().hex}.json"
+    final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
         # Persist the directory entry too; keep the published file (the only recovery copy) even if
@@ -83,35 +78,15 @@ def _write_payload(flush_dir: Path, payload: dict[str, Any], file_id: Optional[s
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
-    from agent.incognito import is_incognito
-    if is_incognito(session_key):
-        return False  # the live FIFO remains in RAM, restart intentionally drops it
     try:
         serialised = _serialise_value(value)
-        if serialised is None or not has_user_content(serialised):
+        if serialised is None:
             return False
-        # Any id-less follow-up needs a stable recovery-only dedupe key. This includes ordinary
-        # MessageEvents flushed from a non-internal queue: leaving those on the legacy content
-        # fallback lets a later identical message destroy the only recovery copy. The key reuses
-        # the spool file's own uuid (one uuid4 per payload, so file names keep their draw order),
-        # and is stamped on a copy: dict values are serialised by identity and belong to the caller.
-        file_id = uuid.uuid4().hex
-        if not serialised.get("message_id") and not serialised.get("recovery_id"):
-            serialised = {**serialised, "recovery_id": f"hermes-recovery-{file_id}"}
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised}, file_id)
+        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
         return False
-
-
-def _pending_arrival_ts(value: Any, fallback: int) -> int | float:
-    """Order MessageEvents by arrival; legacy strings use flush time."""
-    from datetime import datetime
-    stamp = getattr(value, "timestamp", None)
-    if isinstance(stamp, datetime):
-        return stamp.timestamp()
-    return fallback
 
 
 def flush_pending_to_file(pending: dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -121,8 +96,7 @@ def flush_pending_to_file(pending: dict[str, Any], *, reason: str = "shutdown") 
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
-            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason,
-                                    ts=_pending_arrival_ts(value, ts), seq=-1)
+            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts)
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
@@ -144,7 +118,7 @@ def flush_overflow_to_file(overflow_by_session: dict[str, Any], *, reason: str =
         for seq, value in enumerate(list(events)):
             if value is not None:
                 flushed += _flush_value(flush_dir, "overflow", session_key, value, reason=reason,
-                                        ts=_pending_arrival_ts(value, ts), seq=seq)
+                                        ts=ts, seq=seq)
     if flushed:
         logger.info("Flushed %d queued overflow message(s) to %s (reason=%s)", flushed, flush_dir,
                     reason)
@@ -158,9 +132,6 @@ def spool_dropped_transcript_message(session_id: str, message: dict[str, Any]) -
     message under ``<hermes_home>/pending_messages/``), so a runtime cap rotation no longer silently
     discards user data while the process stays up (#78182).
     """
-    from agent.incognito import is_incognito
-    if is_incognito(session_id):
-        return None
     try:
         return _write_payload(_get_flush_dir(), {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
@@ -228,26 +199,6 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     return replayed, remaining
 
 
-def payload_media_urls(data: dict[str, Any]) -> list:
-    """Attachment paths from a pending payload; legacy ``media`` may hold one stringified value."""
-    urls = data.get("media_urls") or data.get("media") or []
-    return [urls] if isinstance(urls, str) else list(urls)
-
-
-def has_user_content(data: dict[str, Any]) -> bool:
-    """A caption-less attachment is still a message; only text- and media-free slots are empty."""
-    return bool(data.get("text")) or bool(payload_media_urls(data))
-
-
-def recovered_message_type(data: dict[str, Any]):
-    """Restore the spooled ``MessageType``; spools written before it was kept replay as TEXT."""
-    from gateway.platforms.event import MessageType
-    try:
-        return MessageType(data.get("message_type") or MessageType.TEXT.value)
-    except ValueError:
-        return MessageType.TEXT
-
-
 def _json_safe(value: Any) -> bool:
     try:
         json.dumps(value)
@@ -256,68 +207,15 @@ def _json_safe(value: Any) -> bool:
         return False
 
 
-def _spooled_event_metadata(event):
-    from gateway.session_synthetic import is_synthetic
-
-    fields: dict[str, Any] = {"native_synthetic": True} if is_synthetic(event) else {}
-    metadata = getattr(event, "metadata", None)
-    if not isinstance(metadata, dict) or not metadata or not _json_safe(metadata):
-        return fields
-    fields["metadata"] = metadata
-    if metadata.get("goal_continuation") is True:
-        from gateway.shutdown_goal_wakes import goal_continuation_only, goal_wake_identities
-        fields["goal_continuation_only"] = goal_continuation_only(event)
-        if fields["goal_continuation_only"]:
-            fields["goal_continuation_wakes"] = goal_wake_identities(event)
-    return fields
-
-
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
-    from gateway.cron_review import is_review_event
-    if is_review_event(value):
-        # A cron review's capture cannot cross a restart; replayed without it the
-        # hidden prompt would run as an ordinary turn and post its reply. The
-        # delivery queue already sends the original report on review failure.
-        return None
     if hasattr(value, "text"):  # MessageEvent-like object
         result: dict[str, Any] = {"text": getattr(value, "text", "")}
-        for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
+        for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
-        recovery_id = getattr(value, "_hermes_recovery_id", None)
-        if recovery_id is not None and _json_safe(recovery_id):
-            result["recovery_id"] = recovery_id
-        for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
-                     "_attended_activity_received_at",
-                     "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
-            val = getattr(value, attr, None)
-            if val is not None and _json_safe(val):
-                result[attr] = val
-        # Voice vs audio-file vs document routing reads the message-level type, not just MIME.
-        message_type = getattr(getattr(value, "message_type", None), "value", None)
-        if isinstance(message_type, str):
-            result["message_type"] = message_type
-        if getattr(value, "reply_to_is_own_message", False) is True:
-            result["reply_to_is_own_message"] = True
-        if getattr(value, "_drain_deferred", False):
-            result["drain_deferred"] = True
-        # Every queued event keeps its turn contract: a machinery notice recovered without
-        # ``internal``/``reply_expected`` would be judged a human turn on replay.
-        result["internal"] = getattr(value, "internal", False) is True
-        result["allow_gateway_control"] = getattr(value, "allow_gateway_control", False) is True
-        reply_expected = getattr(value, "reply_expected", None)
-        if isinstance(reply_expected, bool):
-            result["reply_expected"] = reply_expected
-        result.update(_spooled_event_metadata(value))
-        source = getattr(value, "source", None)
-        if source is not None:
-            for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
-                val = getattr(source, attr, None)
-                if val is not None and _json_safe(val):
-                    result[f"source_{attr}"] = val
         return result
     if isinstance(value, str):  # runner-level _pending_messages
         return {"text": value}
@@ -359,8 +257,11 @@ def is_row_rejection(exc: BaseException) -> bool:
     cannot bind (an unsupported type, or an int outside 64 bits), or a malformed field that fails
     before the write. Lock, I/O, corruption and routing failures stay retryable, and so do constraint
     failures, which can be session-wide. Only a binding message counts among sqlite errors:
-    ``InterfaceError("no more rows available")`` is WAL contention that ``SessionDB`` retries and
-    re-raises unchanged once its patience runs out."""
+    ``InterfaceError("no more rows available")`` is WAL contention that the store retries and
+    re-raises unchanged once its patience runs out. A storage interface error raised from a sqlite
+    error is judged by that sqlite error."""
+    if isinstance(exc, PersistenceError) and isinstance(exc.__cause__, sqlite3.Error):
+        exc = exc.__cause__
     if isinstance(exc, sqlite3.Error):
         return (isinstance(exc, (sqlite3.InterfaceError, sqlite3.ProgrammingError))
                 and "binding parameter" in str(exc).lower())
@@ -379,18 +280,6 @@ def _remove_replayed(path: Path, session_id: str) -> None:
                      "delete it by hand, or the next start writes that row again", session_id, path, exc)
 
 
-def quarantine_pending_spool(path: Path, why: str) -> bool:
-    """Move a pending spool out of every replay glob, keeping it on disk for manual recovery."""
-    target = path.with_name(path.name + QUARANTINE_SUFFIX)
-    try:
-        path.replace(target)
-    except OSError as exc:
-        logger.error("Could not quarantine pending message %s (%s): %s", path, why, exc)
-        return False
-    logger.warning("Quarantined pending message %s to %s (%s); it will not be replayed", path, target, why)
-    return True
-
-
 def _quarantine_spool_file(path: Path, session_id: str, exc: BaseException) -> None:
     """Move a spool file whose row the database rejected out of every replay, so it cannot hold its
     session's later rows back on every write and every restart. It stays on disk for manual recovery."""
@@ -406,125 +295,84 @@ def _quarantine_spool_file(path: Path, session_id: str, exc: BaseException) -> N
                    session_id, exc, target)
 
 
-# Source bytes of decoded payloads one recovery pass may hold for replay. Past it, files are re-read at
-# replay so recovery memory stays bounded however large the backlog; below it, each is parsed once.
-_RETAINED_PAYLOAD_BUDGET = 512 * 1024
+def _order_flush_files(paths) -> list[Path]:
+    """Order recovery payloads by :func:`_spool_sort_key`, as :func:`drain_transcript_spool` does.
+    The store restores a conversation by AUTOINCREMENT id and spool files have random names, so
+    any other order permanently scrambles the recovered transcript.
 
-
-def _scan_flush_files(paths) -> tuple[list[tuple[Path, Any]], bool]:
-    """Order recovery payloads by :func:`_spool_sort_key`, as :func:`drain_transcript_spool` does,
-    reading each file once. ``SessionDB`` restores a conversation by AUTOINCREMENT id and spool files
-    have random names, so any other order permanently scrambles the recovered transcript.
-
-    Returns the ordered ``(path, retained)`` pairs and whether any payload needs the shared default
-    state.db. ``retained`` is the decoded payload while :data:`_RETAINED_PAYLOAD_BUDGET` lasts, the
-    decode error for an unparseable file (sorted last by name), or None for a file the caller re-reads.
+    Keeps only the key and path, not decoded payloads; the caller re-reads each file to replay it.
+    Unparseable files sort last by name.
     """
-    entries, budget, needs_ambient_db = [], _RETAINED_PAYLOAD_BUDGET, False
+    entries = []
     for path in paths:
         try:
-            text = path.read_text(encoding="utf-8-sig")
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise ValueError("payload must be an object")
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         # OSError: unreadable; ValueError: bad JSON or bytes; RecursionError: nesting too deep.
-        except (OSError, ValueError, RecursionError) as exc:
-            entries.append(((1, 0.0, 0.0, path.name), path, exc))
-            continue
-        needs_ambient_db = needs_ambient_db or _payload_needs_ambient_db(payload)
-        retained = None
-        if len(text) <= budget:
-            budget -= len(text)
-            retained = payload
-        entries.append(((0, *_spool_sort_key(payload, path.name)), path, retained))
+        except (OSError, ValueError, RecursionError):
+            payload = None
+        if isinstance(payload, dict):
+            entries.append(((0, *_spool_sort_key(payload, path.name)), path))
+        else:
+            entries.append(((1, 0.0, 0.0, path.name), path))
     entries.sort(key=lambda entry: entry[0])
-    return [(path, retained) for _key, path, retained in entries], needs_ambient_db
+    return [path for _key, path in entries]
 
 
-def _order_flush_files(paths) -> list[Path]:
-    """The paths of :func:`_scan_flush_files`, in replay order."""
-    return [path for path, _retained in _scan_flush_files(paths)[0]]
-
-
-def _payload_needs_ambient_db(payload: dict[str, Any]) -> bool:
-    """Legacy session_id rows and transcript-cap drops replay into the shared default state.db."""
-    data = payload.get("data")
-    return payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON or bool(
-        isinstance(data, dict) and data.get("session_id"))
-
-
-def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_followup=None) -> int:
+def recover_pending_to_db(persistence=None, *, session_resolver=None) -> int:
     """Replay flush-dir ``*.json`` files into state.db; return the number of messages recovered.
     See :func:`recover_pending_spool`, which also reports the sessions it held back."""
-    return recover_pending_spool(
-        session_db, session_resolver=session_resolver, deferred_followup=deferred_followup)[0]
+    return recover_pending_spool(persistence, session_resolver=session_resolver)[0]
 
 
-def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_followup=None) -> tuple[int, set[str]]:
-    """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
+def recover_pending_spool(persistence=None, *, session_resolver=None) -> tuple[int, set[str]]:
+    """Replay flush-dir ``*.json`` files via ``messages.append``, deleting each on success.
 
-    ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
-    ``session_resolver`` (optional ``(session_key, not_after=ts) -> (session_id, db) | None``, e.g.
-    ``SessionStore.resolve_session_id_for_key``) is required for real flush files: adapter
-    ``MessageEvent`` objects carry no ``session_id``, so without it every recovery lands in the skip
-    branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
-    gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
-    payload as a separate turn before it is appended to history. Returns ``(recovered, held_back)``:
-    the number of messages recovered, and the session ids whose spool files this pass held back
-    after a failed replay, so the live writer can drain them before that session's next row.
+    ``persistence`` is a storage interface handle; ``None`` opens (and afterwards closes) one on the
+    current home's store. ``session_resolver`` (optional ``(session_key, not_after=ts) ->
+    (session_id, persistence) | None``, as :func:`recover_gateway_pending` builds from the session
+    store) is required for real flush files: adapter ``MessageEvent`` objects carry no
+    ``session_id``, so without it every recovery lands in the skip branch. A returned handle routes
+    the append to the profile store owning the key (multiplexed gateways); ``None`` preserves the
+    file. Returns ``(recovered, held_back)``: the number of
+    messages recovered, and the session ids whose spool files this pass held back after a failed
+    replay, so the live writer can drain them before that session's next row.
     """
-    flush_files, needs_ambient_db = _scan_flush_files(_get_flush_dir().glob("*.json"))
+    flush_files = _order_flush_files(_get_flush_dir().glob("*.json"))
     if not flush_files:
         return 0, set()
-    own_db = session_db is None
-    # Recovery callers that provide a session resolver normally route every ordinary pending
-    # message to its profile-owned SessionDB. Do not open the shared default state.db just to
-    # discover that fact: on a loaded gateway the registry acquisition can take several seconds,
-    # delaying claim-and-queue of follow-ups. Payloads that inherently need the ambient DB (legacy
-    # session_id rows and transcript-cap drops) still opt into the existing eager path.
-    if own_db and session_resolver is not None and not needs_ambient_db:
-        own_db = False
-    if own_db:
-        from hermes_state_registry import acquire
-        session_db = acquire()
+    own_store = persistence is None
+    if own_store:
+        from persistence_assembly import open_persistence, profile_scope
+        persistence = open_persistence(profile_scope(), eager=True)
     recovered = 0
     # Sessions whose spool replay already failed this pass -> files held back for them. Ordering is a
     # per-session property, so one unhealthy session must not hold back the others.
     blocked_sessions: dict[str, int] = {}
     try:
-        for path, retained in flush_files:
+        for path in flush_files:
             if path in _REPLAYED_UNREMOVABLE:
                 continue
             # One unparseable payload or rejected append must only skip THIS file: the file is
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
-                if isinstance(retained, Exception):
-                    raise retained
-                payload = retained if retained is not None else json.loads(path.read_text(encoding="utf-8-sig"))
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
                 # Agent-history snapshots use a different schema (reason +
                 # messages list) and are meant for manual operator recovery,
                 # not automatic DB insertion. Skip them silently.
                 if payload.get("reason") == AGENT_HISTORY_REASON:
                     continue
-                result = _recover_one_payload(session_db, path, payload,
-                                              session_resolver=session_resolver,
-                                              deferred_followup=deferred_followup,
-                                              blocked_sessions=blocked_sessions)
-                if result is DROP_PENDING:
-                    path.unlink(missing_ok=True)
-                    continue
-                if result:
+                if _recover_one_payload(persistence, path, payload,
+                                        session_resolver=session_resolver,
+                                        blocked_sessions=blocked_sessions):
                     recovered += 1
-                    if result is not CLAIMED_FOLLOWUP:
-                        _remove_replayed(path, payload.get("session_key", ""))
+                    _remove_replayed(path, payload.get("session_key", ""))
             # health: allow BLE001 -- per-file boundary moved unchanged from recover_pending_to_db; a traceback per locked-DB file would only add noise
             except Exception as exc:
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
-        if own_db and session_db is not None:  # shutdown cancellation/interrupt must not strand an owned DB
+        if own_store:  # shutdown cancellation/interrupt must not strand an owned store
             with contextlib.suppress(Exception):
-                from hermes_state_registry import release_or_close
-                release_or_close(session_db)
+                persistence.close()
     if recovered:
         logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
     if blocked_sessions:
@@ -535,65 +383,13 @@ def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_fo
     return recovered, set(blocked_sessions)
 
 
-OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
-CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
-DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without transcript append
-# A stale (>24h) shutdown follow-up waits for its decline note's delivery path only this long.
-# Its session may be pruned, suspended, or never reconnect; without a bound the spool is kept
-# and re-scanned on every boot with no recorded outcome.
-_STALE_FOLLOWUP_RETENTION_SECS = 7 * 24 * 60 * 60
-
-
-def _drop_stale_followup(session_key: str) -> object:
-    """Record the one visible decision for a stale follow-up whose note cannot be sent."""
-    outcome_logger.info("Restart recovery outcome: session=%s outcome=%s",
-                        session_key, "skipped:stale:note-unavailable")
-    return DROP_PENDING
-
-
-def _upgrade_shutdown_follow_up(payload: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
-    """Shutdown follow-ups are independent future turns even when the answered predecessor's
-    resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
-    False from the deferral callback otherwise appends them to history and deletes the spool."""
-    if payload.get("reason") in ("shutdown_follow_up", "turn_lease_wait"):
-        return {**data, "drain_deferred": True, "shutdown_follow_up": True,
-                "_recovery_reason": payload["reason"]}
-    return data
-
-
-def _drop_drain_deferred(path: Path, text: str, data: dict[str, Any], *, keep_expired: bool = False) -> bool:
-    """An expired drain arrival, or a spooled built-in control command, is never replayed.
-
-    With ``keep_expired`` an expired spool is flagged ``_recovery_stale`` instead, so its follow-up
-    owner can decline it visibly rather than deleting a user's message without a word. Past
-    ``_STALE_FOLLOWUP_RETENTION_SECS`` it is also flagged ``_recovery_abandoned``: a note that still
-    cannot be delivered by then is given up with a logged outcome instead of re-scanned forever."""
-    age = time.time() - path.stat().st_mtime
-    if age > 24 * 60 * 60:
-        if keep_expired:
-            data["_recovery_stale"] = True
-            if age > _STALE_FOLLOWUP_RETENTION_SECS:
-                data["_recovery_abandoned"] = True
-        else:
-            logger.warning("Dropping expired drain-deferred message from %s", path)
-            return True
-    from gateway.platforms.event import MessageEvent
-    from hermes_cli.commands import resolve_command
-    command = MessageEvent(
-        text=text, allow_gateway_control=data.get("allow_gateway_control") is not False,
-    ).get_command()
-    if command and resolve_command(command) is not None:
-        logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
-        return True
-    return False
-
-
-def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
-                         session_resolver=None, deferred_followup=None,
-                         blocked_sessions: dict[str, int]) -> bool | object:
-    """Append a flush payload or retain a claimed follow-up until adapter admission."""
-    # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
-    # (#78182). This handles spool files that were never drained before a restart.
+def _recover_one_payload(persistence, path: Path, payload: dict[str, Any], *,
+                         session_resolver=None, blocked_sessions: dict[str, int]) -> bool:
+    """Append one flush payload through ``persistence``; False when it was not replayed (the file is
+    kept, or quarantined when the database rejected the row itself)."""
+    from persistence.conversation.messages import NewMessage
+    # Cap-dropped transcript payloads carry the full message dict keyed by session_id: replay it
+    # directly (#78182). This handles spool files that were never drained before a restart.
     if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
         from gateway.session_transcript import transcript_append_kwargs
         data = payload.get("data", {}) or {}
@@ -609,7 +405,9 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
             blocked_sessions[spooled_sid] += 1
             return False
         try:
-            session_db.append_message(**transcript_append_kwargs(spooled_sid, message, fallback_ts=payload.get("ts")))
+            fields = transcript_append_kwargs(spooled_sid, message, fallback_ts=payload.get("ts"))
+            del fields["session_id"]
+            persistence.messages.append(spooled_sid, NewMessage(**fields))
         except Exception as exc:
             if is_row_rejection(exc):  # no retry can write it, so it must not hold the session back
                 _quarantine_spool_file(path, spooled_sid, exc)
@@ -620,25 +418,17 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
             raise
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
-    data = _upgrade_shutdown_follow_up(payload, data)
-    data = {**data, "_recovery_spool_ts": payload.get("ts")}
     text = data.get("text", "")
-    from gateway.shutdown_goal_wakes import retire_regenerable_goal_continuation
-    if retire_regenerable_goal_continuation(session_key, data) or (
-            data.get("drain_deferred") is True and _drop_drain_deferred(
-                path, text, data,
-                keep_expired=data.get("shutdown_follow_up") is True and deferred_followup is not None)):
-        return DROP_PENDING
-    if not session_key or not has_user_content(data):
+    if not text or not session_key:
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)
         return False
     # session_key is a gateway routing key (e.g. "agent:main:telegram:..."); appending a row
     # needs the real session_id, which real payloads lack — the resolver supplies it together with
-    # the store owning the key. ``session_db`` (the owned default) serves only payloads that already
-    # carry a session_id; a resolver-resolved payload goes to the resolver's db alone, never the
-    # ambient root store (a None db from the resolver is not a fallback signal — it is "preserve").
-    session_id, target_db = data.get("session_id", ""), session_db
+    # the store owning the key. ``persistence`` (the owned default) serves only payloads that already
+    # carry a session_id; a resolver-resolved payload goes to the resolver's handle alone, never the
+    # ambient root store (a None handle from the resolver is not a fallback signal; it is "preserve").
+    session_id, target = data.get("session_id", ""), persistence
     if not session_id and session_resolver is not None:
         try:
             resolved = session_resolver(session_key, not_after=payload.get("ts"))
@@ -646,53 +436,14 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
             logger.debug("Session key->id resolution failed for %s: %s", session_key, exc)
             resolved = None
         if resolved and resolved[1] is not None:
-            session_id, target_db = resolved
+            session_id, target = resolved
     if not session_id:
-        if data.get("_recovery_abandoned") is True:
-            return _drop_stale_followup(session_key)  # pruned session: no note route will return
         logger.warning("Cannot recover pending message for %s: no session_id in flush file and "
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    if deferred_followup is not None:
-        claim = deferred_followup(session_key, session_id, data, path)
-        if claim is DROP_PENDING:
-            return DROP_PENDING
-        if data.get("_recovery_stale") is True and claim is False:
-            return _drop_stale_followup(session_key)
-        if claim is OTHER_PLATFORM_PENDING:
-            logger.debug("Pending message for %s retained until its platform reconnects", session_key)
-            return False
-        if claim is None and data.get("_recovery_abandoned") is True:
-            # Whatever blocks the note (offline adapter, pruned/suspended/mismatched entry, running
-            # session, failed auth check) has outlived the retention bound; decide once and stop.
-            return _drop_stale_followup(session_key)
-        if claim is None:  # resume deferred until its delivery path is ready
-            logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
-                           "resume awaiting platform reconnect", session_key, path)
-            return False
-        if claim:
-            return CLAIMED_FOLLOWUP
-    # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
-    # reply judgement, display filters) does not treat it as a human prompt.
-    row_display: dict[str, Any] = {}
-    if data.get("internal") is True:
-        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
-        from gateway.warning_notifications import diagnostic_metadata
-        row_display["display_kind"] = INTERNAL_NOTIFICATION_DISPLAY_KIND
-        row_display["display_metadata"] = diagnostic_metadata(
-            SimpleNamespace(internal=True, metadata=data.get("metadata")))
-    if isinstance(data.get("reply_expected"), bool):
-        row_display.setdefault("display_metadata", {})["reply_expected"] = data["reply_expected"]
-    if not row_display.get("display_metadata"):
-        row_display.pop("display_metadata", None)
-    if not text:
-        from gateway.run import _build_media_placeholder
-        text = _build_media_placeholder(SimpleNamespace(
-            media_urls=payload_media_urls(data), media_types=data.get("media_types") or [],
-            message_type=recovered_message_type(data)))
-    target_db.append_message(session_id=session_id, role="user", content=text,
-                             timestamp=payload.get("ts", int(time.time())), **row_display)
+    target.messages.append(session_id, NewMessage(role="user", content=text,
+                                                  timestamp=payload.get("ts", int(time.time()))))
     return True
 
 
@@ -709,7 +460,13 @@ def recover_gateway_pending(runner) -> int:
     from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
     store = runner.session_store
-    recovered, held_back = recover_pending_spool(session_resolver=store.resolve_session_id_for_key)
+
+    def resolve(session_key, *, not_after=None):
+        # The id the session store resolves, with the handle beside the store owning the key.
+        resolved = store.resolve_session_id_for_key(session_key, not_after=not_after)
+        return (resolved[0], store._persistence_for_key(session_key)) if resolved else None
+
+    recovered, held_back = recover_pending_spool(session_resolver=resolve)
     store.mark_spooled_drop_sessions(held_back)
     if not getattr(runner.config, "multiplex_profiles", False):
         return recovered
@@ -719,7 +476,7 @@ def recover_gateway_pending(runner) -> int:
             continue
         token = set_hermes_home_override(str(home))
         try:
-            count, held_back = recover_pending_spool(session_resolver=store.resolve_session_id_for_key)
+            count, held_back = recover_pending_spool(session_resolver=resolve)
         except Exception:  # one profile's unreadable spool must not strand the others'
             logger.warning("Pending-message recovery failed for profile %s", name, exc_info=True)
             continue

@@ -63,51 +63,6 @@ def darwin_physical_footprint(pid: int) -> int:
     return int(usage.counters[7])  # ri_phys_footprint
 
 
-@lru_cache(maxsize=1)
-def _darwin_listchildpids():
-    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    fn = lib.proc_listchildpids
-    fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-    fn.restype = ctypes.c_int
-    return fn
-
-
-def darwin_child_pids(pid: int) -> list[int]:
-    """Direct children of *pid* from the kernel's own per-parent lookup."""
-    capacity = 64
-    while True:
-        buffer = (ctypes.c_int * capacity)()
-        count = _darwin_listchildpids()(pid, buffer, ctypes.sizeof(buffer))
-        if count < 0:
-            raise OSError(ctypes.get_errno(), "child pids unavailable")
-        if count < capacity:
-            return [child for child in buffer[:count] if child > 0]
-        capacity *= 2
-
-
-def _descendants(process: psutil.Process) -> list[psutil.Process]:
-    """The kernel's process tree. On macOS psutil's ``children(recursive=True)`` asks every
-    process on the host for its parent, one sysctl each with the GIL held: with ~5,000 host
-    processes that took 3 s per sample, once a second per running cell, and starved every other
-    gateway thread (pre_tool_call hooks timed out and blocked all tool calls). libproc answers
-    per parent, so the cost follows the tree, and ctypes releases the GIL during the call."""
-    if sys.platform != "darwin":
-        return process.children(recursive=True)
-    found: list[psutil.Process] = []
-    pending, seen = [process.pid], {process.pid}
-    while pending:
-        for child in darwin_child_pids(pending.pop()):
-            if child in seen:
-                continue
-            seen.add(child)
-            try:
-                found.append(psutil.Process(child))
-            except psutil.NoSuchProcess:
-                continue
-            pending.append(child)
-    return found
-
-
 def process_memory_bytes(process: psutil.Process) -> int:
     rss = process.memory_info().rss
     if sys.platform == "darwin":
@@ -143,7 +98,7 @@ class KernelMemoryWatch:
         try:
             # psutil Process objects carry creation times: is_running rejects reused
             # PIDs. Never sample unrelated processes or remote PIDs on the host.
-            for member in [process, *_descendants(process)]:
+            for member in [process, *process.children(recursive=True)]:
                 try:
                     if member.is_running():
                         total += process_memory_bytes(member)

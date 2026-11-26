@@ -1,7 +1,7 @@
 """Regression: the state.db repair-loop guards must survive an mtime change.
 
 Incident (2026-08-17): a malformed-SCHEMA state.db sent Hermes into an
-unbounded repair loop that wrote a fresh 98MB forensic copy every ~10s —
+unbounded repair loop that wrote a fresh 98MB forensic copy every ~10s:
 2.3GB in 20 minutes, disk heading to zero, whole agent fleet at risk.
 
 The #86747 guards were already present and did NOT hold, because both keyed
@@ -28,14 +28,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
-import hermes_state
-import hermes_state_repair
-from hermes_state_repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_content_identity, _backup_db_file, _db_fingerprint, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _record_repair_outcome, _repair_backup_headroom_bytes
-
-
-pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+from persistence.sqlite._state import repair as repair_module
+from persistence.sqlite._state.repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_content_identity, _backup_db_file, _db_fingerprint, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _record_repair_outcome, _repair_backup_headroom_bytes
 
 
 def _damaged_db(tmp_path: Path, size: int = 200_000) -> Path:
@@ -53,7 +47,7 @@ def test_fingerprint_survives_mtime_change(tmp_path):
     """A touched-but-unchanged file keeps its identity (the incident's core)."""
     db = _damaged_db(tmp_path)
     before = _db_fingerprint(db)
-    time.sleep(0.01)
+    time.sleep(0.01)  # health: allow HX013 -- the file's mtime must move on the wall clock between passes
     os.utime(db, None)  # live writer / WAL checkpoint / in-place repair pass
     assert _db_fingerprint(db) == before
 
@@ -85,7 +79,7 @@ def test_attempt_budget_exhausts_despite_mtime_churn(tmp_path):
     for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
         assert not _persistent_repair_attempts_exhausted(db)
         _record_repair_outcome(db, repaired=False)
-        time.sleep(0.01)
+        time.sleep(0.01)  # health: allow HX013 -- the file's mtime must move on the wall clock between passes
         os.utime(db, None)
     assert _persistent_repair_attempts_exhausted(db)
 
@@ -110,7 +104,7 @@ def test_backup_dedupes_across_mtime_change(tmp_path):
     first, err = _backup_db_file(db)
     assert err is None and first is not None
     for _ in range(5):
-        time.sleep(0.01)
+        time.sleep(0.01)  # health: allow HX013 -- the file's mtime must move on the wall clock between passes
         os.utime(db, None)
         again, err = _backup_db_file(db)
         assert err is None
@@ -154,7 +148,7 @@ def test_backup_allowed_on_small_volume_with_room(tmp_path):
     guard must allow it rather than hard-stopping repair forever.
     """
     # Sparse: this test DOES copy the file, but the guard and copy both care
-    # about st_size, not content — 50MB of os.urandom would only cost CI time.
+    # about st_size, not content: 50MB of os.urandom would only cost CI time.
     db = tmp_path / "state.db"
     with open(db, "wb") as handle:
         handle.write(b"SQLite format 3\x00")
@@ -218,7 +212,7 @@ def test_failed_copy_leaves_no_countable_debris(tmp_path):
             patch("shutil.copy2", sidecar_fails):
         for _ in range(6):
             _backup_db_file(db)
-            time.sleep(0.01)
+            time.sleep(0.01)  # health: allow HX013 -- the file's mtime must move on the wall clock between passes
             os.utime(db, None)
 
     assert len(_existing_malformed_backups(db)) <= _MAX_MALFORMED_BACKUPS
@@ -244,13 +238,13 @@ def test_backup_allowed_with_ample_disk(tmp_path):
 
 
 def test_repair_aborts_when_backup_refused_for_disk(tmp_path):
-    """Refused backup is a HARD STOP — never mutate the only damaged copy."""
+    """Refused backup is a HARD STOP: never mutate the only damaged copy."""
     db = _damaged_db(tmp_path)
     tight = type(
         "Usage", (), {"total": 0, "used": 0, "free": _REPAIR_BACKUP_MIN_FREE_BYTES // 2}
     )()
     with patch("shutil.disk_usage", return_value=tight):
-        report = hermes_state_repair.repair_state_db_schema(db)
+        report = repair_module.repair_state_db_schema(db)
     assert not report.get("repaired")
     assert "free" in (report.get("error") or "").lower()
 
@@ -294,7 +288,7 @@ def test_fingerprint_takes_no_raw_fd_while_a_connection_is_live(tmp_path):
             fp = _db_fingerprint(db)
 
         assert not opened, f"raw fd taken on a live DB: {opened}"
-        # None is the correct answer here — see
+        # None is the correct answer here: see
         # test_budget_exhausts_when_liveness_alternates_across_passes for why a
         # substitute key shape would be worse than no key at all. The ledger
         # keeps counting against the key already on record.
@@ -308,10 +302,10 @@ def test_live_connection_keeps_its_write_lock_across_a_repair_pass(tmp_path):
 
     The peer runs in a SUBPROCESS on purpose. POSIX advisory locks are owned
     per-process, so a same-process peer shares the holder's lock ownership and
-    cannot demonstrate the cancellation — it stays blocked either way, which
+    cannot demonstrate the cancellation: it stays blocked either way, which
     makes the test vacuous.
 
-    Rollback-journal mode only — WAL coordinates through ``-shm`` rather than
+    Rollback-journal mode only: WAL coordinates through ``-shm`` rather than
     POSIX advisory locks, so it is immune. DELETE mode is what Hermes falls
     back to on NFS/SMB/FUSE/ZFS and on SQLite builds vulnerable to the
     WAL-reset bug, so it is a real deployment shape, not a corner case.
@@ -408,7 +402,7 @@ def test_staging_name_is_outside_the_backup_prefix(tmp_path):
     prefix = f"{db.name}.malformed-backup-"
     for name in staging_names:
         assert not name.startswith(prefix), (
-            f"staging name {name!r} matches the backup prefix — it would be "
+            f"staging name {name!r} matches the backup prefix: it would be "
             "counted by _existing_malformed_backups, sort NEWEST, and let "
             "prune keep partials while deleting intact forensic copies"
         )
@@ -418,8 +412,8 @@ def test_orphaned_staging_is_never_returned_as_the_backup_path(tmp_path):
     """A kill mid-copy leaves a byte-identical staging file; the dedupe must
     not hand it back as the official ``backup_path``.
 
-    It would pass the #69603 hard-stop gate — repair then runs destructive
-    surgery believing a forensic copy exists — and the next pass's sweep
+    It would pass the #69603 hard-stop gate: repair then runs destructive
+    surgery believing a forensic copy exists: and the next pass's sweep
     deletes that very file.
     """
     db = _damaged_db(tmp_path, size=20_000)
@@ -428,7 +422,7 @@ def test_orphaned_staging_is_never_returned_as_the_backup_path(tmp_path):
     )()
 
     # Discover the staging name the implementation actually uses, then plant an
-    # orphan under it — so this binds to the code's scheme, not to a literal.
+    # orphan under it: so this binds to the code's scheme, not to a literal.
     real_copy2 = shutil.copy2
     seen: list[Path] = []
 
@@ -474,7 +468,7 @@ def test_budget_exhausts_when_liveness_alternates_across_passes(tmp_path):
     read unsafe. If the ledger treated that as "no identity" (skip the record)
     or substituted a differently-shaped key (``size:mtime_ns``), then a gateway
     peer connecting and disconnecting between passes would reset the counter to
-    1 forever — the exact unbounded loop this whole ledger exists to stop.
+    1 forever: the exact unbounded loop this whole ledger exists to stop.
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
@@ -507,7 +501,7 @@ def test_budget_exhausts_when_liveness_alternates_across_passes(tmp_path):
 
 
 def test_fingerprint_returns_none_rather_than_a_mtime_shaped_key(tmp_path):
-    """Never mint a second key SHAPE — the ledger compares for equality."""
+    """Never mint a second key SHAPE: the ledger compares for equality."""
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     db = tmp_path / "state.db"
@@ -552,7 +546,7 @@ def test_ordinary_commit_does_not_rekey_the_fingerprint(tmp_path):
     In rollback-journal (DELETE) mode a commit writes the main file directly and
     bumps the header's file change counter (bytes 24-27) and version-valid-for
     (92-95). Those live inside the head sample, so an unmasked fingerprint
-    changed on every ordinary session write — resetting the repair budget to 1
+    changed on every ordinary session write: resetting the repair budget to 1
     forever, which is exactly the unbounded loop this suite exists to pin.
     """
     for journal_mode in ("DELETE", "WAL"):
@@ -689,7 +683,7 @@ def test_backup_not_deduped_after_interior_page_write(tmp_path):
     counters so an ordinary write does not re-key the repair budget. If the
     forensic dedupe reused THAT identity, a live writer committing new rows
     into an interior page (size preserved, first/last 64KiB untouched) would
-    be handed the STALE earlier backup as "identical" — a recovery point that
+    be handed the STALE earlier backup as "identical": a recovery point that
     predates real user data. The dedupe must use ``_backup_content_identity``
     (whole file), which detects the interior change.
     """
@@ -733,7 +727,7 @@ def test_publication_failure_leaves_no_countable_partial_bundle(tmp_path):
     The bundle is published sidecars-first, main-DB-last (the main name is the
     commit marker ``_existing_malformed_backups`` counts). If a promotion after
     the first fails, cleanup must roll back every already-published
-    destination — otherwise an incomplete bundle (main present, a sidecar
+    destination: otherwise an incomplete bundle (main present, a sidecar
     missing) survives, passes the #69603 hard stop, and is deduped/reused as a
     legitimate forensic copy on the next pass.
 

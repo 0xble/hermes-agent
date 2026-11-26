@@ -29,7 +29,7 @@ def hermes_home(tmp_path, monkeypatch):
     # These tests own fresh temporary DB files, never live process-held generations.
     # Enumerating every host FD on each open/close dominates the loop tests on macOS;
     # native retired-WAL detection is exercised by the hermes_state tests instead.
-    monkeypatch.setattr("persistence.sqlite._state.dbfile._iter_darwin_fd_targets", lambda: iter(()))
+    monkeypatch.setattr("hermes_state_dbfile._iter_darwin_fd_targets", lambda: iter(()))
     goals._DB_CACHE.clear()
     yield home
     goals._DB_CACHE.clear()

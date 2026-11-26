@@ -101,7 +101,7 @@ class RuntimeSessionCompressionMixin:
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
         # Adopt the committed generation as the owner stored it: one dict per message_uid.
-        from persistence.sqlite.conversation._store.identity import _newest_message_uid_rows
+        from hermes_state_identity import _newest_message_uid_rows
         compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
         # The worker's local context version (the prompt-cache clock's compaction witness): every
         # in-place rewrite archives through here, a prune or micro-compaction included.
@@ -124,7 +124,7 @@ class RuntimeSessionCompressionMixin:
             lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(messages, result['annotations'])
-        from persistence.sqlite.conversation._store.identity import _newest_message_uid_rows
+        from hermes_state_identity import _newest_message_uid_rows
         messages[:] = _newest_message_uid_rows(messages)
 
     def _compression_receipt_journal(self, candidate, result):

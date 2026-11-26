@@ -5,7 +5,7 @@ import pytest
 
 from gateway.session_envelope import _adapter_event, _snapshot_native, snapshot_native
 from gateway.session_ingress_media import ingress_fingerprint
-from persistence.sqlite._state.keys import admission_fingerprint
+from hermes_state_keys import admission_fingerprint
 from hermes_state_runtime import admit_session_input
 from tests.fakes.runtime_owner import initialize_session_authority
 from tests.gateway.test_unknown_synthetic_settles import _codec, _producer

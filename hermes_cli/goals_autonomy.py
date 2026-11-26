@@ -16,9 +16,7 @@ AUTONOMY_CONTINUATION_TEMPLATE = (
     "rather than stopping for input or approval. Preserve every constraint, hard limit and "
     "verification criterion when revising or replacing. Never use complete or replace to escape "
     "constraints, failing checks or unsolved work. Use goal_set complete only with an evidence "
-    "mapping from EVERY verification criterion to concrete recorded tool output. Clear only an obsolete, "
-    "superseded, duplicated or handed-off goal, with a stated reason; cite verified takeover for a handoff. "
-    "Never clear to escape unmet criteria or failing checks. Use complete for an achieved goal. "
+    "mapping from EVERY verification criterion to concrete recorded tool output. Never clear a goal. "
     "If nothing material changed, reply exactly [SILENT]."
 )
 
@@ -60,36 +58,6 @@ def record_hard_limit_breach(state, reason: str) -> None:
             for row in state.revisions):
         state.revisions.append({"at": time.time(), "kind": "hard_limit_breach", "reason": reason,
                                 "actor": "system", "authority": "autonomy"})
-
-
-def retire_goal(state, reason: str, actor: str, authority: str) -> None:
-    """Clear a goal, recording who retired this instance and why.
-
-    Every clear appends its own row, so the latest clear row always names this retirement's
-    authority. Revisions inherited from an earlier autonomously cleared goal must never make a
-    later user clear look autonomous.
-    """
-    if reason:
-        state.last_reason = reason
-    state.revisions.append({"at": time.time(), "kind": "clear", "reason": reason,
-                            "actor": actor, "authority": authority})
-    state.status = "cleared"
-
-
-def _retired_by_autonomy(state) -> bool:
-    """Whether this instance's own clear was autonomous.
-
-    Only rows after the inherited-history boundary (the ``set`` row appended when this goal was
-    set) belong to this instance, so an earlier goal's clear can never decide this one.
-    """
-    if state.status != "cleared":
-        return False
-    for row in reversed(state.revisions):
-        if row.get("kind") == "set":
-            return False
-        if row.get("kind") == "clear":
-            return row.get("authority") == "autonomy"
-    return False
 
 
 def migrate_autonomous_goal(state) -> bool:
@@ -208,9 +176,8 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
             target for _verb, target, _quoted in _bound_removal_instruction_units(checked[1], requirements)]
         missing = [item for item in removed if _normalize_authority_value(item) not in targets]
         if missing:
-            detail = "Retain each requirement or quote the user's exact removal instruction: " + "; ".join(missing)
             return {"ok": False, "error_code": "constraint_quote_required",
-                    "error": detail, "missing_requirements": missing}
+                    "error": "Retain each requirement or quote the user's exact removal instruction: " + "; ".join(missing)}
     if before == after:
         return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
     state.goal = after["goal"]
@@ -283,14 +250,10 @@ class GoalAutonomyMixin:
 
     @staticmethod
     def _history_for_next_goal(previous):
-        if not goal_autonomy_enabled() or previous is None:
+        if not goal_autonomy_enabled() or previous is None or previous.status != "done":
             return []
-        retired = _retired_by_autonomy(previous)
-        if previous.status != "done" and not retired:
-            return []
-        reason = "Previous goal cleared" if retired else "Previous goal completed"
         return [*previous.revisions, {"at": time.time(), "kind": "set", "actor": "agent",
-                "authority": "autonomy", "reason": reason, "goal": previous.goal,
+                "authority": "autonomy", "reason": "Previous goal completed", "goal": previous.goal,
                 "contract": previous.contract.to_dict()}]
 
     def _autonomy_timer_elapsed(self):

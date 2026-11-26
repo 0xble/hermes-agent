@@ -30,7 +30,7 @@ class FakeChild:
         self.tool_reason = None
         self.steering = []
 
-    def steer(self, text, *, human=True):
+    def steer(self, text):
         self.steering.append(text)
         return True
 

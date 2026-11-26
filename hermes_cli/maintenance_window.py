@@ -23,24 +23,14 @@ DEFAULT_DELETION_WINDOW = "02:00-05:00"
 _WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
 
 
-def normalize_window_spec(spec: object, *, warn: bool = True) -> object:
-    """Return the effective deletion-window spec, optionally logging an invalid value."""
-    if spec is None or (isinstance(spec, str) and not spec.strip()):
-        return spec
-    match = _WINDOW_RE.match(spec) if isinstance(spec, str) else None
-    if match is None or int(match[1]) > 23 or int(match[3]) > 24 or int(match[2]) > 59 or int(match[4]) > 59:
-        if warn:
-            logger.warning("maintenance.deletion_window %r is not HH:MM-HH:MM; using %s", spec, DEFAULT_DELETION_WINDOW)
-        return DEFAULT_DELETION_WINDOW
-    return spec
-
-
 def window_contains(spec: object, at: datetime) -> bool:
     """Whether *at* falls in *spec*. Empty/None means always; an invalid spec uses the default."""
-    spec = normalize_window_spec(spec)
     if spec is None or (isinstance(spec, str) and not spec.strip()):
         return True
     match = _WINDOW_RE.match(spec) if isinstance(spec, str) else None
+    if match is None or int(match[1]) > 23 or int(match[3]) > 24 or int(match[2]) > 59 or int(match[4]) > 59:
+        logger.warning("maintenance.deletion_window %r is not HH:MM-HH:MM; using %s", spec, DEFAULT_DELETION_WINDOW)
+        match = _WINDOW_RE.match(DEFAULT_DELETION_WINDOW)
     start = int(match[1]) * 60 + int(match[2])
     end = int(match[3]) * 60 + int(match[4])
     minute = at.hour * 60 + at.minute

@@ -164,35 +164,9 @@ def log_response_service_tier(agent: Any, response: Any, api_kwargs: dict[str, A
     )
 
 
-def _note_response_usage(agent: Any, usage: Any = None) -> None:
-    if not getattr(agent, "_request_usage_ledger_owned_by_auxiliary", False):
-        from hermes_cli.observability.request_usage_ledger import note_response
-        note_response(agent, usage)
-
-
-def _note_response_if_needed(agent: Any, usage: Any, already_recorded: bool) -> None:
-    if not already_recorded:
-        _note_response_usage(agent, usage)
-
-
-def record_response_ledger(agent: Any, response: Any) -> None:
-    """Queue the ledger row for a provider response before retry branching.
-
-    Response handling can return early for truncation/refusal, before the normal
-    accounting fold below.  This helper deliberately does only the content-free
-    ledger side effect; full accounting still happens in ``record_response_usage``.
-    """
-    usage = getattr(response, "usage", None)
-    canonical = with_served_service_tier(
-        normalize_usage(usage, provider=agent.provider, api_mode=agent.api_mode), response
-    ) if usage else None
-    _note_response_usage(agent, canonical)
-
-
 def record_response_usage(
     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
-    ledger_already_recorded: bool = False,
 ) -> ResponseUsageOutcome:
     """Fold ``response.usage`` into compressor, anchors, session counters, state.db
     and the API-call log line (see module docstring). No-usage responses only
@@ -217,12 +191,10 @@ def record_response_usage(
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
             effort_log_label(getattr(agent, "reasoning_config", None)),
         )
-        _note_response_if_needed(agent, None, ledger_already_recorded)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
-    _note_response_if_needed(agent, canonical_usage, ledger_already_recorded)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
@@ -383,11 +355,6 @@ def record_response_usage(
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
     # loop); drained at finalize via _persist_session.
-    # Keep spare fallback budgets aligned with the same canonical usage object that
-    # is persisted to state.db; direct primary use never sets this marker.
-    from agent.turn_usage_spare import record_spare_fallback_usage
-    record_spare_fallback_usage(agent, canonical_usage)
-
     if agent._session_db and agent.session_id:
         try:
             # Ensure the row exists: under concurrent SQLite load the initial

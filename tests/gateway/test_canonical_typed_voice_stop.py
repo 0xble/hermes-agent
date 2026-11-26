@@ -118,7 +118,7 @@ async def test_a_stop_typed_as_a_busy_correction_ends_the_voice_chat_and_reaches
 @pytest.mark.asyncio
 async def test_other_busy_corrections_still_reach_the_turn(voice_owner):
     voice_owner.runner._voice_mode['s'] = 'voice_only'
-    voice_owner.authority.steer_agent = lambda *a, **_kwargs: (None, True)
+    voice_owner.authority.steer_agent = lambda *a: (None, True)
     voice_owner.authority.check_approval_generation = lambda *a: None
     with voice_owner.db:
         reply = await _call(_connection(voice_owner.authority), 'session.steer', text='stop doing that',

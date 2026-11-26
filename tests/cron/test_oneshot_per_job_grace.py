@@ -58,9 +58,7 @@ def test_per_job_allowance_keeps_one_shot_due(store, monkeypatch, age, allowance
 
 def test_retired_oneshot_diagnostic_reports_actual_allowance(store):
     job = oneshot(601, **{FIELD: 600})
-    from cron.jobs_oneshot_diagnostics import write_retired
-
-    write_retired(job, job["next_run_at"])  # the writer both retirement gates call
+    jobs._write_retired_oneshot_diagnostic(job, job["next_run_at"])
     diagnostic = next((store / "cron/output/once").glob("*.md"))
     assert "grace window: 600s" in diagnostic.read_text()
     assert "grace window: 120s" not in diagnostic.read_text()

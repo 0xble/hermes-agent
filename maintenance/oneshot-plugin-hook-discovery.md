@@ -63,7 +63,7 @@ A worker failure or premature exit still raises rather than serving a partial re
 
 Related patch identity: `windows-plugin-uninstall-gateway`.
 Contract tests: `tests/hermes_cli/test_plugin_startup_reload_barrier.py`,
-  `tests/hermes_cli/test_plugin_reload_observers.py`.
+`tests/hermes_cli/test_plugin_reload_observers.py`.
 
 Synchronous hook calls on an event-loop thread must not wait on discovery.
 Observer-only hooks (`on_session_reset`, `agent_loop_stopped`, `pre_command`) use

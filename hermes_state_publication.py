@@ -17,10 +17,8 @@ _metrics: ContextVar[dict | None] = ContextVar("compaction_publication_metrics",
 
 
 class _PublicationCursor(sqlite3.Cursor):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.completed_rows = 0
-        self.closed = False
+    completed_rows = 0
+    closed = False
 
     def _complete(self):
         self.completed_rows = self.written_rows()
@@ -102,26 +100,12 @@ def record_publication_write(*, wait_s=0.0, hold_s=0.0, rows_written=0):
 
 @contextmanager
 def state_lock(lock, *, db_path, deadline: float | None = None):
-    """Bound compaction publication and retention prune admission, including degraded reads.
+    """Bound only compaction publication's admission, including degraded reads.
 
     Ordinary writers retain their unbounded mutex wait: their SQLite retry budget
     must not turn a queued transcript append into a failed write. Never interrupt
-    an acquired transaction. Under a prune budget, its deadline overrides the
-    passed deadline and acquisition uses a 50 ms non-blocking spin.
+    an acquired transaction.
     """
-    from hermes_state_prune_budget import current_budget
-    if budget := current_budget():
-        budget.check()
-        from hermes_state_prune_pacing import PrunePacer
-        pacer = PrunePacer(max_size=1)
-        while not lock.acquire(blocking=False):
-            pacer.pause(0)
-        try:
-            budget.check()
-            yield
-        finally:
-            lock.release()
-        return
     metrics = _metrics.get()
     if metrics is None:
         with lock:
@@ -185,6 +169,6 @@ def record_publication_attempt():
 
 def raise_if_nonretryable_contention(exc):
     """Expired patience and lost holders are terminal, not a live foreign writer."""
-    from persistence.sqlite._state.errors import CompressionLeaseLostError
+    from hermes_state_errors import CompressionLeaseLostError
     if isinstance(exc, (LocalStateLockTimeout, CompressionLeaseLostError)):
         raise exc

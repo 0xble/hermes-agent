@@ -669,9 +669,10 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path, store):
     runtime = HostedRoomRuntime(
         store=store, placement="profile",
         rooms=bindings,
-        transport_resolver=lambda binding, _task: waiting if binding.room_id == "room-waiting" else healthy,
+        transport_resolver=lambda binding, _task: (
+            waiting if binding.room_id == "room-waiting" else healthy
+        ),
         turn_lock=RecordingTurnLocks(),
-        clock=lambda now=time.time(): now,  # frozen: lease expiry is not the fault under test
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,

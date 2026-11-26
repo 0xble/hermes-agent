@@ -36,5 +36,3 @@ bulk.
 
 Retire when upstream bounds the echoed context. To roll back, revert the patch
 commit; no state or configuration is involved.
-
-Contract tests: `tests/tools/test_async_delegation.py`.

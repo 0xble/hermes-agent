@@ -14,14 +14,7 @@ This is a row ceiling, not a strict byte quota: output sizes can change.
 
 `cron.execution_retention_days` sets the elapsed-day window in `config.yaml`
 (default `8`, `0` disables age expiration while retaining the row backstop).
-Read it in the owning profile at each terminal transition. Retention is best-effort:
-any configuration-resolution failure falls back to the default window and must
-not roll back the execution's terminal state. An unavailable config backend
-(`ConfigBackendUnavailable`, a `SystemExit` subclass) is caught explicitly and
-skips only age pruning for that call, because the selected backend may hold a
-longer window than the default. A duration that overflows the
-UTC cutoff disables only age pruning for that call; the row backstop still runs.
-The virtual-clock
+Read it in the owning profile at each terminal transition. The virtual-clock
 DST soak configures a window longer than its full simulated span: it proves
 every fire and delivery across that span, while dedicated retention tests prove
 expiration. Its final all-runs ledger assertions remain unchanged.
@@ -38,34 +31,12 @@ are eligible. Incidents retain their own error and output-file evidence in
 `cron_incidents`, with no execution-ID reference requiring a ledger-row pin.
 
 Keep cleanup in the shared terminal-transition path. Each call deletes at most
-500 rows across age expiration and ceiling trimming combined, oldest first
-within each policy's scan. SQL excludes each job's latest attempt before
-applying the candidate limit. Latest attempts of one-shot or removed jobs may
-remain protected forever, but cannot fill the candidate page and prevent cleanup
-of other jobs' history. The partial numeric-time index serves expiration and
-bounded counting; a second partial index of the same key also excludes rows with
-delivery obligations (queued outcome, pending or delivering status, provisional
-marker), so those rows cost no scan work and never enter the candidate page.
-The numeric per-job claim index serves latest-attempt exclusion without
-repeatedly sorting each job's history. Finding candidates may scan past any
-number of latest attempts; the limit bounds the remaining eligibility checks,
-not all SQLite work.
-
-Admission journals are files, so SQL cannot exclude them. Each policy checks at
-most four times its deletion budget for current-transition IDs and journal
-presence (2,000 candidates per pass, at most 4,000 per terminal transition).
-These protections have no guaranteed expiry, so each policy keeps a scan cursor
-(`scan_after_jd`, `scan_after_id` on its `execution_prune_watermarks` row, outside
-the read contract). The next call seeks past the last examined candidate; when
-that range ends with page budget left, the same call wraps to the oldest rows up
-to the old cursor, so rows whose protection has since released are not delayed.
-Rows whose finish and claim times are both unparseable have a NULL age key and
-sort first in the index; the cursor can stop inside that segment and every wrap
-passes through it, so such a row is never skipped once a cursor exists (the age
-policy never matches them, so only the ceiling walk visits them).
-A page of journal-protected rows therefore costs one bounded pass per call; it
-cannot permanently hide eligible newer rows.
-Compute the cutoff in UTC before subtracting the duration,
+500 rows across age expiration and ceiling trimming combined, oldest first.
+An existing backlog converges over later terminal writes instead of requiring
+one large write transaction. The partial numeric-time index serves expiration,
+ordering, and bounded counting. A numeric per-job claim index serves the latest
+attempt exclusion without repeatedly sorting each job's history. Eligibility
+also checks delivery state and journal presence. Compute the cutoff in UTC before subtracting the duration,
 and compare parsed instants so offset changes and DST do not move the window.
 The index is additive, preserving named-column reads/writes by older releases.
 
@@ -99,14 +70,7 @@ comparison, with a separate unbounded-by-count unknown population. Neither
 satisfies this contract. These were inspected as prior art, not adopted patches.
 The fork implementation deliberately uses one time policy and one ceiling for
 all terminal states, with a profile-local age-window setting and no new scheduler owner.
-Upstream state was rechecked on 2026-11-05: both PRs remain open. Related
-[PR #79082](https://github.com/NousResearch/hermes-agent/pull/79082) also guards
-configuration resolution, but keeps the count-only policy; it is prior art,
-not an adopted patch. Upstream main at
-`8283794aa41779e55293934a910943a4b129cc78` still uses count-only pruning and does
-not satisfy this unit. The config-failure isolation and scan-bound repair remain
-part of fork patch `cron-execution-history`; no upstream write or runtime
-installation is part of this delivery.
+Upstream state was checked on 2026-10-29. No upstream write is part of this unit.
 
 ## Coverage Evidence
 
@@ -145,14 +109,6 @@ contract, with no new core tool, setting, telemetry or runtime activation.
 
 ## Verification and Retirement
 
-`tests/cron/test_execution_prune_safety.py` covers terminal durability under
-oversized retention, unknown model presets, and non-mapping cron config through
-all six terminal writers. Its protected-backlog cases bound SQLite VM work for
-delivery/journal pages and prove convergence after those protections release,
-and that a full page of older protected rows cannot starve newer eligible rows.
-Permanent singleton/latest backlogs cannot starve age or ceiling cleanup,
-including when the ceiling excess is only one row.
-
 `tests/cron/test_execution_retention.py` owns the time-window and bounded-cleanup
 invariants, including mixed offsets, DST, the cutoff boundary, missing finish
 times, combined policy budgets, configurable windows, and preservation of
@@ -175,5 +131,3 @@ policy, index creation, and regressions together. The extra index may remain
 on disk harmlessly. Rolling back to count-only pruning immediately weakens
 future audit coverage and cannot restore already-deleted history. Source
 qualification alone does not install or activate the change.
-
-Contract tests: `tests/cron/test_execution_retention.py`, `tests/cron/test_execution_coverage.py`, `tests/cron/test_execution_prune_safety.py`, `tests/cron/test_missed_execution_retention.py`.

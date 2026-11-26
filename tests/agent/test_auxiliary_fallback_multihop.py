@@ -309,8 +309,8 @@ def test_auto_custom_failure_quarantines_concrete_custom_route(monkeypatch):
     assert mark.call_args.kwargs["base_url"] == base_url
 
 
-def test_named_custom_route_uses_configured_label_health_identity(tmp_path, monkeypatch):
-    """Named custom routes keep one credential label through mark, read and clear."""
+def test_named_custom_route_uses_one_endpoint_scoped_health_identity(tmp_path, monkeypatch):
+    """Named custom routes use local/custom consistently through mark, read and clear."""
     base_url = "https://proxy.example/v1"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
@@ -319,16 +319,16 @@ def test_named_custom_route_uses_configured_label_health_identity(tmp_path, monk
     now = [100.0]
     monkeypatch.setattr(ac.time, "time", lambda: now[0])
     ac._mark_provider_unhealthy("custom:foo", model="model", ttl=60, reason="rate limit")
-    identity = ac._auxiliary_route_identity("custom:foo", base_url, "model")
+    identity = ac._auxiliary_route_identity("local/custom", base_url, "model")
     assert ac._read_auxiliary_health(identity) is not None
     assert ac._is_provider_unhealthy("custom:foo", model="model")
-    assert not ac._is_provider_unhealthy("local/custom", base_url, "model")
+    assert ac._is_provider_unhealthy("local/custom", base_url, "model")
     now[0] = 161.0
     assert not ac._is_provider_unhealthy("custom:foo", base_url, "model")
     assert ac._candidate_is_unhealthy("custom:foo", model="model") is False
     ac._clear_provider_health("fallback_chain[0](custom:foo)", model="model")
     assert ac._read_auxiliary_health(identity) is None
-    assert not ac._is_provider_unhealthy("custom:foo", base_url, "model")
+    assert not ac._is_provider_unhealthy("local/custom", base_url, "model")
 
 
 @pytest.mark.parametrize("quarantined_provider", ["custom", "custom:foo"])
@@ -352,7 +352,7 @@ def test_named_custom_fallback_health_uses_configured_endpoint(tmp_path, monkeyp
         encoding="utf-8",
     )
     held_url = "http://main-custom:8080/v1" if quarantined_provider == "custom" else "https://foo.example/v1"
-    ac._mark_provider_unhealthy(quarantined_provider, base_url=held_url, model="foo-model", reason="rate limit")
+    ac._mark_provider_unhealthy("custom", base_url=held_url, model="foo-model", reason="rate limit")
 
     client, model, label = ac._try_configured_fallback_chain(
         "title_generation", "primary", reason="provider unavailable",

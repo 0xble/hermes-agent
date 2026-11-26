@@ -22,10 +22,10 @@ class Receiver:
     def __init__(self, accept=True):
         self.accept = accept
 
-    def redirect(self, text, *, human=True):
+    def redirect(self, text):
         return self.accept
 
-    def steer(self, text, *, human=True):
+    def steer(self, text):
         return self.accept
 
 

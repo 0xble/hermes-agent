@@ -167,13 +167,8 @@ class ApiRequestHooksMixin:
         max_retries: Optional[int] = None, retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
-        # Local request telemetry is size/route-only and independent of optional lifecycle hooks.
-        # It must never turn a provider failure into a second failure.
+        # Lazy module import (not from-import) so tests can replace lifecycle dispatch at this call site.
         with suppress(Exception):
-            from hermes_cli.observability.request_usage_ledger import note_error
-            if not getattr(self, "_request_usage_ledger_owned_by_auxiliary", False):
-                note_error(self, reason or error_type)
-            # Lazy module import (not from-import) so tests can replace lifecycle dispatch at this call site.
             from hermes_cli import lifecycle as _lifecycle
             if not _lifecycle.has_hook("api_request_error"):
                 return

@@ -48,7 +48,7 @@ async def _pick_model(authority, owner, live, payload, row):
         return {'model': (await asyncio.to_thread(messaging_route_info, runner, live))['model'], 'note': note}
     # After a restart the chat's saved provider/base_url is only on disk: resolve against it, not
     # config.yaml's provider, or the record step overwrites it (as run_turn_prepare rehydrates).
-    await runner._rehydrate_session_model_override_async(live.route)
+    runner._rehydrate_session_model_override(live.route)
     ctx.apply_override(runner._session_model_override(live.route) or {})
     result, error = await runner._perform_model_switch(ctx, payload['model'], payload.get('provider', ''), live.source)
     if error is not None:

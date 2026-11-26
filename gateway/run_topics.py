@@ -395,9 +395,7 @@ class GatewayTopicThreadsMixin:
         """The key is on and ``source`` is a ``/topic``-mode root DM (reads state.db: call off-loop)."""
         return self._telegram_dm_topic_auto_transfer_configured(source) and self._is_telegram_topic_root_lobby(source)
 
-    async def _transfer_telegram_root_dm(
-        self, source: SessionSource, opening_text: str = "",
-    ) -> Optional[tuple[str, bool]]:
+    async def _transfer_telegram_root_dm(self, source: SessionSource) -> Optional[tuple[str, bool]]:
         """Adapter-ingress transfer hook for an opted-in root-DM message (#139136).
 
         ``(thread_id, True)``: a fresh topic was created and the turn runs there. ``(thread_id, False)``:
@@ -411,17 +409,8 @@ class GatewayTopicThreadsMixin:
         create_topic = getattr(adapter, "_create_dm_topic", None) if adapter is not None else None
         thread_id = None
         if callable(create_topic):
-            title = t("gateway.topic.default_title")
             try:
-                from agent.title_generator import derive_title
-
-                # Some clients do not refresh renamed topics. Give creation the subject now,
-                # without putting a model call or a network lookup on message ingress.
-                title = derive_title(opening_text) or title
-            except Exception:
-                logger.debug("Failed to derive Telegram auto-transfer topic title", exc_info=True)
-            try:
-                thread_id = await create_topic(int(source.chat_id), title)
+                thread_id = await create_topic(int(source.chat_id), t("gateway.topic.default_title"))
             except Exception:
                 logger.debug("Failed to auto-transfer Telegram root DM into a new topic", exc_info=True)
         if thread_id:
@@ -1046,7 +1035,8 @@ class GatewayTopicThreadsMixin:
             await self._select_telegram_topic_icon(
                 source, adapter, topic_name, user_message=user_message, model_icon=model_icon))
 
-        session_db = await asyncio.to_thread(self._sync_session_db)
+        # The binding can change while icon discovery is awaiting Telegram. Recheck
+        # immediately before the write so a stale title/icon cannot cross sessions.
         if session_db is not None:
             try:
                 binding = await session_db.get_telegram_topic_binding(

@@ -6,7 +6,6 @@ import json
 import socket
 import sys
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -27,14 +26,6 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-@pytest.fixture(autouse=True)
-def _socket_tmpdir(short_sock_dir, monkeypatch):
-    import tempfile
-
-    monkeypatch.setenv("TMPDIR", str(short_sock_dir))
-    monkeypatch.setattr(tempfile, "tempdir", str(short_sock_dir))
-
-
 @pytest.fixture()
 def home(tmp_path: Path) -> Path:
     d = tmp_path / "home" / ".hermes"
@@ -51,13 +42,27 @@ def _serve(home: Path, handlers=None):
 # Path resolution
 # ---------------------------------------------------------------------------
 
-def test_short_home_binds_in_home(short_sock_dir):
-    short_home = short_sock_dir / ".hermes"
-    short_home.mkdir()
-    assert len(str(short_home / "gateway.sock").encode()) <= 100
-    bind, pointer = resolve_server_socket_path(short_home)
-    assert bind == short_home / "gateway.sock"
-    assert pointer is None
+def test_short_home_binds_in_home(tmp_path: Path):
+    # A home short enough for sun_path binds in-home with no pointer.
+    # tmp_path can exceed the limit on CI runners, so build one in the
+    # system temp root directly.
+    import tempfile
+
+    try:
+        short_root = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
+    except OSError:
+        pytest.skip("/tmp not writable on this host")
+    try:
+        short_home = short_root / ".hermes"
+        short_home.mkdir()
+        assert len(str(short_home / "gateway.sock").encode()) <= 100
+        bind, pointer = resolve_server_socket_path(short_home)
+        assert bind == short_home / "gateway.sock"
+        assert pointer is None
+    finally:
+        import shutil
+
+        shutil.rmtree(short_root, ignore_errors=True)
 
 
 def test_long_home_uses_pointer_fallback(tmp_path: Path):
@@ -69,28 +74,12 @@ def test_long_home_uses_pointer_fallback(tmp_path: Path):
     assert pointer == deep / "gateway.sock.path"
 
 
-def test_long_home_fallback_server_starts_and_answers(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    home = tmp_path / ("x" * 120) / ".hermes"
-    home.mkdir(parents=True)
-
-    async def scenario():
-        server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
-        assert await server.start()
-        try:
-            return await asyncio.to_thread(query_gateway_control, home, "identify")
-        finally:
-            await server.stop()
-
-    assert _run(scenario()) == {"pid": 1}
-
-
 def test_client_resolution_prefers_direct_then_pointer(home: Path, tmp_path: Path):
     assert resolve_client_socket_path(home) is None
     # pointer file to an existing socket-ish file
     target = tmp_path / "elsewhere.sock"
     target.touch()
-    (home / "gateway.sock.path").write_text(str(target))
+    (home / "gateway.sock.path").write_text(str(target), encoding="utf-8")
     assert resolve_client_socket_path(home) == target
     # direct file wins over pointer
     direct = home / "gateway.sock"
@@ -135,6 +124,68 @@ def test_server_answers_identify_and_status(home: Path):
     ident, status = _run(scenario())
     assert ident == {"pid": 4242, "code_sha": "abc123", "protocol": 1}
     assert status == {"gateway_state": "running"}
+
+
+def test_identify_answers_from_identity_resolved_before_accepting(home: Path, monkeypatch):
+    """A fresh process's first ``identify`` must not pay the code-identity git walk inside the
+    client's deadline: the listener warms it before it accepts (a loaded Windows runner
+    stretched that walk past the 5 s identify budget)."""
+    from hermes_cli import version_info
+
+    resolved = []
+
+    def _resolve_once():
+        resolved.append(True)
+        return version_info.VersionInfo("1.2.3", "1.2.3", 0, "f" * 40, "main", "git")
+
+    monkeypatch.setattr(version_info, "_cached_version_info", None)
+    monkeypatch.setattr(version_info, "_stamp_or_none", _resolve_once)
+
+    async def scenario():
+        server = GatewayControlServer(home)
+        assert await server.start()
+        try:
+            resolved_at_start = len(resolved)
+            ident = await asyncio.get_running_loop().run_in_executor(None, lambda: identify_gateway(home))
+            return resolved_at_start, ident
+        finally:
+            await server.stop()
+
+    resolved_at_start, ident = _run(scenario())
+    assert resolved_at_start == 1
+    assert ident is not None and ident["code_sha"] == "f" * 40
+    assert len(resolved) == 1
+
+
+def test_process_record_is_built_before_the_listener_opens(home: Path, monkeypatch):
+    """The first psutil process probe (``_build_pid_record``) is the other cold cost of a fresh
+    ``identify``: the listener builds it before it opens, so no client's deadline pays it."""
+    from gateway import control_socket, status
+
+    order = []
+    real_record = status._build_pid_record
+    real_open = control_socket.GatewayControlServer._start_windows if sys.platform == "win32" \
+        else control_socket.GatewayControlServer._start_posix
+
+    def _record():
+        order.append("pid_record")
+        return real_record()
+
+    async def _open(self):
+        order.append("listener")
+        return await real_open(self)
+
+    monkeypatch.setattr(status, "_build_pid_record", _record)
+    monkeypatch.setattr(control_socket.GatewayControlServer,
+                        "_start_windows" if sys.platform == "win32" else "_start_posix", _open)
+
+    async def scenario():
+        server = GatewayControlServer(home)
+        assert await server.start()
+        await server.stop()
+
+    _run(scenario())
+    assert order[:2] == ["pid_record", "listener"], order
 
 
 def test_unknown_verb_and_malformed_request(home: Path):
@@ -209,8 +260,7 @@ def test_stop_removes_socket_and_pointer(home: Path):
             home, verb_handlers={"identify": lambda: {"pid": 1}}
         )
         assert await server.start()
-        # The private fallback may differ from the predictable candidate.
-        bind = cast(Path, server._bind_path)
+        bind, _ = resolve_server_socket_path(home)
         assert bind.exists()
         await server.stop()
         return bind
@@ -313,9 +363,8 @@ def test_home_refusing_sockets_listens_on_private_fallback_both_clients_reach(sh
         assert await server.start()
         try:
             pointer = home / "gateway.sock.path"
-            target = Path(pointer.read_text(encoding="utf-8"))
-            assert server._bind_path == target
-            assert target.name.startswith("hermes-gw-") and target.suffix == ".sock"
+            target = Path(pointer.read_text(encoding="utf-8-sig"))
+            assert server._bind_path == target and target.name == "control.sock"
             assert stat.S_IMODE(pointer.lstat().st_mode) == 0o600
             assert stat.S_IMODE(target.parent.lstat().st_mode) == 0o700
             loop = asyncio.get_running_loop()
@@ -324,7 +373,7 @@ def test_home_refusing_sockets_listens_on_private_fallback_both_clients_reach(sh
             await server.stop()
 
     assert _run(scenario()) == ({"pid": 11}, {"pid": 11})
-    assert not Path(attempts[-1]).is_relative_to(home)  # the in-home attempt, if made, was refused
+    assert attempts[-1].endswith("/control.sock")  # the in-home attempt, if made, was refused
     assert not (home / "gateway.sock.path").exists()
 
 
@@ -457,7 +506,6 @@ def test_collect_fleet_versions_falls_back_to_state_file(tmp_path: Path, monkeyp
 
     import hermes_cli.update_receipt as ur
 
-    monkeypatch.setattr(ur, "_gateway_code_root", lambda pid, home: ur._updater_code_root())
     home = tmp_path / ".hermes"
     home.mkdir()
 
@@ -566,40 +614,6 @@ def test_runtime_inventory_prefers_socket_supervisor(tmp_path: Path, monkeypatch
     # supervisor comes from the gateway's own declaration, not a PID scan
     assert gws[0].supervisor == "systemd"
     assert gws[0].code_sha == "SHA555"
-
-
-def test_both_argument_protocols_survive_real_socket_roundtrip(home):
-    async def scenario():
-        server = GatewayControlServer(home, verb_handlers={
-            "agent-update": lambda payload: {"received": payload},
-            "migrate": lambda params: {"received": params},
-            "status": lambda: {"running": True},
-        })
-        assert await server.start()
-        try:
-            for verb, expected in [("agent-update", {"reason": "upgrade"}),
-                                   ("migrate", {"old": "a", "new": "b"})]:
-                result = await asyncio.to_thread(
-                    query_gateway_control, home, verb,
-                    payload={"reason": "upgrade"}, params={"old": "a", "new": "b"})
-                assert result == {"received": expected}
-            assert await asyncio.to_thread(
-                query_gateway_control, home, "status", payload={"ignored": True}) == {"running": True}
-        finally:
-            await server.stop()
-    _run(scenario())
-
-
-def test_handler_typeerror_is_not_retried_and_malformed_params_are_empty(home):
-    calls = []
-    def handler(params):
-        calls.append(params)
-        raise TypeError("callback failed after an effect")
-    server = GatewayControlServer(home, verb_handlers={"migrate": handler})
-    result = json.loads(server.handle_request_line(b'{"verb":"migrate","params":17}'))
-    assert calls == [{}]
-    assert result["ok"] is False
-    assert "callback failed" in result["error"]
 
 
 def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, monkeypatch):

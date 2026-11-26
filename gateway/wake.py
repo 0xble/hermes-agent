@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from time import monotonic
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -26,8 +25,6 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 # turns are last-writer-wins) but DOES enforce a global max_concurrent_runs cap via HTTP 429, which
 # is worth waiting out.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
-_IDLE_TOPIC_ABSENCE_RETRY_SECONDS = 120.0
-_IDLE_TOPIC_ABSENCE_LIMIT = 128
 
 
 def adapter_supports_push(adapter: Any) -> bool:
@@ -97,21 +94,11 @@ def session_owned_by_profile(config: Any, profile: Optional[str], session_id: An
     return row is not None and (row.profile_name or profile) == profile
 
 
-def _idle_topic_absences(adapter, bot):
-    """Keep negative lookups in memory on the exact connector that observed them."""
-    previous_bot, absences = getattr(adapter, "_idle_wake_absences", (None, None))
-    if previous_bot is not bot:
-        absences = {}
-        adapter._idle_wake_absences = (bot, absences)
-    return absences
-
-
-async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: bool = False) -> bool:
+async def automatic_route_available(runner: Any, source: Any) -> bool:
     """Suppress automatic work only for an exact, read-only deleted-topic result.
 
     Topic closure and lookup outages are not deletion. Never probe by sending or
     change the saved goal, loop, session binding or ownership from this check.
-    Only the idle watcher backs off after confirmed absence. Admission rechecks it fresh.
     """
     from gateway.config import Platform
 
@@ -121,17 +108,6 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
     bot = getattr(adapter, "_bot", None)
     if bot is None:
         return True
-    absences = None
-    if idle_backoff:
-        from gateway.session_identity import identity_of
-
-        identity = identity_of(source)
-        profile = identity.runtime_profile if identity is not None else getattr(source, "profile", None)
-        route = (profile or "default", source.chat_type, str(source.chat_id), str(source.thread_id))
-        absences = _idle_topic_absences(adapter, bot)
-        if absences.get(route, 0) > monotonic():
-            return False
-        absences.pop(route, None)
     try:
         from gateway.telegram_retire import _probe_deleted
 
@@ -140,10 +116,6 @@ async def automatic_route_available(runner: Any, source: Any, *, idle_backoff: b
         logger.debug("automatic wake: topic availability lookup failed", exc_info=True)
         return True
     if deleted:
-        if absences is not None:
-            if len(absences) >= _IDLE_TOPIC_ABSENCE_LIMIT:
-                absences.pop(next(iter(absences)))
-            absences[route] = monotonic() + _IDLE_TOPIC_ABSENCE_RETRY_SECONDS
         logger.info(
             "automatic wake: exact lookup found no Telegram topic chat=%s thread=%s; "
             "preserving saved work and skipping wake", source.chat_id, source.thread_id,

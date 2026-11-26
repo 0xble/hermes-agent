@@ -15,9 +15,7 @@ import os
 import time
 from typing import Any, Mapping, Optional
 from utils import atomic_write_text
-from agent.retry_utils import (
-    MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, RETRY_AFTER_CAP_S, _minute_rate_limit_headers, parse_retry_after_seconds,
-)
+from agent.retry_utils import parse_retry_after_seconds
 from agent.rate_limit_tracker import (
     _BUCKET_TAGS, _fmt_seconds, _safe_float, _safe_int, has_rate_limit_headers, lower_headers,
 )
@@ -59,25 +57,6 @@ def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float
     return retry_after if retry_after else None
 
 
-def _clamp_to_minute_window(seconds: float, headers: Optional[Mapping[str, str]]) -> float:
-    """Bound a wait that no rate-limit window in the 429's own headers can explain.
-
-    Some gateways answer a per-minute limit with a days-long ``Retry-After``. Persisting that
-    would block every session on this home for days, so it is cut to the minute-window cap the
-    in-process retry path uses. A wait that fits inside a window the response describes (the
-    body's own retry time, an hourly bucket) is plausible and kept; an exhausted longer bucket
-    keeps its own reset. The caller then applies the overall cap to whatever this returns.
-    """
-    lowered = lower_headers(headers)
-    if seconds <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S or not _minute_rate_limit_headers(lowered):
-        return seconds
-    buckets = list(_parse_buckets_from_headers(lowered).values())
-    if seconds <= max((reset or 0.0 for _remaining, reset in buckets), default=0.0) + 1.0:
-        return seconds
-    exhausted = [reset for remaining, reset in buckets if remaining is not None and remaining <= 0 and reset]
-    return max([MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, *exhausted])
-
-
 def record_nous_rate_limit(
     *, headers: Optional[Mapping[str, str]] = None, error_context: Optional[dict[str, Any]] = None,
     default_cooldown: float = 300.0,
@@ -99,15 +78,6 @@ def record_nous_rate_limit(
         reset_at = now + header_seconds
     if reset_at is None:
         reset_at = now + default_cooldown
-    # Header- and prose-derived waits are bounded twice: to the minute window when the headers
-    # describe one, then to the cap the in-process retry path uses. This file blocks every
-    # session on the home, so a wrong long wait costs far more than one early probe that
-    # re-records the limit. The one exception is a structured welcome-tier refusal: the gateway
-    # states in a parsed field when the free allowance refreshes, that can honestly be hours
-    # away, and a request sent sooner is certain to be refused while the user is told the
-    # wrong refresh time.
-    if not is_long_welcome_rate_limit(error_context):
-        reset_at = now + min(_clamp_to_minute_window(reset_at - now, headers), RETRY_AFTER_CAP_S)
 
     state = {"reset_at": reset_at, "recorded_at": now, "reset_seconds": reset_at - now}
     try:

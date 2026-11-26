@@ -32,7 +32,8 @@ from gateway.platforms.api_server import (
     _admit_api_agent_request,
     _api_request_profile,
     _IdempotencyCache,
-    _derive_chat_session_id,,
+    _derive_chat_session_id,
+    _request_agent_overrides,
     _request_relay_metadata,
     cors_middleware,
     security_headers_middleware,
@@ -2689,7 +2690,6 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "other/model"
         assert captured["provider"] == "otherprov"
         assert captured["api_key"] == "sk-otherprov"
-        assert captured["model_pinned"] is True
 
 
     def test_session_model_override_beats_route(self, monkeypatch):
@@ -2989,6 +2989,15 @@ class TestDirectModelRequestsGate:
     """Bare ``model`` (no ``provider``) is opt-in on OpenAI-compatible
     endpoints so generic clients hardcoding "gpt-4o" keep falling back to
     the gateway default (idea credit: PR #22825 by @mssteuer)."""
+
+    def test_bare_model_dropped_when_disallowed(self):
+        overrides = _request_agent_overrides(
+            {"model": "openai/gpt-5"}, allow_bare_model=False
+        )
+        assert "requested_model" not in overrides
+
+
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_bare_model_honored_when_enabled(self):

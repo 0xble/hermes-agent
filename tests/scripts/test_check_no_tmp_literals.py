@@ -111,26 +111,6 @@ def test_scan_skips_tests_lockfiles_ci_and_translations(tmp_path):
     assert sorted(hits) == ["app/src/a.ts", "skills/x/SKILL.md", "tools/a.py", "website/docs/guide.md"]
     assert all(len(v) == 1 for v in hits.values())
 
-def test_ignored_directories_are_pruned_but_unignored_sources_scanned(tmp_path):
-    mod = _load()
-    import subprocess
-
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("ignored/\nignored-file.py\n", encoding="utf-8")
-    ignored = tmp_path / "ignored"
-    ignored.mkdir()
-    for i in range(50):
-        (ignored / f"artifact-{i}.py").write_text('X = "/tmp/ignored"\n', encoding="utf-8")
-    (tmp_path / "ignored-file.py").write_text('X = "/tmp/ignored-file"\n', encoding="utf-8")
-    (tmp_path / "tracked.py").write_text('X = "/tmp/tracked"\n', encoding="utf-8")
-    (tmp_path / "source.py").write_text('X = "/tmp/source"\n', encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore", "tracked.py"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "init"], check=True)
-
-    hits = mod.scan(root=tmp_path)
-    assert sorted(hits) == ["source.py", "tracked.py"]
-
-
 def test_baseline_entries_are_burned_down_not_grown(tmp_path, monkeypatch, capsys):
     mod = _load()
     (tmp_path / "tools").mkdir()

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 import time
 from pathlib import Path
 from typing import Optional
@@ -31,10 +30,6 @@ MAX_EXTENSION_SECONDS = 1800.0
 # This process's ongoing holds: cron dir -> first held tick. Kept in memory so a failed write
 # mid-drain cannot reset ``since``; cleared when the ticker dispatches again (note_dispatching).
 _hold_since: dict[str, float] = {}
-# Whether the last scan held agent jobs for an update: the hold is logged once per update, not per tick.
-_update_hold_active = False
-
-logger = logging.getLogger(__name__)
 
 
 def note_held(now: Optional[float] = None) -> None:
@@ -60,29 +55,6 @@ def note_dispatching() -> None:
     from cron.jobs import _current_cron_store
 
     _hold_since.pop(str(_current_cron_store().cron_dir), None)
-
-
-def agent_jobs_held_for_update() -> bool:
-    """True while an update owns the install, so this scan must leave agent jobs untouched.
-
-    The update fence can outlive the gateway restart it drives: the new gateway is ready and its
-    ticker dispatches, but every agent fire's handshake answers ``update_paused`` until the update
-    releases its lock. Firing anyway booked a failed run, restored the slot and re-fired it on the
-    next tick, minutes on end. The scan instead holds agent jobs like a drain holds dispatch (the
-    due instant and any pending slot stay put, a held tick is stamped) and they fire once the update
-    ends. Script jobs never reach the gateway and keep running."""
-    global _update_hold_active
-    from hermes_cli.gateway_runtime import update_fence_held
-    from hermes_constants import get_hermes_home
-
-    held = update_fence_held(get_hermes_home())
-    if held != _update_hold_active:
-        _update_hold_active = held
-        logger.info("Cron agent jobs %s", "held while a Hermes update owns the install"
-                    if held else "released: the Hermes update finished")
-    if held:
-        note_held()
-    return held
 
 
 def note_held_profiles(profiles) -> None:

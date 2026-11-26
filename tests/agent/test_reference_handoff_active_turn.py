@@ -19,6 +19,7 @@ from agent.context_compressor import (
     is_user_originated_turn,
     reference_handoff_would_drive_next_model_call,
 )
+from agent.context_compressor_retry import retryable_user_text
 from session_rules.turns import (
     history_before_user_originated_turn, is_compaction_summary_message, retryable_user_text,
     split_user_originated_turn, user_originated_turn_view,

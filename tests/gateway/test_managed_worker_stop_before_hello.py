@@ -5,10 +5,12 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import psutil
 import pytest
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 from gateway.session_contract import SessionActor, SessionRef
-from tests.waiting import async_wait_until, process_alive
+from tests.waiting import async_wait_until
 
 
 @pytest.mark.platforms("linux")
@@ -44,7 +46,7 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers
     child = spawned[0]
-    assert child.poll() is not None and not process_alive(child.pid)
+    assert child.poll() is not None and not psutil.pid_exists(child.pid) or psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE
 
 
 CHILD = """import json, os, sys, psutil
@@ -73,21 +75,20 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
     from ever receiving its bootstrap; the admission settles interrupted, never as a late turn."""
     import threading
     from gateway import session_managed_worker as managed
-    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_authority import LiveSession, SessionAuthority, admission_row
     from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import build_policy
-    from hermes_state import SessionDB
-    from hermes_state_runtime import claim_session_input
-    from tests.fakes.runtime_owner import begin_runtime_epoch
+    from persistence_assembly import open_persistence, profile_scope
+    from tests.fixtures.storage_seed import seed_session
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(db_path=tmp_path / 'state.db')
-    db.create_session('s', source='test')
+    db = open_persistence(profile_scope(home=tmp_path))
+    seed_session(db, 's', 'test')
     runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
                              _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
-                                 epoch=begin_runtime_epoch(db, instance_id='i'))
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='i',
+                                 epoch=db.runtime.begin_epoch(instance_id='i'), persistence=storage_handle(tmp_path))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
     actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
@@ -108,7 +109,7 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
 
     async def scenario():
         await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
-        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
+        row = admission_row(db.admissions.claim(epoch=authority.epoch, session_id='s'))
         turn = asyncio.create_task(managed.execute_managed(authority, ref, row, policy))
         assert await asyncio.to_thread(entered.wait, 10)
         stopped = await AuthorityConnection.interrupt(SimpleNamespace(authority=authority, actor=actor), ref,

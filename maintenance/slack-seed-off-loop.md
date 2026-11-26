@@ -20,5 +20,3 @@ Retire when released upstream seeds Slack DM sessions off the event loop or make
 ## Rollback
 
 Revert the `fix(slack): seed the DM session off the event loop` commit.
-
-Contract tests: `tests/gateway/test_slack.py`.

@@ -34,9 +34,9 @@ runtime setting, lock ordering, cross-process fence, or lock-timeout fallback.
 ## Verification
 
 Contract tests: `tests/cron/test_jobs_ledger_contention.py`,
-  `tests/cron/test_jobs_prefetch_freshness.py`, `tests/cron/test_jobs_prefetch_legacy_claims.py`,
-  `tests/cron/test_scheduled_occurrence.py`,
-  `tests/cron/test_jobs_crossprocess_lock.py`, `tests/cron/test_due_scan_save_failure.py`.
+`tests/cron/test_jobs_prefetch_freshness.py`, `tests/cron/test_jobs_prefetch_legacy_claims.py`,
+`tests/cron/test_scheduled_occurrence.py`,
+`tests/cron/test_jobs_crossprocess_lock.py`, `tests/cron/test_due_scan_save_failure.py`.
 
 Run these through `scripts/run_tests.sh`, then the full `tests/cron/` suite.
 The contention regression blocks preflight while an independent interpreter

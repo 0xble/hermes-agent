@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from hermes_cli.backup import (
     create_quick_snapshot,
     list_quick_snapshots,
 )
+from tests.fixtures.storage_holder import store_copy_seam
 
 
 def test_backup_lock_rejects_a_second_operation(tmp_path) -> None:
@@ -51,6 +53,53 @@ def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
 
     assert final.read_bytes() == b"previous"
     assert not partial.exists()
+
+
+@pytest.mark.platforms("posix")
+def test_atomic_output_syncs_archive_data_before_publishing(tmp_path, monkeypatch) -> None:
+    """A crash after publish must not leave a zero-tailed zip (no EOCD) under the final name."""
+    final = tmp_path / "out" / "backup.zip"
+    final.parent.mkdir()
+    events: list[tuple[str, object]] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        events.append(("fsync", os.fstat(fd).st_ino))
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        events.append(("replace", os.stat(src).st_ino))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    with _atomic_output_path(final) as partial:
+        partial.write_bytes(b"complete")
+
+    published_inode = final.stat().st_ino
+    replace_at = events.index(("replace", published_inode))
+    assert ("fsync", published_inode) in events[:replace_at]
+    dir_inode = final.parent.stat().st_ino
+    assert ("fsync", dir_inode) in events[replace_at:]
+    assert ("fsync", tmp_path.stat().st_ino) in events[replace_at:]  # out/ is new on a first backup
+
+
+def test_atomic_output_publishes_nothing_when_sync_fails(tmp_path, monkeypatch) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    final = out_dir / "backup.zip"
+    final.write_bytes(b"previous")
+
+    def failing_fsync(fd):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError):
+        with _atomic_output_path(final) as partial:
+            partial.write_bytes(b"unsynced")
+
+    assert final.read_bytes() == b"previous"
+    assert list(out_dir.iterdir()) == [final]
 
 
 def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:
@@ -135,96 +184,119 @@ def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatc
     archive.write_bytes(b"previous-valid-backup")
 
     monkeypatch.setattr("hermes_cli.backup._safe_copy_db", lambda _src, _dst: False)
+    monkeypatch.setattr(*store_copy_seam(), lambda _src, _dst, **_kwargs: False)
 
     assert _write_full_zip_backup(archive, home) is None
     assert archive.read_bytes() == b"previous-valid-backup"
     assert list(tmp_path.glob(".*.partial")) == []
 
 
-#: Cap below the database so it is skipped for SIZE — a standing property of the file,
-#: not a transient failure. This is what a real install looks like: a 32 GB state.db
-#: against a 1 GiB cap, on every run, forever.
-_TINY_CAP = 1024
+@pytest.mark.platforms("posix")  # directory fsync is a no-op on Windows
+def test_quick_snapshot_files_are_synced_before_publish(tmp_path, monkeypatch) -> None:
+    """Update auto-restore trusts a published snapshot: its files must be durable before it appears."""
+    home = tmp_path / ".hermes"
+    (home / "cron").mkdir(parents=True)
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (home / "cron" / "jobs.json").write_text('{"jobs": []}\n', encoding="utf-8")
+    synced: set[int] = set()
+    synced_after_publish: set[int] = set()
+    unsynced_at_publish: list[str] = []
+    published: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        (synced_after_publish if published else synced).add(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        src_path = Path(src)
+        if src_path.name.endswith(".partial"):
+            for path in (src_path, *src_path.rglob("*")):
+                if path.stat().st_ino not in synced:
+                    unsynced_at_publish.append(path.relative_to(src_path).as_posix() or ".")
+            published.append(src_path.name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    snapshot_id = create_quick_snapshot(hermes_home=home)
+
+    assert snapshot_id is not None
+    assert unsynced_at_publish == []
+    # The new entry in state-snapshots/, and state-snapshots/ itself on a first snapshot.
+    assert {(home / "state-snapshots").stat().st_ino, home.stat().st_ino} <= synced_after_publish
 
 
-def _home_with_oversized_db(tmp_path):
-    """A home whose state.db is past the snapshot size cap, as a real install's is."""
+def test_quick_snapshot_is_not_published_when_sync_fails(tmp_path, monkeypatch) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
-    (home / "state.db").write_bytes(b"x" * 4096)
-    return home
+
+    def failing_fsync(fd):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError):
+        create_quick_snapshot(hermes_home=home)
+
+    assert list_quick_snapshots(hermes_home=home) == []
+    assert list((home / "state-snapshots").iterdir()) == []
 
 
-def test_a_permanently_oversized_db_does_not_disable_pruning_forever(tmp_path) -> None:
-    """Skipping a file for SIZE must not latch the prune off.
+@pytest.mark.platforms("windows")  # copy2 keeps the read-only attribute; the sync opens O_RDWR
+def test_quick_snapshot_captures_read_only_source_files(tmp_path) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    config = home / "config.yaml"
+    config.write_text("model: {}\n", encoding="utf-8")
+    os.chmod(config, stat.S_IREAD)
+    try:
+        snapshot_id = create_quick_snapshot(hermes_home=home)
+    finally:
+        os.chmod(config, stat.S_IREAD | stat.S_IWRITE)
 
-    The guard exists so an incomplete snapshot never deletes the last good one. Size is
-    not a transient failure though: the condition never clears, so a state.db past the cap
-    made the branch permanent and snapshots grew without bound. Observed on a live install
-    as 26 directories and 32 GB, every one of them also missing that database — so the
-    guard was preserving snapshots that did not contain the thing it was protecting.
-    """
-    home = _home_with_oversized_db(tmp_path)
-    root = home / "state-snapshots"
-
-    ids = [create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP) for _ in range(3)]
-    assert all(ids), "each snapshot must still publish"
-
-    remaining = sorted(d.name for d in root.iterdir() if d.is_dir())
-    assert len(remaining) == 1, f"keep=1 must actually prune, got {remaining}"
-    assert remaining == [ids[-1]]
+    assert snapshot_id is not None
+    copied = home / "state-snapshots" / snapshot_id / "config.yaml"
+    assert copied.read_text(encoding="utf-8") == "model: {}\n"
 
 
-def test_a_snapshot_still_holding_the_oversized_db_is_never_pruned(tmp_path) -> None:
-    """Pruning may not drop the only copy of a database later runs had to skip."""
-    home = _home_with_oversized_db(tmp_path)
-    root = home / "state-snapshots"
-    # Capture a real, manifest-listed SQLite database before it exceeds the cap.
-    (home / "state.db").unlink()
-    with sqlite3.connect(home / "state.db") as conn:
-        conn.execute("CREATE TABLE evidence (value TEXT)")
-        conn.execute("INSERT INTO evidence VALUES ('recovery')")
-    first = create_quick_snapshot(hermes_home=home, keep=1)
-    with sqlite3.connect(home / "state.db") as conn:
-        conn.execute("INSERT INTO evidence VALUES (?)", ("x" * 4096,))
+@pytest.mark.platforms("posix")  # directory fsync is skipped on Windows
+def test_quick_snapshot_is_not_published_when_only_a_directory_sync_fails(tmp_path, monkeypatch) -> None:
+    """File bytes synced but a staged directory entry not: the snapshot could lose names on a crash."""
+    home = tmp_path / ".hermes"
+    (home / "cron").mkdir(parents=True)
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (home / "cron" / "jobs.json").write_text('{"jobs": []}\n', encoding="utf-8")
+    real_fsync = os.fsync
 
-    for _ in range(3):
-        create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
+    def dir_fsync_fails(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
 
-    assert (root / first / "state.db").exists(), "the only copy must survive the prune"
+    monkeypatch.setattr(os, "fsync", dir_fsync_fails)
+    with pytest.raises(OSError):
+        create_quick_snapshot(hermes_home=home)
+
+    assert list_quick_snapshots(hermes_home=home) == []
+    assert list((home / "state-snapshots").iterdir()) == []
 
 
-def test_an_oversized_non_database_is_protected_too(tmp_path) -> None:
-    """Protection is about what this run omitted, not about file type.
-
-    Gating it on ``.db`` meant an oversized auth.json got none, so the prune could drop
-    the only copy of it while happily protecting a database beside it.
-    """
+@pytest.mark.platforms("posix")
+def test_quick_snapshot_publishes_where_directories_cannot_be_fsynced(tmp_path, monkeypatch) -> None:
+    """EINVAL from a directory fsync means the filesystem has no such operation, not lost data."""
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
-    (home / "auth.json").write_bytes(b"the only copy")
-    root = home / "state-snapshots"
+    real_fsync = os.fsync
 
-    first = create_quick_snapshot(hermes_home=home, keep=1)
-    (home / "auth.json").write_bytes(b"y" * 4096)
+    def dir_fsync_unsupported(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real_fsync(fd)
 
-    for _ in range(3):
-        create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
+    monkeypatch.setattr(os, "fsync", dir_fsync_unsupported)
+    snapshot_id = create_quick_snapshot(hermes_home=home)
 
-    assert (root / first / "auth.json").exists(), "the only copy must survive the prune"
-
-
-def test_abandoned_staging_is_reclaimed(tmp_path) -> None:
-    """Only the creating process removes staging, and the prune deliberately skips
-    ``.partial``, so a killed run leaked one permanently. Observed as 22 GB abandoned."""
-    home = _home_with_oversized_db(tmp_path)
-    root = home / "state-snapshots"
-    root.mkdir(parents=True, exist_ok=True)
-    orphan = root / ".20260101-000000.99999.partial"
-    orphan.mkdir()
-    (orphan / "state.db").write_bytes(b"half copied")
-
-    assert create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP) is not None
-    assert not orphan.exists(), "abandoned staging must be reclaimed"
+    assert snapshot_id is not None
+    assert (home / "state-snapshots" / snapshot_id / "config.yaml").is_file()

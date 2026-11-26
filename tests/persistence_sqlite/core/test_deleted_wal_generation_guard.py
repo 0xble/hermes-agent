@@ -269,9 +269,9 @@ def test_iter_holders_rechecks_descriptor_after_close_or_reuse(tmp_path, monkeyp
         return result
 
     if change == "close_during_path_stat":
-        monkeypatch.setattr(state_dbfile.os, "stat", stat_after_close)
+        monkeypatch.setattr(hermes_state_dbfile.os, "stat", stat_after_close)
     else:
-        monkeypatch.setattr(state_dbfile.os, "readlink", readlink_before_reuse)
+        monkeypatch.setattr(hermes_state_dbfile.os, "readlink", readlink_before_reuse)
     try:
         assert iter_deleted_sqlite_sidecar_holders(path) == []
         assert changed, "the descriptor race was not exercised"
@@ -300,7 +300,7 @@ def test_open_guard_settles_closing_holder_but_refuses_persistent_holder(
             os.close(fd)
             closed = True
 
-    monkeypatch.setattr(state_dbfile.time, "sleep", settle)
+    monkeypatch.setattr(hermes_state_dbfile.time, "sleep", settle)
     try:
         if close_during_settle:
             refuse_deleted_wal_generation(path)

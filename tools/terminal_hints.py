@@ -22,7 +22,7 @@ _PYTEST_MISSING_RE = re.compile(
     # Plugins such as `pytest_asyncio` are a different failure: pytest itself is installed.
     r"(?:No module named ['\"]?pytest(?![\w.])['\"]?|pytest: command not found)"
 )
-_SEMAPHORE_NOT_STARTED_RE = re.compile(r"semaphore: not started after\b")
+_HEAVY_SLOT_NOT_STARTED_RE = re.compile(r"heavy-slot: not started after\b")
 
 
 def _regex_hint(pattern: str, message: str | Callable[[str], str], flags: int = 0) -> Callable[[str, str], Optional[str]]:
@@ -228,7 +228,7 @@ def annotate_failure(command: str, exit_code: int, output: str, cwd: str | None 
     if exit_code == 126 and (hint := _wrapper_cd_hint(output)):
         return hint
     window = (output or "")[:_SCAN_CHARS]
-    if exit_code == 75 and _SEMAPHORE_NOT_STARTED_RE.search(window):
+    if exit_code == 75 and _HEAVY_SLOT_NOT_STARTED_RE.search(window):
         return (
             "The command did not run because all shared test slots were busy; the output above includes "
             "its queue position. Rerun with background=true and notify_on_complete=true instead of "

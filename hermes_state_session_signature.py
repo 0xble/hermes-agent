@@ -6,7 +6,7 @@ import marshal
 from pathlib import Path
 import sqlite3
 
-from persistence.sqlite._state.errors import _STATE_DB_GENERATION_KEY
+from hermes_state_errors import _STATE_DB_GENERATION_KEY
 
 
 # Activity heartbeats are deliberately excluded. Liveness comes from active_list,

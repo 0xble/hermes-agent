@@ -195,7 +195,6 @@ class DurableTurnLease:
                 return
             agent._interrupt_requested = False
             agent._interrupt_message = None
-            agent._interrupt_source = None
             getattr(agent, "_hard_interrupt_requested", threading.Event()).clear()
             agent._interrupt_thread_signal_pending = False
             if agent._execution_thread_id is not None:
@@ -514,10 +513,11 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history, *, 
         }
         if hard_interrupted:
             result["_hard_interrupted"] = True
-        # Stamp message-less system stops too: a gateway preemption carries no message, and
-        # without its source the gateway would treat it as a user stop.
-        from agent.interrupt_control import stamp_interrupt_result
-        stamp_interrupt_result(agent, result, interrupted=True)
+        if getattr(agent, "_interrupt_message", None):
+            result["interrupt_message"] = agent._interrupt_message
+            from agent.interrupt_control import interrupt_issuer
+            if (issuer := interrupt_issuer(agent)):
+                result["interrupt_source"] = issuer
         # The finalizer never runs on this early return; clear so a cached agent doesn't
         # fail-close the next turn.
         try:

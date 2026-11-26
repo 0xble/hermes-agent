@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 from pathlib import Path
-from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -163,43 +161,6 @@ async def test_settle_gateway_runtime_waits_for_bot_receipt_tasks():
 
     assert task.done()
     assert finished.is_set()
-
-
-@pytest.mark.asyncio
-async def test_acp_shutdown_cleanup_respects_the_settle_budget(monkeypatch):
-    from gateway import session_acp_lifecycle
-
-    loop = asyncio.get_running_loop()
-    owner_thread = get_ident()
-    entered, release = asyncio.Event(), Event()
-    worker_threads, session_closes = [], []
-
-    @contextmanager
-    def read():
-        worker_threads.append(get_ident())
-        loop.call_soon_threadsafe(entered.set)
-        assert release.wait(3)
-        cursor = SimpleNamespace(execute=lambda *_: [(session_acp_lifecycle.POLICY_PREFIX + 'idle',)])
-        yield cursor
-
-    db = SimpleNamespace(_read_ctx=read)
-    authority = SimpleNamespace(sessions={}, db=db)
-    runner = authority.runner = SimpleNamespace(session_authority=authority)
-    monkeypatch.setattr(session_acp_lifecycle, 'end_idle_acp_session',
-                        lambda _authority, sid: session_closes.append(sid))
-    settling = asyncio.create_task(run_runtime.settle_gateway_runtime(
-        runner, budget=run_runtime.STOP_TAIL_RESERVE_SECONDS + 0.25))
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        assert len(worker_threads) == 1 and worker_threads[0] != owner_thread
-        await asyncio.wait_for(settling, 2)
-        # The shutdown may proceed, but DB close still sees the physical writer.
-        write, = authority._mutation_tasks
-        assert not write.done()
-    finally:
-        release.set()
-        await asyncio.gather(settling, *getattr(authority, '_mutation_tasks', ()))
-    assert session_closes == []
 
 
 @pytest.mark.asyncio

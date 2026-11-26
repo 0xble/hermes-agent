@@ -240,7 +240,6 @@ class RuntimeDeliveryRecoveryMixin:
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
-        from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
@@ -252,7 +251,7 @@ class RuntimeDeliveryRecoveryMixin:
                 continue
             from gateway.checkin_delivery import permits_recovery
             text = None
-            supervisor_checkin = boundary = False
+            supervisor_checkin = False
             try:
                 decision = await self.async_session_store.get_session_metadata(
                     key, "room_silence_decision", {})
@@ -262,7 +261,6 @@ class RuntimeDeliveryRecoveryMixin:
                 prompt = next((message for message in reversed(visible[:-1])
                                if message.get("role") == "user"), {})
                 supervisor_checkin = prompt.get("display_kind") == DISPLAY_KIND
-                boundary = bool(visible) and visible[-1].get("display_kind") == FAILED_TURN_DISPLAY_KIND
                 text = self._crash_left_reply(history, started, origin,
                                               silence_decision=decision, active_token=token)
                 if text is None or (text and not ledger_on):
@@ -287,7 +285,7 @@ class RuntimeDeliveryRecoveryMixin:
                         # Parts were matched against the ledger above; only a single whole-reply
                         # row still needs the content-based duplicate check.
                         resume_turn_id=token, part=ref != f"crash:{token}" or text != content,
-                        supervisor_checkin=supervisor_checkin, boundary=boundary)
+                        supervisor_checkin=supervisor_checkin)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

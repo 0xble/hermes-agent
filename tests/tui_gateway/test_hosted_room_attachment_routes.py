@@ -123,10 +123,10 @@ def _server_module():
 _LEASE_TTL_SECONDS = 30.0
 
 
-def _legacy_runtime(store, rpc: HostedRoomServerRPC, **kwargs) -> HostedRoomRuntime:
+def _legacy_runtime(store, rpc: HostedRoomServerRPC, placement="profile") -> HostedRoomRuntime:
     return HostedRoomRuntime(
         store=store, placement=placement, rooms=[BINDING], rpc=rpc, turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=_LEASE_TTL_SECONDS, poll_interval_seconds=0.01, **kwargs)
+        lease_ttl_seconds=_LEASE_TTL_SECONDS, poll_interval_seconds=0.01)
 
 
 class DispatchingPeerClient:
@@ -191,9 +191,7 @@ def test_legacy_route_refuses_a_turn_with_a_file_before_submitting(db: Path, sto
 def test_legacy_route_still_runs_a_turn_without_a_file(db: Path, store):
     identity = _admit(store)
     server, submits = _server_module()
-    # Lease expiry is not the fault under test.
-    now = time.time()
-    runtime = _legacy_runtime(store, HostedRoomServerRPC(server), clock=lambda: now)
+    runtime = _legacy_runtime(store, HostedRoomServerRPC(server))
 
     task = _run_until_settled_or_error(runtime, store, identity)
 

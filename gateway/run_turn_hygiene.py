@@ -37,116 +37,9 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-_HYGIENE_PENDING_COOLDOWN_WAIT_S = 10.0
-
-
-def _hygiene_compression_timeout_message(
-    *, total_exhausted: bool, elapsed: float, idle_timeout: float, progress_observed: bool) -> str:
-    """Describe the host timeout that actually ended hygiene compression. Chat users cannot edit
-    model config, so the copy names /compress, /new and `hermes doctor`, never a config key or the
-    raw second counts (those stay in the gateway log)."""
-    lead = t("gateway.compress.hygiene_timeout")
-    if total_exhausted:
-        return lead
-    return lead + t("gateway.compress.hygiene_timeout_doctor_hint")
-
-
-def hygiene_no_commit_reason(agent) -> str:
-    """Name WHY a hygiene compression left the session id unchanged with no in-place commit.
-    The terminal ``else`` used to blame "no session_db on the hygiene agent" for every route into it,
-    but that is one of several causes (#71097): an attempt that ABORTED before any commit boundary
-    (lock skip, transient cooldown, summary timeout, codex thread interrupted) leaves
-    ``_last_compression_attempt_in_place`` at ``None``; a DB-less agent is only the case when
-    ``_session_db`` really is missing. Read the per-attempt signals the compressor sets, in that order."""
-    if not bool(getattr(agent, "_last_compression_attempt_recorded", False)):
-        return "compression did not run"
-    lock_skip = getattr(agent, "_compression_skipped_due_to_lock", None)
-    if lock_skip is True or isinstance(lock_skip, str):
-        return "attempt skipped: compression lease held by another process"
-    blocked = getattr(agent, "_compression_blocked_transient", None)
-    if blocked:
-        return f"attempt blocked: {blocked}"
-    if getattr(agent, "_last_compression_attempt_in_place", None) is None:
-        detail = "summary timed out" if getattr(agent, "_last_compression_timed_out", False) else "aborted before commit"
-        warning = getattr(agent, "_last_compression_summary_warning", None)
-        return f"attempt {detail}" + (f": {warning}" if warning else "")
-    if getattr(agent, "_session_db", None) is None:
-        return "no session_db on the hygiene agent"
-    return "in-place commit did not complete"
 
 
 class GatewayTurnHygieneMixin:
-    @staticmethod
-    async def _hmwa_hygiene_off_loop(func, *args, failure_label):
-        """Run a best-effort hygiene state.db write from a loop callback in a worker thread."""
-        try:
-            await asyncio.to_thread(func, *args)
-        except Exception:
-            logger.debug("%s", failure_label, exc_info=True)
-
-
-    def _hmwa_hygiene_schedule_cooldown(self, session_id, func, *args, failure_label):
-        """Write a cooldown off the loop from a path that cannot await. The hygiene gate awaits the
-        pending write before reading the durable cooldown, so the next turn cannot re-arm early."""
-        pending = getattr(self, "_hygiene_pending_cooldowns", None)
-        if not isinstance(pending, dict):
-            pending = self._hygiene_pending_cooldowns = {}
-        task = self._retain_background_task(asyncio.ensure_future(
-            self._hmwa_hygiene_off_loop(func, *args, failure_label=failure_label)))
-        pending[session_id] = task
-
-        def _forget(done, _sid=session_id):
-            if pending.get(_sid) is done:
-                del pending[_sid]
-
-        task.add_done_callback(_forget)
-        return task
-
-
-    async def _hmwa_hygiene_await_pending_cooldown(self, session_id):
-        """Bounded wait for a scheduled cooldown write on ``session_id`` (no-op when none)."""
-        pending = getattr(self, "_hygiene_pending_cooldowns", None)
-        task = pending.get(session_id) if isinstance(pending, dict) else None
-        if task is not None and not task.done():
-            await asyncio.wait({task}, timeout=_HYGIENE_PENDING_COOLDOWN_WAIT_S)
-
-
-    async def _hmwa_hygiene_deferred_failure(self, hs, session_key, session_id, agent, source, meta):
-        """A kept-admission worker whose summary failed after the turn-hold: escalate the failure
-        cooldown and warn the user, as the inline abort path in ``_hmwa_hygiene_apply_result`` does."""
-        from agent.redact import redact_sensitive_text
-        _comp = getattr(agent, "context_compressor", None)
-        _reason = getattr(_comp, "_last_summary_error", None)
-        try:
-            await self._hmwa_hygiene_record_failure_cooldown(hs, session_key, session_id, _reason)
-        except Exception as _cd_err:
-            logger.debug("hygiene failure cooldown after deferred abort failed: %s", _cd_err)
-        await self._hmwa_hygiene_stamp(
-            agent, "session hygiene compression aborted after turn-hold",
-            "AGENT_COMPRESSION_COOLDOWN", "hygiene deferred compression abort activity stamp failed",
-        )
-        _err = redact_sensitive_text(_reason or t("gateway.shared.unknown_error"), force=True)
-        logger.warning("Session hygiene compression aborted after the turn-hold was released: %s", _err)
-        await self._hmwa_hygiene_notify(
-            source, meta, t("gateway.compress.hygiene_failed"), "compression-failure warning",
-        )
-
-
-    def _note_hygiene_deferred_adoption(self, session_key):
-        """Bump the session's deferred-adoption epoch (see ``_hygiene_deferred_adoption_epoch``)."""
-        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
-        if not isinstance(epochs, dict):
-            epochs = self._hygiene_deferred_adoption_epochs = {}
-        epochs[session_key] = epochs.get(session_key, 0) + 1
-
-
-    def _hygiene_deferred_adoption_epoch(self, session_key):
-        """How many deferred hygiene summaries this process adopted for ``session_key``. A turn that
-        sees the epoch move ran on the pre-compaction transcript, so its prompt-token count is stale."""
-        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
-        return epochs.get(session_key, 0) if isinstance(epochs, dict) else 0
-
-
     @dataclasses.dataclass
     class _HygienePlan:
         """Hygiene pre-check outcome for one turn."""
@@ -160,19 +53,17 @@ class GatewayTurnHygieneMixin:
     def _hmwa_hygiene_read_config(hs, data):
         """Apply model / compression knobs from the gateway config onto ``hs`` (invalid values keep the defaults)."""
         # Resolve model name (same logic as run_sync)
-        from hermes_cli.model_alias_runtime import resolve_default_route
-        _default_route = resolve_default_route(data)
         _model_cfg = data.get("model", {})
         if isinstance(_model_cfg, str):
-            hs.model = _default_route.model
+            hs.model = _model_cfg
         elif isinstance(_model_cfg, dict):
-            hs.model = _default_route.model or hs.model
+            hs.model = _model_cfg.get("default") or _model_cfg.get("model") or hs.model
             _raw_ctx = _model_cfg.get("context_length")
             if _raw_ctx is not None:
                 with suppress(TypeError, ValueError):
                     hs.config_context_length = int(_raw_ctx)
-            hs.provider = _default_route.provider or None
-            hs.base_url = _default_route.base_url or None
+            hs.provider = _model_cfg.get("provider") or None
+            hs.base_url = _model_cfg.get("base_url") or None
 
         # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
         _comp_cfg = data.get("compression", {})
@@ -220,14 +111,13 @@ class GatewayTurnHygieneMixin:
             configured_model, configured_provider, configured_base_url = hs.model, hs.provider, hs.base_url
 
             with suppress(Exception):
-                hs.model, _hyg_runtime = await self._resolve_session_agent_runtime_async(
+                hs.model, _hyg_runtime = self._resolve_session_agent_runtime(
                     source=source, session_key=session_key,
                     user_config=hs.data if isinstance(hs.data, dict) else None,
                 )
                 hs.provider = _hyg_runtime.get("provider") or hs.provider
                 hs.base_url = _hyg_runtime.get("base_url") or hs.base_url
                 hs.api_key = _hyg_runtime.get("api_key") or hs.api_key
-                hs.api_mode = _hyg_runtime.get("api_mode") or ""
 
             if hs.config_context_length is not None:
                 try:
@@ -270,7 +160,6 @@ class GatewayTurnHygieneMixin:
         _hyg_context_length = await get_model_context_length_async(
             hs.model, base_url=hs.base_url or "", api_key=hs.api_key or "",
             config_context_length=hs.config_context_length, provider=hs.provider or "",
-            api_mode=hs.api_mode,
         )
         _compress_token_threshold = int(_hyg_context_length * hs.threshold_pct)
         _warn_token_threshold = int(_hyg_context_length * 0.95)
@@ -286,12 +175,8 @@ class GatewayTurnHygieneMixin:
         with image_cost_context(learned_image_token_cost(hs.model, hs.base_url)):
             if session_entry.last_prompt_tokens <= 0:
                 from agent.usage_anchor import persisted_anchor_tokens
-                def _read_anchor():
-                    session_db = getattr(self, "_session_db", None)
-                    return persisted_anchor_tokens(
-                        getattr(session_db, "_db", session_db), session_entry.session_id, history,
-                    )
-                _anchored = await asyncio.to_thread(_read_anchor)
+                _store = getattr(self, "persistence", None)
+                _anchored = persisted_anchor_tokens(_store, session_entry.session_id, history, persistence=_store)
             if session_entry.last_prompt_tokens > 0:
                 _approx_tokens, _token_source = session_entry.last_prompt_tokens, "actual"
             elif _anchored is not None:
@@ -308,22 +193,18 @@ class GatewayTurnHygieneMixin:
             # failing compression is not re-triggered on every restart.
             # The in-memory dict was reset on every restart, re-triggering the same failing compression and
             # wedging session storage (#74136).
-            def _read_cooldown():
-                session_db = getattr(self, "_session_db", None)
-                getter = getattr(getattr(session_db, "_db", session_db), "get_compression_failure_cooldown", None)
-                return getter(session_entry.session_id) if getter is not None else None
-
-            _cooldown_state = None
-            await self._hmwa_hygiene_await_pending_cooldown(session_entry.session_id)
-            with suppress(Exception):
-                _cooldown_state = await asyncio.to_thread(_read_cooldown)
-            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
-                logger.info(
-                    "Session hygiene: skipping compression for %s; "
-                    "previous failure cooldown active for %.1fs",
-                    session_entry.session_id, _cooldown_state["remaining_seconds"],
-                )
-                _needs_compress = False
+            _store = getattr(self, "persistence", None)
+            if _store is not None:
+                _cooldown, _now = None, time.time()
+                with suppress(Exception):
+                    _cooldown = _store.messages.read_compression_cooldown(session_entry.session_id, _now)
+                if _cooldown is not None and _cooldown.until - _now > 0:
+                    logger.info(
+                        "Session hygiene: skipping compression for %s; "
+                        "previous failure cooldown active for %.1fs",
+                        session_entry.session_id, _cooldown.until - _now,
+                    )
+                    _needs_compress = False
 
         if _needs_compress and await self._session_has_compression_in_flight(session_key):
             # A prior compression still holds the durable lock (e.g. a shielded worker left by /stop):
@@ -427,14 +308,10 @@ class GatewayTurnHygieneMixin:
         attempt.cleanup_deferred = True
 
     @staticmethod
-    async def _hmwa_hygiene_stamp(agent, desc, provenance_name, debug_label):
-        """Compression provenance forces a durable activity write, so it runs off the loop."""
+    def _hmwa_hygiene_stamp(agent, desc, provenance_name, debug_label):
         from agent.session_activity import ActivityProvenance
         from gateway.run import _stamp_hygiene_compression_provenance
-        await asyncio.to_thread(
-            _stamp_hygiene_compression_provenance,
-            agent, desc, getattr(ActivityProvenance, provenance_name), debug_label,
-        )
+        _stamp_hygiene_compression_provenance(agent, desc, getattr(ActivityProvenance, provenance_name), debug_label)
 
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
@@ -444,7 +321,7 @@ class GatewayTurnHygieneMixin:
             if _adapter and source.chat_id:
                 await _adapter.emit_warning(source.chat_id, message, metadata=meta,
                                             logical_platform=source.platform)
-        except (OSError, RuntimeError, ValueError) as _werr:
+        except Exception as _werr:
             logger.warning("Failed to deliver %s to user: %s", what, _werr)
 
     async def _hmwa_hygiene_record_failure_cooldown(self, hs, session_key, session_id, reason):
@@ -455,16 +332,12 @@ class GatewayTurnHygieneMixin:
         _hyg_cooldown = await asyncio.to_thread(
             _hygiene_cooldown_for_failure, self, session_key, hs.failure_cooldown_seconds,
         )
-        await asyncio.to_thread(_record_hygiene_cooldown, self, session_id, _hyg_cooldown, reason)
+        _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
 
     async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
-        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission
-        and re-raise; returns the compressed transcript only when the worker was already committing.
-
-        The user hears about it only when nothing will be adopted: a kept-admission worker's summary
-        is adopted later at its fenced commit, so its turn-hold is internal lifecycle (INFO log only).
-        The cancel path still posts the deferral notice; a kept-admission worker that later fails its
-        summary posts the ordinary hygiene-failure warning from the done-callback.
+        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
+        notify the user, and re-raise; returns the compressed transcript only when the worker
+        was already committing.
 
         Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
         only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
@@ -483,10 +356,8 @@ class GatewayTurnHygieneMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
-            _meta = attempt.meta
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
-                _exc = None
                 try:
                     _exc = _fut.exception()
                 except (asyncio.CancelledError, Exception):
@@ -496,46 +367,23 @@ class GatewayTurnHygieneMixin:
                         bool(getattr(_agent, "_last_compaction_in_place", False))
                         or getattr(_agent, "session_id", _sid) != _sid
                     )
-                _comp = getattr(_agent, "context_compressor", None)
-                _summary_failed = (
-                    not _committed and _exc is None and _comp is not None
-                    and bool(getattr(_comp, "_last_compress_aborted", False))
-                )
                 if _committed:
                     logger.info(
                         "Session hygiene compression for session %s finished after the "
                         "turn-hold was released — summary adopted at the watermark-fenced "
                         "commit boundary (#97963)", _sid,
                     )
-                    # The prompt-token count on the entry measured the pre-compaction transcript:
-                    # left in place, the next hygiene check re-fires on the compacted one. Mirror
-                    # the inline adoption reset and fence out this turn's stale end-of-turn count.
-                    session_entry.last_prompt_tokens = 0
-                    _gw._note_hygiene_deferred_adoption(_skey)
-                    _gw._retain_background_task(asyncio.ensure_future(
-                        _gw.async_session_store.update_session(
-                            _skey, last_prompt_tokens=0, touch_activity=False,
-                        )
-                    ))
-                    # Done-callbacks run on the loop; both state.db writes below go to a thread.
-                    _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
-                        _reset_hygiene_failure_streak, _gw, _skey,
-                        failure_label="hygiene streak reset after deferred adoption failed",
-                    )))
-                elif _summary_failed:
-                    # A real summary failure, not a turn-hold: same escalation and warning as the
-                    # inline abort path, which this deferred attempt never reaches.
-                    _gw._retain_background_task(asyncio.ensure_future(
-                        _gw._hmwa_hygiene_deferred_failure(hs, _skey, _sid, _agent, source, _meta)
-                    ))
+                    try:
+                        _reset_hygiene_failure_streak(_gw, _skey)
+                    except Exception as _rs_err:
+                        logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
-                    _gw._hmwa_hygiene_schedule_cooldown(
-                        _sid, _record_hygiene_cooldown, _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+                    _record_hygiene_cooldown(
+                        _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                         "hygiene compression deferred: turn-hold budget expired and the "
                         "detached attempt did not commit",
-                        failure_label="hygiene turn-hold retry spacing failed",
                     )
 
             attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
@@ -543,20 +391,18 @@ class GatewayTurnHygieneMixin:
                 " — the watermark-fenced worker keeps its commit admission and the summary "
                 "will be adopted when it finishes"
             )
-            _notify_user = False
         else:
             _adopted = await self._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene turn-hold")
             if _adopted is not None:
                 return _adopted
             # Short flat retry-after, else every turn re-spawns, holds and cancels a compressor.
-            await asyncio.to_thread(
-                _record_hygiene_cooldown, self, session_entry.session_id, _HYGIENE_TURNHOLD_RETRY_SECONDS,
+            _record_hygiene_cooldown(
+                self, session_entry.session_id, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                 "hygiene compression deferred: turn-hold budget expired while the "
                 "summary was still streaming",
             )
             _log_suffix = ""
-            _notify_user = True
-        await self._hmwa_hygiene_stamp(
+        self._hmwa_hygiene_stamp(
             attempt.agent, "session hygiene compression turn-hold",
             "AGENT_COMPRESSION_TURNHOLD", "hygiene compression turn-hold activity stamp failed",
         )
@@ -565,18 +411,16 @@ class GatewayTurnHygieneMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        if _notify_user:
-            # Cancelled: nothing will be adopted this time, so the user learns why the turn ran long.
-            await self._hmwa_hygiene_notify(
-                source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-            )
+        await self._hmwa_hygiene_notify(
+            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+        )
         raise
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
         """``except asyncio.TimeoutError`` body: cancel at the commit fence, record the failure
         cooldown, warn the user, and re-raise; returns the compressed transcript only when the
         worker crossed the commit boundary first."""
-        from gateway.run_turn_hygiene import _hygiene_compression_timeout_message
+        from gateway.run import _hygiene_compression_timeout_message
         fence = attempt.commit_fence
         _hyg_total_exhausted = fence.deadline_exceeded  # armed with the ceiling before the wait began
         if _hyg_total_exhausted:
@@ -596,7 +440,7 @@ class GatewayTurnHygieneMixin:
                 else "timed out with no output from the summary model"
             ),
         )
-        await self._hmwa_hygiene_stamp(
+        self._hmwa_hygiene_stamp(
             attempt.agent,
             "session hygiene compression cancelled at commit fence" if _hyg_fence_cancelled
             else "session hygiene compression timed out",
@@ -640,18 +484,14 @@ class GatewayTurnHygieneMixin:
         if not attempt.cleanup_deferred:
             self._hmwa_hygiene_defer_cleanup(attempt, "session hygiene unwind")
         if hs.failure_cooldown_seconds >= 0:
-            session_id = session_entry.session_id
-
-            def _record() -> None:
+            try:
                 _record_hygiene_cooldown(
-                    self, session_id,
+                    self, session_entry.session_id,
                     _hygiene_cooldown_for_failure(self, session_key, hs.failure_cooldown_seconds),
                     "session hygiene compression cancelled at commit fence",
                 )
-
-            # The unwinding turn cannot await; the streak read and cooldown write are state.db I/O.
-            self._hmwa_hygiene_schedule_cooldown(
-                session_id, _record, failure_label="hygiene unwind cooldown record failed")
+            except Exception as _cd_err:
+                logger.debug("hygiene unwind cooldown record failed: %s", _cd_err)
 
     async def _hmwa_hygiene_adopt_transcript(
         self, attempt, _compressed, history, plan, *, session_entry, source, _quick_key, run_generation,
@@ -775,7 +615,7 @@ class GatewayTurnHygieneMixin:
                 "session hygiene compression cancelled at commit fence" if _hyg_fence_cancelled
                 else getattr(_comp, "_last_summary_error", None),
             )
-            await self._hmwa_hygiene_stamp(
+            self._hmwa_hygiene_stamp(
                 attempt.agent, "session hygiene compression aborted",
                 "AGENT_COMPRESSION_COOLDOWN", "hygiene compression abort activity stamp failed",
             )
@@ -821,11 +661,13 @@ class GatewayTurnHygieneMixin:
 
     async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry):
         """Build the detached hygiene ``AIAgent`` with the live session's system prompt. Returns
-        ``(agent, sync_session_db)``."""
+        ``(agent, storage interface handle)``."""
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
+        from agent.prompt_caching import refresh_auto_cache_ttl
         from run_agent import AIAgent
         try:
-            _hyg_session_row = await self._session_db.get_session(session_entry.session_id)
+            _hyg_record = await self.persistence.aio.sessions.get(session_entry.session_id)
+            _hyg_session_row = {"system_prompt": _hyg_record.system_prompt} if _hyg_record is not None else None
         except Exception as exc:
             _hyg_session_row = None
             logger.warning(
@@ -833,7 +675,7 @@ class GatewayTurnHygieneMixin:
                 "Preserving an empty prompt so the live turn rebuilds it with its "
                 "configured providers.", session_entry.session_id, exc, exc_info=True,
             )
-        _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
+        _hyg_session_db = getattr(self, "persistence", None)
         # With compression.checkpoint_required on, load the memory provider so the checkpoint exists
         # before any mutation; otherwise keep the fast path (no provider init).
         from hermes_cli.config import load_config as _load_cfg
@@ -842,22 +684,22 @@ class GatewayTurnHygieneMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_runtime.pop("_preflight_fallback", None)
         _hyg_agent = AIAgent(
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
-            session_id=session_entry.session_id, session_db=_hyg_session_db,
+            session_id=session_entry.session_id, persistence=_hyg_session_db,
         )
         _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
         # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
         # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
         # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
         _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
+        refresh_auto_cache_ttl(_hyg_agent)
         return _hyg_agent, _hyg_session_db
 
     async def _hmwa_hygiene_detached_attempt(
         self, attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-        source, session_entry, session_key, _quick_key, run_generation, hygiene_origin="unknown",
+        source, session_entry, session_key, _quick_key, run_generation,
     ):
         """Run one detached hygiene compression attempt end to end; publishes the transcript to
         continue with (compressed or original) on ``attempt.history``."""
@@ -869,9 +711,14 @@ class GatewayTurnHygieneMixin:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
             # continuation child. Without a SessionDB this stays False.
             _hyg_agent.compression_in_place = True
-            _bind_hyg_state = getattr(getattr(_hyg_agent, "context_compressor", None), "bind_session_state", None)
+            _hyg_engine = getattr(_hyg_agent, "context_compressor", None)
+            _bind_hyg_state = getattr(_hyg_engine, "bind_session_state", None)
             if callable(_bind_hyg_state):
-                _bind_hyg_state(_hyg_session_db, session_entry.session_id)
+                from agent.conversation_compression import context_engine_persistence, context_engine_session_db
+
+                # A plugin engine rebinds the SessionDB the agent bound it with, which the agent's close() closes.
+                _bind_hyg_state(context_engine_session_db(_hyg_agent, _hyg_session_db), session_entry.session_id,
+                                **context_engine_persistence(_bind_hyg_state, _hyg_session_db))
             # Never finalize on close() — that would end the live gateway session row.
             _hyg_agent._end_session_on_close = False
             _hyg_agent._print_fn = lambda *a, **kw: None
@@ -881,16 +728,6 @@ class GatewayTurnHygieneMixin:
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
             # agent-work slot. MUST run in the caller's contextvars (multiplex secret scope).
             attempt.commit_fence = _hyg_commit_fence
-            from agent.proxy_request_class import bind_aux_request_origin
-            # The detached worker inherits the live request's effective origin. Without this
-            # binding all hygiene summaries fall back to the compression task default (background).
-            def _run_hygiene_compression():
-                with bind_aux_request_origin(hygiene_origin):
-                    return _hyg_agent._compress_context(
-                        _hyg_msgs, "", approx_tokens=plan.approx_tokens, commit_fence=_hyg_commit_fence,
-                        task_id=session_entry.session_id or "default", trigger="gateway_hygiene",
-                    )
-
             attempt.future = loop.run_in_executor(
                 None,
                 # But it MUST run inside the caller's contextvars: under multiplex_profiles the profile
@@ -900,7 +737,10 @@ class GatewayTurnHygieneMixin:
                 # lossy truncation (#100849 bundle).
                 copy_context().run,
                 # task_id = the live turn's dedup bucket (session row id), never "" (= reset every task).
-                _run_hygiene_compression,
+                lambda: _hyg_agent._compress_context(
+                    _hyg_msgs, "", approx_tokens=plan.approx_tokens, commit_fence=_hyg_commit_fence,
+                    task_id=session_entry.session_id or "default", trigger="gateway_hygiene",
+                ),
             )
             # Register the live worker with shutdown NOW, not only once it is deferred: the default
             # executor is outside self._executor's quiesce, so an untracked in-flight summary would let
@@ -935,8 +775,6 @@ class GatewayTurnHygieneMixin:
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
         from gateway.run import HygieneTurnHoldExceeded
-        from gateway.platforms.event import turn_origin_for_event
-        hygiene_origin = turn_origin_for_event(event)
         if not history or len(history) < 4:
             return history
 
@@ -952,7 +790,7 @@ class GatewayTurnHygieneMixin:
 
         attempt = self._HygieneAttempt(agent=None, meta=self._event_thread_metadata(event, source), history=history)
         try:
-            _hyg_model, _hyg_runtime = await self._resolve_session_agent_runtime_async(
+            _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
                 source=source, session_key=session_key,
                 user_config=hs.data if isinstance(hs.data, dict) else None,
             )
@@ -965,7 +803,7 @@ class GatewayTurnHygieneMixin:
                 if len(_hyg_msgs) >= 4:
                     await self._hmwa_hygiene_detached_attempt(
                         attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-                        source, session_entry, session_key, _quick_key, run_generation, hygiene_origin,
+                        source, session_entry, session_key, _quick_key, run_generation,
                     )
         except HygieneTurnHoldExceeded:
             # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.

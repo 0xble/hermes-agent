@@ -81,12 +81,6 @@ def load_config():
     return copy.deepcopy(frozen) if frozen is not None else _config_mod.load_config()
 
 
-def load_runtime_config_readonly():
-    """Read the active route snapshot without copying it or writing config."""
-    frozen = _FROZEN_RUNTIME_CONFIG.get()
-    return frozen if frozen is not None else _config_mod.load_config_readonly()
-
-
 def get_compatible_custom_providers(config=None):
     return _config_mod.get_compatible_custom_providers(config)
 
@@ -1336,7 +1330,7 @@ def format_runtime_provider_error(error: Exception) -> str:
 
 def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested: Optional[str] = None,
                                   target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
-                                  explicit_api_key: Optional[str] = None, model_pinned: bool = False,
+                                  explicit_api_key: Optional[str] = None,
                                   ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
     """``resolve_runtime_provider`` plus resolution-time fallback: ``(runtime, fallback_entry_or_None)``.
 
@@ -1354,11 +1348,7 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
         from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs, get_fallback_chain
-        from hermes_cli.fallback_config import same_model_fallbacks
-        chain = get_fallback_chain(config)
-        if model_pinned:
-            chain = same_model_fallbacks(chain, target_model or "")
-        for entry in chain:
+        for entry in get_fallback_chain(config):
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
             if not provider or not model:
@@ -1376,16 +1366,13 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
             runtime["provider"] = effective_runtime_provider(entry, runtime)
             # A rate-limit/quota cap is transient (credentials are fine, re-auth cannot help); the log must not
             # mislabel it as an auth failure (#32790).
-            logger.warning("Primary provider %s for model %s (%s). Falling back to %s/%s",
-                           primary_failure_wording(primary_exc)[0], target_model, primary_exc, provider, model)
+            logger.warning("Primary provider %s (%s). Falling back to %s/%s",
+                           primary_failure_wording(primary_exc)[0], primary_exc, provider, model)
             # Carry the primary's failed login forward: if the backup then fails, the turn's copy must
             # lead with the re-login, not only the backup's error.
             from agent.primary_auth_fallback import RUNTIME_KEY, primary_auth_failure_from_exc
             if failure := primary_auth_failure_from_exc(primary_exc, resolve_requested_provider(requested),
                                                         runtime["provider"]):
                 runtime[RUNTIME_KEY] = failure
-            reason = "rate_limit" if primary_failure_wording(primary_exc)[0].startswith("rate-limited") else "credentials_unavailable"
-            runtime["_preflight_fallback"] = {"requested_model": target_model,
-                                               "fallback_model": model, "fallback_reason": reason}
             return runtime, entry
         raise primary_exc

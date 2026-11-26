@@ -15,7 +15,7 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
     "browser_handoff", "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back", "browser_upload", "browser_downloads", "browser_tabs", "browser_close",
+    "browser_type", "browser_scroll", "browser_back", "browser_upload", "browser_downloads", "browser_tabs",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
@@ -483,11 +483,6 @@ def session_disabled_toolsets(
         from tools.react_tool import check_react_requirements
         if not check_react_requirements():
             disabled = [*(disabled or ()), "reactions"]
-    elif platform_registry.reactions_supported(name) is False and "reactions" not in (disabled or ()):
-        # A known adapter that inherits BasePlatformAdapter.add_reaction cannot deliver this tool. A session
-        # whose tools[] were pinned earlier keeps its pinned react (tools.mcp_tool_agent). Unknown/deferred
-        # adapter classes fail open, preserving the old behavior without importing manifests during selection.
-        disabled = [*(disabled or ()), "reactions"]
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms]
     gated += ONESHOT_DISABLED_TOOLSETS if oneshot else ()
     gated = [name for name in gated if name not in (disabled or ())]

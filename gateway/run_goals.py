@@ -8,24 +8,17 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
-import copy
 import dataclasses
 import functools
 import logging
 import time
-import uuid
 from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
 from gateway.delivery import prime_revived_egress
-from gateway.platforms.event import (
-    GOAL_CONTINUATION_METADATA_KEY,
-    MessageEvent,
-    MessageType,
-    is_goal_continuation_event,
-)
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from hermes_cli.goal_notices import HIDDEN, notice_level
 from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -48,24 +41,6 @@ _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 _GOAL_NOTICE_MAX_ATTEMPTS = 3
 # Goal card kinds that mean the goal stopped making progress. Hidden ones wake the session.
 _STALL_KINDS = frozenset({"blocked", "paused", "failed"})
-
-
-def _goal_suspended_while_private(session_entry) -> bool:
-    """A goal neither judges nor changes during a private interval and resumes untouched after it.
-
-    The judge would send the private reply to the auxiliary goal_judge provider, and every goal
-    write is withheld from state.db while private anyway.
-    """
-    return bool(getattr(session_entry, "incognito", False)) or session_private(
-        getattr(session_entry, "session_id", None), getattr(session_entry, "session_key", None),
-    )
-
-
-def session_private(*identities) -> bool:
-    """Suspend background work for private sessions, including an in-flight privacy switch."""
-    from agent.incognito import is_registered
-    from gateway.incognito import transition_pending
-    return any(is_registered(identity) or transition_pending(identity) for identity in identities)
 
 
 def _goal_notice_kind(message: str) -> str:
@@ -678,7 +653,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             loop_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
         else:
             # Older in-process callers stamped the same exact identity under this name. Keep the
-            # compatibility path strict to a two-part tick; tick settlement still requires its identity.
+            # compatibility path strict to a two-part tick; no text-only completion is accepted.
             legacy_tick = metadata.get("gateway_loop_tick")
             if isinstance(legacy_tick, (list, tuple)) and len(legacy_tick) == 2:
                 loop_tick = list(legacy_tick)
@@ -695,7 +670,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _revive_blocked_goal_for_user_turn(self, session_entry, source, event) -> None:
         """Resume only after turn admission, independently of model success or delivery."""
-        if not self._is_user_turn_event(event) or _goal_suspended_while_private(session_entry):
+        if not self._is_user_turn_event(event):
             return
         from hermes_cli.goals import GoalManager
 
@@ -900,7 +875,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 try:
                     # The delivered signal rides the cosmetic cleanup chain, which can time out.
                     await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
                                    session_key, POST_TURN_DELIVERY_WAIT_S)
                 await finish(deferred=True)
@@ -925,74 +900,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 owners.append(bookkeeping_owner)
             captured['post_delivery'] = owners
 
-    async def _retry_failed_synthetic_event(
-        self, event: Any, source: Any, agent_result: Any, *, invalidation_epoch: Optional[int] = None,
-    ) -> bool:
-        """Requeue one failed internal delivery instead of exposing failed-turn copy.
-
-        Admission is durable, but inference can still fail after the admission is consumed. One
-        retry covers provider-transient races without turning a user/lifecycle interrupt into new
-        work; user events and context/safety refusals never enter this path.
-        """
-        if not isinstance(agent_result, dict) or event is None:
-            return False
-        metadata = getattr(event, "metadata", None) or {}
-        if not (getattr(event, "internal", False) or is_goal_continuation_event(event)):
-            return False
-        if metadata.get("gateway_internal_retry_count", 0) >= 1:
-            return False
-        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
-        if metadata.get("gateway_loop_tick") or metadata.get(LOOP_WAKE_METADATA_KEY):
-            return False  # loop settlement schedules the next due tick
-        if agent_result.get("failure_reason") in {"context_overflow", "content_policy_blocked"}:
-            return False
-        # An interrupt is a user/lifecycle decision, not a provider failure. In particular, a
-        # /stop or /new invalidation must never be resurrected by this post-turn hook.
-        if agent_result.get("interrupted"):
-            return False
-        if not (agent_result.get("failed") or agent_result.get("completed") is False):
-            return False
-        if agent_result.get("failure_retryable") is False:
-            return False
-        try:
-            key = self._session_key_for_source(source)
-            if invalidation_epoch is not None:
-                current_epoch = getattr(self, "_session_invalidation_epoch", lambda _key: invalidation_epoch)(key)
-                if current_epoch != invalidation_epoch:
-                    return False
-            if getattr(self, "_user_stop_latched", lambda *_keys: False)(key):
-                return False
-            retry = copy.copy(event)
-            retry.metadata = {**metadata, "gateway_internal_retry_count": 1}
-            # A copied event must not carry the consumed transport/admission identity. Durable
-            # outbox treats those stamps as deduplication keys, so issue a fresh transport id.
-            for name in tuple(vars(retry)):
-                if name.startswith("_outbox_"):
-                    delattr(retry, name)
-            retry._outbox_transport_id = uuid.uuid4().hex
-            adapter = self._delivery_adapter_for(source)
-            if getattr(source, "platform", None) == Platform.LOCAL:
-                from gateway.session_automation import admit_route_wake
-                accepted = await admit_route_wake(
-                    self, adapter, source, retry.text, "internal-failure-retry",
-                    metadata=retry.metadata, event=retry,
-                )
-                if not accepted:
-                    return False
-            elif adapter and key:
-                from gateway.wake import automatic_event_is_current
-                if not await automatic_event_is_current(self, retry):
-                    return False
-                self._enqueue_fifo(key, retry, adapter)
-            else:
-                return False
-            logger.info("requeued failed internal turn for %s", key or "unknown")
-            return True
-        except Exception:
-            logger.debug("failed internal turn requeue failed", exc_info=True)
-            return False
-
-    # health: allow CC -- retry exhaustion warning/pause must remain adjacent to post-turn settlement to preserve the one-retry contract.
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -1010,20 +917,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         )
         if not successful:
             final_text = ""
-        retry_scheduled = False
-        if not successful:
-            try:
-                retry_scheduled = await self._retry_failed_synthetic_event(
-                    event, source, agent_result, invalidation_epoch=invalidation_epoch,
-                )
-            except Exception:
-                # Recovery is best-effort and must never mask goal/loop settlement.
-                logger.debug("failed internal turn recovery hook failed", exc_info=True)
-        exhausted_synthetic = (
-            not successful and not retry_scheduled and event is not None
-            and (getattr(event, "internal", False) or is_goal_continuation_event(event))
-            and (getattr(event, "metadata", None) or {}).get("gateway_internal_retry_count", 0) >= 1
-        )
         try:
             if existing_session_only:
                 # Settlement can precede a stop that suspends this route. Deferred
@@ -1039,22 +932,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        if exhausted_synthetic:
-            from gateway.platforms.event import turn_origin_for_event
-            origin = turn_origin_for_event(event)
-            logger.warning(
-                "synthetic turn retry exhausted: session=%s origin=%s",
-                getattr(session_entry, "session_id", "unknown"), origin,
-            )
-            if origin == "goal_loop":
-                try:
-                    manager, _ = await self._get_goal_manager_for_event(event)
-                    if manager is not None and manager.is_active():
-                        await asyncio.to_thread(
-                            manager.pause, "synthetic turn retry exhausted", by="system",
-                        )
-                except Exception:
-                    logger.debug("pausing goal after synthetic retry exhaustion failed", exc_info=True)
         # Failed/interrupted turns stay out of /goal. Successful empty turns still carry
         # tool evidence; an in-flight /loop tick always needs release/rescheduling.
         # The terminal turn's identity: a queued chain carries its last turn's, not the head's.
@@ -1068,8 +945,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not loop_tick and event is not None:
             loop_tick = self._post_turn_goal_identity(event).get("loop_tick")
         hooks = [("loop completion", self._post_turn_loop_completion,
-                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None,
-                   "loop_identity": getattr(event, "_loop_completion_identity", None)})]
+                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
         if successful:
             # Any delivery into the session is fresh evidence and pierces a goal wait: process or
             # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
@@ -1129,8 +1005,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 goal_kwargs["goal_instance"] = instance
             if invalidation_epoch is not None:
                 goal_kwargs["invalidation_epoch"] = invalidation_epoch
-            if not _goal_suspended_while_private(session_entry):
-                hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             if hook == self._post_turn_goal_continuation and invalidation_epoch is not None and (
                 self._session_invalidation_epoch(self._session_key_for_source(source))
@@ -1222,23 +1097,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self, *, session_entry: Any, source: Any, final_response: str,
         loop_tick: Optional[tuple] = None,
         run_generation: int | None = None,
-        loop_identity: Optional[tuple] = None,
     ) -> None:
-        """Honor explicit completion from the observed loop, or settle an exact wake tick.
+        """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
+        (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
+        / --until judge / caps and schedules the next tick for the idle wakeup watcher.
 
-        A successful final marker from any turn may finish its captured loop definition.
-        Other replies only settle the exact tick they answered. Older unstamped callers
-        retain tick-only settlement and cannot stop a replacement loop by accident.
+        A normal user turn has no loop-tick identity. It must not settle a claimed wakeup merely
+        because the session currently has one awaiting response; only the synthetic event carrying
+        the exact ``gateway_loop_tick`` may do that.
         """
-        if loop_identity is not None and loop_tick is None:
-            from gateway.loop_completion import complete_loop_response
-            message = await self._run_in_executor_with_context(
-                complete_loop_response, session_entry.session_id, loop_identity, final_response,
-            )
-            if message:
-                if source is not None:
-                    await self._defer_goal_status_notice_after_delivery(source, message, section="loops", stall=False)
-                return
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
@@ -1385,7 +1252,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if _turn_owner_exists(include_marker=False):
             return
         # Preserve retired state before compression migration or orphan-tick recovery writes.
-        if not await automatic_route_available(self, source, idle_backoff=True):
+        if not await automatic_route_available(self, source):
             return
 
         # The route may resolve to a different durable session after compression, /resume, a
@@ -1489,16 +1356,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         is_run_current = getattr(self, "_is_session_run_current", None)
         if not callable(is_run_current):
             is_run_current = lambda _key, _generation: True
-        try:
-            wakeup = await self._run_in_executor_with_context(
-                functools.partial(
-                    mgr.fire_tick, generation,
-                    can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
-                )
+        wakeup = await self._run_in_executor_with_context(
+            functools.partial(
+                mgr.fire_tick, generation,
+                can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
             )
-        except BaseException:
-            self._release_background_turn(reservation)
-            raise
+        )
         if not wakeup or _turn_owner_exists() or not is_run_current(session_key, generation):
             self._release_background_turn(reservation)
             # A consumed claim is skipped by recovery after the current owner releases.
@@ -1612,8 +1475,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             forget_goal_wait(self, sid)
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
-        if _goal_suspended_while_private(entry):
-            return  # the barrier clear is withheld while private, so waking would repeat every scan
         assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None
@@ -1647,11 +1508,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         from gateway.wake import automatic_route_available
 
-        if not await automatic_route_available(self, source, idle_backoff=True):
-            return
-        # Recheck after every async eligibility probe. The existing background reservation
-        # then fences /incognito through claim/admission without holding a reentrant route lock.
-        if _goal_suspended_while_private(entry):
+        if not await automatic_route_available(self, source):
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next

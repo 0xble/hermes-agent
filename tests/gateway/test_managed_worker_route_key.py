@@ -15,7 +15,7 @@ BASE_URL = 'https://api.minimax.io/anthropic'
 KEY_ENV = 'KB5_MINIMAX_TEST_KEY'
 
 
-def _minimax_frame(tmp_path, monkeypatch, api_key=None, *, explicit_model=True):
+def _minimax_frame(tmp_path, monkeypatch, api_key=None):
     frame, _ = assignment(tmp_path, monkeypatch)
     config = json.loads(frame['policy']['config_json'])
     config['model'] = {'default': 'MiniMax-M2.7', 'provider': 'custom:minimax', 'base_url': BASE_URL,
@@ -23,8 +23,6 @@ def _minimax_frame(tmp_path, monkeypatch, api_key=None, *, explicit_model=True):
     config['custom_providers'] = [{'name': 'minimax', 'base_url': BASE_URL, 'key_env': KEY_ENV,
                                    'api_mode': 'anthropic_messages'}]
     request = {k: v for k, v in json.loads(frame['policy']['request_json']).items() if k not in ('provider', 'base_url')}
-    if not explicit_model:
-        request.pop('model', None)
     policy = {**frame['policy'], 'model': 'MiniMax-M2.7', 'config_json': json.dumps(config),
               'request_json': json.dumps(request)}
     return {**frame, 'policy': policy, 'api_key': api_key}
@@ -271,48 +269,9 @@ def test_primary_auth_failure_reaches_the_turns_refreshed_fallback_chain(tmp_pat
     against the chain supplied for this turn, so the agent is built (key-less, its own chain switches
     provider, model and key together) instead of a start failure."""
     calls = _primary_auth_failure(monkeypatch, fallback_ok=True)
-    frame = _minimax_frame(tmp_path, monkeypatch, explicit_model=False)
-    built = _execute(_with_turn_chain(frame, [FALLBACK]), monkeypatch)
+    built = _execute(_with_turn_chain(_minimax_frame(tmp_path, monkeypatch), [FALLBACK]), monkeypatch)
     assert FALLBACK['provider'] in calls
     assert built['fallback_model'] == [FALLBACK] and built['api_key'] is None
-    assert not built.get('model_pinned')
-
-
-@pytest.mark.parametrize('same_model', [False, True])
-def test_worker_explicit_model_only_resolves_same_model_fallback(tmp_path, monkeypatch, same_model):
-    from hermes_cli.auth import AuthError
-
-    calls = _primary_auth_failure(monkeypatch, fallback_ok=True)
-    frame = _minimax_frame(tmp_path, monkeypatch)
-    if not same_model:
-        with pytest.raises(AuthError, match='relogin'):
-            _execute(_with_turn_chain(frame, [FALLBACK]), monkeypatch)
-        assert FALLBACK['provider'] not in calls
-    else:
-        same = {**FALLBACK, 'model': frame['policy']['model']}
-        built = _execute(_with_turn_chain(frame, [FALLBACK, same]), monkeypatch)
-        assert FALLBACK['provider'] in calls
-        assert built['model_pinned'] is True
-        assert built['api_key'] is None
-
-
-def test_worker_bootstrap_uses_followed_model_and_drops_superseded_launch_pin(tmp_path, monkeypatch):
-    from dataclasses import replace
-    from gateway.session_managed_worker import _bootstrap
-    from gateway.session_policy import LocalSessionPolicy
-    from gateway.session_worker_construct import policy_pins_model
-
-    _, (authority, ref, row, policy, scope) = assignment(tmp_path, monkeypatch)
-    request = {**json.loads(policy.request_json), 'follow_profile_config': True}
-    policy = replace(policy, request_json=json.dumps(request))
-    live = {'model': {'provider': 'custom', 'default': 'current-profile-model', 'base_url': BASE_URL}}
-    monkeypatch.setattr(LocalSessionPolicy, 'read_profile', lambda self, owner: live if owner else None)
-    frame = _bootstrap(authority, ref, row, policy, scope)
-    hydrated = LocalSessionPolicy(**frame['policy'])
-    config, model = hydrated.effective()
-    assert model == 'current-profile-model'
-    assert config['model']['base_url'] == BASE_URL
-    assert not policy_pins_model(hydrated, config)
 
 
 def test_primary_auth_failure_with_an_unusable_turn_chain_keeps_the_kanban_start_exit(tmp_path, monkeypatch):
@@ -321,7 +280,7 @@ def test_primary_auth_failure_with_an_unusable_turn_chain_keeps_the_kanban_start
     from hermes_cli.auth import AuthError
     from tests.gateway.test_kanban_result_exit import _bound_claim
     path, context = _bound_claim(tmp_path / 'kanban', monkeypatch)
-    frame = _with_turn_chain(_minimax_frame(tmp_path, monkeypatch, explicit_model=False), [FALLBACK])
+    frame = _with_turn_chain(_minimax_frame(tmp_path, monkeypatch), [FALLBACK])
     frame = {**frame, 'policy': {**frame['policy'], 'kanban_json': json.dumps(context)}}
     _primary_auth_failure(monkeypatch, fallback_ok=False)
     monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: None)

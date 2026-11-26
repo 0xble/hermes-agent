@@ -98,7 +98,7 @@ def test_alias_migration_preserves_proxy_credentials_and_fallback_policy():
     route = after['delegation']['backends']['model_map']['options'][0]
     assert after['model_aliases']['delegation-sol']['provider'] == 'custom:openai-proxy'
     assert route['provider'] == 'custom:openai-proxy'
-    assert route['fallback_providers'][0]['model'] == 'claude-haiku-5-5'
+    assert route['fallback_providers'][0]['model'] == 'gpt-6.1-terra'
 
 
 def test_existing_model_map_migration_preserves_explicit_empty_cron_fallbacks():

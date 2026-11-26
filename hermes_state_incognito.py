@@ -6,27 +6,9 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-_RUNTIME_INTERNAL_WRITE = ContextVar("hermes_runtime_internal_write", default=False)
-
-
-@contextmanager
-def runtime_internal_write():
-    """Permit only the runtime admission/settlement receipt to cross a private scope.
-
-    Normal transcript, worker, usage and journal writes remain fail-closed while a
-    turn is incognito. The runtime receipt path owns this narrow exception because
-    it must fence an already-admitted claim even when the turn scope is private.
-    """
-    token = _RUNTIME_INTERNAL_WRITE.set(True)
-    try:
-        yield
-    finally:
-        _RUNTIME_INTERNAL_WRITE.reset(token)
 
 
 def _warning(message: str) -> None:
@@ -86,8 +68,6 @@ def private_write(session_ids: Any = ()) -> bool:
     try:
         from agent.incognito import is_incognito
 
-        if _RUNTIME_INTERNAL_WRITE.get():
-            return False
         blocked = is_incognito() or any(is_incognito(sid) for sid in _identifiers(session_ids))
     except Exception:
         _warning("state.db mutation skipped: privacy state unavailable")

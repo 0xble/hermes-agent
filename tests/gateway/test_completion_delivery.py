@@ -21,6 +21,7 @@ from gateway.run import GatewayRunner
 from tests.module_clock import install_module_clock
 from tools.process_registry import ProcessRegistry, ProcessSession
 
+
 class AdmittingHandler(AsyncMock):
     """Fake transport whose successful insertion issues the production receipt."""
 
@@ -28,6 +29,7 @@ class AdmittingHandler(AsyncMock):
         result = await super()._execute_mock_call(event, *args, **kwargs)
         event._gateway_accepted = True
         return result
+
 
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
@@ -39,6 +41,7 @@ def isolated_registry(tmp_path, monkeypatch):
     registry = pr_module.ProcessRegistry()
     monkeypatch.setattr(pr_module, "process_registry", registry)
     return registry
+
 
 def _runner(adapter, *, origins=None):
     runner = object.__new__(GatewayRunner)
@@ -55,6 +58,7 @@ def _runner(adapter, *, origins=None):
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
     return runner
+
 
 def _async_event(delegation_id="deleg_duplicate"):
     return {

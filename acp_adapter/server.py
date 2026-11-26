@@ -794,7 +794,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 getattr(state.agent, "_supports_active_turn_redirect", False) is True
             ):
                 try:
-                    if state.agent.redirect(user_content, human=True):
+                    if state.agent.redirect(user_content):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
@@ -860,7 +860,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 return agent.run_conversation(
                     user_message=user_content, conversation_history=state.history, task_id=session_id,
                     persist_user_message=user_text or "[Image attachment]",
-                    turn_origin="user",
                 )
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)

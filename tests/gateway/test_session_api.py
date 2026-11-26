@@ -362,7 +362,7 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
         def __init__(self, session_id: str):
             self.session_id = session_id
 
-        def steer(self, text: str, *, human: bool = True) -> bool:
+        def steer(self, text: str) -> bool:
             observed["steer_text"] = text
             return True
 

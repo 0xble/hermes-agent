@@ -29,7 +29,7 @@ class _Receiver:
         self.payload = None
         self.clarify_waiting_at_steer = None
 
-    def steer(self, text, *, human=True):
+    def steer(self, text):
         self.payload = text
         # Releasing the clarify wakes the agent; a steer queued after that can miss its next prep.
         self.clarify_waiting_at_steer = clarify_gateway.get_pending(CLARIFY_ID) is not None

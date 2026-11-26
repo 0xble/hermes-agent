@@ -4,20 +4,18 @@ The channel picked that release, the user did not ask to go back: ``hermes updat
 the build is newer than the release and holds there, exiting 0, instead of refusing the
 downgrade on every attempt. An explicit ``--branch`` to a pre-runtime commit is still refused.
 """
-from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import argparse
-from contextlib import closing
 from copy import deepcopy
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-import hermes_state_runtime as rt
 from hermes_cli import main, source_releases, update_cmd
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.update_channel import set_install_channel
-from hermes_state import SessionDB
+from persistence_assembly import open_persistence, profile_scope
+from tests.fixtures.storage_seed import seed_session
 
 pytestmark = pytest.mark.real_release_channels
 
@@ -79,10 +77,10 @@ def source(tmp_path, monkeypatch):
 
 
 def _ledgered(home):
-    with closing(SessionDB(home / "state.db")) as db:
-        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
-        db.create_session("s", source="cli")
-        rt.admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
+    with open_persistence(profile_scope(home=home)) as store:
+        epoch = store.runtime.begin_epoch(instance_id="owner")
+        seed_session(store, "s", "cli")
+        store.admissions.admit(epoch=epoch, principal_id="p", session_id="s", request_id="r",
                                payload={"text": "x"})
 
 
@@ -134,7 +132,7 @@ def test_an_explicit_branch_to_a_pre_runtime_commit_is_still_refused(source, mon
     _ledgered(source.home)
 
     with pytest.raises(SystemExit) as stopped:
-        update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--branch", "release", "--yes", "--allow-drop-main"]), False)
+        update_cmd._cmd_update_impl(source.parser.parse_args(["update", "--branch", "release", "--yes"]), False)
 
     out = capsys.readouterr().out
     assert stopped.value.code == 1 and git(source.root, "rev-parse", "HEAD") == source.installed

@@ -78,7 +78,7 @@ changes without relaxing the clean-close/sticky-loss invariant.
 Regression coverage belongs in `tests/hermes_state/test_publication_wait_budget.py`
 and `tests/agent/test_compaction_events.py`, with the surrounding state,
 compaction, rollback, display, FTS, and lease suites. Run them with
-`scripts/run_tests.sh`, then the exact-head `bin/ci gate` through `semaphore`.
+`scripts/run_tests.sh`, then the exact-head `bin/ci gate` through `heavy-slot`.
 
 Upstream main `5894e750c3dba980d43b25aa29e3958149ba2c61` and relevant open PRs
 were checked. The follow-up checked guidance at upstream main
@@ -99,5 +99,3 @@ lease renewal admission, while closed
 retry changes with slow-write diagnostics. Neither supplies the fork's bounded
 publication mutex attribution. Extend the existing wrapper and warning instead
 of changing admission, patience, or retries.
-
-Contract tests: `tests/hermes_state/test_publication_wait_budget.py`, `tests/agent/test_compaction_events.py`.

@@ -71,8 +71,6 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     _add_catch_up(cron_create)
     _add_wrap_response(cron_create)
-    cron_create.add_argument("--priority", choices=("live", "production", "background"),
-        help="Business-impact lane when due jobs compete: live starts first, production is ordinary work, background is best-effort. Unset = production.")
     cron_create.add_argument("--skill", dest="skills", action="append",
         help="Attach a skill. Repeat to add multiple skills.")
     cron_create.add_argument("--script",
@@ -159,8 +157,6 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     _add_catch_up(cron_edit)
     _add_wrap_response(cron_edit, allow_inherit=True)
-    cron_edit.add_argument("--priority", choices=("live", "production", "background", ""),
-        help="Business-impact lane: live, production or background. Pass an empty string to clear back to unset/production.")
     cron_edit.add_argument("--skill", dest="skills", action="append",
         help="Replace the job's skills with this set. Repeat to attach multiple skills.")
     cron_edit.add_argument("--add-skill", dest="add_skills", action="append",

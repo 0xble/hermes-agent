@@ -26,8 +26,8 @@ Apply path validation only to cwd: PIPESTATUS keeps its generic numeric body,
 so piped verifier results retain per-segment attribution.
 
 Contract tests: `tests/tools/test_terminal_bash_parser_recovery.py`,
-  `tests/tools/test_terminal_pipeline_status.py`, `tests/tools/test_base_environment.py`,
-  `tests/tools/test_terminal_marker_extraction.py`.
+`tests/tools/test_terminal_pipeline_status.py`, `tests/tools/test_base_environment.py`,
+`tests/tools/test_terminal_marker_extraction.py`.
 The real-shell regressions preserve Bash 3.2's exit 1 and modern Bash's exit 2
 without accepting a signal, retain snapshots and aliases, and recover after a
 command removes its own working directory. Retire only when released upstream

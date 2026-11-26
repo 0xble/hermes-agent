@@ -40,21 +40,6 @@ def proof(db):
     return {"tests pass": "12 passed", "release readback matches": "release readback matches abc1234"}
 
 
-def test_replace_reports_each_missing_requirement(home):
-    from hermes_cli.goals import GoalContract, GoalManager
-
-    mgr = GoalManager("autonomy")
-    limits = "Never restart the gateway\nNever weaken the canary"
-    mgr.set("Ship the repair", contract=GoalContract(
-        verification="The repair is live", constraints=limits))
-    result = mgr.replace(reason="trim the contract", goal="Ship the repair",
-                         contract={"constraints": "Never restart the gateway"})
-    assert result["ok"] is False
-    assert result["error_code"] == "constraint_quote_required"
-    assert result["missing_requirements"] == ["Never weaken the canary"]
-    assert "Never weaken the canary" in result["error"]
-
-
 def test_completion_preserves_unproven_goal_and_records_each_gap(home):
     _, db = home
     mgr = manager()
@@ -147,7 +132,7 @@ def test_blocked_judgment_keeps_a_wake_and_breaches_survive_replacement(home, mo
 
 
 @pytest.mark.parametrize("action", ["pause", "resume", "replace", "clear"])
-def test_model_controls_apply_without_approval(home, action):
+def test_model_controls_never_request_approval_or_clear(home, action):
     manager()
     if action == "resume":
         goals.GoalManager("autonomy").pause()
@@ -156,7 +141,7 @@ def test_model_controls_apply_without_approval(home, action):
         payload={"goal": "alternate route"} if action == "replace" else None)
     assert result.get("status") != "pending"
     if action == "clear":
-        assert not result["ok"] and result["error_code"] == "retirement_proof_required", result
+        assert not result["ok"]
         assert goals.load_goal("autonomy").status == "active"
     elif action == "resume":
         # The pause above is the user's, which the agent never lifts.
@@ -164,20 +149,6 @@ def test_model_controls_apply_without_approval(home, action):
         assert goals.load_goal("autonomy").status == "paused"
     else:
         assert result["ok"], result
-
-
-@pytest.mark.parametrize("reason,allowed", [
-    ("handed off to the release session after verified takeover", True),
-    ("obsolete after handoff to the release session", False),
-])
-def test_model_clear_requires_verified_handoff(home, reason, allowed):
-    manager()
-    result = session_controls.apply_control(
-        "goal", "clear", "autonomy", requester_sid="autonomy", reason=reason)
-    assert result["ok"] is allowed, result
-    if not allowed:
-        assert result["error_code"] == "retirement_proof_required"
-        assert goals.load_goal("autonomy").status == "active"
 
 
 @pytest.mark.parametrize("pause", ["slash", "stop", "quoted_resume", "agent"])
@@ -209,11 +180,10 @@ def test_agent_resumes_only_its_own_goal_pause(home, pause):
 @pytest.mark.parametrize("reason,user_quote", [
     ("temporary dependency wait", ""),
     ("user-paused", ""),
-    ("judge blocked: dependency missing", ""),
     ("session-control", "Pause the goal."),
     ("next step", "Continue the goal."),
 ])
-def test_model_pause_persists_and_never_wakes(home, monkeypatch, entry, reason, user_quote):
+def test_model_pause_has_a_timed_native_wake(home, monkeypatch, entry, reason, user_quote):
     _, db = home
     mgr = manager()
     mgr.add_subgoal("delivery confirmed")
@@ -224,18 +194,22 @@ def test_model_pause_persists_and_never_wakes(home, monkeypatch, entry, reason, 
     result = control("goal", "pause", "autonomy", requester_sid="autonomy", reason=reason, **kwargs)
     assert result["ok"] and result["status"] == "applied", result
     state = goals.load_goal("autonomy")
-    assert state.status == "paused"
-    assert not state.waiting_until and not state.waiting_on_user_message
+    assert state.status == "active"
+    assert state.waiting_until > time.time()
+    assert not state.waiting_on_user_message and state.paused_reason is None
     assert state.contract == before.contract and state.subgoals == before.subgoals
     assert (state.turns_used, state.max_turns, state.created_at) == (
         before.turns_used, before.max_turns, before.created_at)
-    assert not goals.store_has_parked_goal(db)
-    assert goals.list_parked_goals() == []
+    assert goals.store_has_parked_goal(db)
+    assert any(sid == "autonomy" for sid, _ in goals.list_parked_goals())
     wake = goals.GoalManager("autonomy")
-    monkeypatch.setattr(goals.time, "time", lambda: before.last_turn_at + 86400)
     assert wake.lifted_barrier_prompt() is None
-    assert not wake.is_active()
-    assert "paused" in wake.status_line()
+    monkeypatch.setattr(goals.time, "time", lambda: state.waiting_until + 1)
+    assert wake.lifted_barrier_prompt() is not None
+    assert wake.clear_lifted_wait(state.waiting_since)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "next route", False, None, False))
+    decision = wake.evaluate_after_turn("try the next route", user_initiated=False)
+    assert decision["status"] == "active" and wake.state.turns_used == before.turns_used + 1
 
 
 @pytest.mark.parametrize("entry", ["slash", "quote", "stale_quote", "default_off"])
@@ -263,10 +237,13 @@ def test_user_pause_authority_stays_explicit(home, monkeypatch, entry):
             requester_sid="autonomy", reason="temporary dependency wait", user_quote=quote)
         assert result["ok"] and result["status"] == "applied", result
     state = goals.load_goal("autonomy")
-    assert state.status == "paused" and not state.waiting_until
-    assert not goals.store_has_parked_goal(db)
-    assert goals.list_parked_goals() == []
-    assert goals.GoalManager("autonomy").lifted_barrier_prompt() is None
+    if entry == "stale_quote":
+        assert state.status == "active" and state.waiting_until > time.time()
+    else:
+        assert state.status == "paused" and not state.waiting_until
+        assert not goals.store_has_parked_goal(db)
+        assert goals.list_parked_goals() == []
+        assert goals.GoalManager("autonomy").lifted_barrier_prompt() is None
 
 
 def test_legacy_blocks_and_user_waits_migrate_but_default_off_does_not(home):
@@ -360,53 +337,6 @@ def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
     assert result.get("status") != "pending"
     assert not result["ok"] and result["error_code"] == "user_paused", result
     assert goals.load_goal("autonomy").status == "paused"
-
-
-@pytest.mark.parametrize("clearer", ["user", "agent"])
-def test_only_the_current_retirement_decides_inherited_history(home, monkeypatch, clearer):
-    _, db = home
-    mgr = manager()
-    mgr.clear(reason="Superseded by the B route", actor="agent", authority="autonomy")
-    mgr = goals.GoalManager("autonomy")
-    mgr.set("Goal B", contract=goals.GoalContract(verification="tests pass; release readback matches"))
-    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (
-        "blocked", "constraint violation: restarted gateway", False, None, False))
-    mgr.evaluate_after_turn("try another route", user_initiated=False)
-    assert any(row["kind"] == "hard_limit_breach" for row in goals.load_goal("autonomy").revisions)
-    if clearer == "user":
-        mgr.clear()
-    else:
-        mgr.clear(reason="Handed off to a verified takeover", actor="agent", authority="autonomy")
-    mgr = goals.GoalManager("autonomy")
-    mgr.set("Goal C", contract=goals.GoalContract(verification="tests pass; release readback matches"))
-    inherited = goals.load_goal("autonomy").revisions
-    result = mgr.complete(reason="verified", evidence=proof(db))
-    if clearer == "user":
-        # B's inherited autonomous clear of A must not make the user's clear of B a retirement.
-        assert inherited == []
-        assert result["ok"], result
-        assert goals.load_goal("autonomy").status == "done"
-    else:
-        assert inherited[-1]["reason"] == "Previous goal cleared"
-        assert inherited[-1]["goal"] == "Goal B"
-        assert any(row.get("reason") == "Handed off to a verified takeover" for row in inherited)
-        assert not result["ok"]
-        assert "hard constraint breach" in result["error"]
-
-
-def test_autonomy_prompt_explains_reasoned_retirement_and_registry_tracks_it(home):
-    from hermes_cli.goals_autonomy import AUTONOMY_CONTINUATION_TEMPLATE
-    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
-
-    prompt = manager().next_continuation_prompt()
-    assert prompt is not None
-    assert "Never clear a goal." not in prompt
-    assert "Clear only an obsolete" in prompt
-    assert "verified takeover" in prompt
-    assert "Never clear to escape unmet criteria or failing checks" in prompt
-    assert "Use complete for an achieved goal" in prompt
-    assert any(row["formatter"] == "autonomy" and row["template"] == AUTONOMY_CONTINUATION_TEMPLATE
-               for row in GOAL_PROMPT_REGISTRY)
 
 
 def test_autonomy_reads_the_owning_profile_for_each_activity(home):

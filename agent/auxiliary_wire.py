@@ -2,12 +2,7 @@
 
 from openai import AsyncOpenAI, OpenAI
 
-from agent.proxy_request_class import apply_aux_request_class
 from agent.transports.chat_completions import ChatCompletionsTransport
-
-
-def prepare_aux_request(client, kwargs: dict, *, provider: str, api_mode: str | None, task: str | None) -> dict:
-    return apply_aux_request_class(client, prepare_chat_messages(client, kwargs), provider, api_mode, task)
 
 
 def prepare_chat_messages(client, kwargs: dict) -> dict:

@@ -51,10 +51,7 @@ def _prepare_test_tools() -> tuple[Path, dict] | None:
     try:
         for record in records.values():
             assert record is not None
-            # __pycache__ is runtime state PM's digest already skips, and a hermes launch elsewhere
-            # in the run sweeps it out of the checkout mid-copy.
-            shutil.copytree(source / record["entry"], prepared / record["entry"], symlinks=True,
-                            ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(source / record["entry"], prepared / record["entry"], symlinks=True)
         (prepared / "facts.json").write_text(
             json.dumps({"schema": 1, "packages": records}), encoding="utf-8"
         )

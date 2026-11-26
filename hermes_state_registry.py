@@ -35,9 +35,3 @@ def release(db) -> bool:
 def release_or_close(db) -> None:
     """Close ``db``."""
     release(db)
-
-
-def close_all_under(directory) -> int:
-    """Close persistence stores rooted below ``directory`` for legacy callers."""
-    from persistence_assembly import close_stores_under
-    return close_stores_under(directory)

@@ -71,8 +71,8 @@ def _open_streams(adapter, chat_id="D1"):
     return [s for k, s in adapter._active_streams.items() if k[1] == chat_id]
 
 
-META = {"thread_id": "111.000", "user_id": "U123", "_draft_id": 7}
-META_B = {"thread_id": "222.000", "user_id": "U123", "_draft_id": 8}
+META = {"thread_id": "111.000", "user_id": "U123"}
+META_B = {"thread_id": "222.000", "user_id": "U123"}
 
 
 class TestSupportsDraftStreaming:
@@ -168,33 +168,6 @@ class TestSendDraft:
         client.chat_stopStream.assert_awaited()  # sealed segment one
         (stream,) = _open_streams(adapter)
         assert stream["ts"] == "124.000"
-
-    @pytest.mark.asyncio
-    async def test_new_draft_does_not_overwrite_replacement_opened_while_sealing(self):
-        adapter, client = _make_adapter()
-        await adapter.send_draft("D1", 7, "Segment one", metadata=META)
-        client.chat_startStream = AsyncMock(side_effect=[{"ok": True, "ts": "124.000"},
-                                                          {"ok": True, "ts": "125.000"}])
-        sealing = asyncio.Event()
-        release = asyncio.Event()
-
-        async def delayed_seal(*args, **kwargs):
-            sealing.set()
-            await release.wait()
-            return True
-
-        adapter._seal_stream = delayed_seal
-        old = asyncio.create_task(adapter.send_draft("D1", 8, "Segment two", metadata=META))
-        await sealing.wait()
-        replacement = await adapter.send_draft("D1", 9, "Segment three", metadata=META)
-        release.set()
-        result = await old
-
-        assert replacement.success and replacement.message_id == "124.000"
-        assert result.success and result.message_id == "124.000"
-        assert client.chat_startStream.await_count == 1
-        (stream,) = _open_streams(adapter)
-        assert stream["draft_id"] == 9 and stream["ts"] == "124.000"
 
 
     @pytest.mark.asyncio
@@ -399,60 +372,3 @@ class TestDisconnectCleanup:
         client.chat_stopStream.assert_awaited()
         assert client.chat_stopStream.await_args.kwargs["channel"] == "D1"
         assert not adapter._active_streams
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("draft_id", [None, 99], ids=["background-body", "other-turn"])
-async def test_matching_text_without_stream_ownership_does_not_finalize(draft_id):
-    adapter, client = _make_adapter()
-    await adapter.send_draft("D1", 7, "same text", metadata=META)
-    (stream,) = _open_streams(adapter)
-    metadata = {key: value for key, value in META.items() if key != "_draft_id"}
-    metadata["notify"] = True
-    if draft_id is not None:
-        metadata["_draft_id"] = draft_id
-
-    result = await adapter.send("D1", "same text", metadata=metadata)
-
-    assert result.message_id == "999.111"
-    assert _open_streams(adapter) == [stream]
-    client.chat_postMessage.assert_awaited_once()
-    client.chat_stopStream.assert_not_awaited()
-    client.chat_update.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_consumer_final_owns_stream_while_matching_background_body_posts():
-    adapter, client = _make_adapter()
-    started = asyncio.Event()
-
-    async def start_stream(**kwargs):
-        started.set()
-        return {"ok": True, "ts": "123.456"}
-
-    client.chat_startStream.side_effect = start_stream
-    metadata = {key: value for key, value in META.items() if key != "_draft_id"}
-    consumer = GatewayStreamConsumer(adapter, "D1", StreamConsumerConfig(
-        transport="auto", chat_type="dm", edit_interval=0.01, buffer_threshold=1, cursor="",
-    ), metadata=metadata)
-    task = asyncio.create_task(consumer.run())
-    try:
-        consumer.on_delta("same text")
-        await asyncio.wait_for(started.wait(), timeout=5)
-        background = await adapter.send("D1", "same text", metadata=metadata)
-        still_open = bool(_open_streams(adapter))
-        seals_before_final = client.chat_stopStream.await_count
-    finally:
-        consumer.finish("same text, finished")
-        await asyncio.wait_for(task, timeout=5)
-
-    assert background.message_id == "999.111"
-    assert still_open
-    assert seals_before_final == 0
-    assert consumer.message_id == "123.456"
-    assert consumer.delivered_final_matches("same text, finished")
-    client.chat_postMessage.assert_awaited_once()
-    client.chat_stopStream.assert_awaited_once()
-    assert client.chat_stopStream.await_args.kwargs["markdown_text"] == ", finished"
-    assert not _open_streams(adapter)
-    assert metadata == {"thread_id": "111.000", "user_id": "U123"}

@@ -15,7 +15,6 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping
-from contextvars import ContextVar
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -34,26 +33,13 @@ from tools.environments.local_env_policy import (
     strip_profile_gate_env, strip_supervised_process_identity)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
+from tools.environments.base_session_env import (
+    _secret_fd_token, _secret_gen_token, _secret_restore_token, _secret_src_token)
+from tools.environments.local_secret_handoff import SecretHandoff, profile_secret_names
 from hermes_cli._startup_fast import project_root_str
 
 
 _IS_WINDOWS = platform.system() == "Windows"
-_PROCESS_EXIT_CLEANUP = ContextVar("terminal_process_exit_cleanup", default=False)
-
-
-@contextlib.contextmanager
-def process_exit_cleanup():
-    """Skip shared-directory scans only in the process-stop task and its workers.
-
-    Orphan atomic snapshots remain eligible for normal temp-cache housekeeping;
-    ordinary session cleanup still removes them immediately.
-    """
-    token = _PROCESS_EXIT_CLEANUP.set(True)
-    try:
-        yield
-    finally:
-        _PROCESS_EXIT_CLEANUP.reset(token)
-
 
 logger = logging.getLogger(__name__)
 
@@ -293,33 +279,6 @@ def _inject_session_context_env(env: dict) -> None:
                 env[name] = value
 
 
-def strip_session_context_env(env: dict[str, str]) -> None:
-    """Remove per-session routing metadata before spawning a sessionless child.
-
-    A cron worker is not itself a conversation, so its process environment may contain
-    the gateway's last-writer-wins session mirror without a bound ContextVar to correct it.
-    Removing the canonical session names prevents a no-agent script from attributing an
-    outbound relay to an unrelated live session.
-    """
-    try:
-        from gateway.session_context import _VAR_MAP
-        names = _VAR_MAP
-    except Exception:
-        names = {
-            "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
-            "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
-            "HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_USER_NAME",
-            "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
-            "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
-            "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
-            "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_TURN_ORIGIN",
-            "HERMES_CRON_AUTO_DELIVER_PLATFORM", "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
-            "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
-        }
-    for name in names:
-        env.pop(name, None)
-
-
 def _filter_secret_env(
     items: Mapping[str, str], out: dict, *, unwrap_force: bool,
     plugin_strip: frozenset = frozenset()) -> None:
@@ -369,8 +328,8 @@ def _finalize_child_env(env: dict) -> dict:
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
     """Filter each ``(items, unwrap_force)`` in *parts* into one env, rewrite PATH via
-    *fix_path* (keeping the Hermes install dir available without masking a client
-    session's selected toolchain), then apply the shared guards."""
+    *fix_path* (always prepending the hermes install dir so bare ``hermes`` resolves
+    for children of a systemd/cron-launched gateway), then apply the shared guards."""
     out: dict[str, str] = {}
     for items, unwrap_force in parts:
         _filter_secret_env(drop_bridge_markers(dict(items)), out, unwrap_force=unwrap_force,
@@ -769,21 +728,13 @@ def _resolve_hermes_bin_dir() -> str | None:
 
 
 def _prepend_hermes_bin_dir(existing_path: str) -> str:
-    """Keep Hermes available without masking the toolchain selected for a client.
-
-    A sealed payload's launcher still moves first: another install's redirector
-    may not run. Bound client sessions keep their selected PATH, including its
-    gateway fallback. Unbound service jobs keep the install-dir-first behavior.
-    """
+    """Prepend the hermes install dir to ``existing_path`` if missing. A sealed payload's
+    launcher dir moves to the front even when already listed: a login PATH can list
+    another install's ``hermes`` ahead of it."""
     bin_dir = _resolve_hermes_bin_dir()
     if bin_dir and _HERMES_BIN_DIR_IS_PAYLOAD:
         rest = [entry for entry in existing_path.split(os.pathsep) if entry and entry != bin_dir]
         return os.pathsep.join([bin_dir, *rest])
-    if bin_dir:
-        from agent.session_client_env import bound_client_env
-        if bound_client_env() is not None:
-            entries = [entry for entry in existing_path.split(os.pathsep) if entry]
-            return os.pathsep.join(dict.fromkeys([*entries, bin_dir]))
     return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
 
 
@@ -1076,15 +1027,13 @@ def _leader_is_ours(pgid, expected_start) -> bool:
         return True
 
 
-def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> None:
+def _kill_process_group_posix(proc) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
     grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller).
     PID-reuse guard (#43044): the group is only signalled while its leader's start
-    time still matches the spawn-time baseline — a recycled PGID is never killed.
-    ``snapshot_descendants=False`` is the shutdown path: no host-wide psutil scan,
-    but the same group guards, bounded TERM→KILL waits and wrapper reaping remain."""
+    time still matches the spawn-time baseline — a recycled PGID is never killed."""
     expected_start = getattr(proc, "_hermes_pgid_start", None)
     try:
         pgid = os.getpgid(proc.pid)
@@ -1097,8 +1046,6 @@ def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> Non
         # orphaned grandchild may leak, which is strictly preferable to killing a
         # stranger. Sweep the snapshotted descendants by PID (identity-checked)
         # so we still reach escapees that are verifiably ours.
-        if not snapshot_descendants:
-            return
         descendants = []
         try:
             import psutil
@@ -1107,13 +1054,11 @@ def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> Non
             pass
         _sweep_escaped_descendants(descendants, pgid)
         return
-    descendants = []
-    if snapshot_descendants:
-        try:  # empty on any failure (must never break the kill)
-            import psutil
-            descendants = psutil.Process(proc.pid).children(recursive=True)
-        except Exception:
-            descendants = []
+    try:  # psutil children snapshot; empty on any failure (must never break the kill)
+        import psutil
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+    except Exception:
+        descendants = []
     if pgid == os.getpgrp():
         # The child shares OUR group (a spawner that skipped setsid — the Darwin gateway's
         # posix_spawn shim, #107029): killpg would signal the caller itself. Tear down by PID.
@@ -1193,7 +1138,20 @@ class LocalEnvironment(BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True):
         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)
+        self._secret_handoff = SecretHandoff()
         self.init_session()
+
+    def _secret_dump_args(self) -> dict:
+        """Secret exports leave the snapshot file through a pipe ``_run_bash`` hands the shell and
+        reach the next command as process env (``local_secret_handoff``, #62336). The script names
+        the pipe by a per-session token; ``_run_bash`` swaps in the fd number it opened. Windows has
+        no ``pass_fds``, so Git Bash keeps the on-disk snapshot as it was."""
+        if _IS_WINDOWS or getattr(self, "_secret_handoff", None) is None:
+            return {}
+        names = (*profile_secret_names(), *self._secret_handoff.names())
+        return {"secret_fd": _secret_fd_token(self._session_id), "secret_names": names,
+                "secret_gen": _secret_gen_token(self._session_id), "secret_src": _secret_src_token(self._session_id),
+                "secret_restore": _secret_restore_token(self._session_id)}
 
     def get_temp_dir(self) -> str:
         """Shell-safe writable temp dir. Precedence: ``TERMINAL_TEMP_DIR``, TMPDIR/TMP/TEMP
@@ -1259,54 +1217,59 @@ class LocalEnvironment(BaseEnvironment):
             return (cwd if resolved != cwd else safe_cwd), None
         return safe_cwd, {"requested": cwd, "used": safe_cwd}
 
-    def _recover_cwd(self) -> None:
-        """Swap ``self.cwd`` for a usable directory if it vanished or is inaccessible
-        (e.g. a command ``rm -rf``'d its own cwd) — otherwise Popen raises before bash
-        starts and every subsequent call fails. A benign MSYS→Windows normalization
-        is not warned about."""
-        # Recover when the cwd has been deleted out from under us — usually by a previous tool call that ran
-        # ``rm -rf`` on its own working dir (issue #17558). On Windows, ``_resolve_safe_cwd`` also
-        # normalises Git Bash-style POSIX paths (``/c/Users/...``) to native form so a perfectly valid ``pwd
-        # -P`` result from bash isn't mistakenly treated as "missing" and spammed as a warning on every
-        # command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd == self.cwd:
-            return
-        if safe_cwd != _msys_to_windows_path(self.cwd):
-            logger.warning(
-                "LocalEnvironment cwd %r is missing on disk; "
-                "falling back to %r so terminal commands keep working.",
-                self.cwd, safe_cwd)
-        self.cwd = safe_cwd
+    def _spawn_cwd(self) -> str:
+        """A directory bash can be spawned in: ``self.cwd``, or a usable ancestor if it vanished
+        (e.g. a command ``rm -rf``'d its own cwd) — otherwise Popen raises before bash starts
+        (#17558). Never stored: the wrapper's ``cd`` decides where the command runs, and only
+        ``execute(allow_cwd_fallback=True)`` may move it (the cwd marker then heals ``self.cwd``).
+        Persisting the swap here made file operations resolve relative paths against the ancestor
+        and read a different file. On Windows ``_resolve_safe_cwd`` also normalises ``/c/...``."""
+        return _resolve_safe_cwd(self.cwd)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
-        # Login invocations still load shell functions and custom init files. A login
-        # profile may reset PATH, so carry the selected toolchain separately through it.
+        handoff = getattr(self, "_secret_handoff", None)  # absent on bare test doubles (__new__)
+        session_id = getattr(self, "_session_id", "")
+        token = _secret_fd_token(session_id)
+        secret_fd, source_fd, restore_fd, secret_reader = -1, -1, -1, None
+        if handoff is not None and token in cmd_string:
+            # This session's secret exports ride the command's own env, never the snapshot file;
+            # the dump writes the new set to the pipe (``local_secret_handoff``, #62336). Names the
+            # wrapper save/restores (declared key holders, profile passthrough) take the run env's
+            # value, exactly as when the snapshot carried them, so a scrubbed key stays scrubbed.
+            if not login:
+                source_fd, restore_fd = handoff.open_source(
+                    self._shell_state_paths(), skip=self._snapshot_excluded_passthrough_names())
+                cmd_string = (cmd_string.replace(_secret_src_token(session_id), str(source_fd))
+                              .replace(_secret_restore_token(session_id), str(restore_fd)))
+            generation = handoff.new_generation()
+            secret_fd, secret_reader = handoff.start_reader(self._snapshot_write_path(login), generation)
+            cmd_string = cmd_string.replace(token, str(secret_fd)).replace(_secret_gen_token(session_id), generation)
+        # Login invocations (init_session's env snapshot) source the user's rc /
+        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
+        # spawn env's dirs a resetting profile dropped are re-appended (#56634).
         if login:
-            if not _IS_WINDOWS:
-                from agent.session_client_env import bound_client_env
-                if bound_client_env() is not None or 'PATH' in self.env:
-                    run_env['_HERMES_LOCAL_LAUNCH_PATH'] = run_env.get('PATH', '')
-                    cmd_string = ('export PATH="$_HERMES_LOCAL_LAUNCH_PATH"\n'
-                                  'unset _HERMES_LOCAL_LAUNCH_PATH\n' + cmd_string)
-                else:
-                    # Unbound shells keep login-selected precedence and regain dropped tools.
-                    cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
+            cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
-        self._recover_cwd()
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
-        proc = subprocess.Popen(
-            args, text=True, env=run_env, encoding="utf-8", errors="replace",
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            # detached-spawn: ok — owned via own_process_groups right below
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        try:
+            proc = subprocess.Popen(
+                args, text=True, env=run_env, encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                # detached-spawn: ok — owned via own_process_groups right below
+                start_new_session=True, cwd=self._spawn_cwd(),
+                pass_fds=tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0),
+                creationflags=windows_hide_flags() if _IS_WINDOWS else 0)
+        finally:
+            for fd in (secret_fd, source_fd, restore_fd):
+                if fd >= 0:
+                    os.close(fd)  # the child holds its copy; the reader sees EOF once it is gone
+        proc._hermes_secret_reader = secret_reader
         if not _IS_WINDOWS:
             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
             # running `npm run dev` or `sleep` on init. Released once the wait returns (see below).
@@ -1328,10 +1291,13 @@ class LocalEnvironment(BaseEnvironment):
         """Base wait, then hand the command's group back from the owner-death supervisor: once the
         command returned, what it left running in the background (`server &`) is not ours to kill,
         exactly as on a graceful exit. A command that yielded to background took the group with it
-        (``ProcessRegistry.adopt_local`` clears ``_hermes_owned_pgid``)."""
+        (``ProcessRegistry.adopt_local`` clears ``_hermes_owned_pgid``). The secret hand-off reader
+        is joined first, so the next command sees what this one exported."""
         try:
             return super()._wait_for_process(proc, *args, **kwargs)
         finally:
+            if (reader := getattr(proc, "_hermes_secret_reader", None)) is not None:
+                reader.join(timeout=2)
             if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
                 proc._hermes_owned_pgid = None
                 release_process_groups([owned_pgid])
@@ -1354,21 +1320,9 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the owned group; ordinary cancellation also sweeps setsid escapees."""
-        from tools.environments.base import foreground_cleanup_in_progress
-        from tools.interrupt import INTERRUPT_REASON_GATEWAY_SHUTDOWN, get_interrupt_reason
-
-        shutdown = not _IS_WINDOWS and (foreground_cleanup_in_progress()
-                                         or get_interrupt_reason() == INTERRUPT_REASON_GATEWAY_SHUTDOWN)
+        """Kill the entire process group (all children)."""
         try:
-            if shutdown:
-                # macOS children(recursive=True) scans every host PID's ppid. Repeating
-                # it on concurrent interrupted tool workers can consume the watchdog
-                # before ANY signal is sent. Keep bounded group teardown and all PGID
-                # guards, but omit the best-effort escapee snapshot during shutdown.
-                _kill_process_group_posix(proc, snapshot_descendants=False)
-            else:
-                (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
@@ -1388,20 +1342,17 @@ class LocalEnvironment(BaseEnvironment):
         with contextlib.suppress(OSError):
             proc.kill()
 
-    def _extract_cwd_from_output(self, result: dict):
+    def _parse_cwd_marker(self, result: dict):
         """Base semantics plus: Git Bash ``pwd -P`` emits MSYS form on Windows —
         normalize to native and require the dir to exist, else ``_run_bash`` would
-        warn every command. A stale path rolls back to the previous cwd, which this
-        command did not observe, so ``cwd_observed`` is dropped."""
-        prev_cwd = self.cwd
-        super()._extract_cwd_from_output(result)
-        if self.cwd != prev_cwd:
-            normalized = _msys_to_windows_path(self.cwd)
+        warn every command. A stale path is not an observation, so ``cwd_observed``
+        is dropped and ``self.cwd`` keeps its value."""
+        super()._parse_cwd_marker(result)
+        if result.get("cwd_observed"):
+            normalized = _msys_to_windows_path(result["cwd"])
             if normalized and os.path.isdir(normalized):
-                self.cwd = normalized
                 result["cwd"] = normalized
             else:
-                self.cwd = prev_cwd
                 result.pop("cwd_observed", None)
                 result.pop("cwd", None)
 
@@ -1414,12 +1365,11 @@ class LocalEnvironment(BaseEnvironment):
         import glob
         try:
             # Delegated children's per-task snapshots (``_task_snapshot_path``) and their temps.
-            stale = [] if _PROCESS_EXIT_CLEANUP.get() else (
-                glob.glob(f"{self._snapshot_path}.tmp.*")
-                + glob.glob(f"{self._snapshot_path[:-3]}-*.sh*")
-            )
+            stale = glob.glob(f"{self._snapshot_path}.tmp.*") + glob.glob(f"{self._snapshot_path[:-3]}-*.sh*")
         except Exception:
             stale = []
         for f in (self._snapshot_path, self._cwd_file, *stale):
             with contextlib.suppress(OSError):
                 os.unlink(f)
+        if (handoff := getattr(self, "_secret_handoff", None)) is not None:
+            handoff.forget()

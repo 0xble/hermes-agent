@@ -15,9 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SendResult, outbound_class, utf16_len
+from gateway.platforms.base import OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SendResult, outbound_class
 from plugins.platforms.telegram import daily_quota as dq
-from plugins.platforms.telegram import progress as telegram_progress
 from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
 from plugins.platforms.telegram.daily_quota import DailyQuota
 
@@ -214,26 +213,6 @@ def _spend(adapter, n):
 
 def test_ceiling_comes_from_platform_extra(tmp_path):
     assert _adapter(tmp_path, ceiling=1234)._daily_quota().soft_ceiling == 1234
-
-
-def test_daily_pause_notice_is_italic_and_long_progress_fits_limit(tmp_path):
-    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
-
-    adapter = _adapter(tmp_path)
-    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
-    _spend_calls(adapter._daily_quota(), 10)
-    token = bind_trigger(SimpleNamespace(text="show the verbose tool arguments"))
-    try:
-        raw = adapter.format_progress_text(CHAT, "Reading " + "x" * 10000)
-    finally:
-        reset_trigger(token)
-    rendered = adapter.format_message(raw)
-    formatted_notice = adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}")
-
-    assert formatted_notice == f"\n_{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE.strip('*')}_"
-    assert raw.endswith(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}")
-    assert rendered.endswith(formatted_notice)
-    assert utf16_len(rendered) <= adapter.MAX_MESSAGE_LENGTH
 
 
 def _voice_runner_and_event(adapter):
@@ -701,9 +680,9 @@ async def test_tool_progress_edits_follow_daily_budget_without_restoring_typing(
         assert bool((edited.raw_response or {}).get("skipped")) is bool(used)
         adapter._bot.send_message.assert_awaited_once()
         first_text = adapter._bot.send_message.call_args.kwargs["text"]
-        assert (telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE.strip("*") in first_text) is bool(used)
+        assert ("Live updates paused" in first_text) is bool(used)
         if used:
-            assert first_text.endswith(adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}"))
+            assert first_text.endswith(adapter.format_message("Live updates paused (daily Telegram limit)"))
         assert getattr(state, "skipped_edits", 0) == (1 if used else 0)
         assert adapter._bot.edit_message_text.await_count == (0 if used else 1)
         if used:
@@ -865,7 +844,7 @@ async def test_initial_tool_bubble_does_not_exempt_adapter_split_continuations(t
         assert not used or state.tool_progress_sent
         if used:
             first_text = adapter._bot.send_message.call_args_list[0].kwargs["text"]
-            assert first_text.endswith(adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}"))
+            assert first_text.endswith(adapter.format_message("Live updates paused (daily Telegram limit)"))
     finally:
         reset_trigger(token)
 

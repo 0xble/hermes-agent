@@ -1,17 +1,12 @@
-"""Isolated script and protected-interval lanes beside the general executor.
-
-Due jobs are submitted by business priority (``cron.constants.job_priority_rank``), and the script
-lane keeps that order across ticks. The general, reserved and person-send executors stay FIFO.
-"""
+"""Isolated script and protected-interval lanes beside the FIFO general executor."""
 
 import concurrent.futures
-import heapq
 import logging
 import threading
 import time
 from datetime import datetime
 
-from cron.constants import is_protected_interval, job_priority_rank
+from cron.constants import is_protected_interval
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger("cron.scheduler")
@@ -25,75 +20,6 @@ _lock = threading.Lock()
 _wake = threading.Event()
 _tick_scans = threading.local()
 _SLOT_WAKE_CHECK_SECONDS = 0.25
-
-
-PRODUCTION_RANK = 1
-
-
-class PriorityThreadPoolExecutor:
-    """Script-lane executor: best business rank first, FIFO within a rank.
-
-    A thin wrapper over the public ThreadPoolExecutor API. Each submit pushes one entry on a
-    heap and exactly one ``_run_next`` token on the inner executor, so tokens always equal
-    entries. Whichever worker takes a token runs the best entry queued at that moment: a live
-    job submitted behind a backlog overtakes it as soon as any worker frees. Because nothing is
-    resubmitted later, the inner executor's own shutdown contract applies unchanged: with
-    ``cancel_futures=False`` every queued token still drains and completes its entry. Worker
-    count is the inner pool's.
-    """
-
-    def __init__(self, max_workers: int, *, thread_name_prefix: str):
-        self._inner = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix=thread_name_prefix)
-        self._lock = threading.Lock()
-        self._heap: list = []
-        self._sequence = 0
-
-    def submit(self, fn, /, *args, **kwargs):
-        return self.submit_ranked(PRODUCTION_RANK, fn, *args, **kwargs)
-
-    def submit_ranked(self, rank: int, fn, /, *args, **kwargs):
-        future = concurrent.futures.Future()
-        with self._lock:
-            entry = (rank, self._sequence, fn, args, kwargs, future)
-            self._sequence += 1
-            heapq.heappush(self._heap, entry)
-            try:
-                self._inner.submit(self._run_next)
-            except BaseException:
-                self._heap.remove(entry)
-                heapq.heapify(self._heap)
-                raise
-        return future
-
-    def _run_next(self) -> None:
-        with self._lock:
-            if not self._heap:
-                # A token whose submit raised after the inner pool queued it (thread start failed)
-                # outlives its removed entry; it has nothing to run.
-                return
-            _, _, fn, args, kwargs, future = heapq.heappop(self._heap)
-        if future.set_running_or_notify_cancel():
-            try:
-                future.set_result(fn(*args, **kwargs))
-            except BaseException as exc:  # health: allow BLE001 -- executor boundary: the caller's Future owns the exception, exactly as ThreadPoolExecutor's own worker does
-                future.set_exception(exc)
-
-    def shutdown(self, wait=True, *, cancel_futures=False):
-        if cancel_futures:
-            with self._lock:
-                pending = [entry[-1] for entry in self._heap]
-            for future in pending:
-                future.cancel()
-        # Tokens for cancelled entries still pop and skip them, keeping the count exact.
-        self._inner.shutdown(wait=wait, cancel_futures=False)
-
-
-def submit_ranked(pool, job: dict, fn, /, *args):
-    """Submit with the job's business rank when the pool orders by rank; plain pools ignore it."""
-    if isinstance(pool, PriorityThreadPoolExecutor):
-        return pool.submit_ranked(job_priority_rank(job), fn, *args)
-    return pool.submit(fn, *args)
 
 
 class AgentAdmissionRequired(Exception):
@@ -153,12 +79,11 @@ def script_pool(home, lane="script"):
 
 
 def reserved_job_id(jobs: list[dict], home) -> str | None:
-    """Select the best-impact eligible protected job; ties retain persisted store order."""
+    """Select in store order, not due order, so a later deadline cannot steal the reservation."""
     from cron.jobs import is_job_runnable, is_terminal_job
 
     eligible = tuple(
-        str(job["id"]) for job in sorted(
-            jobs, key=job_priority_rank)
+        str(job["id"]) for job in jobs
         if is_protected_interval(job) and is_job_runnable(job) and not is_terminal_job(job))
     key = hermes_home_key(home)
     with _lock:
@@ -189,10 +114,9 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
             # Selection can change while the previous owner still holds its fenced slot.
             # Treat the replacement as overflow, keeping its place in the general FIFO.
             reserved_id = None
-    due_jobs = sorted(due_jobs, key=job_priority_rank)
     futures = []
-    # Start the reserved lane before general submission bookkeeping. Within a rank, due-scan
-    # order is kept for every lane (including protected extras in the general pool).
+    # Start the reserved lane before general submission bookkeeping, without changing
+    # the relative admission order of any general-pool jobs (including protected extras).
     for job in due_jobs:
         if job["id"] == reserved_id:
             future = submit_reserved(job, process_job)
@@ -219,9 +143,8 @@ def _get_lane_pool(key: str, lane: str) -> concurrent.futures.ThreadPoolExecutor
     pools = _lane_pools[lane]
     pool = pools.get(key)
     if pool is None:
-        pool = (PriorityThreadPoolExecutor(max_workers=4, thread_name_prefix="cron-script")
-                if lane == "script" else concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix=f"cron-{lane}"))
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4 if lane == "script" else 1, thread_name_prefix=f"cron-{lane}")
         pools[key] = pool
     return pool
 

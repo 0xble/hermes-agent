@@ -47,7 +47,7 @@ class StatusDelivery:
             task.add_done_callback(self.tasks.discard)
         else:
             self.owners[mid] = adapter
-            self.ctx.track_cleanup_id(mid)
+            self.ctx._cleanup_msg_ids.append(mid)
 
     async def delete(self, adapter, mid):
         with suppress(Exception):

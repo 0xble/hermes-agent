@@ -44,6 +44,7 @@ from hermes_cli.profiles import (
 )
 from hermes_cli.config import DEFAULT_CONFIG
 
+
 # ---------------------------------------------------------------------------
 # Shared fixture: redirect Path.home() and HERMES_HOME for profile tests
 # ---------------------------------------------------------------------------
@@ -61,6 +62,7 @@ def profile_env(tmp_path, monkeypatch):
     default_home.mkdir(exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     return tmp_path
+
 
 # ===================================================================
 # TestValidateProfileName
@@ -88,6 +90,7 @@ class TestNormalizeProfileName:
         # non-string coercion created the phantom profile.
         assert normalize_profile_name("0") == "0"
 
+
 class TestValidateProfileName:
     """Tests for validate_profile_name()."""
 
@@ -95,6 +98,7 @@ class TestValidateProfileName:
     def test_valid_names_accepted(self, name):
         # Should not raise
         validate_profile_name(name)
+
 
     @pytest.mark.parametrize("name", ["UPPER", "has space", ".hidden", "-leading"])
     def test_invalid_names_rejected(self, name):

@@ -4,7 +4,6 @@ import time
 import pytest
 
 from persistence.core.errors import AuthorityRefusal
-from hermes_state_runtime import RuntimeStoreError
 from persistence.sqlite.conversation._store.core import REACTIONS_METADATA_KEY
 from persistence.sqlite.conversation._store.messages import (
     append_message, append_messages_batch, archive_and_compact, get_messages_as_conversation, set_message_reaction,

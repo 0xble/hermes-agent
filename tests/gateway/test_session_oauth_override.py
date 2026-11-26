@@ -187,9 +187,9 @@ def test_managed_session_route_bypasses_channel_resolution(tmp_path, monkeypatch
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", resolve)
     model, runtime = runner._resolve_session_agent_runtime(source=source, session_key="session")
     assert model == "selected-model"
-    assert runtime == {**{k: override.get(k) for k in (
+    assert runtime == {k: override.get(k) for k in (
         "provider", "requested_provider", "api_key", "base_url", "api_mode", "max_tokens",
-        "credential_pool", "request_overrides", "capabilities")}, "model_pinned": True}
+        "credential_pool", "request_overrides", "capabilities")}
     assert runtime["api_key"] == "fresh-key"
     assert runtime["credential_pool"] is None
     assert override["credential_pool"] is None

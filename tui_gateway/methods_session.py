@@ -1269,7 +1269,7 @@ def _(rid, params: dict) -> dict:
         with (_session_profile_runtime_scope(session) if session else contextlib.nullcontext()):
             return _ok(rid, {"text": run_oneshot(
                 instructions=instructions, user_input=user_input, template=template, variables=variables,
-                task=(params.get("task") or "oneshot").strip() or "oneshot",
+                task=(params.get("task") or "title_generation").strip() or "title_generation",
                 max_tokens=_int_param(params, "max_tokens", 1024) or 1024, temperature=temperature,
                 main_runtime=_main_runtime_from_agent(session.get("agent")) if session else None)})
     except (KeyError, ValueError) as e:

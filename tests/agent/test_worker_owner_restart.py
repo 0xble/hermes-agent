@@ -129,8 +129,8 @@ def test_absent_owner_deadline_preserves_journal_and_explains_cause(tmp_path, mo
     from agent import runtime_session_store as worker
     from agent.turn_explainers import TurnExplainersMixin
     from hermes_cli import gateway_runtime, gateway_runtime_discovery as discovery
-    from persistence.sqlite._state.errors import PERSISTENCE_ERROR_CAUSES, classify_persistence_error
-    from storage_user_copy import describe_storage_failure
+    from hermes_state_errors import PERSISTENCE_ERROR_CAUSES, classify_persistence_error
+    from hermes_state_user_copy import describe_storage_failure
 
     # A virtual clock proves the full production patience without wall-clock sleeps.
     clock = SimpleNamespace(now=0.0, waits=[])

@@ -67,32 +67,6 @@ def validate_schedule_knobs(
             f"missed); this job's schedule kind is {kind!r}.")
 
 
-CATCH_UP_TICK_SECONDS = 60  # the ticker's default scan interval (cron/scheduler_provider.py)
-
-
-def validate_catch_up_floor(schedule: dict, limit: Optional[float]) -> None:
-    """Reject a catch-up deadline a protected interval (<= 2 min) cannot meet.
-
-    These jobs start late by up to about one scheduler tick under ordinary load, because a busy
-    tick dispatches after the deadline it scanned for and the fire claim then waits on the shared
-    jobs lock. A strict deadline below one cadence plus one tick therefore skips routine
-    occurrences and alerts the owner each time, while buying no freshness: the next occurrence is
-    at most one cadence away. Longer intervals and cron schedules keep the documented strict
-    semantics, including 0.
-    """
-    from cron.constants import PROTECTED_INTERVAL_MAX_SECONDS, is_protected_interval
-
-    if limit is None or not is_protected_interval({"schedule": schedule}):
-        return
-    floor = float(schedule["minutes"]) * 60 + CATCH_UP_TICK_SECONDS
-    if limit < floor:
-        raise ValueError(
-            f"max_catch_up_lateness_seconds={limit:g} is below {floor:g}s, the routine start "
-            f"lateness of an interval of {PROTECTED_INTERVAL_MAX_SECONDS // 60} minutes or less "
-            f"(one cadence plus one {CATCH_UP_TICK_SECONDS}s scheduler tick); occurrences would "
-            f"be skipped routinely. Use at least {floor:g}, or omit it to never skip.")
-
-
 def _script_is_command_line(script: str) -> bool:
     """A ``script`` with whitespace that resolves to no file is a command line (``echo hi``),
     not a path; run every tick it would deliver "Script not found" as the payload. A plain

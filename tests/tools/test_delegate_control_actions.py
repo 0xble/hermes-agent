@@ -34,7 +34,7 @@ class _StubChild:
         if parent is not None:
             self._delegate_parent_ref = weakref.ref(parent)
 
-    def steer(self, text: str, *, human: bool = True) -> bool:
+    def steer(self, text: str) -> bool:
         if not self.accept_steer:
             return False
         self.steered.append(text)

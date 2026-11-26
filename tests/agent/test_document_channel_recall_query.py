@@ -3,7 +3,7 @@ import pytest
 
 from agent.attachment_context import format_document_content, strip_inbound_recall_context
 from agent.synthetic_prompt import auto_recall_query
-from session_rules.turns import flatten_message_text
+from agent.message_content import flatten_message_text
 
 
 CAPTION = 'What deadlines did we agree on?\n\nKeep both paragraphs of my caption.'

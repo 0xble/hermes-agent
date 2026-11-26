@@ -37,7 +37,6 @@ class StubProvider:
         self.primary_available = False
         self.retry_after: str | None = "7200"
         self.failure_status = 429
-        self.billing_failures = 0
         self.requests: list[dict] = []
         stub = self
 
@@ -55,11 +54,7 @@ class StubProvider:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
                 model = body.get("model")
                 stream = bool(body.get("stream"))
-                if model == PRIMARY_MODEL and stub.billing_failures:
-                    stub.billing_failures -= 1
-                    ok = False
-                else:
-                    ok = model != PRIMARY_MODEL or stub.primary_available
+                ok = model != PRIMARY_MODEL or stub.primary_available
                 status = 200 if ok else stub.failure_status
                 stub.requests.append({"model": model, "status": status, "stream": stream})
                 if not ok:
@@ -127,12 +122,11 @@ import json, sys
 from run_agent import AIAgent
 url, mode = sys.argv[1:3]
 notices = []
-fallback = [] if mode == "nonproxy" else [{"provider": "custom", "model": "fallback-model", "base_url": url, "api_key": "fixture", "api_mode": "chat_completions"}]
+fallback = [{"provider": "custom", "model": "fallback-model", "base_url": url, "api_key": "fixture", "api_mode": "chat_completions"}]
 agent = AIAgent(
     api_key="fixture", base_url=url, provider="custom", model="primary-model",
     api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True,
     enabled_toolsets=[], fallback_model=fallback, max_iterations=3,
-    requested_provider="cliproxy" if mode == "pooled" else None,
     platform="cron" if mode == "direct" else None,
     status_callback=lambda kind, message: notices.append(str(message)),
 )
@@ -156,12 +150,6 @@ print(json.dumps({
 
 def run_turn(hermes_home: Path, url: str, mode: str = "stream") -> dict:
     """Run one real conversation turn in a separate process against the stub."""
-    if mode == "pooled":
-        (hermes_home / "config.yaml").write_text(
-            "providers:\n  cliproxy:\n    api: " + url + "\n    api_key: fixture\n"
-            "    hermes_request_class: true\n",
-            encoding="utf-8",
-        )
     env = os.environ.copy()
     env.update({
         "HERMES_HOME": str(hermes_home),

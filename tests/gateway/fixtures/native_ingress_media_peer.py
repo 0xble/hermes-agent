@@ -146,9 +146,6 @@ async def probe(mode, peer):
         task = authority.sessions[sid].task
         if task:
             await asyncio.wait_for(task, 35)
-        notices = list(getattr(authority, 'pause_announcements', {}).values())
-        if notices:
-            await asyncio.wait_for(asyncio.gather(*notices, return_exceptions=True), 35)
         after = rows(sid)
         assert after[0]['status'] == 'terminal' and after[0]['outcome'] == 'completed', after
         assert after[0]['payload'] == before['saved']['payload']
@@ -167,9 +164,6 @@ async def probe(mode, peer):
             delivery = next(d for d in adapter.deliveries if 'LOCAL_ACK' in d['content'])
             assert delivery['chat_id'] == source.chat_id and delivery['reply_to'] == 'media-1', delivery
             assert delivery['metadata']['thread_id'] == 'topic-7', delivery
-            # The lost turn's chat is told once, by the boot that fenced it (restart-pause-notice).
-            paused = [d['chat_id'] for d in adapter.deliveries if 'This conversation is paused' in d['content']]
-            assert paused == ['unknown-media'], adapter.deliveries
         else:
             assert not peer.requests and not adapter.deliveries
         (state / 'recovered.json').write_text(json.dumps(dict(model_calls=len(peer.requests),

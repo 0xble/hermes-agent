@@ -105,31 +105,6 @@ def test_tui_wakeup_stream_never_shows_the_marker(monkeypatch):
     assert "".join(_run(LOOP_WAKEUP, "Queue is 2.", ["Checking.", "\n\nQueue is 2."])) == "Checking.\n\nQueue is 2."
 
 
-def test_tui_forwards_user_origin_only_for_identified_user_turns(monkeypatch):
-    from tui_gateway.prompt_turn import _TurnRun
-
-    # The server installs this function with its shared handler globals.
-    invoke_agent = getattr(srv, "_invoke_agent")
-
-    monkeypatch.setattr(srv, "_emit", lambda *_a, **_k: None)
-    monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
-    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (
-        SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
-    seen = []
-
-    def run_conversation(_message, *, turn_origin="unknown", **kwargs):
-        seen.append(turn_origin)
-        return {"final_response": "ok"}
-
-    agent = SimpleNamespace(run_conversation=run_conversation)
-    session = {"session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
-    for user_turn, origin in ((True, "user"), (False, "goal_loop")):
-        st = _TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
-        invoke_agent("sid", session, st, LOOP_WAKEUP, LOOP_WAKEUP, None, [], None, None,
-                     user_turn=user_turn, turn_origin=origin)
-    assert seen == ["user", "goal_loop"]
-
-
 def test_tui_voice_fallback_speaks_delivered_text_not_the_marker(monkeypatch):
     spoken = []
     monkeypatch.setattr(srv, "_voice_tts_enabled", lambda: True)
@@ -181,14 +156,6 @@ def test_cli_wakeup_stream_drops_a_bare_marker_and_streams_real_replies(monkeypa
     cli._stream_delta("ENT] noted, but the queue is 2.\n")
     cli._flush_stream()
     assert any("the queue is 2." in line for line in emitted)
-
-    # A combined silent reply with the loop control marker stays hidden, whole or in pieces.
-    for chunks in (["[SILENT]\nLOOP_COMPLETE"], ["[SIL", "ENT]", "\nLO", "OP_COMP", "LETE\n"]):
-        cli, emitted = _cli_stub(monkeypatch, quiet=True)
-        for chunk in chunks:
-            cli._stream_delta(chunk)
-        cli._flush_stream()
-        assert emitted == [] and cli._stream_box_opened is False
 
     cli, emitted = _cli_stub(monkeypatch, quiet=False)
     cli._stream_delta("[SILENT]\n")
@@ -266,10 +233,6 @@ def test_cli_streaming_tts_never_speaks_a_wakeup_marker(monkeypatch):
     assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["[SIL", "ENT]"]) == ""
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["Checking the queue.", "\n\n[SILENT]"]) == "Checking the queue."
-    assert _cli_streaming_tts_turn(
-        monkeypatch, quiet=True, chunks=["[SILENT]\nLOOP_COMPLETE"]) == ""
-    assert _cli_streaming_tts_turn(
-        monkeypatch, quiet=True, chunks=["[SIL", "ENT]\nLO", "OP_COMPLETE"]) == ""
     assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["NO"]) == "NO"
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["Queue", " is 2."]) == "Queue is 2."

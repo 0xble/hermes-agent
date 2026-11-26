@@ -13,11 +13,10 @@ def _readiness_issue() -> str:
     from hermes_constants import get_hermes_home
     from pm.plugins_state import read_home_selection
     from plugins.memory import load_memory_provider
-    from agent.memory_provider import is_core_memory_provider
 
     config = read_home_selection(get_hermes_home()) or {}
     name = (config.get("memory") or {}).get("provider")
-    if is_core_memory_provider(name):
+    if not name or not name.strip():
         return ""
     provider = load_memory_provider(name.strip(), register_skills=False)
     if provider is None:
@@ -31,14 +30,9 @@ def _readiness_issue() -> str:
         return ""
     from hermes_cli.memory_setup import memory_provider_dependency_inputs
     from packaging.requirements import Requirement
-    packages = []
-    try:
-        manifest, _inputs = memory_provider_dependency_inputs(name.strip())
-        packages = [Requirement(raw).name for raw in
-                    (manifest.get("python_dependencies") or manifest.get("pip_dependencies") or ())]
-    except Exception:  # health: allow BLE001 -- marker identity fallback must never break readiness checks
-        # Optional package names enrich the warning, never gate its delivery.
-        logger.debug("Could not read memory client package hints for %s", name, exc_info=True)
+    manifest, _inputs = memory_provider_dependency_inputs(name.strip())
+    packages = [Requirement(raw).name for raw in
+                (manifest.get("python_dependencies") or manifest.get("pip_dependencies") or ())]
     detail = f" Client packages: {', '.join(packages)}." if packages else ""
     return (f"Memory provider {name} is unavailable: {reason}{detail} "
             "Run `hermes pm install` (or `hermes pm repair` for a broken client), then restart Hermes.")
@@ -51,36 +45,9 @@ def _marker(home: Path) -> Path:
     return home / "state" / "memory-client-health" / key
 
 
-def _failure_key(home: Path) -> str:
-    try:
-        return str(_marker(home))
-    except Exception:  # health: allow BLE001 -- marker identity fallback must never break readiness checks
-        return f"{__file__}:{home}"
-def _health_scopes(runner) -> list[tuple[str | None, Path]]:
-    from gateway.run import _multiplex_profile_homes
-    from hermes_constants import get_hermes_home
-
-    config = getattr(runner, "config", None)
-    if config is not None and getattr(config, "multiplex_profiles", False):
-        # Adapter ownership uses None for the served default home, not the launch home.
-        return [(None if name == "default" else name, Path(home))
-                for name, home in _multiplex_profile_homes(config)]
-    return [(None, get_hermes_home())]
-
-
-def _primary_home(runner) -> Path:
-    """Home behind the ``(None, None)`` scope. A multiplexed gateway serves the default root
-    there even when a named profile launched it. A single-profile gateway serves only its
-    launch home, which may be a named profile rather than the default root."""
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-
-    if getattr(getattr(runner, "config", None), "multiplex_profiles", False):
-        return get_default_hermes_root()
-    return get_hermes_home()
-
-
 async def check_memory_health(runner) -> None:
-    from gateway.run import _async_profile_runtime_scope
+    from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+    from hermes_constants import get_hermes_home
 
     lock = getattr(runner, "_memory_health_lock", None)
     if lock is None:
@@ -88,21 +55,15 @@ async def check_memory_health(runner) -> None:
     if lock.locked():
         return
     async with lock:
-        for profile, home in await asyncio.to_thread(_health_scopes, runner):
+        for profile, home in _handoff_watch_scopes(runner):
             try:
-                home = Path(home or _primary_home(runner))
+                home = Path(home or get_hermes_home())
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
-            except Exception:  # health: allow BLE001 -- advisory profile probes must isolate failures
+            except Exception:
                 # Advisory probes must not block startup or the remaining profiles.
-                failures = getattr(runner, "_memory_health_failures", None)
-                if failures is None:
-                    failures = runner._memory_health_failures = set()
-                key = (profile, await asyncio.to_thread(_failure_key, home))
-                log = logger.debug if key in failures else logger.error
-                failures.add(key)
-                log("Memory readiness check failed [profile=%s, home=%s]",
-                    profile, home, exc_info=True)
+                logger.error("Memory readiness check failed [profile=%s, home=%s]",
+                             profile, home, exc_info=True)
 
 
 def _pending_notice(home: Path) -> tuple[Path, str, bool]:
@@ -188,9 +149,9 @@ async def install_health_notices(runner) -> None:
     except Exception:
         logger.error("Cron store health notice setup failed", exc_info=True)
     try:
-        schedule_memory_health(runner, asyncio.get_running_loop())
+        await check_memory_health(runner)
     except Exception:
-        logger.error("Memory health notice setup failed", exc_info=True)
+        logger.error("Boot memory health check failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:

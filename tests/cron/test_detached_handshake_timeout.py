@@ -48,7 +48,7 @@ def test_exhausted_attach_timeout_is_phase_labeled():
 
 def test_exhausted_owner_transition_is_phase_labeled():
     from cron import detached_authority
-    from persistence.sqlite._state.errors import GatewayOwnerRestartError
+    from hermes_state_errors import GatewayOwnerRestartError
 
     class RPC:
         def __call__(self, _method, **_params):

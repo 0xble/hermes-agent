@@ -2,9 +2,9 @@
 
 Onboarding is one long turn: the plugins card blocks inside ``setup_beat`` while the user installs. In
 a live run the go-live notice waited for the next user message and arrived six minutes after the
-install, after the model had already failed to use the plugin. The notice now follows the next tool
-batch as a new row, keeping results and cached history untouched. The next user message carries only
-what no continuation did, and nothing is told twice.
+install, after the model had already failed to use the plugin. The notice now rides the next tool
+result (a new row, so the cached prefix is untouched); the next user message carries only what no
+tool result did, and nothing is told twice.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.plugin_live_notes import pop_plugin_notices, queue_plugin_notice, with_plugin_notices
+from agent.plugin_live_notes import attach_to_tool_message, pop_plugin_notices, queue_plugin_notice
 from agent.redact_secret_sources import publish_secret_source_values
+from agent.tool_dispatch_helpers import make_tool_result_message
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from run_agent import AIAgent
 from tools.budget_config import BudgetConfig
@@ -34,10 +35,10 @@ def _no_background_titles(monkeypatch):
     monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *args, **kwargs: None)
 
 
-def _agent(tool_name="web_search"):
+def _agent():
     home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
     (home / "logs").mkdir(parents=True, exist_ok=True)
-    tool = {"type": "function", "function": {"name": tool_name, "description": "search",
+    tool = {"type": "function", "function": {"name": "web_search", "description": "search",
                                              "parameters": {"type": "object", "properties": {}}}}
     with (
         patch("model_tools.get_tool_definitions", return_value=[tool]),
@@ -55,9 +56,9 @@ def _agent(tool_name="web_search"):
     return agent
 
 
-def _response(content="", tool_call_id=None, tool_name="web_search"):
+def _response(content="", tool_call_id=None):
     calls = [SimpleNamespace(id=tool_call_id, type="function",
-                             function=SimpleNamespace(name=tool_name, arguments="{}"))] if tool_call_id else None
+                             function=SimpleNamespace(name="web_search", arguments="{}"))] if tool_call_id else None
     message = SimpleNamespace(content=content, tool_calls=calls)
     choice = SimpleNamespace(message=message, finish_reason="tool_calls" if calls else "stop")
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
@@ -97,7 +98,7 @@ def _install_during_tool():
                           queue_plugin_notice(agent, "blender", NOTE), TOOL_OUTPUT)[-1]
 
 
-def test_a_plugin_installed_during_a_tool_is_told_after_its_batch_and_not_again_next_turn():
+def test_a_plugin_installed_during_a_tool_is_told_in_its_result_and_not_again_next_turn():
     agent = _agent()
     requests = _script(agent, _response(tool_call_id="c1"), _response("done"), _response("gg back"))
     install = _install_during_tool()
@@ -107,11 +108,9 @@ def test_a_plugin_installed_during_a_tool_is_told_after_its_batch_and_not_again_
 
     in_turn = requests[1]  # the model call right after the tool result
     tool_row = next(m for m in in_turn if m.get("role") == "tool")
-    # The wrapper/result is untouched. The host note is a separate continuation row.
+    # After the tool's output and outside the untrusted-data wrapper a web result gets: Hermes' own note.
     assert TOOL_OUTPUT in tool_row["content"]
-    assert tool_row["content"].endswith("</untrusted_tool_result>")
-    assert NOTE not in tool_row["content"]
-    assert in_turn[-1]["role"] == "user" and NOTE in in_turn[-1]["content"]
+    assert tool_row["content"].endswith(f"</untrusted_tool_result>\n\n{NOTE}")
     assert OLD_NOTE not in json.dumps(in_turn)  # a reinstall replaces the plugin's older notice
 
     next_turn = requests[2]
@@ -142,8 +141,7 @@ def test_the_notice_survives_the_turn_budget_spilling_its_tool_result():
 
     tool_row = next(m for m in requests[1] if m.get("role") == "tool")
     assert big not in tool_row["content"]  # spilled to a file, a preview stays inline
-    assert NOTE not in tool_row["content"]
-    assert requests[1][-1]["role"] == "user" and NOTE in requests[1][-1]["content"]
+    assert tool_row["content"].endswith(NOTE)
 
 @pytest.mark.parametrize("delivery", ["tool_result", "user_turn"])
 def test_secret_source_value_in_deferred_note_is_redacted_on_model_egress(tmp_path, delivery):
@@ -156,7 +154,8 @@ def test_secret_source_value_in_deferred_note_is_redacted_on_model_egress(tmp_pa
         agent = SimpleNamespace()
         queue_plugin_notice(agent, "lsp:config.py", f"LSP diagnostic: unexpected value {secret}")
         if delivery == "tool_result":
-            row = with_plugin_notices(agent, {"role": "user", "content": "edited file"})
+            row = make_tool_result_message("patch", "edited file", "call_1")
+            attach_to_tool_message(agent, row)
             emitted = row["content"]
         else:
             emitted = pop_plugin_notices(agent)
@@ -165,18 +164,3 @@ def test_secret_source_value_in_deferred_note_is_redacted_on_model_egress(tmp_pa
     finally:
         publish_secret_source_values(tmp_path, {})
         reset_hermes_home_override(token)
-
-def test_notice_preserves_multimodal_parts_and_null_metadata():
-    agent = SimpleNamespace()
-    queue_plugin_notice(agent, "blender", NOTE)
-    row = with_plugin_notices(agent, {
-        "role": "user",
-        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}],
-        "api_content": [{"type": "input_image", "image_url": {"url": "data:image/png;base64,x"}}],
-        "display_metadata": None,
-    })
-
-    assert NOTE in row["content"][0]["text"]
-    assert row["content"][1]["type"] == "image_url"
-    assert NOTE in row["api_content"][0]["text"]
-    assert row["api_content"][1]["type"] == "input_image"

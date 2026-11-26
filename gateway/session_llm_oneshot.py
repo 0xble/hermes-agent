@@ -255,7 +255,7 @@ async def oneshot(connection, ref, params):
             return {'text': run_oneshot(
                 instructions=params.get('instructions') or '', user_input=params.get('input') or '',
                 template=(params.get('template') or '').strip() or None, variables=params.get('variables') or {},
-                task=(params.get('task') or '').strip() or 'oneshot',
+                task=(params.get('task') or '').strip() or 'title_generation',
                 max_tokens=int(params.get('max_tokens') or 1024),
                 temperature=0.3 if params.get('temperature') is None else float(params['temperature']),
                 main_runtime=runtime())}

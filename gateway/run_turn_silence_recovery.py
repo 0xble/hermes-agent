@@ -49,18 +49,7 @@ def silence_recovery_due(runner, response: Any, turn_ctx: TurnContext, *,
             response.get("queued_terminal_reply_expected", turn_ctx.reply_expected),
         )
         and turn_ctx._run_still_current()
-        and not _completes_active_loop(response.get("final_response", ""), turn_ctx.session_id)
     )
-
-
-def _completes_active_loop(final_response: Any, session_id: Any) -> bool:
-    """A silent LOOP_COMPLETE reply to an active loop is answered by the loop's own finish notice
-    (``gateway.loop_completion``); a re-prompt would drop the marker the first run gave."""
-    from hermes_cli.loops import response_signals_complete
-    if not (session_id and isinstance(final_response, str) and response_signals_complete(final_response)):
-        return False
-    from gateway.loop_completion import capture_loop_identity
-    return capture_loop_identity(session_id) is not None
 
 
 async def run_silence_followup(runner, response: dict, turn_ctx: TurnContext) -> dict[str, Any]:

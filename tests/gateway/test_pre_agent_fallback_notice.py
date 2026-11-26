@@ -59,7 +59,6 @@ def _runner_with_real_runtime_resolution():
         setattr(runner, helper, types.MethodType(getattr(GatewayTurnMixin, helper), runner))
     runner._load_session_agent_runtime = GatewayTurnMixin._load_session_agent_runtime
     runner._session_model_override.return_value = None
-    runner._attended_route_for_session.return_value = None
     runner._session_model_override_epoch.return_value = 0
     # Pass the resolved runtime straight through so the kwargs handed to AIAgent are the resolved ones.
     # (Production pops ``request_overrides`` out of the runtime into the route; mirror that so the
@@ -99,29 +98,8 @@ def test_credential_resolution_fallback_reaches_agent_notice_not_agent_kwargs():
     notice = agent._pending_fallback_notice
     assert "openai-codex/gpt-5.6-sol" in notice and "anthropic/claude-sonnet-5" in notice
     assert "_fallback_notice" not in _RecordingAgent.built_kwargs
-    assert "_preflight_fallback" not in _RecordingAgent.built_kwargs
-    assert agent._preflight_fallback == {"requested_model": "gpt-5.6-sol",
-                                         "fallback_model": "claude-sonnet-5",
-                                         "fallback_reason": "credentials_unavailable"}
     # Consumed by the turn: a later resolution without fallback must not re-attach a stale notice.
     assert runner._pre_agent_fallback_notice is None
-
-
-def test_pre_agent_fallback_does_not_become_last_good_model(monkeypatch):
-    from gateway.run_turn_prepare import load_session_agent_runtime
-
-    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda _: "primary")
-    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {
-        "provider": "backup", "model": "temporary",
-        "_preflight_fallback": {"requested_model": "primary", "fallback_model": "temporary"},
-    })
-    model, runtime, _, cache_model = load_session_agent_runtime(
-        source=None, skey="test", user_config={}, config=None, override=None,
-        last_model="primary", attended_route=None,
-    )
-    assert (model, runtime["provider"]) == ("temporary", "backup")
-    assert not cache_model
-    assert not runtime.get("model_pinned")
 
 
 def test_model_override_fast_path_clears_stale_notice():

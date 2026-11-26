@@ -110,19 +110,8 @@ class ClientLifecycleMixin:
             # A session can run several task IDs; delegated IDs also differ from session_id.
             # Never match the environment key (e.g. "default"), shared by parent and siblings.
             owners = getattr(self, "_process_owner_task_ids", ())
-            handed_off = {
-                str(item.get("session_id"))
-                for item in (getattr(self, "_handed_off_processes", ()) or ())
-                if isinstance(item, dict) and item.get("session_id")
-            }
             for process in process_registry.list_sessions():
-                # Handoff changes the registry owner, but a child may retain the
-                # parent's task id in its accumulated owner set after a turn bind.
-                # The durable handoff record is the stronger exclusion: never let
-                # child teardown kill a process explicitly transferred to its parent.
-                if (process["session_id"] not in handed_off
-                        and process["owner_task_id"] in owners
-                        and process["status"] == "running"):
+                if process["owner_task_id"] in owners and process["status"] == "running":
                     # Restart-surviving jobs are also lifecycle-persistent: agent.close() must
                     # leave them for the successor gateway to recover. Explicit process kills still
                     # use their non-lifecycle source and reach them.

@@ -673,9 +673,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             server.register_live_transport(transport)
         # Cross-backend liveness: a heartbeat row lets the startup orphan sweep tell "live but idle
         # backend" from "truly orphaned". Idempotent and once-per-process, like the orphan sweep (the
-        # desktop app and web dashboard reach the agent via this sidecar, not entry.main()). Its first
-        # heartbeat write takes the state.db writer, so it runs off the loop.
-        await asyncio.to_thread(_start_backend_liveness)
+        # desktop app and web dashboard reach the agent via this sidecar, not entry.main()).
+        _start_backend_liveness()
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1

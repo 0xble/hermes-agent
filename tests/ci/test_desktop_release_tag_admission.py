@@ -90,11 +90,6 @@ _GIT = _native_tool("git")
 _BASH = _native_tool("bash")
 
 
-def _workflow() -> dict:
-    yaml = pytest.importorskip("hermes_yaml")
-    return yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
-
-
 def _git(*args: str, cwd: Path) -> str:
     out = subprocess.run(
         [_GIT, *args], cwd=cwd, capture_output=True, text=True, check=True,

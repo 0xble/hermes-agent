@@ -98,13 +98,7 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
         return [str(sealed), *prefix, *args]
     if resolve_store_python(root) is None:
         return runtime_command(root, args, module=module, python=python, home=home)
-    # Immutable release directories do not carry a mutable ``.hermes/bin`` launcher. Persisting
-    # that path made recovered commands point into a release later pruned after promotion.
-    launcher = root / ".hermes" / "bin" / "hermes"
-    if not launcher.is_file():
-        return runtime_command(root, args, module=module, python=python, home=home)
-    prefix = [] if module == "hermes_cli.main" else ["--run-module", module]
-    return [str(launcher), *prefix, *args]
+    return [str(root / ".hermes" / "bin" / "hermes"), *prefix, *args]
 
 
 def sealed_service_launcher(repo_root: Path) -> Path | None:

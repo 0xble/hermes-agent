@@ -34,12 +34,6 @@ case stayed parked for 14.5 hours.
   owns the chat (see [restart-parked goal wake](goal-restart-parked-wake.md)), and for suspended or
   unroutable sessions. One ticker owns both `/loop` and goal idle
   injection, so any future overlapping-gateway admission fence has one owner to transfer.
-- A restart that retires a superseded goal wake spool re-arms this ticker as the goal's owner
-  (`gateway/shutdown_goal_wakes.py`). The evaluator that superseded the spool already stamped
-  `last_automatic_continuation_at` for a successor the restart lost, so the owner clears that
-  stamp and resumes on the first scan after boot, not one `min_continuation_gap_seconds` later.
-  The `/restart` notice says only that the gateway restarted: it never promises that work
-  continues, because the turn, follow-up or goal that resumes is its own visible signal.
 - TUI/Desktop/dashboard: the session-owner notification poller resumes the goal like `/loop` and
   `/heartbeat` ticks and leaves gateway-routed conversations to the gateway.
 - Classic CLI keeps its idle hook and now uses the same shared check and note.
@@ -58,10 +52,6 @@ barrier cap from f8b87f5. Upstream `main` has the same gap: its gateway and TUI 
 re-check. No upstream issue or pull request was found for "goal parked gateway", "goal wait
 barrier", or "goal parked forever" as of 2026-09-26.
 
-Evidence (2026-11-15): a session-requested restart retired its superseded goal wake at boot,
-posted "Your session continues", and nothing ran in that topic for 30 minutes, the configured
-continuation gap measured from the lost successor's stamp.
-
 ## Verification
 
 - Focused verification uses exact one-file commands:
@@ -72,7 +62,6 @@ continuation gap measured from the lost successor's stamp.
   - `tests/hermes_cli/test_goals.py`
   - `tests/hermes_cli/test_goal_external_wait_backoff.py`
   - `tests/hermes_cli/test_goal_dispatch.py`
-  - `tests/gateway/test_pending_goal_continuation_retirement.py`
   plus the related goal and session-control modules. The repository-wide
   `scripts/run_tests.sh` wrapper is intentionally not used here.
 
@@ -81,5 +70,3 @@ continuation gap measured from the lost successor's stamp.
 Retire when upstream ships an equivalent idle re-check across gateway and TUI that passes these
 tests. Roll back by reverting this patch's commit. No schema, config, or state migration is
 introduced, and parked goals keep their barriers.
-
-Contract tests: `tests/hermes_cli/test_goal_parked_idle_wake.py`, `tests/gateway/test_goal_continuation_drain.py`, `tests/gateway/test_goal_parked_idle_wake.py`, `tests/tui_gateway/test_goal_parked_idle_wake.py`, `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_external_wait_backoff.py`, `tests/hermes_cli/test_goal_dispatch.py`, `tests/gateway/test_pending_goal_continuation_retirement.py`.

@@ -1488,7 +1488,7 @@ class CLITuiMixin:
                 accepted = False
                 try:
                     if self.agent is not None and hasattr(self.agent, "steer"):
-                        accepted = self.agent.steer(text, human=True)
+                        accepted = self.agent.steer(text)
                 except Exception as exc:
                     _cprint(f"  {_DIM}{t('cli.tui.steer_failed_queued', error=exc)}{_RST}")
                     accepted = False
@@ -1513,7 +1513,7 @@ class CLITuiMixin:
                         self.agent is not None
                         and getattr(self.agent, "_supports_active_turn_redirect", False) is True
                         and hasattr(self.agent, "redirect")):
-                        redirected = self.agent.redirect(text, human=True)
+                        redirected = self.agent.redirect(text)
                 except Exception:
                     redirected = False
             if redirected == "voice_stopped":  # TUI-26: consumed as a voice stop; nothing to queue

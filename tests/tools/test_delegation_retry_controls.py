@@ -19,13 +19,7 @@ from tests.tools.test_delegation_retry import T0, _dispatch, _ledger, _rate_limi
 def _control_state(monkeypatch):
     ad._reset_for_tests()
     monkeypatch.setattr(registry, "_active_subagents", {})
-    clock = dr.time
-    monkeypatch.setattr(dr, "time", SimpleNamespace(
-        time=lambda: T0 + 3600,
-        localtime=clock.localtime,
-        mktime=clock.mktime,
-        strftime=clock.strftime,
-    ))
+    monkeypatch.setattr(dr.time, "time", lambda: T0 + 3600)
     yield
     ad._reset_for_tests()
 

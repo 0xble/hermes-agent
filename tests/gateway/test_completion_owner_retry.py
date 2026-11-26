@@ -3,7 +3,7 @@
 import queue
 import sqlite3
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import cast
 
 import pytest
 

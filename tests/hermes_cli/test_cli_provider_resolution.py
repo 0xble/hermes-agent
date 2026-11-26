@@ -3,7 +3,6 @@ import sys
 import types
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -340,57 +339,13 @@ def test_fallback_runtime_resolves_the_fallback_entry_model(monkeypatch, tmp_pat
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "sk-test-go")
     monkeypatch.setattr("cli._cprint", lambda *a, **k: None, raising=False)
 
-    shell: Any = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
-    shell.model = "mimo-v2.5-free"
-    shell._explicit_model_override = False
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
     shell._fallback_model = [{"provider": "opencode-go", "model": "mimo-v2.5"}]
     runtime = shell._resolve_fallback_runtime(AuthError("no key", provider="opencode-zen", code="missing_api_key"))
 
     assert runtime is not None
     assert shell.model == "mimo-v2.5"
     assert runtime["base_url"] == "https://opencode.ai/zen/go/v1"
-    assert shell._preflight_fallback == {
-        "requested_model": "mimo-v2.5-free",
-        "fallback_model": "mimo-v2.5",
-        "fallback_reason": "credentials_unavailable",
-    }
-
-
-@pytest.mark.parametrize("same_model_spare", [False, True])
-def test_pinned_cli_startup_fallback_keeps_the_model(monkeypatch, same_model_spare):
-    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
-
-    attempted = []
-    runtime = {"provider": "spare", "base_url": "https://spare.test/v1", "api_key": "test-key"}
-
-    def resolve(**kwargs):
-        attempted.append(kwargs)
-        return runtime
-
-    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
-    monkeypatch.setattr("cli._cprint", lambda *a, **k: None)
-    shell: Any = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
-    shell.model = "picked-model"
-    shell.requested_provider = "primary"
-    shell._explicit_model_override = True
-    shell._fallback_model = [{"provider": "other", "model": "other-model"}]
-    if same_model_spare:
-        shell._fallback_model.append({"provider": "spare", "model": "picked-model"})
-
-    resolved = shell._resolve_fallback_runtime(AuthError("original auth error"))
-
-    assert shell.model == "picked-model"
-    if same_model_spare:
-        assert resolved is runtime
-        assert attempted == [{"requested": "spare", "target_model": "picked-model"}]
-        assert shell._preflight_fallback == {
-            "requested_model": "picked-model", "fallback_model": "picked-model",
-            "fallback_reason": "credentials_unavailable",
-        }
-    else:
-        assert resolved is None
-        assert attempted == []
-        assert shell.requested_provider == "primary"
 
 
 def _quota_auth_error():
@@ -424,9 +379,7 @@ def test_fallback_runtime_labels_quota_outage_and_bad_credentials_distinctly(mon
     )
     monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: "k")
 
-    shell: Any = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
-    shell.model = "codex-model"
-    shell._explicit_model_override = False
+    shell = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
     shell._fallback_model = [{"provider": "custom", "model": "local-model"}]
     runtime = shell._resolve_fallback_runtime(exc_factory())
 

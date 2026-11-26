@@ -1319,12 +1319,12 @@ def _model_dedup_key(model_id: str) -> str:
         return key
 
 
-def _merge_with_models_dev(provider: str, curated: list[str], *, allow_network: bool = True) -> list[str]:
+def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     """models.dev entries first (their order), then curated-only extras, case-insensitively deduped
     while preserving curated casing. Curated unchanged when models.dev is unreachable/empty."""
     try:
         from agent.models_dev import list_agentic_models
-        mdev = list_agentic_models(provider) if allow_network else list_agentic_models(provider, allow_network=False)
+        mdev = list_agentic_models(provider)
     except Exception:
         mdev = []
     if not mdev:

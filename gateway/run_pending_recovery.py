@@ -1,7 +1,5 @@
 """Replay shutdown spools under each owning gateway profile at startup."""
 
-from contextlib import suppress
-from datetime import datetime, UTC
 import logging
 import math
 from pathlib import Path
@@ -256,14 +254,6 @@ def _recovered_followup_event(data, source, author_id):
     event._attended_activity_received_at = receipt
     if recovery_id is not None:
         event._hermes_recovery_id = recovery_id
-    arrival = data.get("_recovery_spool_ts")
-    if type(arrival) in (int, float) and arrival > 0:
-        with suppress(OverflowError, OSError, ValueError):
-            event.timestamp = datetime.fromtimestamp(arrival, UTC)
-    if data.get("native_synthetic") is True:
-        # This bit is written by the owner spool, independently of inbound metadata.
-        from gateway.session_synthetic import mark_synthetic
-        mark_synthetic(event)
     return event
 
 

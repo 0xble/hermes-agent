@@ -182,7 +182,7 @@ class CanonicalListParams(ProfileParams):
     title: str | None = None
     include_hidden: bool = False
     # Only conversations of this folder, judged on each conversation's first row by the classic CLI's
-    # ``hermes -c`` rule (``hermes_state_sessions_workspace.workspace_key``): its git repo root equals this, or
+    # ``hermes -c`` rule (``persistence.conversation.sessions.workspace_key``): its git repo root equals this, or
     # (no root recorded) its cwd is this folder or under it. Pass the caller's repo root (else its cwd).
     workspace: str | None = None
     # Each row also carries the picker fields below (off by default: a live-list poll does not pay for them).
@@ -267,7 +267,6 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     # (memory attribution only), the model-facing text when it differs from the persisted ``text``
     # (voice prefix, model-switch / skills-reload notes) and a one-turn ``/model --once`` override.
     turn_author: CanonicalTurnAuthor | None = None
-    turn_origin: str | None = None
     api_text: str | None = None
     model_override: CanonicalModelOverride | None = None
     # The submitter answers the clarify tool's whole batch in one ``clarify`` server request (main's
@@ -309,7 +308,6 @@ class CanonicalControlParams(CanonicalSessionParams):
 
 class CanonicalCorrectionParams(CanonicalControlParams):
     text: str
-    human: bool = True
 
 
 class CanonicalCorrectionAck(Result):

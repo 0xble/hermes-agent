@@ -3,8 +3,8 @@ and must not accumulate identical multi-hundred-MB forensic backups.
 
 Reported incident: b-tree page corruption (a class none of the repair
 strategies can heal) failed `repair_state_db_schema` on every process start
-for 11 days — 105 attempts, each taking a fresh ~900MB
-`state.db.malformed-backup-*` copy of the SAME damaged bytes, 89GB total —
+for 11 days: 105 attempts, each taking a fresh ~900MB
+`state.db.malformed-backup-*` copy of the SAME damaged bytes, 89GB total:
 while `_claim_repair_attempt`'s in-memory set only bounded a single process.
 
 Fix under test:
@@ -24,18 +24,12 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
-import hermes_state
-import hermes_state_repair
-from hermes_state_repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _backup_db_file, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _prune_malformed_backups, _record_repair_outcome, _repair_ledger_path, repair_state_db_schema
-
-
-pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+from persistence.sqlite._state import repair as repair_module
+from persistence.sqlite._state.repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _backup_db_file, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _prune_malformed_backups, _record_repair_outcome, _repair_ledger_path, repair_state_db_schema
 
 
 def _make_unrepairable_db(tmp_path: Path) -> Path:
-    """A file sqlite3 opens as garbage — no strategy can heal it."""
+    """A file sqlite3 opens as garbage: no strategy can heal it."""
     db = tmp_path / "state.db"
     db.write_bytes(b"SQLite format 3\x00" + os.urandom(4096))
     return db
@@ -72,7 +66,7 @@ class TestPersistentAttemptCap:
         # Budget burned: the next call must refuse WITHOUT running surgery
         # (and without taking another backup).
         backups_before = len(_existing_malformed_backups(db))
-        with patch.object(hermes_state_repair, "_repair_state_db_schema_locked") as surgery:
+        with patch.object(repair_module, "_repair_state_db_schema_locked") as surgery:
             report = repair_state_db_schema(db)
         surgery.assert_not_called()
         assert report["repaired"] is False

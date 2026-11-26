@@ -118,23 +118,21 @@ def _locked(root: Path):
         os.close(fd)  # closing the descriptor releases the flock
 
 
-def load_skips(
-    root: Path, *, persist: bool = True, state_dir: Path | None = None,
-) -> frozenset[str]:
-    """Names to skip this pass; optionally keep tracking metadata outside the entry namespace."""
-    state_root = root if state_dir is None else state_dir
-    if not tracking_supported() or not (state_root / STUCK_STATE_NAME).exists():
+def load_skips(root: Path, *, persist: bool = True) -> frozenset[str]:
+    """Names to skip this pass. Records that no longer hold (see module doc) are dropped, so
+    that entry is judged normally again."""
+    if not tracking_supported() or not (root / STUCK_STATE_NAME).exists():
         return frozenset()
     now = time.time()
     if not persist:
-        state = _read(state_root)
+        state = _read(root)
         return frozenset(n for n, rec in state.items() if _still_stuck(root, n, rec, now))
     try:
-        with _locked(state_root):
-            state = _read(state_root)
+        with _locked(root):
+            state = _read(root)
             live = {n: rec for n, rec in state.items() if _still_stuck(root, n, rec, now)}
             if live != state:
-                _write(state_root, live)
+                _write(root, live)
     except OSError:
         return frozenset()
     return frozenset(live)
@@ -171,19 +169,16 @@ def removal_hint(entry: Path) -> str:
     return hint
 
 
-def record(
-    root: Path, entry: Path, blockers: list[str], audit, *, state_dir: Path | None = None,
-) -> None:
+def record(root: Path, entry: Path, blockers: list[str], audit) -> None:
     """Remember *entry* as not removable by this user and log the one actionable line."""
-    state_root = root if state_dir is None else state_dir
     fp = _fingerprint(entry)
     if fp is None or not blockers:
         return
     rec = {"fp": fp, "since": time.time(), "uid": os.geteuid(), "blockers": blockers[:_MAX_BLOCKERS]}  # windows-footgun: ok — only reached when tracking_supported()
-    with contextlib.suppress(OSError), _locked(state_root):
-        state = _read(state_root)  # re-read under the lock: merge, never publish a stale snapshot
+    with contextlib.suppress(OSError), _locked(root):
+        state = _read(root)  # re-read under the lock: merge, never publish a stale snapshot
         state[entry.name] = rec
-        _write(state_root, state)
+        _write(root, state)
     audit.info(
         "scratch prune: cannot remove %r: it holds files this user (uid %d) may not read or "
         "delete, usually root-owned output of a Docker container; skipping it until that is "
@@ -193,22 +188,5 @@ def record(
 
 
 def stuck_entries(root: Path) -> list[Path]:
-    """Entries the prune is currently skipping as not removable (for ``hermes doctor``).
-
-    Held entries keep their stuck state beside the holding day's ``entries/`` directory, so
-    inspect those day directories as well as the live scratch root.
-    """
-    result = [root / name for name in sorted(load_skips(root, persist=False))]
-    trash = Path(os.path.realpath(root)).parent / ".scratch-trash"
-    try:
-        if trash.is_symlink() or not trash.is_dir():
-            return result
-        days = list(trash.iterdir())
-    except OSError:
-        return result
-    for day in days:
-        entries = day / "entries"
-        if not day.is_dir() or day.is_symlink() or not entries.is_dir() or entries.is_symlink():
-            continue
-        result.extend(entries / name for name in sorted(load_skips(entries, persist=False, state_dir=day)))
-    return result
+    """Entries the prune is currently skipping as not removable (for ``hermes doctor``)."""
+    return [root / name for name in sorted(load_skips(root, persist=False))]

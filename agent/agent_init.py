@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_init_fallback import _bind_init_fallback, _fallback_entries, _init_fallback_chain, _pin_init_fallbacks
+from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
 from agent.agent_runtime_helpers import _ra
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
@@ -38,6 +38,7 @@ from agent.primary_runtime_snapshot import _snapshot_primary_runtime
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.agent_init_memory_provider import _memory_provider_init_kwargs, resolve_memory_provider
+from agent.agent_init_session import _publish_session_id, stand_in_interface
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
@@ -262,8 +263,10 @@ def _cfg_dict(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     section = cfg.get(key, {})
     return section if isinstance(section, dict) else {}
 
+
 class CompressionSettings(SimpleNamespace):
     """Parsed ``compression`` config section (see ``_parse_compression_config``)."""
+
 
 _EXPLICIT_API_MODES = {
     "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
@@ -422,7 +425,7 @@ _CONTROL_STATE: dict[str, Any] = {
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
-    "_interrupt_message": None, "_interrupt_source": None,  # trigger text; system/user provenance
+    "_interrupt_message": None,  # optional message that triggered the interrupt
     "_hard_interrupt_requested": threading.Event,
     "_execution_thread_id": None,  # set at run_conversation() start
     "_interrupt_thread_signal_pending": False,
@@ -507,17 +510,14 @@ _SESSION_STATE: dict[str, Any] = {
     # Whether close() also closes _session_db. False: a caller-supplied handle is usually the
     # SHARED launch handle; callers handing over a DEDICATED handle set True.
     "_owns_session_db": False,
+    # The deprecated hermes_state.SessionDB a plugin context engine binds; opened on first need, closed with the agent.
+    "_context_engine_session_db": None,
     # Close flush and turn-start flush can overlap; the durable marker lives on each message
     # dict, so its test-and-append is serialized per agent.
     "_session_persist_lock": threading.RLock,
     # CLI's just-accepted user dict, reused by turn setup so its durable marker survives a
     # close-persistence race.
     "_pending_cli_user_message": None,
-    # The user's explicit session-scoped reasoning pick (/reasoning, --reasoning, /model
-    # --reasoning), set by the surface; None when reasoning_config is only the configured
-    # default. Delegation passes it to children (tools/delegate_tool_config.py).
-    "reasoning_override": None,
-    "_pre_fallback_reasoning_override": None,  # set aside by fallback, restored with the primary
     "_last_flushed_db_idx": 0,  # DB-write cursor (prevents duplicate writes)
     "_session_db_created": False,  # DB row deferred to run_conversation()
     # False on helper agents (compression / hygiene / review forks) that hand the session to
@@ -536,10 +536,11 @@ _STREAM_STATE: dict[str, Any] = {
     # per-delta regexes (both tags must be in one string).
     "_stream_context_scrubber": StreamingContextScrubber,
     "_stream_think_scrubber": StreamingThinkScrubber,
-    "_current_streamed_assistant_text": "",  # any-consumer text: recovery and liveness
-    "_display_streamed_assistant_text": "",  # display-only text: replay/dedup
+    "_current_streamed_assistant_text": "",  # so a later completed interim isn't re-sent
     "_delivered_interim_texts": set,  # interims this user turn (spans Codex continuations)
-    # Single-writer guard fences stale stream attempts from the delta sink.
+    # Single-writer guard for the delta sink: each attempt claims a monotonic writer token and
+    # the sink drops chunks from threads holding a stale one, so a superseded stream can't
+    # interleave with the retry's. Threads that never claimed are never fenced.
     "_stream_writer_lock": threading.Lock,
     "_stream_writer_token": 0,
     "_stream_writer_tls": threading.local,
@@ -562,34 +563,17 @@ def _init_prompt_cache_config(agent):
         agent._anthropic_prompt_cache_policy()
     )
     agent._cache_disabled = False
-    # cache_ttl: "5m" (default), "1h" (2x write cost; pays off with >5-minute pauses) or "auto"
-    # (1h when a person paces the session, 5m when a machine does); unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans
-    # billing cache writes, proxies adding their own cache_control); the disable survives
-    # /model switches and fallback re-derivation.
-    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from config.yaml under
-    # prompt_caching.cache_ttl; unknown values keep "5m". 1h tier costs 2x on write vs 1.25x for 5m, but
-    # amortizes across long sessions with >5-minute pauses between turns (#14971). This is useful for OAuth
-    # subscription users where cache writes bill against "extra usage" or for third-party proxies that
-    # inject their own cache_control markers (#13477).
-    agent._cache_ttl = "5m"
+    # cache_ttl: "auto" (default) picks 1h when a person paces the session and 5m when a machine does;
+    # "5m"/"1h" pin a tier (1h writes cost 2x vs 1.25x and only pay off across >5-minute pauses, #14971);
+    # unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans billing cache
+    # writes against "extra usage", proxies injecting their own cache_control, #13477); the disable
+    # survives /model switches and fallback re-derivation. An unreadable config falls back to "auto".
+    from agent.agent_runtime_helpers import cache_ttl_means_disabled
+    from agent.prompt_caching import AUTO_CACHE_TTL, auto_start_cache_ttl
+    ttl = AUTO_CACHE_TTL
     try:
         from hermes_cli.config import load_config_readonly as _load_pc_cfg
-        from agent.agent_runtime_helpers import cache_ttl_means_disabled
-        from agent.prompt_caching import AUTO_CACHE_TTL, auto_cache_ttl_for_source
-        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
-        _ttl = _pc_cfg.get("cache_ttl", "5m")
-        if _ttl in {"5m", "1h"}:
-            agent._cache_ttl = _ttl
-        elif _ttl == AUTO_CACHE_TTL:
-            # Decided once per session from its source (a delegated child is clamped to 5m again
-            # in delegate_tool regardless).
-            from agent.session_source import session_source_for
-            agent._cache_ttl = auto_cache_ttl_for_source(session_source_for(getattr(agent, "platform", None)))
-        elif cache_ttl_means_disabled(_ttl):
-            agent._use_prompt_caching = False
-            agent._use_native_cache_layout = False
-            agent._cache_ttl = None
-            agent._cache_disabled = True
+        ttl = (_load_pc_cfg().get("prompt_caching", {}) or {}).get("cache_ttl", AUTO_CACHE_TTL)
     except Exception as exc:  # health: allow BLE001 -- init must survive any config failure; the class is logged
         # Config values and traceback frames may contain credentials.
         logger.warning(
@@ -599,6 +583,20 @@ def _init_prompt_cache_config(agent):
             "configuration imports work again.",
             type(exc).__name__,
         )
+    agent._cache_ttl = "5m"
+    # Auto takes the send-time route clamp (Bedrock legacy 5m) even when a fork copies a 1h tier.
+    agent._cache_ttl_auto = ttl == AUTO_CACHE_TTL
+    if ttl in ("5m", "1h"):  # a tuple: an unhashable YAML value (a list) must not raise here
+        agent._cache_ttl = ttl
+    elif ttl == AUTO_CACHE_TTL and not getattr(agent, "side_agent", False):
+        # From the session's source (delegate_tool clamps children to 5m; a side agent keeps 5m); a 1h
+        # choice starts on 5m and upgrades at the first pause over 5 minutes (prompt_cache_lifecycle.tier).
+        agent._cache_ttl = auto_start_cache_ttl(agent)
+    elif cache_ttl_means_disabled(ttl):
+        agent._use_prompt_caching = False
+        agent._use_native_cache_layout = False
+        agent._cache_ttl = None
+        agent._cache_disabled = True
 
 
 def _init_turn_state(agent, run_budget_seconds):
@@ -742,8 +740,8 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict
         with suppress(Exception):
             from providers import get_provider_profile as _gpf
             _ph = _gpf(agent.provider)
-            if _ph and (_headers := _ph.get_default_headers()):
-                client_kwargs["default_headers"] = _headers
+            if _ph and _ph.default_headers:
+                client_kwargs["default_headers"] = dict(_ph.default_headers)
     return client_kwargs
 
 
@@ -793,11 +791,18 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             )
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
-        # A MoA entry names the preset itself; the resolved model is only its aggregator.
-        next_model = _fb["model"] if str(_fb["provider"]).strip().lower() == "moa" else (_fb_model or _fb["model"])
-        accepted, needs_client = _bind_init_fallback(agent, _fb["provider"], next_model, _fb_client)
-        if accepted:
-            return _client_kwargs_from_routed(_fb_client, _provider_timeout) if needs_client else None
+        agent._fallback_activated = True
+        if _fb_provider.strip().lower() == "moa":
+            # The chokepoint handed back the preset's aggregator client, which only proves the
+            # preset resolves and its aggregator has credentials. A MoA entry means the preset
+            # itself (same as ``provider: moa`` in config), so bind the facade, not the aggregator.
+            from agent.moa_loop import bind_moa_runtime
+            bind_moa_runtime(agent, _fb["model"])
+            return None
+        agent.provider = agent.requested_provider = _fb["provider"]
+        agent.model = _fb_model or _fb["model"]
+        recompute_init_fallback_api_mode(agent, _fb_client)
+        return _client_kwargs_from_routed(_fb_client, _provider_timeout)
     # A burned credential pool (#119533) is otherwise indistinguishable from missing config,
     # so name it even when no fallback entries are configured.
     _pool_exhausted = False
@@ -1040,7 +1045,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         print("📝 Trajectory saving enabled")
     if agent.ephemeral_system_prompt:
         prompt_preview = agent.ephemeral_system_prompt[:60] + "..." if len(agent.ephemeral_system_prompt) > 60 else agent.ephemeral_system_prompt
-        agent._safe_print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+        print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
     if agent._use_prompt_caching:
         if agent._use_native_cache_layout and agent.provider == "anthropic":
             source = "native Anthropic"
@@ -1048,56 +1053,32 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
             source = "Anthropic-compatible endpoint"
         else:
             source = "Claude via OpenRouter"
-        print(f"💾 Prompt caching: ENABLED ({source}, {agent._cache_ttl} TTL)")
-
-
-def _publish_session_id(session_id: str) -> None:
-    """Expose the session ID to tools via ContextVar (+ legacy os.environ fallback).
-
-    If the ContextVar bridge fails to import, keep the root-agent env fallback but never let
-    delegated construction publish a child ID process-wide.
-    """
-    try:
-        from gateway.session_context import set_current_session_id
-        set_current_session_id(session_id)
-    except Exception:
-        try:
-            from agent.delegation_context import is_delegated_child_context
-            delegated_child = is_delegated_child_context()
-        except Exception:
-            delegated_child = False
-        if not delegated_child:
-            os.environ["HERMES_SESSION_ID"] = session_id
+        from agent.prompt_caching import effective_cache_ttl
+        ttl = effective_cache_ttl(agent._cache_ttl, provider=agent.provider, model=agent.model,
+                                  base_url=agent.base_url or "", auto=agent._cache_ttl_auto)
+        print(f"💾 Prompt caching: ENABLED ({source}, {ttl} TTL)")
 
 
 def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
-    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb):
+    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb, persistence=None):
     agent.session_start = datetime.now()
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
-    if agent.incognito:
-        from agent.incognito import register_session
-        register_session(agent.session_id)
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
     _set_defaults(agent, _SESSION_STATE)
-    agent._persist_disabled = getattr(agent, "incognito", False)
-    if agent.incognito:
-        agent.save_trajectories = False
-        agent.skip_background_review = True
 
     # Filesystem checkpoint manager (transparent — not a tool)
     from agent.checkpoints.manager import CheckpointManager
     agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled and not agent.incognito, max_snapshots=checkpoint_max_snapshots,
+        enabled=checkpoints_enabled, max_snapshots=checkpoint_max_snapshots,
         max_total_size_mb=checkpoint_max_total_size_mb,
         max_file_size_mb=checkpoint_max_file_size_mb,
     )
 
-    agent._incognito_session_db = session_db if agent.incognito else None
-    agent._session_db = None if agent.incognito else session_db  # optional SQLite store
+    agent._session_db, agent.persistence = session_db, persistence  # optional store and its storage interface
     agent._parent_session_id = parent_session_id
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
@@ -1162,7 +1143,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    agent._skill_review_human_turn_seen = False
     from agent.safe_worker_policy import safe_worker_enabled
     from tools.hosted_tool_policy import host_feature_enabled
     if safe_worker_enabled() or not host_feature_enabled("builtin_memory"):  # hosted: not the agent's memory
@@ -1199,7 +1179,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
-                    read_only=getattr(agent, "incognito", False),
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
                 )
@@ -1211,19 +1190,13 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead
         # of being re-initialized (#120116). No initialize_all — the providers are already bound.
-        memory_manager.set_read_only(getattr(agent, "incognito", False))
         agent._memory_manager = memory_manager
     elif not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
             if not is_core_memory_provider(_mem_provider_name):
                 from agent.memory_manager import MemoryManager as _MemoryManager
-                from agent.memory_manager import parse_prefetch_max_age as _parse_prefetch_max_age
-                agent._memory_manager = _MemoryManager(
-                    read_only=getattr(agent, "incognito", False),
-                    recall_synthetic_turns=is_truthy_value(mem_config.get("recall_synthetic_turns"), default=False),
-                    prefetch_max_age_seconds=_parse_prefetch_max_age(mem_config.get("prefetch_max_age_seconds")),
-                )
+                agent._memory_manager = _MemoryManager()
                 _mp = resolve_memory_provider(_mem_provider_name, say=agent._emit_startup_warning)
                 if _mp is not None:
                     agent._memory_manager.add_provider(_mp)
@@ -1383,9 +1356,6 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     """Parse the ``compression`` section. Defaults here MUST match DEFAULT_CONFIG."""
     cfg = _cfg_dict(_agent_cfg, "compression")
     threshold, autoraise_notice_enabled = _compression_threshold(agent, cfg)
-    _default_prune_tokens = int(
-        cfg_get(DEFAULT_CONFIG, "compression", "proactive_prune_tokens", default=0) or 0
-    )
     # Plain int()/float() coercions raise on garbage; evaluated up front, in config order.
     target_ratio = float(cfg.get("target_ratio", 0.20))
     protect_last = int(cfg.get("protect_last_n", 20))
@@ -1421,10 +1391,8 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         # Actionable user messages guaranteed to survive in the tail (default 1, floor 1).
         min_tail_users=max(1, _parse_config_int(cfg.get("min_tail_user_messages", 1), 1)),
         max_attempts=min(max_attempts, 10),
-        # Proactive tool-result prune trigger: absent, null or invalid -> DEFAULT_CONFIG; 0 or negative disables.
-        proactive_prune_tokens=max(0, _parse_config_int(
-            cfg.get("proactive_prune_tokens", _default_prune_tokens), _default_prune_tokens
-        )),
+        # Opt-in proactive tool-result prune trigger (0 = disabled; negatives = disabled).
+        proactive_prune_tokens=max(0, _parse_config_int(cfg.get("proactive_prune_tokens", 0), 0)),
         proactive_prune_min_chars=_parse_config_int(
             cfg.get("proactive_prune_min_result_chars", 8000), 8000
         ),
@@ -1439,8 +1407,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             str(k): float(v) for k, v in _cfg_dict(cfg, "model_thresholds").items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
-        threshold_tokens=threshold_tokens, agent_request_floor_ratio=max(0.0, float(cfg.get("agent_request_floor_ratio", 0.30))),
-        agent_request_cooldown_api_calls=max(0, _parse_config_int(cfg.get("agent_request_cooldown_api_calls", 10), 10)),
+        threshold_tokens=threshold_tokens,
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -1835,8 +1802,9 @@ def _compressor_max_tokens(agent):
     return None
 
 
-def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = None if getattr(agent, 'incognito', False) else _select_context_engine(_agent_cfg)
+def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
+                          persistence=None):
+    _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -1849,7 +1817,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         _plugin_ctx_len = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
             config_context_length=_effective_context_length, provider=agent.provider,
-            custom_providers=_custom_providers, api_mode=agent.api_mode,
+            custom_providers=_custom_providers,
         )
         # Per-model overrides BEFORE the initial update_model() so the first threshold
         # resolution already sees them.
@@ -1879,8 +1847,10 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
+        from agent.conversation_compression import context_engine_persistence, context_engine_session_db
         with suppress(Exception):
-            _bind_session_state(session_db=session_db, session_id=agent.session_id)
+            _bind_session_state(session_db=context_engine_session_db(agent, session_db), session_id=agent.session_id,
+                                **context_engine_persistence(_bind_session_state, persistence))
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
@@ -1903,7 +1873,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     if cs.prepare_ahead and isinstance(_cc, ContextCompressor):
         from agent.prepared_compaction import PreparedCompaction
         _cc.prepared_compaction = PreparedCompaction()
-    agent.compression_checkpoint_required = cs.checkpoint_required and not getattr(agent, 'incognito', False)
+    agent.compression_checkpoint_required = cs.checkpoint_required
     from agent.conversation_compression_checkpoint import _warn_checkpoint_required_without_capable_provider
     _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
@@ -1916,8 +1886,6 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
-    agent.compression_agent_request_floor_ratio, agent.compression_agent_request_cooldown_api_calls = cs.agent_request_floor_ratio, cs.agent_request_cooldown_api_calls
-    agent._agent_compaction_request_lock = threading.Lock()
 
 
 def _enforce_minimum_context(agent):
@@ -2071,10 +2039,6 @@ _USAGE_STATE: dict[str, Any] = {
 }
 
 
-from agent.incognito_agent import private_init
-
-
-@private_init
 def init_agent(
     agent, base_url: str | None = None, api_key: str | None = None, provider: str | None = None, api_mode: str | None = None,
     acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
@@ -2106,15 +2070,14 @@ def init_agent(
     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
     gateway_session_key: str | None = None, skip_context_files: bool = False,
     load_soul_identity: bool = False, skip_memory: bool = False,
-    skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
+    skip_background_review: bool = False, session_db=None, persistence=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
-    fallback_model: dict[str, Any] | None = None, model_pinned: bool = False, credential_pool=None, checkpoints_enabled: bool = False,
-    fallback_chain_owned: bool = False, allow_billing_fallback: bool = False, checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
+    fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
+    checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None, memory_agent_context: str | None = None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
-    incognito: bool = False,
 ):
     from agent.safe_worker_policy import safe_worker_enabled
 
@@ -2124,8 +2087,6 @@ def init_agent(
         prefill_messages = []
         fallback_model = {}
     _install_safe_stdio()
-    from agent.incognito import is_incognito
-    agent.incognito = bool(incognito) or is_incognito(session_id)
 
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
@@ -2191,14 +2152,14 @@ def init_agent(
     _init_prompt_cache_config(agent)
     _init_turn_state(agent, run_budget_seconds)
     _set_defaults(agent, _STREAM_STATE)
-    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned, fallback_chain_owned)
-    _build_client(agent, api_key, base_url, fallback_chain)
-    _init_fallback_chain(agent, fallback_chain)
+    _build_client(agent, api_key, base_url, fallback_model)
+    _init_fallback_chain(agent, fallback_model)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+    persistence = persistence if persistence is not None else stand_in_interface(session_db)
     _init_session_state(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
-    )
+        persistence=persistence)
 
     # Load config once for memory, skills, and compression sections
     try:
@@ -2223,7 +2184,8 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
-    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, agent._session_db)
+    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
+                          persistence=persistence)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
@@ -2232,11 +2194,6 @@ def init_agent(
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
-    # Gateway eviction and independent workers construct fresh agents. Adopt a durable primary
-    # outage before the first turn so construction itself never leaves a cooled primary active.
-    with suppress(Exception):
-        from agent.agent_runtime_helpers import _adopt_shared_primary_cooldown
-        _adopt_shared_primary_cooldown(agent)
 
 
 __all__ = ["init_agent"]

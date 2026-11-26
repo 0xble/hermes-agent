@@ -108,21 +108,8 @@ clock remains provenance only and never refreshes activity.
 - Draft PR only. No merge, activation, runtime restart/update, or live queue/DB
   mutation. Maintenance owns any later activation.
 
-## Named interruption notice
-
-The settled turn's transcript notice names the automation that stopped, read from the
-admission's own request identity and prompt (`automation_name`): the cron job's name, the goal
-or `/loop` task line, the background process or delegation id, a relayed note, a webhook or a
-Kanban card. An admission that says none of these keeps the generic copy. A Hermes-authored
-boundary is never streamed, so a crash-left one is ledgered `pending` and redelivered plainly,
-not under the "Recovered reply — this may be a duplicate" marker. On 2026-11-14 eight topics got
-that marker on a notice that named nothing.
-
 ## Removal condition
 
 Remove after upstream implements the private synthetic classification and both
 merge-order human-veto regressions pass on the replacement. Never remove merely
 because the older automation-only precedent is upstream.
-
-
-Contract tests: `tests/gateway/test_loop_tick_native_settlement.py`, `tests/gateway/test_synthetic_provenance_retry.py`, `tests/gateway/test_unknown_synthetic_settles.py`, `tests/gateway/test_automation_interrupted_notice_names.py`.

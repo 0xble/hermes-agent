@@ -206,11 +206,6 @@ _CONTEXT_FILES_INTRO = (
     "\nThe workspace's project context files are reproduced below. Their conventions and invariants are binding for "
     "your work in this workspace.\n\n"
 )
-_WEB_SEARCH_GUIDANCE = (
-    "\nWeb research guidance: search in rounds of about 5 queries and read results before widening; reuse earlier "
-    "results and do not loop templated searches over a list from code. If you already know the URL, or would use "
-    "site: to reach a specific page, call web_extract on the URL instead."
-)
 _COMPLETION_INSTRUCTIONS = (
     "\nComplete this task using the tools available to you. When finished, provide a clear, concise summary of:\n"
     "- What you did\n- What you found or accomplished\n- Any files you created or modified\n- Any issues encountered\n\n"
@@ -271,7 +266,6 @@ def _build_child_system_prompt(
             _ctx_files = build_context_files_prompt(cwd=str(workspace_path), skip_soul=True)
         if _ctx_files.strip():
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
-    parts.append(_WEB_SEARCH_GUIDANCE)
     parts.append(_COMPLETION_INSTRUCTIONS)
     if role == "orchestrator":
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE

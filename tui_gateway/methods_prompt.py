@@ -19,7 +19,7 @@ _GROUP_PROBE_FAILED_MSG = "Could not verify this group. Try again after the gate
 
 def _history_user_indices(history: list) -> list:
     """Indices of canonical live-user turns, including composite carriers."""
-    from agent.context_compressor import user_originated_turn_view
+    from session_rules.turns import user_originated_turn_view
     return [i for i, m in enumerate(history) if user_originated_turn_view(m) is not None]
 
 
@@ -42,8 +42,7 @@ def _mem_db_pair_agrees(mem, db_msg) -> bool:
     if mem.get("role") != db_msg.get("role"):
         return False
     if mem.get("role") == "user":
-        from agent.context_compressor import user_originated_turn_view
-        from agent.memory_context import sanitize_context
+        from session_rules.turns import user_originated_turn_view, sanitize_context
         mem_view = user_originated_turn_view(mem)
         db_view = user_originated_turn_view(db_msg)
         if (mem_view is None) != (db_view is None):
@@ -80,19 +79,18 @@ def _load_durable_truncation_history(
     session_key = _submit_row_target_key(session) or str(fallback_sid or "")
     if not session_key:
         return []
+    from persistence.conversation.messages import ConversationRequest
     try:
-        with _session_db(session) as db:
-            get_conv = getattr(db, "get_messages_as_conversation", None)
-            if not callable(get_conv):
+        with _session_db(session) as db, _persistence_for(db) as persistence:
+            if persistence is None:
                 return None
-            history = get_conv(
-                session_key, repair_alternation=repair_alternation, include_row_ids=True)
+            return [message.as_openai_message() for message in persistence.messages.read_conversation(
+                session_key, ConversationRequest(repair_alternation=repair_alternation, include_row_ids=True))]
     except Exception:
         logger.debug(
             "prompt.submit: failed loading durable history for session %s", session_key,
             exc_info=True)
         return None
-    return history if isinstance(history, list) else None
 
 
 def _resolve_truncate_row_id(session: dict, history: list, target_row_id: int):
@@ -173,8 +171,7 @@ def _merge_carrier_holds_target_text(carrier: dict, db_msg: dict) -> bool:
     empty side drops out), so the target's sanitized text either IS the carrier's
     content or appears in it as a whole ``"\\n\\n"``-delimited part. Both views are
     user-originated by construction (the caller only visits user turns)."""
-    from agent.context_compressor import user_originated_turn_view
-    from agent.memory_context import sanitize_context
+    from session_rules.turns import user_originated_turn_view, sanitize_context
     mem_view = user_originated_turn_view(carrier)
     db_view = user_originated_turn_view(db_msg)
     if mem_view is None or db_view is None:
@@ -214,18 +211,19 @@ def _pending_reaction_notes(session: dict) -> str:
     except Exception:
         return ""
     try:
-        with _session_db(session) as db:
-            pending = None if db is None else db.take_unseen_reactions(session_key, author="user")
+        with _session_db(session) as db, _persistence_for(db) as persistence:
+            pending = None if persistence is None else persistence.messages.take_unseen_reactions(
+                session_key, author="user")
     except Exception:
         logger.debug("Failed to read pending reactions", exc_info=True)
         return ""
     notes = []
     for entry in pending or ():
-        snippet = (entry.get("text") or "").strip().replace("\n", " ")
+        snippet = (entry.text or "").strip().replace("\n", " ")
         if len(snippet) > 120:
             snippet = snippet[:120] + "…"
-        emoji = entry.get("emoji") or ""
-        whose = "their own" if entry.get("role") == "user" else "your"
+        emoji = entry.emoji or ""
+        whose = "their own" if entry.role == "user" else "your"
         if snippet:
             notes.append(f'[The user reacted {emoji} to {whose} message: "{snippet}"]')
         else:
@@ -296,15 +294,16 @@ def _legacy_group_fence_error(rid, session, params):
     if not room_id:
         return None
     try:
-        from gateway.hosted_rooms import (
-            HostedRoomError, RoomProbeUnavailableError, default_db_path, probe_hosted_room,
-            probe_peer_room_reservation)
-        hosted = probe_hosted_room(default_db_path(), room_id=room_id)
+        from gateway.hosted_rooms import probe_hosted_room, probe_peer_room_reservation
+        from persistence.gateway.hosted_rooms import HostedRoomError, RoomProbeUnavailableError
+        from tui_gateway.methods_groups import _active_store
+        store = _active_store()
+        hosted = probe_hosted_room(store, placement="shared", room_id=room_id)
         peer = False
         if not hosted:
             from hermes_constants import profile_name_for_home
             peer = probe_peer_room_reservation(
-                default_db_path(), room_id=room_id, target_profile=(
+                store, placement="shared", room_id=room_id, target_profile=(
                     profile_name_for_home(session.get("profile_home"))
                     or str(params.get("profile") or "").strip()
                     or str(_current_profile_name() or "default").strip()))
@@ -462,7 +461,7 @@ def _archived_user_turns(session, sid, history, cut_index, survivor_ids) -> int:
     (#94486): its turns are counted from the physical durable rows, and every id that cannot be
     classified there counts as a turn (fail closed). On a durable-carrier cut the run's rows
     before the target survive (*survivor_ids*)."""
-    from agent.context_compressor import user_originated_turn_view
+    from session_rules.turns import user_originated_turn_view
     physical = None
     archived = 0
     for h_idx in _history_user_indices(history):
@@ -494,7 +493,7 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     if err is not None:
         return err, {}
     durable_prefix = resolved[3] if len(resolved) > 3 else None
-    from agent.context_compressor import history_before_user_originated_turn
+    from session_rules.turns import history_before_user_originated_turn
     if durable_prefix is not None:
         # Durable-boundary cut: the target row is physically present but merged into
         # a repaired live carrier; the physical rows strictly before it are the
@@ -540,21 +539,22 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     # after the in-memory rewrite would stack the new exchange on the "undone" turns).
     # Writes through _session_db (profile sessions own their state.db).
     fields = {}
-    with _session_db(session) as db:
-        if db is not None:
+    from persistence.conversation.messages import ReplaceMode
+    with _session_db(session) as db, _persistence_for(db) as persistence:
+        if persistence is not None:
             try:
                 # NULL session_key (old CLI-origin sessions) would trip an FK violation.
-                # active_only=True: replace only the live (active=1) rows. In-place compaction (#38763)
+                # ARCHIVE_DROPPED replaces only the live (active=1) rows. In-place compaction (#38763)
                 # keeps the pre-compaction transcript as active=0/compacted=1 rows under this same session
-                # key; a bare replace_messages() would DELETE that durable archive on every edit/regenerate
+                # key; a destructive replace would DELETE that durable archive on every edit/regenerate
                 # — the same bug class #80216 fixed for /retry. On an uncompacted session all rows are
-                # active=1, so this is behaviorally identical to the full replace. archive_dropped: a rewind
+                # active=1, so this is behaviorally identical to the full replace. Archiving: a rewind
                 # overwrites turns the user may not have meant to drop, and this write is the last step
                 # before they are gone — three reported incidents ended here with nothing to restore from
                 # (#70516, #80763, #82756). Soft-archiving keeps them on disk (active=0) and in the FTS
                 # index, so a mis-aimed cut is recoverable instead of terminal. The live transcript is
                 # unchanged. Fall back to session id when session_key is NULL — CLI-origin sessions created
-                # before the session_key default fix have no key, and replace_messages(None) triggers an FK
+                # before the session_key default fix have no key, and a replace under None triggers an FK
                 # violation.
                 truncation_key = session.get("session_key") or sid
                 old_active_row_ids = _row_ids_of(history)
@@ -567,17 +567,29 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
                         raise RuntimeError("could not load durable row identities for truncation")
                     old_active_row_ids.update(_row_ids_of(durable_rebind_history))
                 old_survivor_row_ids = [_message_row_id(message) for message in truncated]
-                # active_only: a bare replace would DELETE the compaction archive (active=0
-                # rows) on every edit.  archive_dropped: a mis-aimed cut stays recoverable.
-                db.replace_messages(
-                    truncation_key, truncated, active_only=True, archive_dropped=True,
+                # Only the live rows: a bare replace would DELETE the compaction archive (active=0
+                # rows) on every edit.  Archived, not deleted: a mis-aimed cut stays recoverable.
+                replaced = persistence.messages.replace_transcript(
+                    truncation_key, [_new_message(message) for message in truncated], ReplaceMode.ARCHIVE_DROPPED,
                     reject_active_turn_lease=True)
+                # The row state the write gave each message: a kept row only its id and uid, an inserted row
+                # its stored timestamp, ownership version and tool-call uids as well.
+                for message, row in zip(truncated, replaced.rows):
+                    message["_row_id"] = int(row.id)
+                    if row.message_uid:
+                        message["message_uid"] = row.message_uid
+                    if row.db_row_snapshot is not None:
+                        message.update(timestamp=row.timestamp, _db_row_snapshot=row.db_row_snapshot)
+                        if row.tool_call_uids is not None:
+                            message["_tool_call_uids"] = dict(row.tool_call_uids)
+                        if row.tool_call_uid is not None:
+                            message["_tool_call_uid"] = row.tool_call_uid
             except Exception as exc:
                 logger.error(
                     "prompt.submit: replace_messages failed for session %s (ordinal=%d); refusing "
                     "turn so memory and DB stay aligned: %s",
                     sid, ordinal, exc, exc_info=True)
-                return _err(rid, 5008, f"failed to persist history truncation: {exc}"), {}
+                return _err(rid, 5008, f"failed to persist history truncation: {_store_error_text(exc)}"), {}
             # Surface the survivors' live ids so the client rebinds its cached rowIds
             # (a strict-prefix cut keeps them unchanged since #82956; a divergent
             # rewrite mints new rows).  None entries: the client must drop that turn's id.
@@ -614,13 +626,16 @@ def _reopen_if_finalized(db, session_id: str) -> None:
     live again. Best-effort: a failed read must not block the send."""
     if not session_id:
         return
-    try:
-        row = db.get_session(session_id)
-    except Exception:
-        logger.debug("finalized-session reopen check failed for %s", session_id, exc_info=True)
-        return
-    if row is not None and row.get("ended_at") is not None:
-        db.reopen_session(session_id)
+    with _persistence_for(db) as persistence:
+        if persistence is None:
+            return
+        try:
+            row = persistence.sessions.get(session_id)
+        except Exception:
+            logger.debug("finalized-session reopen check failed for %s", session_id, exc_info=True)
+            return
+        if row is not None and row.ended_at is not None:
+            persistence.sessions.reopen(session_id)
 
 
 def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
@@ -652,14 +667,14 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
                 rid, 5070,
                 "Session storage could not be written, so this message was not saved: the disk is full. "
                 "Free some disk space, then send your message again.",
-                data=_storage_error_data(failure, exc))
+                data=_storage_error_data(failure, _store_error_text(exc)))
         else:
             logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
             error = _err(
                 rid, 5071,
                 f"Session storage could not be written, so this message was not saved. Cause: {failure.gloss}. "
                 f"{failure.action} Then send your message again.",
-                data=_storage_error_data(failure, exc))
+                data=_storage_error_data(failure, _store_error_text(exc)))
     # No turn thread will start, so neither resume nor the busy queue may see
     # this rejected prompt as live. Release the slot a turn would normally own.
     with session["history_lock"]:
@@ -673,7 +688,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 def _run_after_agent_ready(
     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
-    queue_token=None, hosted_images=None,
+    hosted_images=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -704,8 +719,7 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
-        user_turn=display_kind is None and turn_author is None, queue_token=queue_token)
+        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author)
 
 
 _TRUNCATION_PARAMS = (
@@ -834,7 +848,8 @@ def _claim_submit_turn(
     return err, fields
 
 
-# Per-turn client surfaces shared with canonical admission (gateway.session_surface).
+# Per-turn client surfaces that carry a model-bound note (session_notifications._hud_surface_note);
+# the canonical admission path shares the same set (gateway.session_surface).
 from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
@@ -907,18 +922,6 @@ def _(rid, params: dict) -> dict:
             return refusal
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
-    # Stop/Esc cancels the session-owned record. Resolve that terminal state before
-    # accepting a queued client retry so every surface can drop its stale queue item
-    # instead of treating a canceled token as a transient submit failure.
-    moa_token = params.get("moa_token")
-    if moa_token:
-        from . import pending_moa
-        record = pending_moa.get(session, moa_token)
-        if record is None or pending_moa.status(record) in {"cancelled", "consumed"}:
-            message = "Deferred MoA request was cancelled or is no longer available; prompt dropped."
-            return _ok(rid, {
-                "status": "dropped", "reason": "deferred_moa_unavailable", "message": message,
-            })
     # Claim the turn against a possibly-running session (busy/queued reply, else fall
     # through once ``running`` is observed False).  The provider interrupt happens after
     # history_lock is released (a non-interruptible tool may hold it); if the old turn
@@ -941,7 +944,7 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4009, "session busy")
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind, moa_token=params.get("moa_token"))
+            display_kind=display_kind)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -971,8 +974,7 @@ def _(rid, params: dict) -> dict:
             logger.debug("finalized-session reopen before isolated dispatch failed for %s",
                          sid, exc_info=True)
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-            user_turn=display_kind is None and turn_author is None, queue_token=params.get("moa_token"))
+            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -1000,7 +1002,7 @@ def _(rid, params: dict) -> dict:
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            queue_token=params.get("moa_token"), hosted_images=hosted_images),
+            hosted_images),
         daemon=True, name=f"prompt-submit-{sid}")
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -1222,10 +1224,8 @@ def _(rid, params: dict) -> dict:
     def body():
         from run_agent import AIAgent
         kwargs = _background_agent_kwargs(session["agent"], task_id)
-        kwargs.pop("_preflight_fallback", None)
-        kwargs.pop("_fallback_notice", None)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            agent = AIAgent(**{**kwargs, "session_db": session_db})
+        with _side_agent_session_db(kwargs.get("session_db")) as session_db, _persistence_for(session_db) as persistence:
+            agent = AIAgent(**{**kwargs, "session_db": session_db, "persistence": persistence})
             try:
                 result = agent.run_conversation(user_message=text, task_id=task_id)
             finally:
@@ -1442,15 +1442,23 @@ def _pdf_page_range(rid, params):
 # ── side agents (background / btw / preview.restart) ────────────────────────
 
 def _final_response_text(result) -> str:
-    from gateway.copy_blocks import render_copy_blocks_inline
-    text = result.get("final_response", str(result)) if isinstance(result, dict) else str(result)
-    return render_copy_blocks_inline(text or "")
+    return (result.get("final_response", str(result)) if isinstance(result, dict) else str(result))
+
+
+def _preview_restart_prompt(url: str, cwd: str, context: str, has_history: bool) -> str:
+    """The hidden restart agent's task, shared by this transport and the gateway's
+    (``gateway/session_tui_side.py``) so the two cannot drift."""
+    return "\n".join(line for line in [
+        "The desktop preview pane cannot load a local server URL.", f"Preview URL: {url.strip()}",
+        f"Current working directory: {cwd or '(unknown)'}",
+        f"Preview console:\n{context}" if context else "",
+        _PREVIEW_RESTART_HISTORY_NOTE if has_history else "", *_PREVIEW_RESTART_RULES] if line)
 
 
 def _validated_preview_cwd(cwd: str) -> str:
     """The client's cwd as an existing absolute directory, else ``""``. A malformed client path
     (embedded NUL, a missing dir) is "no validated cwd", never an error."""
-    import os
+    import os  # this module's globals are bound by tui_gateway.server; the gateway calls it unbound
 
     try:
         preview_cwd = os.path.abspath(os.path.expanduser(cwd)) if cwd else ""
@@ -1526,14 +1534,6 @@ _PREVIEW_RESTART_RULES = (
 _PREVIEW_RESTART_HISTORY_NOTE = (
     "The conversation history above is from the user's main session — including the commands you (the assistant) previously ran to start servers, edit files, or check ports. Use it to figure out exactly which server should be running at this Preview URL. The user did not start a brand new task; recover what they had working."
 )
-
-
-def _preview_restart_prompt(url: str, cwd: str, context: str, has_history: bool) -> str:
-    return "\n".join(line for line in [
-        "The desktop preview pane cannot load a local server URL.", f"Preview URL: {url.strip()}",
-        f"Current working directory: {cwd or '(unknown)'}",
-        f"Preview console:\n{context}" if context else "",
-        _PREVIEW_RESTART_HISTORY_NOTE if has_history else "", *_PREVIEW_RESTART_RULES] if line)
 
 
 # ── batch clarify locks ─────────────────────────────────────────────────────

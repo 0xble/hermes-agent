@@ -68,13 +68,6 @@ def _statuses(authority):
             for row in authority.persistence.admissions.list(session_id=session_id, pending_only=False)}
 
 
-async def _wait_for(predicate, timeout=5):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        assert asyncio.get_running_loop().time() < deadline, 'condition not reached'
-        await asyncio.sleep(0.01)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize('delay_first_delivery', [False, True], ids=['normal', 'delayed-first-delivery'])
 async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypatch, delay_first_delivery):

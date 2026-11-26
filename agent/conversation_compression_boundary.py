@@ -21,8 +21,8 @@ def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:
             from tools.computer_use.tool import reset_screenshot_dedup
             reset_screenshot_dedup(session_id)
     with contextlib.suppress(Exception):
-        from tools.skills_tool_dedup import advance_skill_view_dedup_generation
-        advance_skill_view_dedup_generation(task_id)
+        from tools.skills_tool import reset_skill_view_dedup
+        reset_skill_view_dedup(task_id)
 
 
 def mark_context_loss_boundary(

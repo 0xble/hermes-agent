@@ -161,8 +161,6 @@ def test_network_git_dies_with_its_killed_owner_without_a_parent_death_signal(re
 
 
 def _assert_fetch_dies_with_killed_owner(repo, tmp_path, prelude: str) -> None:
-    from hermes_cli._git_process_scope import _exited
-
     script = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(REPO_ROOT)!r})
@@ -194,18 +192,26 @@ def _assert_fetch_dies_with_killed_owner(repo, tmp_path, prelude: str) -> None:
         assert "git" in Path(f"/proc/{fetch_pid}/cmdline").read_text(encoding="utf-8-sig", errors="replace")
         owner.kill()
         owner.wait(timeout=10)
-        fetch_proc = Path(f"/proc/{fetch_pid}")
         for _ in range(100):
-            if _exited(fetch_proc):
+            if not Path(f"/proc/{fetch_pid}").exists() or "Z" in _state(fetch_pid):
                 break
             time.sleep(0.05)
-        assert _exited(fetch_proc), "git fetch outlived its killed update owner"
+        assert not Path(f"/proc/{fetch_pid}").exists() or "Z" in _state(fetch_pid), \
+            "git fetch outlived its killed update owner"
     finally:
         if owner.poll() is None:
             owner.kill()
         blocker_pid = Path(f"{started}.self")
         if blocker_pid.exists():
             subprocess.run(["kill", "-9", blocker_pid.read_text(encoding="utf-8-sig").strip()], capture_output=True, check=False)
+
+
+def _state(pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig")
+    except OSError:
+        return "Z"
+    return stat[stat.rfind(")") + 2:][:1]
 
 
 def test_a_refused_build_join_is_logged_and_noted_in_the_receipt(tmp_path, monkeypatch, caplog):

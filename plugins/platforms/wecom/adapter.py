@@ -867,12 +867,9 @@ def register(ctx) -> None:
         env_overrides=gateway_env.ENV_OVERRIDES,
         env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )
-    from plugins.platforms.wecom.callback_adapter import (
-        WecomCallbackAdapter, check_wecom_callback_requirements, ensure_wecom_callback_requirements,
-    )
+    from plugins.platforms.wecom.callback_adapter import check_wecom_callback_requirements, ensure_wecom_callback_requirements
     ctx.register_platform(
         name="wecom_callback", label="WeCom Callback (self-built apps)", adapter_factory=_build_callback_adapter,
-        adapter_class=WecomCallbackAdapter,
         dashboard_label="WeCom (app)",
         dashboard_description="Two-way WeCom integration via callback app.",
         docs_url="https://developer.work.weixin.qq.com/document/path/90930",

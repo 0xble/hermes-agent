@@ -93,8 +93,7 @@ class GatewayProcessNotificationsMixin:
                     if process_registry._claim_survivor_delivery(session):
                         process_registry._mark_survivor_delivered(session)
                 else:
-                    await asyncio.to_thread(acknowledge_survivor_notifications, process_registry,
-                                            (({"session_id": session_id}, ""),))
+                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                 return None
             return False
         return True
@@ -143,7 +142,5 @@ class GatewayProcessNotificationsMixin:
         # Presented, or deliberately suppressed by the notification mode: either way the
         # claimed survivor completion is settled and must not replay on a successor.
         if settled:
-            # The acknowledgement can load retained results, whose ownership check opens state.db.
-            await asyncio.to_thread(acknowledge_survivor_notifications, process_registry,
-                                    (({"session_id": session_id}, ""),))
+            acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
         return True

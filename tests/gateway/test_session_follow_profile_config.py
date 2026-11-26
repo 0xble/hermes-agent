@@ -6,9 +6,15 @@ so the frozen request says "follow" and each turn re-reads the profile's model s
 included). Real SessionStore/SessionAuthority and a real config.yaml; ``_load_gateway_config`` is not
 patched.
 """
-from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
+from types import SimpleNamespace
+
 import pytest
 import json
+from persistence_assembly import store_location
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
+from pathlib import Path
+
+pytestmark = pytest.mark.usefixtures('authority_cwd_in_tmp')  # symbolic profile_id: a relative home
 
 
 def _profile(home, model, port, key):
@@ -18,25 +24,17 @@ def _profile(home, model, port, key):
 
 def _owner(home):
     from gateway.config import GatewayConfig
-    from gateway.run import GatewayRunner
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
     from gateway.session_controls import AuthorityConnection
-    import hermes_state_runtime as rt
     store = SessionStore(home / 'sessions', GatewayConfig())
-    db = store._db
-    # Keep real session-key derivation and scoped runtime publication without starting a gateway.
-    runner = object.__new__(GatewayRunner)
-    runner.session_store = store
-    runner._session_db = db
-    runner.adapters = {}
-    runner._draining = False
-    runner._evict_cached_agent = lambda route: None
-    runner._cached_agent_for = lambda route: None
-    runner._handle_message = None
+    db = store.persistence
+    runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
+                             _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
+                             _handle_message=None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', persistence=storage_handle(db.scope.profile_dir),
+                                 epoch=db.runtime.begin_epoch(instance_id='owner'))
     runner.session_authority = authority
     return store, runner, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 
@@ -67,7 +65,7 @@ async def test_follow_profile_session_runs_the_profiles_current_route_and_a_pick
     _profile(home, 'old', 1, 'k-old')
     store, runner, authority, owner = _owner(home)
     try:
-        assert authority.db.db_path.parent.resolve() == home.resolve()
+        assert Path(store_location(authority.persistence.scope)).parent.resolve() == home.resolve()
         follow = await _create(owner, authority, home, 'follow')
         pick = await _create(owner, authority, home, 'pick', model='pick')
         assert _route(runner, follow) == ('old', 'http://127.0.0.1:1/v1', 'k-old')

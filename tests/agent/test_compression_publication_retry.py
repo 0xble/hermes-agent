@@ -7,7 +7,7 @@ import pytest
 from agent.conversation_compression import CompressionCommitFence, _attempt_stall_fallback
 from agent.conversation_compression_publication import retry_publication
 from hermes_state import SessionDB
-from persistence.sqlite._state.errors import CompressionLeaseLostError
+from hermes_state_errors import CompressionLeaseLostError
 from hermes_state_publication import LocalStateLockTimeout
 
 

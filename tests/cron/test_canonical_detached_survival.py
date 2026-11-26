@@ -230,10 +230,7 @@ async def test_cron_worker_registration_still_requires_adoption_capability(tmp_p
     from tests.cron.test_cron_recovery import _owner
 
     owner, db = _owner(tmp_path, monkeypatch)
-    async def claim(*_args):
-        return 'producer-claim'
-
-    monkeypatch.setattr(session_worker, '_claim', claim)
+    monkeypatch.setattr(session_worker, '_claim', lambda *args: 'producer-claim')
     connection = SimpleNamespace(authority=owner, actor=SessionActor(
         'human', str(tmp_path), frozenset({'session:control'}), 'test'))
     params = {'profile_id': str(tmp_path), 'session_id': 'cron-session', 'execution_id': 'cron-worker:fire',
@@ -251,7 +248,7 @@ async def test_cron_worker_registration_still_requires_adoption_capability(tmp_p
 @pytest.fixture
 def detached_observation(tmp_path, monkeypatch):
     from cron import executions, scheduler_authority
-    from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
+    from hermes_state_keys import CRON_PRINCIPAL_ID
 
     monkeypatch.setattr(executions, 'EXECUTIONS_FILE', tmp_path / 'executions.db')
     execution = executions.create_execution('observe-job', source='test')

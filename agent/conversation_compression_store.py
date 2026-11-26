@@ -95,7 +95,7 @@ def _capture_authoritative_cooldown_under_lease(
         if not isinstance(durable_state, dict):
             raise TypeError("raw compression cooldown snapshot must be a mapping")
         ContextCompressor.get_active_compression_failure_cooldown(compressor, refresh=True)
-    except Exception as exc:  # health: allow BLE001 -- storage failure leaves the compression record unchanged
+    except Exception as exc:
         logger.debug("authoritative compression cooldown capture failed: %s", exc)
         return False, None
     authoritative = getattr(compressor, "_last_cooldown_refresh_was_authoritative", None)
@@ -145,7 +145,7 @@ def _reopen_orphaned_parent(session_db: Any, session_id: str, store: Any = None)
         if (store.lineage.reopen_orphaned_compression(session_id) if store is not None
                 else orphan_reopener(session_db, session_id)):
             logger.warning("compression recovery: reopened orphaned session=%s with no continuation", session_id)
-    except Exception as exc:  # health: allow BLE001 -- storage failure leaves the compression record unchanged
+    except Exception as exc:
         logger.warning("orphaned compression session reopen failed for %s: %s", session_id, exc)
 
 

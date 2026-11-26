@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 import pytest
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from tui_gateway import server
 

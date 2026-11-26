@@ -8,10 +8,6 @@ and [related implementation](https://github.com/NousResearch/hermes-agent/pull/1
 are comparison candidates, not substitutes for the accepted mid-session contract.
 The CLI's safe mode and rule opt-outs do not establish a persistence boundary.
 
-Runtime admission and settlement retain an internal incognito bypass for the
-current private turn. Public callers still resolve and validate durable owners
-before writing, so the bypass cannot be used to mutate another session.
-
 ## Ownership And Adoption
 
 The user-facing contract and configuration belong to the Incognito Gateway Topics
@@ -44,19 +40,6 @@ not only the command reply.
   session private. Remove the record to repair that topic.
 - `/new` in a private topic ends the interval, then binds, titles and announces
   the new session as public work. `/topic` is refused while private.
-- A goal is suspended while its topic is private: no judge call, no revive, no
-  wakeup and no continuation. The judge would send the private reply to the
-  auxiliary goal_judge provider, and goal writes are withheld anyway. The goal
-  resumes untouched after `/incognito off`. Background wake admission holds its
-  existing reservation through bookkeeping and physical writes that outlive caller
-  cancellation. `/incognito` refuses while admission is pending, another task owns
-  the adapter guard, or authority work is queued/running before its agent slot exists.
-  The command's own otherwise-idle adapter guard is not foreign work. Do not hold
-  the model-route lock across dispatch, because an inline slash command acquires it itself.
-  A reservation the gate prunes before the admission task's first step (a claim on the
-  key, or expiry) is restored by `admitting`, so the fence holds and no KeyError escapes.
-  A privacy switch that races past the watcher's suspend check is refused by the durable
-  route snapshot and retried, not parked as a terminal wait until restart.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
@@ -76,23 +59,6 @@ not only the command reply.
   Private input and plugin injections must stay on the in-process RAM lane, and
   delayed admission, worker, local-mutation and compression writers must carry
   every affected session identity into SQLite admission.
-- Runtime receipts project ownership from their closed operation schema and the
-  owner's actual lineage. A public message, title, tool output or result mentioning
-  a private session ID remains public content. Privacy refusal is `privacy_denied`,
-  never a successful empty receipt, and consumes no sequence or revision.
-  A title write also owns every row it may clear: the exact holder, and for an
-  automatic reclaim each holder the reclaim's shared `auto_title_holders`
-  predicate matches (case-folded or `#N` alias), so a private holder refuses it.
-- Worker outboxes check producer scope, revoked copied work and typed ownership
-  before their first save, replay or adoption save. Public writes still journal
-  before send. A definite first-send owner privacy refusal releases its uncommitted
-  sequence. Reopened entries and ambiguous lost ACKs retain the exact pending
-  operation for replay, since a later refusal cannot disprove an earlier commit.
-- Entering incognito also waits for registered, running or unknown durable work
-  anywhere in the conversation's logical/physical lineage. It does not cancel
-  workers. The store takes its lock, the owning DB writer lock, then exclusive
-  privacy admission before sidecar/model/registry publication. New assignments
-  refuse private targets. An unavailable or closed DB cannot acknowledge entry.
 - Relay instrumentation, cached public Relay leases and shared metrics must not
   observe a private turn. Refuse instrumentation before discovering or creating
   a host, not after the subscriber has queued its payload.
@@ -171,6 +137,3 @@ Retire this unit with its implementation only after a replacement passes that
 same boundary proof. A source rollback removes the feature, it does not retract
 content already sent to messaging or model providers. Never turn an active
 private lane public merely by ignoring or deleting its routing sidecar.
-
-Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/hermes_state/test_incognito_off_regression.py`,
-  `tests/gateway/test_incognito_goal_suspend.py`, `tests/gateway/test_incognito_worker_boundary.py`, `tests/hermes_state/test_incognito_worker_write_contract.py`, `tests/hermes_state/test_runtime_privacy_journal.py`, `tests/hermes_state/test_runtime_privacy_ownership.py`.

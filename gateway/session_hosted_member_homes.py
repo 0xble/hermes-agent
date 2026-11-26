@@ -26,9 +26,6 @@ from pathlib import Path
 from persistence.gateway.hosted_rooms import RoomStopPendingError
 
 
-_HOMES = 'gateway.hosted.member_homes.v1:'
-
-
 class MemberHomeUnknownError(RoomStopPendingError):
     """Disband waits on a turn whose member profile is no longer configured and whose home was
     never recorded: nothing here can reach its daemon, so only the user can unblock it."""

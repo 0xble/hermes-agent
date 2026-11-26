@@ -31,5 +31,3 @@ the `@` stem parsing.
 
 Retire with the observation inbox. Rollback reverts this commit. Files named with
 `@` would then be skipped by `index` as invalid skill names, not misattributed.
-
-Contract tests: `tests/scripts/test_curate_skill_observations.py`.

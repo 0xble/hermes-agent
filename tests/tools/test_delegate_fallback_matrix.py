@@ -70,24 +70,6 @@ def test_pin_is_derived_from_provider_base_url_or_model(overrides, expected):
     assert _spawn_kwargs(_parent(list(PARENT_CHAIN)), {}, **overrides)["fallback_model"] == expected
 
 
-@pytest.mark.parametrize("authored_route,expected_pin", [(None, True), ({"provider": "minimax"}, False),
-                                                        ({"model": "primary"}, True)])
-def test_model_pin_uses_route_intent_not_the_provider_default(authored_route, expected_pin):
-    child = _spawn_kwargs(_parent(), {}, model="primary", routing_cfg=authored_route)
-    assert child["model"] == "primary"
-    assert child["model_pinned"] is expected_pin
-
-
-def test_billing_fallback_flag_reaches_pinned_child():
-    child = _spawn_kwargs(
-        _parent(),
-        {"allow_billing_fallback": True},
-        model="gpt-6.2-sol",
-        routing_cfg={"model": "gpt-6.2-sol", "fallback_providers": list(DECLARED_CHAIN)},
-    )
-    assert child["allow_billing_fallback"] is True
-
-
 def test_declared_chain_flows_through_real_profile_config_loader(
     tmp_path, monkeypatch
 ):

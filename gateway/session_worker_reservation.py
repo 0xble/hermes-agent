@@ -74,42 +74,10 @@ def reserve_admission_worker(authority, *, admission_id, process, principal_id, 
     """
     authority._require_admission_open()
     pid, birth = verify_worker_identity(process, hello)
-    secret = secrets.token_urlsafe(32)
-
-    def write(conn):
-        _epoch(conn, authority.epoch)
-        admission = _admission(conn, admission_id)
-        if admission['status'] != 'started' or admission['owner_epoch'] != authority.epoch:
-            raise RuntimeStoreError('producer_not_started')
-        if not same_owner(admission['principal_id'], principal_id):
-            raise RuntimeStoreError('permission_denied')
-        owner, generation = admission['target_session_id'], admission['generation']
-        if _session(conn, owner)['runtime_generation'] != generation:
-            raise RuntimeStoreError('stale_generation')
-        from hermes_state_local_lineage import local_physical_target
-        sid = local_physical_target(conn, owner)
-        execution_id = 'admission-worker:' + admission_id
-        if conn.execute('SELECT 1 FROM worker_executions WHERE execution_id=?', (execution_id,)).fetchone():
-            raise RuntimeStoreError('admission_conflict')
-        if conn.execute("SELECT 1 FROM worker_executions WHERE session_id=? AND status!='terminal'", (sid,)).fetchone():
-            raise RuntimeStoreError('stale_generation')
-        # The private worker fence follows its physical assignment; admission/FIFO
-        # generation and identity remain on the logical owner.
-        conn.execute('UPDATE sessions SET runtime_generation=? WHERE id=?', (generation, sid))
-        if sid != owner:
-            conn.execute("UPDATE session_admissions SET lineage_json=json_insert(lineage_json,'$[#]',?) "
-                         "WHERE admission_id=?", (sid, admission_id))
-        scope = dict(profile_id=authority.profile_id, session_id=sid, execution_id=execution_id,
-                     generation=generation, pid=pid, birth=birth, secret=secret)
-        claim = admission_fingerprint(canonical_target=sid, payload=scope | {'principal': worker_subject or principal_id})
-        conn.execute("INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
-                     "VALUES(?,?,'compute',?,?,'registered',?)",
-                     (execution_id, sid, authority.epoch, generation, _secret_digest(claim)))
-        return scope | {'epoch': authority.epoch}
-
-    from hermes_state_runtime_privacy import admission_owners, execute_owned_write
-    return execute_owned_write(authority.db, write, (),
-        resolve=lambda conn: admission_owners(conn, admission_id))
+    return asdict(authority_persistence(authority).worker_executions.reserve_for_admission(
+        epoch=authority.epoch, admission_id=admission_id, principal_id=principal_id,
+        profile_id=authority.profile_id, pid=pid, birth=birth, secret=secrets.token_urlsafe(32),
+        owner=owner_rule(), worker_subject=worker_subject))
 
 
 def lose_admission_worker(authority, row, scope):

@@ -63,13 +63,7 @@ def _alive(identity):
 
 
 def _read(path):
-    try:
-        wait_until(path.exists, timeout=60, what=f"owner receipt {path.name}")
-    except AssertionError as exc:
-        # The owner subprocess's own output is the only evidence of why it never wrote a receipt.
-        log = path.parent / "owners.log"
-        detail = log.read_text(encoding="utf-8", errors="replace")[-6000:] if log.exists() else "(no owners.log)"
-        raise AssertionError(f"{exc}\n--- owners.log ---\n{detail}") from None
+    wait_until(path.exists, timeout=60, what=f"owner receipt {path.name}")
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 

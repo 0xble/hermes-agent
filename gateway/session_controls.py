@@ -656,17 +656,6 @@ class AuthorityConnection:
         return {'sessions': await asyncio.to_thread(live_picker_page, self.authority, sessions, limit, workspace, picker),
                 'scope': 'live'}
 
-    async def _authorize_resume(self, ref, capability):
-        if ref.session_id in self.authority.sessions:
-            self.authority.authorize(self.actor, ref, capability)
-            return
-        from gateway.session_store_async import run_store_call
-        # A cold authorization can mount a routed conversation and read its
-        # persisted route under the session-store lock.
-        await run_store_call(self.authority.authorize, self.actor, ref, capability)
-        if ref.session_id not in self.authority.sessions:
-            raise RuntimeStoreError('not_found')
-
     async def resume(self, ref, params):
         from gateway.session_local_inventory import snapshot_info
         replay_from = self.replay_cursors.pop(ref.session_id, None)
@@ -710,18 +699,18 @@ class AuthorityConnection:
                 from gateway.session_route_recovery import messaging_owner_ref
                 ref = messaging_owner_ref(self.authority, ref)
         if params.get('editor') is not None:
-            await self._authorize_resume(ref, 'session:control')
+            self.authority.authorize(self.actor, ref, 'session:control')
             from gateway.session_local_mcp import resume_editor_mcp
             resume_editor_mcp(self.authority, ref, params['editor'])
         if 'api_key' in params:
             # A launch-only key re-supplied after a restart (`--resume <id> --api-key`).
-            await self._authorize_resume(ref, 'session:control')
+            self.authority.authorize(self.actor, ref, 'session:control')
             from gateway.session_policy import rebind_launch_key
             rebind_launch_key(self.authority, ref, params['api_key'])
         # Read-only mount (#85303): an ended row stays ended until the first admitted turn
         # reopens it (``reopen_local_session`` in the drain), so opening a finished chat
         # never re-lights DB-derived liveness with no new activity.
-        await self._authorize_resume(ref, 'session:read')
+        self.authority.authorize(self.actor, ref, 'session:read')
         mounted = self.authority.sessions[ref.session_id].source
         # Only a local route has a stored creation policy to refresh; a platform lane's turns read the profile.
         if 'session:control' in self.actor.capabilities and getattr(mounted, 'platform', None) == Platform.LOCAL:
@@ -899,7 +888,7 @@ class AuthorityConnection:
             raise AuthorityRefusal('permission_denied')
         forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'turn_origin', 'api_text', 'model_override', 'clarify_batch'}
+                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
         if forbidden:
             raise AuthorityRefusal('invalid_params')
         request_id = params.get('submission_id') or params.get('input_id')

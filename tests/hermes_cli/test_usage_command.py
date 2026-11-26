@@ -62,16 +62,3 @@ def test_hermes_usage_without_credential_exits_nonzero_with_one_stderr_line(caps
     assert out == ""
     assert err.count("\n") == 1 and "openai-codex" in err
 
-
-def test_hermes_usage_ledger_supports_filters_limit_and_parent_json(capsys):
-    rows = [{"timestamp": "2026-09-20T00:00:00+00:00", "resolved_model": "gpt-5"}]
-    with patch("hermes_cli.observability.request_usage_ledger.request_usage_rows", return_value=rows) as read:
-        assert _run(["usage", "--json", "ledger", "--since", "2026-09-19", "--limit", "7"], lambda *_a, **_k: None) == 0
-    assert json.loads(capsys.readouterr().out) == rows
-    assert read.call_args.kwargs["since"] == "2026-09-19"
-    assert read.call_args.kwargs["limit"] == 7
-
-    with patch("hermes_cli.observability.request_usage_ledger.request_usage_rows", return_value=rows):
-        assert _run(["usage", "ledger", "--json"], lambda *_a, **_k: None) == 0
-    assert json.loads(capsys.readouterr().out) == rows
-

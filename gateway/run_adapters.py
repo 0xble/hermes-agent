@@ -938,8 +938,6 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             recover_api_turns(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
-        from gateway.missed_inbound_recovery import schedule_missed_inbound_recovery
-        schedule_missed_inbound_recovery(self, platform)
 
     async def _recover_spool_after_reconnect(self, platform) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""

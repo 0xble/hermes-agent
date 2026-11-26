@@ -104,7 +104,7 @@ class TestSteerBusyPathDispatch:
 
         cli.process_command("/steer focus on errors")
 
-        cli.agent.steer.assert_called_once_with("focus on errors", human=True)
+        cli.agent.steer.assert_called_once_with("focus on errors")
         cli._pending_input.put.assert_not_called()
 
     def test_idle_path_queues_as_next_turn(self):

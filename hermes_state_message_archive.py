@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from hermes_state_common import _placeholders
-from persistence.sqlite.conversation._store.identity import _carried_tail_slots, _compaction_messages, _unrepresented_tail_rows
+from hermes_state_identity import _carried_tail_slots, _compaction_messages, _unrepresented_tail_rows
 from hermes_state_write_metrics import add_write_rows, write_phase
 
 if TYPE_CHECKING:

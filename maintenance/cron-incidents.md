@@ -35,6 +35,3 @@ Run the exact-head portable gate before integration.
 Retire when the selected upstream release preserves these classification
 contracts without the local patch. Rollback reverts the commit carrying
 `Fork-Patch: cron-incident-classification`, without rewriting stored incidents.
-
-
-Contract tests: `tests/cron/test_incident_classification.py`.

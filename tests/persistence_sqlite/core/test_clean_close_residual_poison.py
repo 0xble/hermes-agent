@@ -1,4 +1,4 @@
-"""A clean ``SessionDB.close()`` racing a live caller must never be classified as an externally
+"""A clean ``StoreHolder.close()`` racing a live caller must never be classified as an externally
 deleted WAL generation (regression for #116244, sibling of #105567).
 
 ``append_message`` already probes the replaced/lost generation INSIDE ``_lock`` so it can only see
@@ -10,18 +10,24 @@ healthy handle. ``normal`` is the control.
 import sqlite3
 import threading
 import pytest
-from hermes_state import SessionDB
+from persistence.sqlite import _registry
+from persistence.sqlite._holder import StoreHolder
+from persistence.sqlite.admin import SQLiteStoreAdmin
+from persistence.sqlite.admin._maintenance import _optimize_fts
+from persistence.sqlite.conversation._store.messages import append_message
+from persistence.sqlite.conversation._store.search import rebuild_fts
+from persistence.sqlite.conversation._store.sessions import create_session
 
 
 @pytest.mark.requires_wal  # the sticky flag exists only for a recorded WAL/SHM generation; DELETE mode has none
 @pytest.mark.parametrize("entry", ["normal", "optimize", "rebuild", "vacuum", "error_branch"])
 def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry):
     path = tmp_path / "synthetic.db"
-    db = SessionDB(db_path=path)
-    db.create_session("synthetic", "cli")
+    db = StoreHolder(db_path=path)
+    create_session(db, "synthetic", "cli")
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
-    lock, close = db._lock, db._close_connection_quietly
+    lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -32,37 +38,32 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         return threading.current_thread().name == "synthetic-writer"
 
     class ObservedLock:
+        def acquire(self, *args, **kwargs):
+            if is_writer():
+                progress.set()
+            return lock.acquire(*args, **kwargs)
+
+        def release(self):
+            lock.release()
+            if is_writer() and entry == "error_branch" and calls == 1:
+                second.set()
 
         def __enter__(self):
             self.acquire()
             return self
 
-        def acquire(self, blocking=True, timeout=-1):
-            if is_writer():
-                progress.set()
-            return lock.acquire(blocking=blocking, timeout=timeout)
-
         def __exit__(self, *args):
             self.release()
 
-        def release(self):
-            lock.release()
-            if is_writer() and entry == "error_branch" and not second.is_set():
-                progress.clear()
-                second.set()
-                assert closed.wait(10), "close did not reach its teardown window"
-
-    def observe_guard(guard):
-        def observed_guard():
-            nonlocal calls
+    def observed_guard():
+        nonlocal calls
+        if is_writer():
+            calls += 1
+        try:
+            return guard()
+        finally:
             if is_writer():
-                calls += 1
-            try:
-                return guard()
-            finally:
-                if is_writer():
-                    progress.set()
-        return observed_guard
+                progress.set()
 
     def paused_close(connection):
         close(connection)
@@ -73,10 +74,10 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
-    # Normal writers use the cached generation check, SQLite-error recovery the
-    # full probe. Both must observe the stable state under the same writer lock.
-    for name in ("_raise_if_db_replaced", "_raise_if_db_generation_flagged"):
-        monkeypatch.setattr(db, name, observe_guard(getattr(db, name)))
+    monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
+    if entry == "vacuum":  # the store admin's vacuum runs on the registry's writer for the file: lend it this handle
+        monkeypatch.setattr(_registry, "acquire", lambda _path: db)
+        monkeypatch.setattr(_registry, "release_or_close", lambda _db: None)
 
     def closer():
         try:
@@ -91,14 +92,14 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     def writer():
         try:
-            if entry == "normal":
-                db.append_message("synthetic", "tool", content="normal-during-close")
+            if entry == "normal":  # health: allow HX011 -- one branch per write entry the race is parametrised over
+                append_message(db, "synthetic", "tool", content="normal-during-close")
             elif entry == "optimize":
-                db.optimize_fts()
+                _optimize_fts(db)
             elif entry == "rebuild":
-                db.rebuild_fts()
+                rebuild_fts(db)
             elif entry == "vacuum":
-                db.vacuum()
+                SQLiteStoreAdmin(path, read_only=False).vacuum()
             else:
                 db._execute_write(inject_error)
         except BaseException as e:
@@ -122,7 +123,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         assert not any("AssertionError" in x for x in errors), errors
         sticky = bool(db._db_wal_generation_lost)
         try:
-            db.append_message("synthetic", "tool", content="after-legitimate-close")
+            append_message(db, "synthetic", "tool", content="after-legitimate-close")
         except Exception as e:
             post_errors.append(type(e).__name__ + ": " + str(e))
         reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

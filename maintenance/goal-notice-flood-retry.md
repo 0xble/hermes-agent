@@ -119,5 +119,3 @@ passes the proof surface.
 
 **Rollback:** revert the logical patch in one commit; no schema, config, or
 persistent-state migration is introduced.
-
-Contract tests: `tests/gateway/test_goal_status_notice.py`.

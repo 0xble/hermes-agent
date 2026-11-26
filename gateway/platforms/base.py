@@ -2043,10 +2043,6 @@ _strip_media_directives = _strip_media_tag_directives
 class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
-    # Reaction exposure is derived from this adapter class without constructing an adapter. ``None``
-    # means ``PlatformRegistry`` checks whether ``add_reaction`` is overridden; adapters may set an
-    # explicit bool when their transport capability differs from the method implementation.
-    SUPPORTS_REACTIONS: Optional[bool] = None
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
     supports_code_blocks: bool = False
@@ -2182,19 +2178,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         event._deferred_session_key = session_key
         event._deferred_generation = generation
         queue.append((session_key, generation, event))
-        self._unresolved_deferred_map()[id(event)] = event
         return len(queue)
-
-    def _unresolved_deferred_map(self) -> dict[int, MessageEvent]:
-        """Acknowledged deferred commands without a visible outcome yet, keyed by ``id(event)``.
-
-        Teardown reports each one left here, so a command acked with "scheduled after the current
-        turn commits" never ends silently. Created lazily: adapter doubles skip ``__init__``.
-        """
-        pending = getattr(self, "_unresolved_deferred", None)
-        if pending is None:
-            pending = self._unresolved_deferred = {}
-        return pending
 
     def _pop_deferred_command(self, session_key: str) -> Optional[MessageEvent]:
         queue = self._deferred_commands.get(session_key)
@@ -2248,52 +2232,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         if deferred is not None:
             self._start_session_processing(deferred, session_key)
 
-    def _invalidate_deferred_commands(self, session_key: str, *, forget_unresolved: bool = True) -> None:
-        """Advance the session incarnation and discard commands from the old one.
-
-        A per-session invalidation follows the user's own /stop, /new or /reset, so the dropped
-        commands are forgotten silently. Teardown passes ``forget_unresolved=False`` and reports them.
-        """
+    def _invalidate_deferred_commands(self, session_key: str) -> None:
+        """Advance the session incarnation and discard commands from the old one."""
         self._session_generations[session_key] = self._session_generations.get(session_key, 0) + 1
         self._deferred_commands.pop(session_key, None)
-        if forget_unresolved:
-            self._unresolved_deferred = {
-                key: event for key, event in self._unresolved_deferred_map().items()
-                if getattr(event, "_deferred_session_key", None) != session_key
-            }
 
     def _invalidate_all_deferred_commands(self) -> None:
         """Fence every queued command during adapter shutdown/replacement."""
         for session_key in set(self._session_generations) | set(self._deferred_commands):
-            self._invalidate_deferred_commands(session_key, forget_unresolved=False)
-
-    def _resolve_deferred_command(self, event: MessageEvent, *, outcome_visible: bool = True) -> None:
-        """The deferred command's handler returned: its own reply (or a park) is the outcome.
-        Any other event is absent from the map, so this is a no-op for it."""
-        if outcome_visible and not getattr(event, "_deferred_parked", False):
-            self._unresolved_deferred_map().pop(id(event), None)
-
-    async def _report_unrun_deferred_commands(self) -> None:
-        """Tell each chat which acknowledged deferred command will not run (teardown only).
-
-        The deferred queue is in-memory and a restart cannot replay it; without this the earlier
-        "scheduled after the current turn commits" ack is the last word. Bounded and best-effort:
-        a wedged transport must not stall shutdown.
-        """
-        events, self._unresolved_deferred = list(self._unresolved_deferred_map().values()), {}
-        if not events:
-            return
-
-        async def _report(event: MessageEvent) -> None:
-            text = t("gateway.busy.deferred_dropped", command=event.get_command() or "command")
-            await self.send(event.source.chat_id, text, metadata=_thread_metadata_for_event(event))
-
-        results = await asyncio.wait_for(
-            asyncio.gather(*(_report(e) for e in events), return_exceptions=True), timeout=5.0,
-        )
-        for result in results:
-            if isinstance(result, BaseException):
-                logger.warning("[%s] Could not report an unrun deferred command: %s", self.name, result)
+            self._invalidate_deferred_commands(session_key)
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         """Length function for message size; override where the platform counts
@@ -5348,18 +5295,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         The pending slot stays visible during backoff for FIFO admission and shutdown.
         Controls retain the existing task cancellation and guard ownership boundaries.
         """
+        assert self._message_handler is not None
         while True:
-            handler = self._message_handler
-            if handler is None:
-                # Hard drain can withdraw ingress after this task took ownership of the event.
-                # Return it to shutdown recovery rather than failing a turn that never ran.
-                runner = self.gateway_runner
-                if runner is not None and runner._draining and runner._preserve_drain_event(session_key, event):
-                    return None
-                raise RuntimeError("Gateway message handler is unavailable")
             token = post_delivery_owner.set((self, event))
             try:
-                response = await handler(event)
+                response = await self._message_handler(event)
             finally:
                 post_delivery_owner.reset(token)
             if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
@@ -5388,7 +5328,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             if (deferred_session != session_key
                     or getattr(event, "_deferred_generation", None) != current_generation):
                 logger.info("[%s] Dropping stale deferred command for session %s", self.name, session_key)
-                self._unresolved_deferred_map().pop(id(event), None)
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
@@ -5419,7 +5358,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             # The handler can recover source routing (for example, a missing thread id);
             # build final transport metadata from that resolved event.
             _thread_metadata = _thread_metadata_for_event(event)
-            if getattr(event, "_drain_deferred", False):
+            if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
                 return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
@@ -5499,8 +5438,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
-            # A deferred command's own reply was its outcome, unless that reply failed to deliver.
-            self._resolve_deferred_command(event, outcome_visible=delivery_succeeded or not delivery_attempted)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -5537,7 +5474,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             raise
         except BaseException as e:
             bind_event_turn(event)
-            self._resolve_deferred_command(event)  # a deferred command's turn-error notice is its outcome
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             await review_capture.notify_error(self, event, e, session_key)
@@ -5551,8 +5487,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata, event=event)
-            from gateway.session_ingress import settle_pause_notice
-            settle_pause_notice(event, delivery_succeeded)  # a pause notice is told only once delivered
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
                 # A FIFO-run turn names its exact owner and generation; the interrupt event's
@@ -5690,10 +5624,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                                self.name, sum(not t.done() for t in tasks))
                 break
         self._invalidate_all_deferred_commands()
-        try:
-            await self._report_unrun_deferred_commands()
-        except Exception as exc:  # incl. the 5s bound: reporting never blocks teardown
-            logger.warning("[%s] Reporting unrun deferred commands failed: %r", self.name, exc, exc_info=True)
         # The gateway knows each key's runtime profile even when a shared primary bot received it.
         # Its first shutdown pass normally emptied these slots; retry leftovers through the same
         # owner-scoped writer rather than silently depositing them in the launch home's spool.

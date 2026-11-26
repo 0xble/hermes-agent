@@ -63,7 +63,7 @@ def test_building_store_closes_every_connection(tmp_path, monkeypatch):
 
 
 def test_reader_lock_keeps_store_usable_and_retries_wal_later(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr("sqlite_support.is_sqlite_wal_reset_vulnerable", lambda **_: False)
+    monkeypatch.setattr("hermes_state_wal.is_sqlite_wal_reset_vulnerable", lambda **_: False)
     database_path = tmp_path / "metrics.sqlite3"
     outbox_directory = tmp_path / "outbox"
     SharedMetricsStore(database_path, outbox_directory)

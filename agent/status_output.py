@@ -9,7 +9,6 @@ import sys
 
 from agent.i18n import t
 from agent.session_activity import ActivityProvenance
-from agent.notice_style import ContextNotice
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -40,19 +39,10 @@ class StatusOutputMixin:
             return
         if diagnostic and not self._warning_presentation_enabled():
             return
-        print_fn = getattr(self, "_print_fn", None)  # unset while __init__ is still printing
-        if print_fn is None and self._private_turn():
-            # Raw stdout bypasses the privacy log filter and a gateway redirects it to a log
-            # file. Status and warnings still reach the user through status_callback.
-            return
         try:
-            (print_fn or print)(*args, **kwargs)
+            (self._print_fn or print)(*args, **kwargs)
         except (OSError, ValueError):
             pass
-
-    def _private_turn(self) -> bool:
-        from agent.incognito import is_incognito
-        return getattr(self, "incognito", False) is True or is_incognito(getattr(self, "session_id", None))
 
     def _vprint(self, *args, force: bool = False, diagnostic: bool = False, **kwargs):
         """Verbose print — suppressed while tokens are streaming (allowed during tool execution) and after
@@ -117,15 +107,15 @@ class StatusOutputMixin:
             # A presentation preference must never turn a recoverable notice into a failed turn.
             return True
 
-    def _emit_diagnostic_status(self, message: str, *, context: bool = False) -> None:
+    def _emit_diagnostic_status(self, message: str) -> None:
         """A diagnostic on the lifecycle rail, without changing legacy formatting."""
         from gateway.warning_notifications import DiagnosticText
         # A finer producer class (TerminalFailureText) stays: the gateway filter reads it.
-        self._emit_status(message if isinstance(message, DiagnosticText) else DiagnosticText(ContextNotice(message) if context else message))
+        self._emit_status(message if isinstance(message, DiagnosticText) else DiagnosticText(message))
 
-    def _emit_status(self, message: str, *, context: bool = False) -> None:
+    def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
-        self._emit_status_kind("lifecycle", ContextNotice(message) if context else message, origin="_emit_status")
+        self._emit_status_kind("lifecycle", message, origin="_emit_status")
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning for degraded side paths where the turn continues but the user must know."""
@@ -138,7 +128,6 @@ class StatusOutputMixin:
         a sticky warn ``AgentNotice``: Desktop renders notices but no warn-kind ``status.update``, and the
         messaging gateway wires its callbacks per turn, after init, so a notice raised before then waits
         for :meth:`_replay_startup_warnings` on the first turn."""
-        notice_style = getattr(message, "notice_style", None)
         message = message.strip()
         if (getattr(self, "platform", None) or "cli") == "cli":
             if getattr(self, "_gateway_session_key", None):
@@ -152,7 +141,7 @@ class StatusOutputMixin:
 
         key = f"startup-warning.{zlib.crc32(message.encode()):08x}"
         level = "success" if message.startswith("✓") else "warn"  # a recovered provider is good news
-        notice = AgentNotice(text=message, level=level, kind="sticky", key=key, id=key, notice_style=notice_style)
+        notice = AgentNotice(text=message, level=level, kind="sticky", key=key, id=key)
         if getattr(self, "notice_callback", None):
             self._emit_notice(notice)
         else:
@@ -253,24 +242,21 @@ class StatusOutputMixin:
             buf.clear()
 
     def _emit_pending_fallback_notice(self) -> None:
-        """Surface the one-shot fallback-switch notice on successful recovery: a provider switch is durable
-        state operators must see, unlike the retry chatter ``_clear_status_buffer`` drops. Emitted once, then
-        cleared; on terminal failure the buffered switch line is flushed instead (``_flush_status_buffer``)."""
+        """Surface a fallback switch decided before the turn (the primary's credentials failed while the
+        agent was built) at turn start, before the fallback answers. In-turn switches announce themselves
+        when they happen (``fallback_notice.announce_fallback_switch``). Emitted once, then cleared."""
         notice = getattr(self, "_pending_fallback_notice", None)
         if not notice:
             return
         # Clear before emitting so a (swallowed) callback error can't leave a stale re-emit.
         self._pending_fallback_notice = None
+        from agent.fallback_notice import announce_fallback_switch
         for item in notice if isinstance(notice, list) else [notice]:
-            try:
-                self._emit_diagnostic_status(ContextNotice(item))
-            except Exception:
-                # One surface failure must not hide later switches from the same chain.
-                continue
+            announce_fallback_switch(self, item)
 
     def _flush_status_buffer(self) -> None:
         """Emit buffered retry messages — call on terminal failure so the user sees what was tried."""
-        # The buffered trace already carries the switch line; drop the one-shot notice.
+        # A pre-turn switch notice was already shown at turn start; never repeat it after a failure.
         self._pending_fallback_notice = None
         buf = getattr(self, "_retry_status_buffer", None)
         if not buf:

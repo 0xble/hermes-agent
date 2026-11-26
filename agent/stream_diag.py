@@ -202,21 +202,6 @@ def _request_body_bytes(request: Any) -> Optional[int]:
     return None
 
 
-def _never_connected(error: BaseException) -> bool:
-    """True when the connection itself failed (refused, DNS, connect timeout): no byte of the body
-    was sent, so its size cannot be why. A proxy rejecting a large body resets or answers after
-    the connection opened."""
-    import httpx
-    link: Optional[BaseException] = error
-    for _ in range(8):
-        if link is None:
-            return False
-        if isinstance(link, (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError)):
-            return True
-        link = link.__cause__ or link.__context__
-    return False
-
-
 def connect_exhausted_notice(error: BaseException, *, attempts: int, base_url: Any) -> str:
     """The one user-facing line for \"no stream event ever arrived and the connect retries are spent\":
     names the host, the attempt count and the serialized request size so a body-size limit is
@@ -232,7 +217,7 @@ def connect_exhausted_notice(error: BaseException, *, attempts: int, base_url: A
     if size is None:
         return line + "; the endpoint looks unreachable — try again in a moment."
     line += f" (request {max(1, round(size / 1024))} KB)"
-    if size >= LARGE_REQUEST_HINT_BYTES and not _never_connected(error):
+    if size >= LARGE_REQUEST_HINT_BYTES:
         return line + "; the endpoint or a proxy in front of it may reject requests this large."
     return line + "; the endpoint looks unreachable — try again in a moment."
 

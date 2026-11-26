@@ -1,6 +1,6 @@
 """close_all_under releases the cached header-probe fds of the homes it sweeps.
 
-persistence.sqlite._state.dbfile keeps one O_RDONLY fd per state.db for lock-safe header reads. Without
+hermes_state_dbfile keeps one O_RDONLY fd per state.db for lock-safe header reads. Without
 this release a multiplexed gateway keeps one such fd for every profile it has unserved, until
 the process exits. The fd may only close once nothing else in the process has the inode open,
 because closing any descriptor on the file cancels the process's POSIX locks on it.

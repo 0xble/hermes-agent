@@ -489,7 +489,6 @@ gateway:
     matrix_scope_mode: "  نطاق الجلسة: {scope}"
     matrix_scope_key: "  مفتاح الجلسة: {session_key}"
     session_id: "**معرّف الجلسة:** `{session_id}`"
-    incognito: "**وضع التصفح المتخفي:** {state}"
     title: "**العنوان:** {title}"
     created: "**أُنشئت:** {timestamp}"
     last_activity: "**آخر نشاط:** {timestamp}"
@@ -775,7 +774,6 @@ gateway:
     drain_rejected: "⏳ البوّابة {action} ولا تقبل دورًا آخر الآن."
     drain_rejected_new_work: "⏳ البوّابة {action} ولا تقبل عملًا جديدًا الآن."
     demoted_tail: " — رسالتك في قائمة الانتظار حتى ينتهي (استخدم /stop لإلغاء كل شيء)."
-    deferred_dropped: "⚠️ لم يُنفَّذ `/{command}`: أُعيد تشغيل Hermes أو إعادة اتصاله أولًا. أرسله مرة أخرى إن كنت لا تزال تحتاجه."
     elapsed_min: "انقضت {minutes} دقيقة"
     running_tool: "قيد التشغيل: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -913,7 +911,7 @@ gateway:
     interrupted_turn: "↻ تمت المقاطعة لأن Hermes توقّف. سأتابع هنا تلقائيًا بمجرد عودته."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ أُعيد تشغيل البوّابة بنجاح."
+    restarted: "♻ أُعيد تشغيل البوّابة بنجاح. جلستك مستمرة."
     online: "♻️ البوّابة متصلة — Hermes عاد وجاهز."
     db_corrupt: "⚠️ رُصد تلف في قاعدة بيانات الجلسات. قد لا تُحفظ الرسائل. خيارات الاستعادة:\n1. شغّل `hermes {profile_arg}doctor --fix`\n2. أوقف البوّابة، ثم استعد بـ:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (إذا أفاد بإمكانية الاستعادة) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — تأخذ الاستعادة لقطة من الملف المتضرر أولًا؛ لا تشغّل `sqlite3 ... \".recover\"` على state.db الحي، فقد يزيد sqlite3 CLI المعرّض للثغرات من تلفه\n3. استعد من نسخة احتياطية في {backups_dir}/\nشغّل `hermes {profile_arg}doctor` للحصول على تشخيصات منقّحة."
     db_fts_corrupt: "⚠️ أفادت قاعدة بيانات الجلسات بخطأ تلف محصور في فهرس البحث (FTS5)؛ جداول الرسائل غير متضررة. قد لا تُحفظ الرسائل حتى إصلاحه: شغّل `hermes {profile_arg}doctor --fix` ثم أعد تشغيل البوّابة. لا تشغّل أدوات الاستعادة ولا تستعد نسخة احتياطية إلا إذا أكّد `hermes {profile_arg}doctor` وجود تلف."
@@ -3623,7 +3621,7 @@ explainer:
     partial_stream_recovery: "توقّف البث مبكرًا ولم يُسترجع سوى رد جزئي. أرسل `continue` للاستئناف من حيث توقّف."
     fallback_prior_turn_content: "لم يُنتَج محتوى جديد في هذا الدور؛ يُعرض السياق السابق المسترجَع. أرسل `continue` لإعادة المحاولة."
     redirect_restart_limit_exceeded: "أُلغي الطلب بتصحيح جديد في كل محاولة، فتوقّف الدور بدلًا من إعادة المحاولة إلى ما لا نهاية. تصحيحك الأخير في قائمة الانتظار كرسالتك التالية."
-    rebuilt_restart_limit_exceeded: "بلغ التبديل بين المسارات حدّه الأقصى. المسارات المطلوبة: {routes}. ربما لم تُجرَّب مسارات مهيّأة أخرى. أرسل `continue` أو بدّل المزوّد."
+    rebuilt_restart_limit_exceeded: "ظلّ كل مزوّد في سلسلة الاحتياط يتحوّل إلى البديل، فتوقّف الدور بدلًا من إعادة المحاولة إلى ما لا نهاية. أرسل `continue` أو بدّل المزوّد."
     budget_exhausted: "استُنفدت ميزانية التكرار/التكلفة لهذا الدور قبل الوصول إلى إجابة نهائية. أرسل `continue` للمتابعة."
     ollama_runtime_context_too_small: "نافذة سياق النموذج المحلي أصغر من أن تكفي لإتمام العمل. زِد حجم السياق أو استخدم نموذجًا أكبر."
     pending_tool_result: "توقّف الدور بينما كانت نتيجة أداة لا تزال قيد الانتظار، ولم ينتج النموذج أي نص لاحق. أرسل `continue` ليقوم بالتلخيص."
@@ -3650,9 +3648,6 @@ explainer:
     failed: "فشل"
   shared:
     and_more: "  • … و{count} أخرى"
-    no_routes_requested: "لا شيء مسجّل"
-    attempted_routes: "المسارات المطلوبة: {routes}."
-    chain_exhausted: "استُنفدت سلسلة الاحتياط، ولم يبقَ أي مسار مؤهّل."
     the_model: "النموذج"
 tips:
   t001: "/bg <prompt> يشغّل مهمة في جلسة منفصلة بينما تبقى جلستك الحالية حرّة؛ و/btw <question> يجيب عن سؤال جانبي حول هذه المحادثة دون مقاطعتها."

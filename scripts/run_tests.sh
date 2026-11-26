@@ -33,39 +33,135 @@
 #
 # A missing or stale checkout environment is rebuilt by run-in-hermes-env,
 # which runs setup-hermes.sh. That setup writes tool, dependency, and
-# test-env state into the inherited HERMES_HOME, and PM writes the resolved
-# root's tools/ (hermes_constants._hermes_root_of, pm/environments.store_root).
-# The fallback refuses when that home, or the root it resolves to, is live:
-# a current release pointer (including a dangling one), gateway_state.json,
-# a gateway pid kill -0 can see (including EPERM from another user's gateway),
-# or any path under the OS account default. A home under the account default
-# resolves to that default. Otherwise the profiles parent is lexical, matching
-# hermes_constants._hermes_root_of: <root>/profiles/<name> resolves to <root>
-# even when that profile directory is a symlink. Canonicalization matches
-# Python Path.resolve(strict=False), including a missing suffix under a
-# symlinked ancestor. If that canonical root differs from the lexical root,
-# refuse when either root is live. A resolution error is live.
-# The account default comes from the password database (getent, dscl, or
-# ~user), never $HOME and never /usr/bin/python3. Workers pin HOME to scratch.
-# If that lookup fails, the home is treated as live. Rebuild the checkout-local
-# venv instead, from the checkout, after stopping anything that is using .venv
-# and removing it if it exists:
+# test-env state into the inherited HERMES_HOME. The fallback refuses when
+# that home is a live runtime home: a current release pointer
+# ($HERMES_HOME/current symlink, including a dangling one), gateway_state.json,
+# a running gateway pid (gateway.pid or gateway.b.pid), or the OS account's
+# default Hermes home. The account default comes from the password database,
+# not $HOME — workers pin HOME to scratch. Rebuild the checkout-local venv
+# instead, from the checkout, after stopping anything that is using .venv and
+# removing it if it exists:
 #   python -m pm.build_env --source . --out .venv --group dev --group test
-# Or set both HERMES_HOME and HERMES_RUNTIME_DIR to scratch directories that are
-# not a live runtime home (HERMES_HOME alone still resolves the live bootstrap store).
+# Or set HERMES_HOME to a scratch directory that is not a live runtime home.
 # HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
-# that home is deliberate. Activation's hermes_sync uses the same guard, even
-# when called directly. hermes update and the installer do not use this guard.
+# that home is deliberate. hermes update and the installer do not use this guard.
 
 set -euo pipefail
 
-# The shared library defines hermes_runtime_home_is_live and setup admission.
-# Sourcing this runner still exposes the predicates without running the suite.
-# shellcheck source=scripts/_setup_guard.sh
-case "${BASH_SOURCE[0]}" in
-  */*) . "${BASH_SOURCE[0]%/*}/_setup_guard.sh" ;;
-  *) . "./_setup_guard.sh" ;;
-esac
+# Predicate for the test-runner fallback. Sourcing this file defines it and
+# returns; it does not run the suite. The runner body below executes only when
+# this file is the program.
+hermes_account_default_home() {
+  local py=""
+  if [ -x /usr/bin/python3 ]; then
+    py=/usr/bin/python3
+  elif command -v python3 >/dev/null 2>&1; then
+    py="$(command -v python3)"
+  else
+    return 1
+  fi
+  "$py" -c 'import os, pwd, sys
+from pathlib import Path
+suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+try:
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir)
+except Exception:
+    raise SystemExit(1)
+if sys.platform == "win32":
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    base = Path(local) if local else account / "AppData" / "Local"
+    print(base / ("hermes" + suffix))
+else:
+    print(account / (".hermes" + suffix))
+' || return 1
+}
+
+hermes_canonical_home() {
+  local path="${1%/}"
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    (cd "$path" && pwd -P) || return 1
+    return 0
+  fi
+  printf '%s\n' "$path"
+}
+
+hermes_same_home() {
+  local left right
+  left="$(hermes_canonical_home "$1")" || return 1
+  right="$(hermes_canonical_home "$2")" || return 1
+  [ "$left" = "$right" ]
+}
+
+hermes_pid_from_file() {
+  local file="$1" line pid
+  [ -f "$file" ] || [ -L "$file" ] || return 1
+  # JSON {"pid": N} or a legacy bare integer. Read only; never unlink.
+  line="$(sed -n '1,20p' "$file" 2>/dev/null || true)"
+  pid="$(printf '%s\n' "$line" | sed -n \
+    -e 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    -e 's/^\([0-9][0-9]*\)$/\1/p' | sed -n '1p')"
+  [ -n "$pid" ] || return 1
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+hermes_gateway_pid_running() {
+  local home="$1" file pid
+  for file in "$home/gateway.pid" "$home/gateway.b.pid"; do
+    pid="$(hermes_pid_from_file "$file" 2>/dev/null || true)"
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+hermes_effective_test_home() {
+  local os
+  if [ -n "${HERMES_HOME:-}" ]; then
+    printf '%s\n' "$HERMES_HOME"
+    return 0
+  fi
+  os="$(uname -s 2>/dev/null || printf '%s' unknown)"
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${LOCALAPPDATA:-${HOME:-}/AppData/Local}/hermes" ;;
+    *) printf '%s\n' "${HOME:-}/.hermes" ;;
+  esac
+}
+
+# Prints why HOME is a live runtime home, or nothing and status 1.
+# The optional second argument is an already-resolved account default.
+hermes_runtime_home_live_reason() {
+  local home="$1"
+  local account_default="${2-}"
+  [ -n "$home" ] || return 1
+  if [ -L "$home/current" ]; then
+    printf '%s\n' "current release pointer"
+    return 0
+  fi
+  if [ -e "$home/gateway_state.json" ] || [ -L "$home/gateway_state.json" ]; then
+    printf '%s\n' "gateway_state.json"
+    return 0
+  fi
+  if hermes_gateway_pid_running "$home"; then
+    printf '%s\n' "running gateway pid"
+    return 0
+  fi
+  if [ -z "$account_default" ]; then
+    account_default="$(hermes_account_default_home 2>/dev/null || true)"
+  fi
+  if [ -n "$account_default" ] && hermes_same_home "$home" "$account_default"; then
+    printf '%s\n' "account default home"
+    return 0
+  fi
+  return 1
+}
+
+hermes_runtime_home_is_live() {
+  hermes_runtime_home_live_reason "$@" >/dev/null
+}
 
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
@@ -77,17 +173,17 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Even targeted runs compile the whole checkout. Acquire host admission before
 # activation or compilation, not through spelling-dependent shell wrappers.
-# The re-exec marker also handles semaphore's disabled / ancestor-reuse paths,
-# which can exec the payload without setting SEMAPHORE_HELD.
-if [ -z "${SEMAPHORE_HELD:-}${__HERMES_TESTS_SEMAPHORE:-}" ]; then
+# The re-exec marker also handles heavy-slot's disabled / ancestor-reuse paths,
+# which can exec the payload without setting HEAVY_SLOT_HELD.
+if [ -z "${HEAVY_SLOT_HELD:-}${__HERMES_TESTS_HEAVY_SLOT:-}" ]; then
   # Match the terminal resolver when a service PATH omits ~/.local/bin.
-  SEMAPHORE_BIN="$(command -v semaphore || true)"
-  if [ -z "$SEMAPHORE_BIN" ] && [ -f "$HOME/.local/bin/semaphore" ] && [ -x "$HOME/.local/bin/semaphore" ]; then
-    SEMAPHORE_BIN="$HOME/.local/bin/semaphore"
+  HEAVY_SLOT_BIN="$(command -v heavy-slot || true)"
+  if [ -z "$HEAVY_SLOT_BIN" ] && [ -f "$HOME/.local/bin/heavy-slot" ] && [ -x "$HOME/.local/bin/heavy-slot" ]; then
+    HEAVY_SLOT_BIN="$HOME/.local/bin/heavy-slot"
   fi
-  if [ -n "$SEMAPHORE_BIN" ]; then
-    exec "$SEMAPHORE_BIN" --label "scripts/run_tests.sh (in $REPO_ROOT)" -- \
-      env __HERMES_TESTS_SEMAPHORE=1 "$BASH" "$SCRIPT_DIR/run_tests.sh" "$@"
+  if [ -n "$HEAVY_SLOT_BIN" ]; then
+    exec "$HEAVY_SLOT_BIN" --label "scripts/run_tests.sh (in $REPO_ROOT)" -- \
+      env __HERMES_TESTS_HEAVY_SLOT=1 "$BASH" "$SCRIPT_DIR/run_tests.sh" "$@"
   fi
 fi
 
@@ -122,19 +218,142 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
 # account store's tool dirs, so a test writing through a PATH tool
 # (`pip install`, `npm -g`) would write into the account store. An explicit
 # HERMES_RUNTIME_DIR, a custom HERMES_HOME, a home that already holds a store,
-# or an account without a usable store keep today's per-home layout.
+# or an account without a usable store keep today's per-home layout, unless
+# what they name is the account's store (_avoid_account_stores).
+# Prints the OS account's home when HOME is faked (it is not that home).
+_account_home() {
+  local account
+  account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p')"
+  [ -n "$account" ] && [ -d "$account" ] && [ ! "$account" -ef "$HOME" ] || return 1
+  printf '%s\n' "$account"
+}
 # Prints the account home, then the pinned Python minor.
 _account_tool_store() {
   local account py_minor
   [ -z "${HERMES_RUNTIME_DIR:-}" ] || return 1
   case "${HERMES_HOME:-}" in "" | "$HOME/.hermes" | "$HOME/.hermes/"*) ;; *) return 1 ;; esac
   [ ! -f "$HOME/.hermes/tools/facts.json" ] || return 1
-  account="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-  [ -n "$account" ] || account="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: *//p')"
-  [ -n "$account" ] && [ -d "$account" ] && [ ! "$account" -ef "$HOME" ] || return 1
+  account="$(_account_home)" || return 1
   [ -f "$account/.hermes/tools/facts.json" ] && [ -w "$account/.hermes/tools" ] || return 1
   py_minor="$(_store_has_pins "$account/.hermes/tools")" || return 1
   printf '%s\n%s\n' "$account" "$py_minor"
+}
+# The pin rule covers a faked-HOME run that names the account's store itself.
+# An explicit HERMES_RUNTIME_DIR (the recipe lanes used before this runner
+# shared by itself) or an inherited HERMES_HOME (an agent's shell exports one)
+# makes pm resolve that store with no check, and `pm install` then re-stages
+# this checkout's pins over the ones the account's own Hermes runs on: its
+# tools read as not installed and a running browser loses its directory.
+# Such a run provisions the faked home's own store instead, and is refused when
+# that store is a link into the account's, or when no interpreter can tell
+# which store pm would pick: setup fetches its own Python and would provision
+# whatever that turns out to be.
+# Prints the account's stores: its default home's, and the one
+# HERMES_DATA_DIR_SUFFIX selects (hermes_constants._platform_default_hermes_home).
+_account_stores() {
+  local account suffix
+  account="$(_account_home)" || return 0
+  for suffix in "" ${HERMES_DATA_DIR_SUFFIX:+"$HERMES_DATA_DIR_SUFFIX"}; do
+    if [ -f "$account/.hermes$suffix/tools/facts.json" ]; then
+      printf '%s\n' "$account/.hermes$suffix/tools"
+    fi
+  done
+}
+# Prints the store of the newline-separated STORES that PATH is, by identity.
+_which_store() {
+  local store
+  while IFS= read -r store; do
+    if [ "$1" -ef "$store" ]; then printf '%s\n' "$store"; return 0; fi
+  done <<<"$2"
+  return 1
+}
+# Prints PATH as pm's Path.resolve() reads it in the checkout, where setup reads
+# it (setup-hermes.sh cd's there first): every symlink followed, dangling ones
+# too, a `..` taken after the link it follows, a missing part kept as written.
+# `-ef` alone stats the literal path, so `<store>/missing/..` would not match
+# <store>. Status 1 past 40 links (the kernel's limit; Path.resolve() keeps
+# going there, but refusing is the stricter choice) or when readlink fails.
+_resolved_path() {
+  local resolved="" rest="$1" part target hops=0
+  case "$rest" in /*) ;; *) resolved="$(cd -P "$REPO_ROOT" && pwd)"; resolved="${resolved%/}" ;; esac
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    case "$part" in
+      "" | .) ;;
+      ..) resolved="${resolved%/*}" ;;
+      *) if [ -L "$resolved/$part" ]; then
+           hops=$((hops + 1))
+           [ "$hops" -le 40 ] || return 1
+           # $(...) strips every trailing newline, and BSD readlink adds none
+           # to a target already ending in one: read it bare, then strip x.
+           target="$(readlink -n "$resolved/$part" && printf x)" || return 1
+           target="${target%x}"
+           case "$target" in /*) resolved="" ;; esac
+           rest="$target${rest:+/$rest}"
+         else
+           resolved="$resolved/$part"
+         fi ;;
+    esac
+  done
+  printf '%s\n' "${resolved:-/}"
+}
+# Prints the store this run's `pm install` writes: HERMES_RUNTIME_DIR as pm
+# takes it, else pm's own resolver (stamps, HERMES_HOME, profiles), run by the
+# bootstrap interpreter found beside STORE; says why on stderr when it cannot.
+_pm_store() (
+  if [ -n "${HERMES_RUNTIME_DIR:-}" ]; then
+    _resolved_path "$HERMES_RUNTIME_DIR" && exit
+    echo "error: faked HOME: HERMES_RUNTIME_DIR cannot be resolved (more than 40 symlinks, or a link readlink cannot read)" >&2
+    exit 1
+  fi
+  # Asked and resolved from the checkout, as setup asks: a relative HERMES_HOME
+  # names a store there, not in the caller's directory.
+  cd "$REPO_ROOT" || exit 1
+  if ! python="$(HERMES_RUNTIME_DIR="$1" hermes_bootstrap_python "$REPO_ROOT")"; then
+    echo "error: faked HOME: no bootstrap Python to ask pm which tool store this run provisions" >&2
+    exit 1
+  fi
+  PYTHONHOME= "$python" -I -B -c 'import sys
+sys.path.insert(0, sys.argv[1])
+from pm.environments import store_root
+try:
+    print(store_root(sys.argv[1]).resolve())
+except Exception as error:
+    sys.exit(f"error: faked HOME: pm cannot resolve the tool store this run provisions: {error}")' "$REPO_ROOT"
+)
+# Points HERMES_RUNTIME_DIR away from an account store that this run's
+# `pm install` would write other pins into; status 1 when it cannot.
+_avoid_account_stores() {
+  local stores target named fallback
+  stores="$(_account_stores)"
+  [ -n "$stores" ] || return 0
+  # Both print one newline after the path; the x keeps a path's own from $(...).
+  if ! target="$(_pm_store "${stores%%$'\n'*}" && printf x)"; then
+    echo "error: faked HOME: cannot check whether that is the account's tool store (${stores//$'\n'/, }); set HERMES_RUNTIME_DIR to a store of this home's own" >&2
+    return 1
+  fi
+  target="${target%$'\nx'}"
+  # setup-hermes.sh stages its bootstrap uv into $HOME/.hermes/tools before pm
+  # runs; when that is the account's store, point it at the one pm provisions.
+  if [ -z "${HERMES_RUNTIME_DIR:-}" ] && _which_store "$HOME/.hermes/tools" "$stores" >/dev/null; then
+    export HERMES_RUNTIME_DIR="$target"
+  fi
+  named="$(_which_store "$target" "$stores")" || return 0
+  ! _store_has_pins "$named" >/dev/null || return 0
+  # The suffix is appended literally (hermes_constants), `..` included.
+  if ! fallback="$(_resolved_path "$HOME/.hermes${HERMES_DATA_DIR_SUFFIX:-}/tools" && printf x)"; then
+    echo "error: faked HOME: $HOME/.hermes${HERMES_DATA_DIR_SUFFIX:-}/tools cannot be resolved (more than 40 symlinks, or a link readlink cannot read)" >&2
+    return 1
+  fi
+  fallback="${fallback%$'\nx'}"
+  if _which_store "$fallback" "$stores" >/dev/null; then
+    echo "error: faked HOME: $fallback is the account's tool store $named, which records other pins; set HERMES_RUNTIME_DIR to a store of this home's own" >&2
+    return 1
+  fi
+  export HERMES_RUNTIME_DIR="$fallback"
+  echo "▶ faked HOME: the account's tool store records other pins; provisioning $HERMES_RUNTIME_DIR instead"
 }
 # Read-only check that the store already records this checkout's pins
 # (scripts/tool_store_pins.py says why and what counts); prints the Python minor.
@@ -143,18 +362,22 @@ _store_has_pins() {
   python="$(HERMES_RUNTIME_DIR="$1" hermes_bootstrap_python "$REPO_ROOT")" || return 1
   PYTHONHOME= "$python" -I -B "$REPO_ROOT/scripts/tool_store_pins.py" "$REPO_ROOT" "$1" 2>/dev/null
 }
-if _shared="$(_account_tool_store)"; then
-  _account="${_shared%%$'\n'*}"
-  export HERMES_RUNTIME_DIR="$_account/.hermes/tools"
+# Picks the tool store the setup below provisions; status 1 refuses the run.
+# Only a run that reaches setup asks: one that never provisions has no store
+# to keep off the account's.
+_choose_tool_store() {
+  local shared account
+  shared="$(_account_tool_store)" || { _avoid_account_stores; return; }
+  account="${shared%%$'\n'*}"
+  export HERMES_RUNTIME_DIR="$account/.hermes/tools"
   # setup-hermes.sh's uv-managed bootstrap interpreter is the same kind of
   # cache, but only reused: a missing pinned minor would download into it.
-  if [ -z "${UV_PYTHON_INSTALL_DIR:-}" ] && [ -w "$_account/.local/share/uv/python" ] \
-      && compgen -G "$_account/.local/share/uv/python/cpython-${_shared#*$'\n'}[.-]*" >/dev/null; then
-    export UV_PYTHON_INSTALL_DIR="$_account/.local/share/uv/python"
+  if [ -z "${UV_PYTHON_INSTALL_DIR:-}" ] && [ -w "$account/.local/share/uv/python" ] \
+      && compgen -G "$account/.local/share/uv/python/cpython-${shared#*$'\n'}[.-]*" >/dev/null; then
+    export UV_PYTHON_INSTALL_DIR="$account/.local/share/uv/python"
   fi
   echo "▶ faked HOME: using the account's tool store $HERMES_RUNTIME_DIR"
-fi
-unset _account _shared
+}
 if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   # The Nix devShell's HERMES_PYTHON is the lock's interpreter, which finds the
@@ -168,8 +391,24 @@ else
       echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
     fi
-    # Fail before re-exec; hermes_sync also enforces this shared admission check.
-    hermes_require_safe_setup "$REPO_ROOT" || exit 1
+    # Only this fallback. hermes update and the installer call setup directly.
+    if [ "${HERMES_ALLOW_LIVE_HOME_SETUP:-}" != 1 ]; then
+      _live_home="$(hermes_effective_test_home)"
+      _live_reason="$(hermes_runtime_home_live_reason "$_live_home" || true)"
+      if [ -n "$_live_reason" ]; then
+        echo "error: refusing to run test-environment setup against a live runtime home: $_live_home ($_live_reason)." >&2
+        echo "That setup writes tool, dependency, and test-env state into HERMES_HOME." >&2
+        echo "Rebuild the checkout-local venv instead. From the checkout, stop anything using .venv, remove it if it exists, then run:" >&2
+        echo "  python -m pm.build_env --source . --out .venv --group dev --group test" >&2
+        echo "Then explicitly select that interpreter (clearing any stale activation for this command only):" >&2
+        echo '  env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh' >&2
+        echo "Append your original test arguments to that command." >&2
+        echo "Or set HERMES_HOME to a scratch directory that is not a live runtime home." >&2
+        echo "Set HERMES_ALLOW_LIVE_HOME_SETUP=1 only when setup against this home is deliberate." >&2
+        exit 1
+      fi
+    fi
+    _choose_tool_store || exit 1
     echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
     export __HERMES_TESTS_REEXEC=1
     exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"

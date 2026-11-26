@@ -20,7 +20,6 @@ from persistence.conversation.messages import (
     TranscriptView,
 )
 from persistence.core.errors import PruneRowStale, PruneRowUnresolved
-from hermes_state import SessionDB
 from persistence_assembly import open_persistence, profile_scope
 from tests.fixtures.storage_holder import raw_holder
 from tests.fixtures.storage_read import conversation, session_row, transcript_rows

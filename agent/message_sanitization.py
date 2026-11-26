@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable, NamedTuple
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER, hidden_interrupt_placeholder_row
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.vision_message_prep import _provider_model_key
-from session_rules.turns import _tc_field, coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
+from session_rules.turns import _tc_field, coalesce_tool_call_id
 from session_rules.turns import _IMAGE_PART_TYPES
 
 logger = logging.getLogger(__name__)

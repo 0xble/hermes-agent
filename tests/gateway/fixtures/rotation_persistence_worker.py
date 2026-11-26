@@ -9,7 +9,7 @@ import psutil
 from hermes_cli.process_identity import worker_birth
 from agent import runtime_session_store
 from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
-from persistence.sqlite._state.errors import GatewayOwnerRestartError
+from hermes_state_errors import GatewayOwnerRestartError
 from tests.gateway.fixtures.agent_persistence_worker import writable_fds
 
 

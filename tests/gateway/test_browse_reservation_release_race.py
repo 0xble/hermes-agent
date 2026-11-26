@@ -5,7 +5,7 @@ import pytest
 
 from gateway.run_bootstrap import _reserve_waiting_out_browse_reconcile
 from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
-from persistence.sqlite.admin._reconcile import BROWSE_RECONCILE_PURPOSE
+from hermes_state_reconcile import BROWSE_RECONCILE_PURPOSE
 
 
 @pytest.mark.parametrize("wait_s", [0.0, 1.0])
