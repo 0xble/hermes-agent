@@ -230,11 +230,13 @@ class UserQuote(tuple):
     """Keep tuple compatibility while carrying authenticated relay provenance."""
     relay_receipt: str
     source_session_id: str
+    message: str
 
     def __new__(cls, quote, message, *, relay_receipt="", source_session_id=""):
         value = super().__new__(cls, (quote, message))
         value.relay_receipt = relay_receipt
         value.source_session_id = source_session_id
+        value.message = message
         return value
 
 
@@ -270,7 +272,7 @@ def _current_quote_source(db, session_id, rows, quote, *, cursor=None):
     return "", "", ""
 
 
-def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
+def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> UserQuote | str:
     """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:
@@ -319,10 +321,9 @@ def quote_authorizes(source: UserQuote, controlled_session_id: str, *, cursor=No
     return bool(origin) and (origin == controlled_session_id or _quote_names_target(
         _governing_sentence(_normalize(source[0]), _normalize(source[1])), controlled_session_id, cursor=cursor))
 
-
 def check_user_quote(requester_session_id: str, quote: str, *, cursor=None,
                      controlled_session_id: Optional[str] = None,
-                     quoted_targets: bool = False, stop_condition: str = "") -> tuple[str, str] | str:
+                     quoted_targets: bool = False, stop_condition: str = "") -> UserQuote | str:
     """Validate a current authenticated quote against its typed origin and controlled session."""
     checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
     if isinstance(checked, str):
@@ -580,11 +581,13 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     policy_state = (load_goal if kind == "goal" else load_loop)(target_sid, cursor=cursor)
     permission = decision(kind, action, policy_state, actor=caller.actor,
                           autonomous=caller is LifecycleAuthority.AUTONOMY)
-    if permission != A:
-        user_pause = (policy_state is not None and policy_state.status == "paused"
-                      and policy_state.paused_by != "agent" and action in {"resume", "stop"})
-        code = "user_paused" if user_pause else "user_only"
-        return {"result": {"ok": False, "error_code": code}}
+    if permission != A and not (
+            kind == "goal" and action == "clear" and caller is LifecycleAuthority.AUTONOMY):
+        if (policy_state is not None and policy_state.status == "paused"
+                and policy_state.paused_by != "agent" and action in {"resume", "stop"}):
+            # A /goal or /loop pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
+            return {"result": _user_paused(policy_state, kind), "state": policy_state}
+        return {"result": {"ok": False, "error_code": "user_only"}, "state": policy_state}
     if action == "replace" and kind == "goal":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
@@ -612,6 +615,9 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
         autonomous = caller.actor == "agent"
+        if autonomous and manager.state.paused_by != "agent":
+            # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
+            return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
         result = manager.resume(reset_budget=not autonomous, user_override=not autonomous,
                                 by="agent" if autonomous else "user")
         if result is None:
@@ -1196,16 +1202,15 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
     if autonomous and kind == "goal" and action == "clear":
-        # Main: opted-in autonomy may retire a goal with a recorded reason (proof is checked in
-        # _clear_goal); the declarative policy below must not turn that back into user-only.
         if not isinstance(reason, str) or not reason.strip():
             return {"ok": False, "error_code": "reason_required",
                     "error": "clearing a goal requires a nonempty reason"}
         reason = reason.strip()
-    else:
-        from hermes_cli.lifecycle_policy import decision, D
-        if decision(kind, action, None, autonomous=autonomous) == D:
-            return {"ok": False, "error_code": "user_only", "error": "Clearing is user-only"}
+    from hermes_cli.lifecycle_policy import decision, D
+    # Autonomous goal retirement is main's proof-gated exception (see _clear_goal).
+    if decision(kind, action, None, autonomous=autonomous) == D and not (
+            autonomous and kind == "goal" and action == "clear"):
+        return {"ok": False, "error_code": "user_only", "error": "Clearing is user-only"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1388,8 +1393,16 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
             return record
 
         expected = record.get("target_fingerprint")
-        kind, action = record.get("kind"), record.get("action")
-        live = _meta_value(conn, _definition_key(kind, record.get("target_session_id", "")))
+        kind_value = record.get("kind")
+        action_value = record.get("action")
+        target_session_id = record.get("target_session_id")
+        if (not isinstance(kind_value, str) or not isinstance(action_value, str)
+                or not isinstance(target_session_id, str)):
+            record["status"], record["error"] = "failed", "invalid_request"
+            _save_record(record, cursor=conn)
+            return record
+        kind, action = kind_value, action_value
+        live = _meta_value(conn, _definition_key(kind, target_session_id))
         definition_changed = expected != _definition_fingerprint(kind, live)
         # Clearing is an instruction about the target's current goal state, not an instruction
         # to install the definition shown on the card. Keep the fence for replacements and all
@@ -1404,7 +1417,7 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
         # Roll back even a partially saved manager action before persisting a failure receipt.
         conn.execute("SAVEPOINT session_control_apply")
         try:
-            result = _manager_apply(kind, action, record["target_session_id"],
+            result = _manager_apply(kind, action, target_session_id,
                                     reason=record.get("reason") or "session-control",
                                     payload=record.get("payload"), authority=record["authority"], cursor=conn)
             manager_result = result.get("result")
@@ -1557,20 +1570,19 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.lifecycle_authority import LifecycleAuthority
     caller = LifecycleAuthority.from_control(authority)
     manager = GoalManager(sid, cursor=cursor)
-    # Mark explicit controls separately from migratable legacy judge/budget pauses.
-    # Model-supplied reason text must not accidentally opt this pause into migration.
-    # Record the agent as owner of its own pause so it may later lift it, as for loops.
+    # Session controls preserve main's explicit pause prefix and user/agent ownership mapping.
     return manager.pause(reason="session-control: " + (reason or "paused"),
-                         by=caller.actor)
-
+                         by="agent" if caller is LifecycleAuthority.AUTONOMY else caller.actor)
 
 
 def _clear_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
     import re
 
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     manager = GoalManager(sid, cursor=cursor)
-    if (authority or {}).get("via") == "autonomy":
+    if caller is LifecycleAuthority.AUTONOMY:
         state = manager.state
         if state is not None and state.status == "paused" and state.paused_by != "agent":
             # A reason never ends a /goal pause, /stop, Ctrl+C, quoted or system pause.
@@ -1611,7 +1623,11 @@ def _resume_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.lifecycle_authority import LifecycleAuthority
     caller = LifecycleAuthority.from_control(authority)
     if caller.actor == "user":
-        return manager.resume(by=caller.actor)
+        return manager.resume()
+    state = manager.state
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        # A user, Ctrl+C or tick-budget pause is the user's to lift.
+        return _user_paused(state, "loop")
     return manager.resume(by="agent")  # None unless this is the agent's own pause
 
 
@@ -1623,6 +1639,9 @@ def _stop_loop(sid, reason, payload, authority, cursor=None):
     caller = LifecycleAuthority.from_control(authority)
     if caller.actor == "user":
         return manager.clear()
+    state = manager.state
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        return _user_paused(state, "loop")
     # The agent finishes its loop; clearing it stays a user control.
     return manager.finish(reason or "agent finished the loop")
 

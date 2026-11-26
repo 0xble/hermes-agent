@@ -60,10 +60,12 @@ def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, An
             old = str(before.get("until") or "").strip()
             new = str(after.get("until") or "").strip()
             if old and not new:
-                # Keep lifecycle stop words out of the removal verbs: "Stop the loop" and
-                # "End the loop" are stop actions, not instructions to remove ``until``.
-                removal_words = {"remove", "drop", "delete", "clear", "cancel"}
-                checks.append(bool(words & removal_words) and bool(words & field_evidence["until"]))
+                # Lifecycle verbs (stop/end/cancel) and generic timing words (when/after/done)
+                # never remove ``until``: "Cancel the loop when done" cancels the loop. Removal
+                # needs a removal verb plus a noun naming the stop condition itself.
+                removal_words = {"remove", "drop", "delete"}
+                condition_nouns = {"condition", "stopping", "until"}
+                checks.append(bool(words & removal_words) and bool(words & condition_nouns))
             else:
                 checks.append(bool(words & field_evidence["until"]))
         elif field in {"interval_seconds", "mode", "current_delay"}:
@@ -137,7 +139,7 @@ class LoopRevisionsMixin:
                                    stop_condition=stop_condition)
         if isinstance(checked, str):
             return None, checked, {"error": "user_quote has no current authenticated source"}
-        if changed and not _quote_authorizes_delta(checked[1], changed, before or {}, after or {}):
+        if changed and not _quote_authorizes_delta(checked.message, changed, before or {}, after or {}):
             return None, "user_quote_qualified", {
                 "error": "user_quote does not authorize every requested loop change"
             }

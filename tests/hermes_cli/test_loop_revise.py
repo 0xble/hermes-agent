@@ -174,6 +174,27 @@ def test_stop_and_end_commands_never_remove_until_or_replace(tmp_path, monkeypat
         assert mgr.state.to_json() == before
 
 
+def test_cancel_or_clear_with_generic_timing_never_removes_until(tmp_path, monkeypatch):
+    for index, command in enumerate((
+        "Cancel the loop when done", "Cancel the loop after the build", "Clear the loop when it is done",
+        "Cancel the loop once it is done",
+    )):
+        mgr = _manager(tmp_path, monkeypatch, f"cancel-when-done-{index}")
+        mgr.set("watch", interval_seconds=300, until="build green")
+        before = mgr.state.to_json()
+        result = mgr.revise(reason="cancel is not until removal", until="",
+                            user_quote=command, user_messages=_record_quote(mgr.session_id, command))
+        assert result["error_code"] == "user_quote_qualified", (command, result)
+        assert mgr.state.to_json() == before
+
+    mgr = _manager(tmp_path, monkeypatch, "remove-until-ok")
+    mgr.set("watch", interval_seconds=300, until="build green")
+    quote = "Remove the loop stop condition"
+    result = mgr.revise(reason="user removed condition", until="",
+                        user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
+    assert result["ok"], result
+
+
 def test_field_quote_binds_interval_only(tmp_path, monkeypatch):
     mgr = _manager(tmp_path, monkeypatch, "field-cadence")
     mgr.set("watch", interval_seconds=300)
