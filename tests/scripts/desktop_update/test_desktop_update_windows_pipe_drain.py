@@ -93,6 +93,9 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     The existing leak/flood arms retain their measured Windows 11 / PowerShell
     5.1 budgets; the stall arm uses the same real runner and process table.
     """
+    script = WINDOWS_PS1.read_text(encoding="utf-8-sig")
+    assert "function Write-HandoffLog([string]$Message, [bool]$ReplayToHost = $true)" in script
+    assert "if ($ReplayToHost) { Write-Host $line }" in script
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     powershell = (
         system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
