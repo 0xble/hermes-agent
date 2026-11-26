@@ -1414,7 +1414,14 @@ def _deobfuscate_shell_word(word: str) -> str:
     return word
 
 
-def _iter_shell_command_starts(command: str):
+def _shell_command_starts(command: str) -> tuple[int, ...]:
+    """Return command starts once per source string.
+
+    Several approval projections need the same quote-aware command positions.  Re-scanning a long
+    separator-only command for every projection is still linear per projection, but its aggregate
+    cost is large enough to miss the hosted test budget.  The scan is pure for a given string, so a
+    small bounded cache shares it without retaining an unbounded command history.
+    """
     starts = [0]
 
     def scan(start: int, end: int) -> None:
@@ -1441,7 +1448,11 @@ def _iter_shell_command_starts(command: str):
     scan(0, len(command))
     seen = set()
     run_from = run_to = -1
-    for start in starts:
+    result = []
+    index = 0
+    while index < len(starts):
+        start = starts[index]
+        index += 1
         # Each newline of a blank-line run is a start that skips to the same word: reuse the last skip
         # when the start falls inside the run it covered instead of rescanning the run per newline.
         if not run_from <= start <= run_to:
@@ -1450,10 +1461,15 @@ def _iter_shell_command_starts(command: str):
         if start >= len(command) or start in seen or _is_shell_comment_start(command, start):
             continue
         seen.add(start)
-        yield start
+        result.append(start)
         _, end, word = _read_shell_word(command, start)
         if word in _SHELL_COMMAND_TRANSITIONS:
             starts.append(end)
+    return tuple(result)
+
+
+def _iter_shell_command_starts(command: str):
+    yield from _shell_command_starts(command)
 
 
 def _mark_command_starts(command: str, marker: str = "\n", skip=()) -> str:
