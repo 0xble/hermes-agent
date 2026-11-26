@@ -145,13 +145,14 @@ class PluginHost:
                 return self._channel  # type: ignore[return-value]
             self._stopping = False
             argv = self._argv()
-            # Do not make the profile directory the host's current directory. Windows holds a
-            # process current directory open, which makes an otherwise safe profile rename fail
-            # with WinError 32 while the dashboard's hosted plugin process is still alive.
-            # Plugin code receives the profile through its environment/context, not cwd.
+            # Windows holds a process's current directory open, so a host started in the profile
+            # directory makes an otherwise safe profile rename fail with WinError 32 while it is
+            # alive. Start it outside the profile there. POSIX renames a cwd freely, so it keeps
+            # the profile home.
+            cwd = Path(__file__).resolve().parents[1] if sys.platform == "win32" else self._home
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, env=self._env(),
-                                    cwd=str(Path(__file__).resolve().parents[1]), bufsize=0)
+                                    stderr=subprocess.PIPE, env=self._env(), cwd=str(cwd),
+                                    bufsize=0)
             threading.Thread(target=_pump_stderr, args=(proc, self._home.name), daemon=True,
                              name=f"plugin-host-{proc.pid}-stderr").start()
             self._generation += 1

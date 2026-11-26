@@ -263,8 +263,15 @@ async function withWebapp(
     }
 
     await provider.close()
-    keepGatewayLogsOnFailure(sandbox, failed)
-    sandbox.cleanup()
+
+    try {
+      keepGatewayLogsOnFailure(sandbox, failed)
+    } catch (error) {
+      // Best-effort diagnostics: never replace the test's own failure or skip cleanup.
+      console.warn('could not keep the gateway logs', error)
+    } finally {
+      sandbox.cleanup()
+    }
   }
 }
 
