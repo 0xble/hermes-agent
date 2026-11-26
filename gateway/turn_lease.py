@@ -181,6 +181,7 @@ class SessionTurnLeaseRegistry:
         # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
+        contended_task = None
         acquired = False
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -188,7 +189,9 @@ class SessionTurnLeaseRegistry:
             # Let lock.acquire() register its waiter before an awaited contention hook runs.
             await asyncio.sleep(0)
             if on_contended is not None:
-                await on_contended()
+                # The contention hook may wait for publication, but it must not postpone the
+                # initial lease timeout or the restart-recovery spool/notice deadlines.
+                contended_task = asyncio.create_task(on_contended())
             deadlines = [(timeout, on_timeout)]
             if on_wait is not None:
                 deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
@@ -204,6 +207,12 @@ class SessionTurnLeaseRegistry:
                 await waiter
                 acquired = True
         finally:
+            if contended_task is not None:
+                if not acquired:
+                    contended_task.cancel()
+                # Acquired: the holder is released, so the callback finishes at once (an ack in flight
+                # completes before the turn runs, as when it was awaited inline).
+                await asyncio.gather(contended_task, return_exceptions=True)
             if not acquired:
                 waiter.cancel()
                 await asyncio.gather(waiter, return_exceptions=True)

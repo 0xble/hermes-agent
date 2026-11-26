@@ -276,7 +276,7 @@ async def test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('successor', ['ended', 'successor-turn'])
+@pytest.mark.parametrize('successor', ['ended', 'successor-turn', 'generation-bump'])
 async def test_pending_wait_ending_or_successor_turn_is_never_interrupted(tmp_path, monkeypatch, successor):
     """The machine turn ends during the pending wait, or a successor reuses the slot: nothing is interrupted."""
     from gateway.run import _AGENT_PENDING_SENTINEL
@@ -290,6 +290,9 @@ async def test_pending_wait_ending_or_successor_turn_is_never_interrupted(tmp_pa
         if successor == 'successor-turn':
             turn.event = MessageEvent(text='next', source=source, message_id='succ', reply_expected=True)
             turn.publish_agent(agent, None, generation)  # the successor's agent, a different opener
+        if successor == 'generation-bump':
+            # Same opener event and a real publication, but the run generation moved on (/new, /stop).
+            turn.publish_agent(agent, None, runner._begin_session_run_generation(key))
         turn.turn_ended_event.set()
 
     rows, steers, interrupts, sent = await _queued_behind(
@@ -298,6 +301,7 @@ async def test_pending_wait_ending_or_successor_turn_is_never_interrupted(tmp_pa
     )
     assert [(row['request_id'], row['status']) for row in rows] == [('h-' + successor, 'queued')]
     assert interrupts == [] and steers == []
+    assert sent == []
 
 
 def test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop(tmp_path, monkeypatch):
@@ -326,3 +330,138 @@ def test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop(tmp_pa
             authority.adopt_agent('s', 2, agent)
         assert preempted._interrupt_requested is True
         assert stale._interrupt_requested is False
+
+
+@pytest.mark.asyncio
+async def test_pending_timeout_ack_is_not_sent_once_the_slot_belongs_to_another_turn(tmp_path, monkeypatch):
+    """The bound expires after the opener ended and a successor took the slot: no stale queued ack."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    monkeypatch.setattr('gateway.run_turn_lease_wait.lease_wait_max_seconds', lambda: 2.0)  # long enough to swap the slot first
+
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
+
+    async def successor_takes_slot(runner, source, turn, agent):
+        turn.event = MessageEvent(text='next', source=source, message_id='succ-ack', reply_expected=True)
+
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-stale-ack', publish_pending=True, wait_for_busy=False,
+        after_admit=successor_takes_slot,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-stale-ack', 'queued')]
+    assert interrupts == [] and steers == [] and sent == []
+
+
+class _CachedAgent:
+    """A cached agent with the real interrupt-state semantics the next turn's first iteration reads."""
+
+    def __init__(self):
+        self._interrupt_requested = False
+        self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
+        self.api_calls = 0
+
+    def interrupt(self, message=None, *, tool_reason=None, **_):
+        self._interrupt_message, self._tool_interrupt_reason = message, tool_reason
+        self._interrupt_source = 'system'
+        self._interrupt_requested = True
+
+    def clear_interrupt(self, **_):
+        self._interrupt_requested = False
+        self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
+
+    def run_first_iteration(self):
+        """agent/turn_iteration_prep.py: an interrupt pending here breaks out with zero API calls."""
+        if self._interrupt_requested:
+            return False
+        self.api_calls += 1
+        return True
+
+
+def _wire_turn(agent, ctx):
+    """The gateway's real per-turn adoption of a (cached) agent by the turn owning *ctx*."""
+    from gateway.turn_context import TurnContext
+    TurnContext.bind_agent_lifetime(ctx, agent)
+
+
+def _ctx():
+    import types
+    return types.SimpleNamespace(agent_holder=[None], _worker=None)
+
+
+def test_preemption_from_a_previous_generation_is_cleared_when_the_next_turn_adopts_the_agent():
+    """A preemption left on the cached agent never interrupts the user's next turn."""
+    from gateway.run_turn_pending_preemption import stamp_preemption_target
+
+    agent, machine_ctx, user_ctx = _CachedAgent(), _ctx(), _ctx()
+    stamp_preemption_target(agent, machine_ctx)
+    agent.interrupt(None, tool_reason='gateway user turn preemption')  # aimed at the machine turn
+    _wire_turn(agent, user_ctx)  # generation N+1 adopts the same cached agent
+    assert agent._interrupt_requested is False
+    assert not hasattr(agent, '_gateway_preempt_ctx')
+    assert agent.run_first_iteration() is True and agent.api_calls == 1
+
+
+def test_preemption_aimed_at_the_adopting_turn_is_kept():
+    from gateway.run_turn_pending_preemption import stamp_preemption_target
+
+    agent, ctx = _CachedAgent(), _ctx()
+    stamp_preemption_target(agent, ctx)
+    agent.interrupt(None, tool_reason='gateway user turn preemption')
+    _wire_turn(agent, ctx)
+    assert agent._interrupt_requested is True
+    assert agent._tool_interrupt_reason == 'gateway user turn preemption'
+    assert not hasattr(agent, '_gateway_preempt_ctx')
+
+
+def test_an_unstamped_user_interrupt_survives_adoption():
+    agent = _CachedAgent()
+    agent.interrupt('stop that', tool_reason='user interrupt')
+    agent._interrupt_source = None
+    _wire_turn(agent, _ctx())
+    assert agent._interrupt_requested is True
+
+
+@pytest.mark.asyncio
+async def test_preemption_after_the_machine_agent_finished_does_not_interrupt_the_next_user_turn(tmp_path, monkeypatch):
+    """The finalizer already cleared interrupts but the slot is not yet released: the late preemption is stale."""
+    from tests.waiting import async_wait_until
+
+    runner, authority, source, _agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
+    monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
+    monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
+    finished, machine_ctx = _CachedAgent(), _ctx()
+    _goal_turn(runner, source, turn, finished)
+    turn.ctx = machine_ctx  # the machine turn finished its run (finalizer cleared interrupts); slot still held
+    try:
+        event = MessageEvent(text='check now', source=source, message_id='h-late', reply_expected=True)
+        task = asyncio.ensure_future(runner._hm_admit_to_fifo(
+            authority, event, source, runner._session_key_for_source(source), True,
+        ))
+        await async_wait_until(lambda: finished._interrupt_requested, timeout=10, what='the late preemption')
+        await asyncio.wait_for(asyncio.gather(*getattr(runner, '_background_tasks', ()), return_exceptions=True), 10)
+        task.cancel()
+        _wire_turn(finished, _ctx())  # the user's queued turn reuses the cached agent
+        assert finished._interrupt_requested is False
+        assert finished.run_first_iteration() is True and finished.api_calls == 1
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_published_generation_is_never_none_for_a_pending_waiter():
+    """The cold path matches ``agent_published_generation == holder.generation``; None never matches."""
+    import types
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session_state import TurnState
+
+    agent, turn = _CachedAgent(), TurnState()
+    state = types.SimpleNamespace(turn=turn)
+    runner = types.SimpleNamespace(
+        _is_session_run_current=lambda key, generation: True,
+        _session_state=lambda key: state,
+        _current_session_run_generation=lambda key: 7,
+        _draining=False,
+    )
+    ctx = types.SimpleNamespace(session_key='k', run_generation=None, agent_holder=[agent])
+    await GatewayTurnMixin._run_agent_track_agent(runner, ctx)
+    assert turn.agent is agent and turn.agent_published_generation == 7

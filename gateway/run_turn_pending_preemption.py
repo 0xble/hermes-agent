@@ -9,6 +9,28 @@ logger = logging.getLogger("gateway.run")
 _REASON = "gateway user turn preemption"
 
 
+def stamp_preemption_target(agent: Any, ctx: Any) -> None:
+    """Record the turn context a soft preemption is aimed at, before ``interrupt()``."""
+    agent._gateway_preempt_ctx = ctx
+
+
+def settle_stale_preemption(agent: Any, ctx: Any) -> None:
+    """A turn about to run on *agent* keeps a soft preemption only if it was aimed at this turn.
+
+    The machine turn's finalizer clears interrupts before the gateway releases the slot, so a
+    preemption landing in that window sits on the cached agent and would break the next (user)
+    turn at its first iteration check with no API call. The stamp is always consumed.
+    """
+    target = getattr(agent, "_gateway_preempt_ctx", None)
+    if hasattr(agent, "_gateway_preempt_ctx"):
+        del agent._gateway_preempt_ctx
+    from agent.interrupt_control import interrupt_issuer
+    clear = getattr(agent, "clear_interrupt", None)
+    if clear is not None and interrupt_issuer(agent) == "gateway_user_turn_preemption" and (
+            ctx is None or target is not ctx):
+        clear()
+
+
 async def _wait_for_events(events: list[Any], timeout: float) -> bool:
     """Wait for the first real state event; True only when the bound expired with none set."""
     waits = [asyncio.create_task(event.wait()) for event in events if event is not None]
@@ -75,6 +97,7 @@ async def preempt_machine_holder(runner: Any, event: Any, quick_key: str, holder
             or getattr(turn, "agent_published_generation", holder.generation) != holder.generation):
         return
     try:
+        stamp_preemption_target(agent, getattr(turn, "ctx", None))
         agent.interrupt(None, tool_reason=_REASON)
     except Exception:
         logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
@@ -107,7 +130,8 @@ async def _authority_preemption(
 
     if pending and await _wait_for_events([turn.agent_published_event, turn.turn_ended_event], lease_wait_max_seconds()):
         # Never published within the bound: behave exactly as plain queue mode (no interrupt, one ack).
-        await runner._busy_interrupt_and_ack(event, quick_key, adapter, state, running_agent, outcome("queue"))
+        if turn.event is opener:
+            await runner._busy_interrupt_and_ack(event, quick_key, adapter, state, running_agent, outcome("queue"))
         return
 
     def current() -> Any:
@@ -132,6 +156,7 @@ async def _authority_preemption(
         await runner._busy_interrupt_and_ack(event, quick_key, adapter, state, agent, outcome("queue", subagents, compression))
         return
     try:
+        stamp_preemption_target(agent, getattr(turn, "ctx", None))
         agent.interrupt(None, tool_reason=_REASON)
     except Exception:
         logger.debug("Authority machine-turn preemption failed", exc_info=True)

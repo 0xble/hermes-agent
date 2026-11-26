@@ -909,3 +909,45 @@ async def test_spool_failure_does_not_run_unserialized_or_leak_waiter(monkeypatc
     registry.release(holder)
     successor = await registry.acquire("session", owner_key="topic", generation=10, timeout=0.02)
     assert registry.release(successor)
+
+
+@pytest.mark.asyncio
+async def test_pending_holder_that_never_publishes_does_not_delay_the_restart_spool(monkeypatch):
+    """The preemption wait runs beside the lease deadlines: the spool fires at its own deadline."""
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner = object.__new__(GatewayTurnPrepareMixin)
+    registry = SessionTurnLeaseRegistry()
+    runner._turn_leases = registry  # type: ignore[reportAttributeAccessIssue]
+    state = SimpleNamespace(turn=SimpleNamespace(
+        agent=_AGENT_PENDING_SENTINEL, agent_published_event=asyncio.Event(), lease_tokens={}))
+    runner._peek_session_state = lambda _key: state  # type: ignore[reportAttributeAccessIssue]
+    runner._session_state = lambda _key: state  # type: ignore[reportAttributeAccessIssue]
+    runner._delivery_adapter_for = lambda _source: object()  # type: ignore[reportAttributeAccessIssue]
+    runner._clear_session_env = lambda _tokens: None  # type: ignore[reportAttributeAccessIssue]
+    runner._is_user_turn_event = lambda event: not event.internal  # type: ignore[reportAttributeAccessIssue]
+    monkeypatch.setattr("gateway.meeting_lane.busy_input_mode", AsyncMock(return_value="queue"))
+    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.05")
+    spooled = asyncio.Event()
+
+    async def spool(*_args):
+        spooled.set()
+
+    monkeypatch.setattr("gateway.run_turn_lease_wait.preserve_lease_wait_async", spool)
+    holder = await registry.acquire("session", owner_key="machine", generation=1,
+                                    event=SimpleNamespace(internal=True))
+    user_event = SimpleNamespace(internal=False, text="hello", source=object())
+    task = asyncio.create_task(runner._hmwa_acquire_turn_lease(
+        "topic", 2, SimpleNamespace(session_id="session"), None, user_event,
+    ))
+    try:
+        await asyncio.wait_for(spooled.wait(), 5)  # pre-fix: held back until the 1800 s preemption bound
+        assert not task.done()
+        registry.release(holder)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+        registry.release(state.turn.lease_tokens[2])
+    finally:
+        registry.release(holder)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

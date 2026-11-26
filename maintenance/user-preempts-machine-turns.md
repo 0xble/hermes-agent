@@ -38,12 +38,24 @@ keeps the wait a soft yield and prevents a late publication from interrupting a
 successor turn; a pending-stop latch was not used because it is coupled to hard
 stop attribution and would broaden the control path.
 
+A preemption is scoped to the turn it was aimed at. Before `interrupt()` the
+gateway stamps the target turn's context on the agent (`_gateway_preempt_ctx`); the
+next turn's agent binding (`TurnContext.bind_agent_lifetime` → `settle_stale_preemption`) keeps a
+gateway preemption only when the stamp is its own context and clears it otherwise. The
+machine turn's finalizer clears interrupts before the gateway releases the slot, so a
+preemption landing in that window would otherwise break the user's next turn at its
+first iteration with no API call.
+
+On the cold path the contention callback runs as a task beside the lease deadlines in
+`SessionTurnLeaseRegistry._wait_for_lock`, so the 5 s restart-recovery spool and the
+30 s notice are never held back by the long pending-agent wait.
+
 The session task is never cancelled. Soft preemption is cooperative: if the
 machine turn is inside a non-interruptible tool or step, it keeps the lease until
 that step yields; the user message remains FIFO behind it and receives the
 existing "Interrupting" acknowledgement instead of a second queued notice.
 
-Contract tests: `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_is_soft_preempted_once`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_with_active_subagents_stays_queued`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_origin_text_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_relay_event_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_a_persons_own_turn_still_queues_silently`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_publishes_then_is_preempted_once`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_releases_without_publication_and_is_not_preempted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_machine_turn_never_published_gets_one_queued_ack_and_no_interrupt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_turn`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_wait_ending_or_successor_turn_is_never_interrupted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop`.
+Contract tests: `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_is_soft_preempted_once`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_machine_turn_with_active_subagents_stays_queued`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_origin_text_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_relay_event_behind_machine_turn_does_not_preempt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_typed_text_behind_a_persons_own_turn_still_queues_silently`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_publishes_then_is_preempted_once`, `tests/gateway/test_turn_lease_queue.py::test_pending_internal_holder_releases_without_publication_and_is_not_preempted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_machine_turn_never_published_gets_one_queued_ack_and_no_interrupt`, `tests/gateway/test_authority_busy_preempt_parity.py::test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_turn`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_wait_ending_or_successor_turn_is_never_interrupted`, `tests/gateway/test_authority_busy_preempt_parity.py::test_adopt_agent_keeps_a_soft_preemption_but_still_drops_a_stale_stop`, `tests/gateway/test_authority_busy_preempt_parity.py::test_preemption_from_a_previous_generation_is_cleared_when_the_next_turn_adopts_the_agent`, `tests/gateway/test_authority_busy_preempt_parity.py::test_preemption_aimed_at_the_adopting_turn_is_kept`, `tests/gateway/test_authority_busy_preempt_parity.py::test_an_unstamped_user_interrupt_survives_adoption`, `tests/gateway/test_authority_busy_preempt_parity.py::test_preemption_after_the_machine_agent_finished_does_not_interrupt_the_next_user_turn`, `tests/gateway/test_authority_busy_preempt_parity.py::test_pending_timeout_ack_is_not_sent_once_the_slot_belongs_to_another_turn`, `tests/gateway/test_authority_busy_preempt_parity.py::test_agent_published_generation_is_never_none_for_a_pending_waiter`, `tests/gateway/test_turn_lease_queue.py::test_pending_holder_that_never_publishes_does_not_delay_the_restart_spool`.
 
 ## Interrupt attribution on early returns
 
