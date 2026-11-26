@@ -484,7 +484,12 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
             anchor = os.path.join(str(base), *sub.split("/"))
             if _named_remote():
                 if _is_under(resolved, _realpath(anchor)):
-                    return "credential"
+                    # A successful batch is only an optimization. Confirm the matching protected
+                    # anchor through the ordinary resolver so an unavailable anchor cannot become a
+                    # normal lexical deny.
+                    from tools.file_backend_state import confirm_policy_realpath
+                    if _is_under(resolved, confirm_policy_realpath(anchor)):
+                        return "credential"
             elif deny_path_under(resolved, _realpath(anchor)):
                 return "credential"
 

@@ -102,6 +102,21 @@ def policy_realpath(path: str) -> str:
     return execution.policy_paths[text]
 
 
+def confirm_policy_realpath(path: str) -> str:
+    """Re-resolve one prefetched policy anchor through the normal failure boundary.
+
+    Batches are an optimization only: a batch cannot observe test/runtime hooks that make one
+    anchor unavailable. A caller that has a matching protected anchor must confirm that anchor
+    with the ordinary resolver before returning a deny.
+    """
+    execution = current_execution()
+    if execution is None:
+        raise RuntimeError("Remote policy resolution requires a bound node")
+    text = str(path)
+    execution.policy_paths[text] = remote_path(text)
+    return execution.policy_paths[text]
+
+
 def prefetch_policy_realpaths(paths) -> None:
     """Resolve many policy anchors in ONE target round trip, filling the per-invocation cache.
 
