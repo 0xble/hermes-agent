@@ -465,7 +465,8 @@ def test_descriptive_loop_stop_quote_with_hidden_cards(state, target):
     if target == "requester":
         assert result["status"] == "applied", result
         assert result["record"]["authority"]["via"] == "quote"
-        assert load_loop(target) is None
+        loop = load_loop(target)
+        assert loop is not None and loop.status == "cleared"
     else:
         assert not result["ok"] and result["error_code"] == "user_quote_mismatch"
         loop = load_loop(target)
