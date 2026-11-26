@@ -120,7 +120,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR ${!HERMES_BROWSER_CONTROL_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
-        f"> {tmp_path}")
+        # ``>|`` truncates the mktemp file even when the session has ``noclobber`` (``set -C``) on:
+        # mktemp pre-creates it, so a plain ``>`` fails and the snapshot never persists exports.
+        f">| {tmp_path}")
 
 
 def _shell_state_dump(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
