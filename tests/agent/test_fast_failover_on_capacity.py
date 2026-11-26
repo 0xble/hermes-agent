@@ -1,10 +1,15 @@
 """Fallback routes get one short provider-capacity/transport retry, never a long cooldown."""
+import ssl
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import anthropic
+import httpx
+import openai
 import pytest
 
-from agent.error_classifier import classify_api_error
+from agent.error_classifier import FailoverReason, classify_api_error
+from agent.route_verdicts import reset_route_verdicts, route_visit
 from agent.turn_api_error import fast_failover_on_provider_outage, settle_unrecovered_error
 from agent.turn_recovery import compute_error_backoff
 from agent.turn_retry_state import TurnRetryState
@@ -28,17 +33,26 @@ class _Agent:
     _current_streamed_assistant_text = ""
 
     def __init__(self, fallback=True):
-        self.fallback = fallback
+        # ``fallback`` is the number of fallback routes still pending (True counts as one).
+        self.fallback = int(fallback)
         self._retry_status_buffer = []
         self.waits = []
         self.statuses = []
+        self.activations = 0
+        self.route = "primary"
 
     def _has_pending_fallback(self):
-        return self.fallback
+        return self.fallback > 0
 
     def _try_activate_fallback(self, **kwargs):
         self.activated = True
-        return self.fallback
+        if self.fallback <= 0:
+            return False
+        self.fallback -= 1
+        self.activations += 1
+        self.route = f"fallback-{self.activations}"
+        reset_route_verdicts(self)  # a fallback bind starts a new route visit (route_binding)
+        return True
 
     def _try_recover_primary_transport(self, *args, **kwargs):
         return False
@@ -85,7 +99,8 @@ def _settle(agent, error, *, retry=None, retry_count=0, max_retries=3, sleeps=No
         ),
     ):
         verdict = settle_unrecovered_error(
-            agent, api_error=error, classified=classified, _retry=retry, status_code=error.status_code,
+            agent, api_error=error, classified=classified, _retry=retry,
+            status_code=getattr(error, "status_code", None),
             error_msg=str(error).lower(), is_context_length_error=False, is_rate_limited=False,
             _is_zai_coding_overload=False, _provider=agent.provider, _base="http://proxy", _model="primary",
             messages=[], api_messages=[], api_kwargs={}, active_system_prompt=None,
@@ -129,10 +144,133 @@ def test_auth_unavailable_is_capacity_but_real_401_is_not():
     assert not fast_failover_on_provider_outage(_Agent(), _classified(invalid), invalid)
 
 
+def _request():
+    return httpx.Request("POST", "http://proxy/v1/chat/completions")
+
+
+def _wrapped(sdk_error, cause):
+    sdk_error.__cause__ = cause
+    return sdk_error
+
+
 @pytest.mark.parametrize(
-    "message", ["unexpected EOF", "connection reset by peer", "TLS handshake EOF", "connection refused"]
+    "build",
+    [
+        pytest.param(lambda: httpx.ConnectError("all connection attempts failed"), id="httpx-connect-error"),
+        pytest.param(lambda: httpx.ConnectTimeout("timed out"), id="httpx-connect-timeout"),
+        pytest.param(lambda: httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                     id="httpx-remote-protocol"),
+        pytest.param(lambda: ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:2406)"),
+                     id="tls-handshake-eof"),
+        pytest.param(lambda: ConnectionResetError(54, "Connection reset by peer"), id="connection-reset"),
+        pytest.param(lambda: ConnectionRefusedError(61, "Connection refused"), id="connection-refused"),
+        pytest.param(lambda: openai.APIConnectionError(request=_request()), id="openai-connection"),
+        pytest.param(lambda: openai.APITimeoutError(request=_request()), id="openai-timeout"),
+        pytest.param(lambda: anthropic.APIConnectionError(request=_request()), id="anthropic-connection"),
+        pytest.param(
+            lambda: _wrapped(openai.APIConnectionError(request=_request()),
+                             ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:2406)")),
+            id="openai-connection-over-tls-eof",
+        ),
+    ],
 )
-def test_transport_failures_get_fast_failover(message):
-    error = _Err(None, message)
-    agent = _Agent()
-    assert fast_failover_on_provider_outage(agent, _classified(error), error)
+def test_transport_exception_types_get_fast_failover(build):
+    error = build()
+    classified = _classified(error)
+    assert classified.reason is FailoverReason.timeout, classified
+    assert fast_failover_on_provider_outage(_Agent(), classified, error)
+    assert not fast_failover_on_provider_outage(_Agent(fallback=False), classified, error)
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["unexpected EOF", "connection reset by peer", "TLS handshake EOF", "connection refused", "upstream connect error"],
+)
+def test_transport_wording_without_a_transport_exception_is_not_an_outage(message):
+    # Text alone proves nothing: only the exception type (or a status) can.
+    error = RuntimeError(message)
+    assert not fast_failover_on_provider_outage(_Agent(), _classified(error), error)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "connection reset by peer",
+        "connection refused",
+        "auth_unavailable: no auth available",
+        "unexpected eof while reading; tls handshake failed; upstream connect error; no auth available",
+    ],
+)
+def test_4xx_bodies_echoing_outage_text_never_fail_over(status, body):
+    error = _Err(status, f"the tool output was: {body}", retry_after=600)
+    classified = _classified(error)
+    assert not fast_failover_on_provider_outage(_Agent(), classified, error)
+    retry = TurnRetryState(primary_recovery_attempted=True)
+    _settle(_Agent(), error, retry=retry, retry_count=1, sleeps=[])
+    assert retry.fast_failover_retry_visit is None, "the short-retry path was entered for a 4xx"
+
+
+@pytest.mark.parametrize("status", [503, 529])
+def test_gateway_statuses_get_fast_failover(status):
+    error = _Err(status, "upstream unavailable", retry_after=300)
+    classified = _classified(error)
+    assert fast_failover_on_provider_outage(_Agent(), classified, error)
+    assert not fast_failover_on_provider_outage(_Agent(fallback=False), classified, error)
+
+
+def test_429_needs_a_long_retry_after():
+    assert fast_failover_on_provider_outage(
+        _Agent(), _classified(_Err(429, "slow down", retry_after=300)), _Err(429, "slow down", retry_after=300))
+    short = _Err(429, "slow down", retry_after=2)
+    assert not fast_failover_on_provider_outage(_Agent(), _classified(short), short)
+    bare = _Err(429, "slow down")
+    assert not fast_failover_on_provider_outage(_Agent(), _classified(bare), bare)
+
+
+@pytest.mark.parametrize(
+    "upstream", ["rate_limit_error: This request would exceed your account's rate limit", "overloaded_error"],
+)
+def test_structured_proxy_auth_unavailable_is_an_outage_via_the_classifier(upstream):
+    error = _Err(
+        503,
+        f"auth_unavailable: no auth available (providers=claude; last upstream error: {upstream})",
+        retry_after=300,
+    )
+    classified = _classified(error)
+    assert classified.reason in {FailoverReason.rate_limit, FailoverReason.overloaded}
+    assert fast_failover_on_provider_outage(_Agent(), classified, error)
+
+
+def test_auth_unavailable_text_on_a_client_error_is_not_structured_evidence():
+    error = _Err(401, "auth_unavailable: no auth available; last upstream error: rate_limit_error", retry_after=300)
+    assert not fast_failover_on_provider_outage(_Agent(), _classified(error), error)
+
+
+def test_each_fallback_route_gets_its_own_short_retry():
+    """The one short retry is per route: a fallback that also fails gets its own, not the primary's spent one."""
+    error = _Err(503, "server_is_overloaded", retry_after=320)
+    agent = _Agent(fallback=2)
+    retry = TurnRetryState(primary_recovery_attempted=True)
+
+    sleeps = []
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)  # primary: short retry
+    assert verdict.action == "fallthrough" and len(sleeps) == 1 and sleeps[0] <= 5
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)  # primary spent: fail over
+    assert verdict.action == "break" and agent.route == "fallback-1"
+    assert len(sleeps) == 1
+
+    # The first fallback is also overloaded once, with a second fallback still pending.
+    visit = route_visit(agent)
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)
+    assert verdict.action == "fallthrough", "the fallback's own short retry was skipped"
+    assert len(sleeps) == 2 and sleeps[1] <= 5
+    assert agent.route == "fallback-1" and route_visit(agent) == visit  # retried in place
+
+    # ...and then it succeeds on that retry: nothing further was activated.
+    assert agent.activations == 1
+
+    # A fallback that keeps failing is still bounded: one short retry per route, then the next route.
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)
+    assert verdict.action == "break" and agent.route == "fallback-2"
+    assert len(sleeps) == 2

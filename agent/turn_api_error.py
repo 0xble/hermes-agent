@@ -332,47 +332,70 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     return retry_after is not None and retry_after > cap
 
 
+# Gateway/capacity statuses a pending fallback may take over from after one short retry. Other
+# 4xx never qualify (a 400/401/403 body may echo user or tool text), 429 is judged on its Retry-After.
+# A generic 500/502/504 remains on the established retry path; only explicit capacity statuses
+# (503/529), or the classifier's overloaded verdict, enter this provider-outage shortcut.
+_FAST_FAILOVER_5XX = frozenset({503, 529})
+_FAST_FAILOVER_5XX_REASONS = frozenset({
+    FailoverReason.overloaded, FailoverReason.server_error, FailoverReason.timeout, FailoverReason.rate_limit,
+})
+_FAST_FAILOVER_TRANSPORT_NAMES = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "PoolTimeout", "ReadError", "WriteError",
+    "RemoteProtocolError", "ServerDisconnectedError", "APIConnectionError", "APITimeoutError",
+    "SSLEOFError", "SSLZeroReturnError", "SSLSyscallError", "IncompleteRead", "RemoteDisconnected",
+})
+
+
+def _has_transport_exception(api_error: Any) -> bool:
+    """Whether the error, or one in its cause chain, is a connection/timeout/EOF exception type.
+
+    Decided by exception class only: a message that merely says "connection reset" proves nothing.
+    """
+    seen: set[int] = set()
+    node = api_error
+    for _ in range(5):
+        if node is None or id(node) in seen:
+            break
+        seen.add(id(node))
+        if isinstance(node, (ConnectionError, TimeoutError, EOFError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+            return True
+        if any(base.__name__ in _FAST_FAILOVER_TRANSPORT_NAMES for base in type(node).__mro__):
+            return True
+        node = getattr(node, "__cause__", None) or getattr(node, "__context__", None)
+    return False
+
+
 def fast_failover_on_provider_outage(agent: Any, classified: Any, api_error: Any) -> bool:
     """Whether a pending fallback should get one short retry before activation.
 
     Provider-capacity and transport failures are unlikely to recover during a provider-declared
     multi-minute cooldown.  A configured fallback can make progress, so keep one bounded probe of
     the primary and then move on.  With no pending fallback this is false, preserving the existing
-    Retry-After and recovery-ladder behavior.  Authentication failures are intentionally absent:
-    a real 401/invalid credential must keep its existing refresh/terminal path.
+    Retry-After and recovery-ladder behavior.
+
+    The verdict comes from the HTTP status, the exception type and the error classifier's own
+    reason (which already reads a structured proxy ``auth_unavailable``), never from a substring of
+    the error text.  A 4xx other than 429 is never an outage here: a real 401/403 keeps its
+    refresh/terminal path, and a 400 keeps its request-validation path.
     """
     if not agent._has_pending_fallback() or getattr(agent, "_turn_independent_attempt_active", False):
         return False
+    status = getattr(classified, "status_code", None)
+    status = status if isinstance(status, int) and not isinstance(status, bool) else None
+    if status is not None and 400 <= status < 500 and status != 429:
+        return False
     reason = getattr(classified, "reason", None)
-    context = getattr(classified, "error_context", None) or {}
     if reason is FailoverReason.overloaded:
         return True
-    error_text = " ".join(
-        str(value).lower()
-        for value in (api_error, getattr(api_error, "message", None), getattr(api_error, "body", None))
-        if value is not None
-    )
-    if any(
-        marker in error_text
-        for marker in (
-            "unexpected eof", "tls handshake", "ssl handshake", "connection reset", "connection refused",
-            "upstream connect error",
-        )
-    ):
-        return True
-    # CLIProxyAPI uses auth_unavailable while every pooled credential is cooling down. It is
-    # capacity exhaustion, not a bad user key, when it arrives on a transient provider verdict.
-    if "auth_unavailable" in error_text or "no auth available" in error_text:
-        if reason in {FailoverReason.rate_limit, FailoverReason.server_error, FailoverReason.timeout}:
-            return True
-    from agent.retry_utils import provider_retry_after_seconds
-    retry_after = provider_retry_after_seconds(api_error)
-    if reason is FailoverReason.rate_limit and retry_after is not None and retry_after > 5.0:
-        return True
-    if reason is FailoverReason.timeout:
-        return context.get("transport") in {"connection", "timeout"}
-    if reason is FailoverReason.server_error:
-        return context.get("transport") == "connection"
+    if status == 429:
+        from agent.retry_utils import provider_retry_after_seconds
+        retry_after = provider_retry_after_seconds(api_error)
+        return reason is FailoverReason.rate_limit and retry_after is not None and retry_after > 5.0
+    if status in _FAST_FAILOVER_5XX:
+        return reason in _FAST_FAILOVER_5XX_REASONS
+    if status is None:
+        return reason is FailoverReason.timeout and _has_transport_exception(api_error)
     return False
 
 
@@ -553,10 +576,12 @@ def settle_unrecovered_error(  # health: allow CC -- preserves the ordered recov
         # Keep ``max_retries`` intact: the fallback restart budget also governs the rebuilt
         # message handoff, including its independent-endpoint allowance. Only the provider's
         # same-route retry budget is shortened here.
-        if getattr(_retry, "fast_failover_retry_attempted", False):
+        # The retry is spent per route visit: a fallback activation starts a new visit, so a
+        # fallback that also fails with a capacity error gets its own short retry.
+        if _retry.fast_failover_retry_visit == route_visit(agent):
             retry_count = max_retries
         else:
-            _retry.fast_failover_retry_attempted = True
+            _retry.fast_failover_retry_visit = route_visit(agent)
 
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
