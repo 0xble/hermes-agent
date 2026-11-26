@@ -312,16 +312,10 @@ class StreamFallbackMixin:
 
         self._message_id = last_message_id
         self._already_sent = True
-        mark_final = getattr(self, "_mark_final_delivered", None)
-        if callable(mark_final):
-            # A tail-only fallback sets the final flags (cleanup, suppression of a duplicate send) but
-            # records no payload: the preview head and the tail were separate wire frames, so
-            # reconciliation must judge the complete answer against what is visible, not trust a record.
-            mark_final(record=final_text if continuation == final_text else None)
-            result = locals().get("result")
-            if result is not None:
-                from gateway.reply_latency import record_final_reply
-                record_final_reply(getattr(self, "_reply_latency_receipt", None), chunks[-1], result)
+        # Recorder substitutes the unsplit ledger on a split turn.
+        self._mark_final_delivered(record=final_text)
+        from gateway.reply_latency import record_final_reply
+        record_final_reply(getattr(self, "_reply_latency_receipt", None), chunks[-1], result)
         self._last_sent_text = chunks[-1]
         self._final_response_sent = True
         self._fallback_prefix = ""
