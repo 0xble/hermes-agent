@@ -31,17 +31,21 @@ logger = logging.getLogger("gateway.platforms.api_server")
 async def _iter_stream_items(stream_q, agent_task, response):
     """Yield agent stream items until EOS, writing SSE keepalives while idle.
 
-    Yields the ``None`` sentinel once so callers can run EOS-only work; when ``agent_task``
-    is already done the remaining queue is drained and the sentinel swallowed.
+    Keep one queue waiter alive instead of repeatedly cancelling ``Queue.get`` with
+    ``wait_for``.  Cancellation and a producer's completion callback can otherwise
+    cross at the exact point where the callback publishes EOS, leaving the consumer
+    asleep even though the agent has already completed.
     """
     from gateway.platforms.api_server import CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS
 
+    queue_get = asyncio.create_task(stream_q.get())
     last_activity = time.monotonic()
-    while True:
-        try:
-            item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
-        except TimeoutError:
-            if agent_task.done():
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                (queue_get, agent_task), timeout=0.5,
+                return_when=asyncio.FIRST_COMPLETED)
+            if agent_task in done:
                 while True:
                     try:
                         item = stream_q.get_nowait()
@@ -51,15 +55,23 @@ async def _iter_stream_items(stream_q, agent_task, response):
                         return
                     yield item
                     last_activity = time.monotonic()
+            if queue_get in done:
+                item = queue_get.result()
+                if item is None:
+                    yield None
+                    return
+                yield item
+                last_activity = time.monotonic()
+                queue_get = asyncio.create_task(stream_q.get())
+                continue
             if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
                 await response.write(b": keepalive\n\n")
                 last_activity = time.monotonic()
-            continue
-        if item is None:
-            yield None
-            return
-        yield item
-        last_activity = time.monotonic()
+    finally:
+        if not queue_get.done():
+            queue_get.cancel()
+        with suppress(asyncio.CancelledError):
+            await queue_get
 
 
 def _result_flags(result: Any) -> tuple:
