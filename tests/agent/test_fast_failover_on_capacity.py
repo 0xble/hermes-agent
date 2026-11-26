@@ -32,9 +32,11 @@ class _Agent:
     _credential_pool = None
     _current_streamed_assistant_text = ""
 
-    def __init__(self, fallback=True):
+    def __init__(self, fallback=True, recover_primary=False):
         # ``fallback`` is the number of fallback routes still pending (True counts as one).
         self.fallback = int(fallback)
+        self.recover_primary = recover_primary
+        self.recovery_calls = 0
         self._retry_status_buffer = []
         self.waits = []
         self.statuses = []
@@ -55,7 +57,8 @@ class _Agent:
         return True
 
     def _try_recover_primary_transport(self, *args, **kwargs):
-        return False
+        self.recovery_calls += 1
+        return self.recover_primary
 
     def _emit_diagnostic_status(self, text):
         self.statuses.append(str(text))
@@ -124,6 +127,40 @@ def test_overload_gets_one_retry_capped_to_five_seconds_then_fallback():
     verdict, agent = _settle(agent, error, retry=retry, retry_count=1)
     assert verdict.action == "break"
     assert getattr(agent, "activated", False)
+
+
+def test_fast_failover_exhaustion_skips_successful_primary_recovery():
+    """A spent fast-failover retry must activate fallback without rebuilding primary."""
+    error = _Err(503, "server_is_overloaded", retry_after=320)
+    agent = _Agent(recover_primary=True)
+    retry = TurnRetryState()
+    sleeps = []
+
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)
+    assert verdict.action == "fallthrough"
+    assert sleeps and sleeps[0] <= 5.0
+
+    verdict, _ = _settle(agent, error, retry=retry, retry_count=1, sleeps=sleeps)
+
+    assert verdict.action == "break"
+    assert agent.activations == 1
+    assert agent.recovery_calls == 0
+    assert len(sleeps) == 1
+
+
+def test_fast_failover_retry_wait_cap_survives_adaptive_backoff():
+    error = _Err(429, "rate limited")
+    agent = _Agent()
+    with patch(
+        "agent.retry_utils.adaptive_rate_limit_backoff",
+        return_value=(30.0, "zai_coding_overload_long"),
+    ):
+        wait = compute_error_backoff(
+            agent, error, retry_count=4, max_retries=5, is_rate_limited=True,
+            is_zai_coding_overload=False, base_url="http://proxy", model="primary",
+            retry_wait_cap=5.0,
+        )
+    assert wait == 5.0
 
 
 def test_same_overload_without_fallback_keeps_retry_after():

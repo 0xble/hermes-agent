@@ -611,7 +611,7 @@ def settle_unrecovered_error(  # health: allow CC -- preserves the ordered recov
         # transient transport errors (stale pool, TCP reset). Not after a spent unattended
         # window with a fallback pending: the route already had its recovery time.
         if (
-            not over_wait_cap and not skip_to_fallback and not _retry.primary_recovery_attempted
+            not over_wait_cap and not skip_to_fallback and not fast_failover and not _retry.primary_recovery_attempted
             and agent._try_recover_primary_transport(api_error, retry_count=retry_count, max_retries=max_retries)
         ):
             _retry.primary_recovery_attempted = True

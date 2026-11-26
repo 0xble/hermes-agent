@@ -1394,6 +1394,10 @@ def compute_error_backoff(
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
+    if retry_wait_cap is not None:
+        # Adaptive provider policies can replace the default wait after the first cap; the
+        # fast-failover route still owns this retry's hard upper bound.
+        wait_time = min(wait_time, max(0.0, float(retry_wait_cap)))
     _reset = reset_hint(api_error) if _adaptive else ""
     _free_busy = is_rate_limited and on_free_model(agent, base_url)
     _wait_reason = ("The free model is busy" if _free_busy
