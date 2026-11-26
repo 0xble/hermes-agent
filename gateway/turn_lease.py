@@ -46,12 +46,14 @@ class TurnLeaseToken:
     """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
     release idempotent."""
 
-    __slots__ = ("event", "generation", "lease", "owner_key", "released", "session_id")
+    __slots__ = ("event", "generation", "lease", "owner_key", "released", "released_event", "session_id")
 
     def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
         self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
         self.event = None
         self.released = False
+        # Contention callbacks can wait for either agent publication or this exact holder's release.
+        self.released_event = asyncio.Event()
         # The concrete lease, so release resolves by identity even after a rotation re-aliases
         # ``session_id`` (both ids map to this same lease).
         self.lease = lease
@@ -73,6 +75,20 @@ class _SessionLease:
     def idle(self) -> bool:
         """True when evictable: nobody holds or awaits it."""
         return self.holder is None and not self.lock.locked() and self.pending_acquires == 0
+
+
+def _drop_lock_waiter(waiter: "asyncio.Task", lock: asyncio.Lock) -> None:
+    """Cancel an unneeded ``lock.acquire()`` waiter and give back any lock it already won, now or
+    when it settles, so a second cancel while draining can never leave it detached and locked."""
+    def _give_back(task: "asyncio.Task") -> None:
+        if not task.cancelled() and task.exception() is None and task.result():
+            lock.release()
+
+    if waiter.done():
+        _give_back(waiter)
+        return
+    waiter.add_done_callback(_give_back)
+    waiter.cancel()
 
 
 class SessionTurnLeaseRegistry:
@@ -179,14 +195,17 @@ class SessionTurnLeaseRegistry:
         # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
+        contended_task = None
         acquired = False
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             # Let lock.acquire() register its waiter before an awaited contention hook runs.
             await asyncio.sleep(0)
             if on_contended is not None:
-                await on_contended()
-            loop = asyncio.get_running_loop()
-            started = loop.time()
+                # The contention hook may wait for publication, but it must not postpone the
+                # initial lease timeout or the restart-recovery spool/notice deadlines.
+                contended_task = asyncio.create_task(on_contended())
             deadlines = [(timeout, on_timeout)]
             if on_wait is not None:
                 deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
@@ -202,11 +221,20 @@ class SessionTurnLeaseRegistry:
                 await waiter
                 acquired = True
         finally:
+            # No await below may skip the waiter drain or strand an acquired lock on cancellation.
             if not acquired:
-                waiter.cancel()
+                _drop_lock_waiter(waiter, lock)
+                if contended_task is not None:
+                    contended_task.cancel()  # not awaited: a slow cancel must not outlive the drain
                 await asyncio.gather(waiter, return_exceptions=True)
-                if not waiter.cancelled() and waiter.exception() is None and waiter.result():
+            elif contended_task is not None:
+                # Acquired: the holder is released, so the callback finishes at once (an ack in flight
+                # completes before the turn runs). Cancelled here, the caller never publishes a holder.
+                try:
+                    await asyncio.gather(contended_task, return_exceptions=True)
+                except asyncio.CancelledError:
                     lock.release()
+                    raise
 
     def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:
         """Alias a HELD lease onto ``new_session_id`` after mid-turn rotation (compression) so the
@@ -240,6 +268,7 @@ class SessionTurnLeaseRegistry:
         if token is None or token.released:
             return False
         token.released = True
+        token.released_event.set()
         lease = token.lease
         if lease.holder is not token:
             logger.debug("turn lease release skipped on session %s: token (key %s gen %s) is not "

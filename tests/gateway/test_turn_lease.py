@@ -450,3 +450,88 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
     _run(scenario())
 
 
+
+
+# ---------------------------------------------------------------------------
+# Cancellation while the contention callback is still running
+# ---------------------------------------------------------------------------
+
+
+async def _yield(times=10):
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+def test_cancel_after_lock_won_while_contention_callback_runs_releases_lock():
+    """Won the lock, callback still in flight, task cancelled: the lock must not stay held."""
+
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        holder = await registry.acquire("s", owner_key="machine", generation=1)
+        released_seen = asyncio.Event()
+
+        async def ack_still_sending(token):
+            await token.released_event.wait()
+            released_seen.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(registry.acquire(
+            "s", owner_key="user", generation=2, timeout=60, on_contended=ack_still_sending,
+        ))
+        await _yield()
+        registry.release(holder)
+        await asyncio.wait_for(released_seen.wait(), 30)
+        lease = registry._leases["s"]
+        while not lease.lock.locked():
+            await asyncio.sleep(0)
+        await _yield()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        assert not lease.lock.locked() and lease.holder is None
+        assert lease.pending_acquires == 0
+        successor = await asyncio.wait_for(
+            registry.acquire("s", owner_key="next", generation=3, timeout=1), 30)
+        assert successor is not None
+        registry.release(successor)
+
+    _run(scenario())
+
+
+def test_second_cancel_while_cancelled_callback_unwinds_never_leaks_the_waiter():
+    """A second cancel during the callback's slow unwind must not detach the lock waiter."""
+
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        holder = await registry.acquire("s", owner_key="machine", generation=1)
+        started, gate = asyncio.Event(), asyncio.Event()
+
+        async def slow_unwind(_token):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await gate.wait()
+                raise
+
+        task = asyncio.create_task(registry.acquire(
+            "s", owner_key="user", generation=2, timeout=60, on_contended=slow_unwind,
+        ))
+        await asyncio.wait_for(started.wait(), 30)
+        task.cancel()
+        await _yield()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        registry.release(holder)
+        await _yield()
+        gate.set()
+        await _yield()
+        lease = registry._leases["s"]
+        assert not lease.lock.locked() and lease.holder is None
+        assert lease.pending_acquires == 0
+        successor = await asyncio.wait_for(
+            registry.acquire("s", owner_key="next", generation=3, timeout=1), 30)
+        assert successor is not None
+        registry.release(successor)
+
+    _run(scenario())
