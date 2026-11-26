@@ -402,13 +402,11 @@ def _is_direct_instruction(kind: str, action: str, target_sid: str, requester_si
     k = words.index(next(w for w in words if w in kind_words))
     if k <= i:
         return False
-    phrase = [w for w in words[i + 1:k] if w not in _DETERMINERS]
-    names = _target_name_phrases(target_sid, cursor=cursor)
+    # A self-target already identifies the sole control of this kind in the session.
     if target_sid != requester_sid:
-        if phrase not in names:
+        phrase = [w for w in words[i + 1:k] if w not in _DETERMINERS]
+        if phrase not in _target_name_phrases(target_sid, cursor=cursor):
             return False
-    elif phrase and phrase not in names:
-        return False
     tail = words[k + 1:]
     if action == "replace" and tail and tail[0] in _REPLACE_LINKS:
         if len(tail) < 2 or any(w in _CORRECTION_TOKENS for w in tail[1:]):
@@ -1205,6 +1203,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         except ValueError as exc:
             return {"ok": False, "error_code": str(exc), "error": str(exc)}
         if not record.get("id"):
+            if refused == "user_quote_mismatch" and record.get("error_code") == "approval_cards_hidden":
+                return {"ok": False, "error_code": refused, "error": "user quote does not match this control"}
             return record
         outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record,
                    "non_blocking": True}

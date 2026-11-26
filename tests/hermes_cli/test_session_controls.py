@@ -448,6 +448,31 @@ def test_loop_controls_and_goal_replace(state):
     assert apply_control("loop", "resume", "target", requester_sid="requester", reason="x")["status"] == "pending"
 
 
+@pytest.mark.parametrize("target", ["requester", "target"], ids=["self", "cross-session"])
+def test_descriptive_loop_stop_quote_with_hidden_cards(state, target):
+    from hermes_cli import config, session_controls
+    from hermes_cli.loops import LoopManager, load_loop
+
+    config.set_config_value("loops.notices", "hidden")
+    LoopManager(target).set("check status")
+    quote = "stop the trust loop"
+    _user(state, "requester", quote)
+
+    result = session_controls.apply_control(
+        "loop", "stop", target, requester_sid="requester", user_quote=quote,
+    )
+
+    if target == "requester":
+        assert result["status"] == "applied", result
+        assert result["record"]["authority"]["via"] == "quote"
+        assert load_loop(target) is None
+    else:
+        assert not result["ok"] and result["error_code"] == "user_quote_mismatch"
+        loop = load_loop(target)
+        assert loop is not None and loop.status == "active"
+        assert session_controls.pending_outbox() == []
+
+
 def test_target_resolution_errors(state):
     from hermes_cli.session_controls import resolve_target
     assert resolve_target("target") == "target"
