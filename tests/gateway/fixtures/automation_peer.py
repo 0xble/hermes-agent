@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, cast
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -164,6 +165,19 @@ async def _arm_peer_goal_wait(root, env, home, desc, sid):
     return instance
 
 
+async def _kill_and_reap(proc, phase):
+    # The asyncio child watcher reaps with a blocking waitpid on macOS (or a pidfd
+    # on Linux), independent of the relay. Avoid Popen.wait(timeout)'s sleep/poll loop.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass  # The watcher won the race with kill; still wait for its status.
+    try:
+        return await asyncio.wait_for(proc.wait(), 10)
+    except TimeoutError as exc:
+        raise TimeoutError(f'{phase}: PID {proc.pid} exit not reaped within 10s of kill') from exc
+
+
 async def probe(root, base, mode):
     home, user = base / 'state', base / 'user'
     home.mkdir(); user.mkdir()
@@ -173,6 +187,10 @@ async def probe(root, base, mode):
     outgoing = []
     outbound_at = {}
     status_ack = asyncio.Event()
+    old_ws = None
+    reply_sources = {}
+    delayed_replies = []
+    expose_successor_reply = False
     async def connector(ws):
         hello = json.loads(await ws.recv())
         assert hello['platform'] == 'telegram', hello
@@ -183,7 +201,18 @@ async def probe(root, base, mode):
         await ready.put(ws)
         async for line in ws:
             frame = json.loads(line)
-            outgoing.append(frame)
+            action = frame.get('action', {})
+            if (frame['type'] == 'outbound' and action.get('op') == 'send'
+                    and action.get('content') == 'AUTOMATION_ACK'):
+                reply_sources[id(action)] = ws
+                if (mode == 'restart-started' and old_ws is not None and ws is not old_ws
+                        and not expose_successor_reply):
+                    # Hold only observation, not the wire acknowledgement or durable settlement.
+                    delayed_replies.append(frame)
+                else:
+                    outgoing.append(frame)
+            else:
+                outgoing.append(frame)
             if frame['type'] == 'outbound':
                 if 'AUTOMATION_ACK' in json.dumps(frame):
                     outbound_at['initial'] = time.time()
@@ -227,7 +256,7 @@ async def probe(root, base, mode):
             with (home / 'daemon.log').open('w+') as log:
                 launch = ([sys.executable, str(root / 'tests/gateway/fixtures/supervisor_boundary_daemon.py')]
                           if race else [sys.executable, '-m', 'gateway.run'])
-                proc = subprocess.Popen(launch, cwd=root, env=env,  # noqa: ASYNC220 -- Popen returns immediately; the test drives the child through its handle
+                proc = await asyncio.create_subprocess_exec(*launch, cwd=root, env=env,
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
                 try:
                     ws = await asyncio.wait_for(ready.get(), 35)
@@ -349,24 +378,40 @@ async def probe(root, base, mode):
                     async with websocket(home, desc) as observer:
                         assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
                     if mode.startswith('restart-'):
+                        # Do not let a late reply to the warm-up turn count as the recovered reply.
+                        await wait_for(lambda: 'initial' in outbound_at)
                         model.gate.touch()
                         assert await asyncio.to_thread(model.completion_blocked.wait, 20)
                         automatic = [r for r in rows() if r['principal_id'].startswith('automation:')]
                         assert len(automatic) == 1 and automatic[0]['status'] == 'started', rows()
                         await send('human-follower', 'HUMAN_FIFO_FOLLOWER')
-                        await wait_for(lambda: any(r['request_id'] == 'human-follower' for r in rows()))
+                        def follower_queued():
+                            return any(r['request_id'] == 'human-follower' and r['status'] == 'queued'
+                                       and r['target_session_id'] == sid for r in rows())
+
+                        await wait_for(follower_queued)
                         old_pid, old_epoch = proc.pid, desc['authority_epoch']
+                        old_ws = ws
                         sent_before_restart = len(outgoing)
-                        proc.kill()
-                        await asyncio.to_thread(proc.wait, 10)
+                        old_proc, proc = proc, None  # Exactly one reap attempt for the old owner.
+                        returncode = await _kill_and_reap(old_proc, 'old owner')
+                        if os.name == 'nt':
+                            assert returncode == 1, returncode  # TerminateProcess exit code.
+                        else:
+                            assert returncode == -signal.SIGKILL, returncode  # windows-footgun: ok
+                        if mode == 'restart-started':
+                            # Inject the delayed busy frame at the relay observation boundary.
+                            # Its order relative to the successor's real send must not depend on load.
+                            outgoing.append({'type': 'outbound', 'action': {'op': 'send',
+                                'content': '⏳ Queued for the next turn', 'chat_id': 'automation-chat'}})
                         model.hold_completion = False
                         model.completion_release.set()
                         if mode == 'restart-denied':
                             env['GATEWAY_RELAY_SECRET'] = 'changed-fixture-secret'
-                        proc = await asyncio.to_thread(subprocess.Popen,
-                            [sys.executable, '-m', 'gateway.run'], cwd=root, env=env,
+                        proc = await asyncio.create_subprocess_exec(
+                            sys.executable, '-m', 'gateway.run', cwd=root, env=env,
                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-                        ws = await asyncio.wait_for(ready.get(), 35)
+                        ws = successor_ws = await asyncio.wait_for(ready.get(), 35)
                         desc = await _identify_until_ready(home, 35)
                         assert desc.get('state') == 'ready', desc
                         assert proc.pid != old_pid and desc['authority_epoch'] > old_epoch
@@ -389,19 +434,32 @@ async def probe(root, base, mode):
                         recovered = [r for r in rows() if r['principal_id'].startswith('automation:')]
                         assert len(recovered) == 1 and recovered[0]['outcome'] == 'interrupted', rows()
                         assert recovered[0]['admission_id'] == automatic[0]['admission_id']
+                        follower = next(r for r in rows() if r['request_id'] == 'human-follower')
+                        assert follower['outcome'] == 'completed', follower
+
                         def recovered_replies():
                             return [f['action'] for f in outgoing[sent_before_restart:]
                                 if f.get('type') == 'outbound' and f.get('action', {}).get('op') == 'send'
                                 and f['action'].get('content') == 'AUTOMATION_ACK']
 
-                        # The ledger can settle and a busy notice can arrive before the reply.
+                        # The first predicate check sees a busy notice and a settled ledger, but
+                        # cannot see the real reply until it yields back to the relay connector.
+                        def expose_replies():
+                            nonlocal expose_successor_reply
+                            expose_successor_reply = True
+                            outgoing.extend(delayed_replies)
+                            delayed_replies.clear()
+
+                        asyncio.get_running_loop().call_soon(expose_replies)
                         await wait_for(recovered_replies)
                         revived_sends = recovered_replies()
                         assert len(revived_sends) == 1, outgoing[sent_before_restart:]
+                        assert reply_sources[id(revived_sends[0])] is successor_ws, revived_sends
                         assert revived_sends[0].get('metadata', {}).get('user_id') == 'fixture-user', revived_sends
                         await send('after-recovery', 'AFTER_RECOVERY')
                         await wait_for(lambda: any(r['request_id'] == 'after-recovery'
-                            and r['status'] == 'terminal' for r in rows()))
+                            and r['status'] == 'terminal' and r['outcome'] == 'completed'
+                            and r['seq'] > follower['seq'] for r in rows()))
                         texts = [next((m.get('content', '') for m in reversed(r['messages'])
                             if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]
                         assert sum('REAL_TERMINAL_COMPLETION' in str(t) for t in texts) == 1, texts
@@ -410,7 +468,8 @@ async def probe(root, base, mode):
                         with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
                             notices = db.execute("SELECT content FROM messages WHERE session_id=? AND role='assistant'",
                                                  (sid,)).fetchall()
-                        assert any('interrupt' in str(n).lower() for n in notices), notices
+                        assert any('was interrupted and was not run again' in (text or '')
+                                   for (text,) in notices), notices
                         print(json.dumps({'old_pid': old_pid, 'new_pid': proc.pid, 'ledger': rows(),
                                           'model_inputs': texts, 'interruption_notices': notices}))
                         return
@@ -442,27 +501,46 @@ async def probe(root, base, mode):
                     assert 'HUMAN_FIFO_FOLLOWER' in str(texts[-2]), texts
                     print(json.dumps({'daemon_pid': proc.pid, 'ledger': rows(), 'model_inputs': texts,
                                       'observer_closed_before_completion': True}))
-                except BaseException:
-                    (home / 'boundary-release').touch()
+                except BaseException as primary:
                     status_ack.set()
-                    if (home / 'state.db').exists():
-                        print(json.dumps({'ledger_at_failure': rows(), 'outgoing': outgoing,
-                            'model_inputs': [next((m.get('content', '') for m in reversed(r['messages'])
-                                if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]}),
-                            file=sys.stderr)
-                    print((home / 'daemon.log').read_text()[-24000:], file=sys.stderr)
-                    for name in ('logs/gateway.log', 'sessions/sessions.json', 'sessions.json'):
-                        diagnostic = home / name
-                        if diagnostic.is_file():
-                            print(name + '\n' + diagnostic.read_text()[-24000:], file=sys.stderr)
+                    try:
+                        (home / 'boundary-release').touch()
+                        if (home / 'state.db').exists():
+                            print(json.dumps({'ledger_at_failure': rows(), 'outgoing': outgoing,
+                                'model_inputs': [next((m.get('content', '') for m in reversed(r['messages'])
+                                    if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]}),
+                                file=sys.stderr)
+                        print((home / 'daemon.log').read_text()[-24000:], file=sys.stderr)
+                        for name in ('logs/gateway.log', 'sessions/sessions.json', 'sessions.json'):
+                            diagnostic = home / name
+                            if diagnostic.is_file():
+                                print(name + '\n' + diagnostic.read_text()[-24000:], file=sys.stderr)
+                    except (OSError, sqlite3.Error) as exc:
+                        primary.add_note(f'Could not collect fixture diagnostics: {exc!r}')
                     raise
     finally:
-        model.gate.touch()
-        model.release.set()
-        model.completion_release.set()
-        if proc is not None:
-            proc.kill(); proc.wait(timeout=10)
-        model.shutdown(); model.server_close()
+        primary = sys.exception()
+        try:
+            if proc is not None:
+                await _kill_and_reap(proc, 'fixture cleanup')
+        except Exception as exc:
+            if primary is None:
+                raise
+            primary.add_note(f'Owner cleanup failed: {exc!r}')
+        finally:
+            active_error = sys.exception()
+            try:
+                model.release.set()
+                model.completion_release.set()
+                try:
+                    model.gate.touch()
+                finally:
+                    model.shutdown()
+                    model.server_close()
+            except Exception as exc:
+                if active_error is None:
+                    raise
+                active_error.add_note(f'Model cleanup failed: {exc!r}')
 
 
 if __name__ == '__main__':
