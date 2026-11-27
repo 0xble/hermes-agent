@@ -205,17 +205,16 @@ async def test_incomplete_merge_returns_to_quiet_preparation(runtime, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_capped_preparation_wake_waits_and_is_readmitted(runtime):
-    """Burst: max_concurrent_sessions refused the wake; it must not be recorded as admitted."""
+async def test_wake_dropped_by_the_session_cap_is_readmitted_when_stale(runtime, monkeypatch):
+    """Burst: admission was acknowledged, then max_concurrent_sessions dropped the turn. Dedupe must expire."""
     r = runtime
+    clock = [1000.0]
+    monkeypatch.setattr("gateway.telegram_retire_prepare.time.time", lambda: clock[0])
     items = [{"id": "loop", "kind": "loop", "title": "Watch Service"}]
-    r.adapter.handle_message.side_effect = AsyncMock(side_effect=lambda event: None)
     assert not await queue_preparation(r.runner, r.source, r.state, items)
-    assert r.runner._telegram_retire_preparations == {}
-    assert (await load(r.runner, r.source))["phase"] == "waiting"
-
-    async def accept(event):
-        event._gateway_accepted = True
-    r.adapter.handle_message.side_effect = accept
+    clock[0] += 60
     assert not await queue_preparation(r.runner, r.source, r.state, items)
-    assert len(r.runner._telegram_retire_preparations) == 1
+    assert r.adapter.handle_message.await_count == 1
+    clock[0] += 300
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert r.adapter.handle_message.await_count == 2

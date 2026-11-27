@@ -151,8 +151,11 @@ async def test_cancelled_close_keeps_topic_and_durable_unresolved_attempt(setup_
     state = await retire.load(runner, source)
     assert state["closing_attempt"] and not state.get("closing_receipt")
     adapter.send.side_effect = None
+    # The interrupted attempt has no receipt, so the next pass re-sends the note and only then deletes.
     await retire.advance(runner, source)
-    adapter._bot.delete_forum_topic.assert_not_awaited()
+    assert adapter.send.await_count == 2
+    adapter._bot.delete_forum_topic.assert_awaited_once()
+    assert (await retire.load(runner, source))["phase"] == "done"
 
 
 @pytest.mark.asyncio
@@ -354,7 +357,8 @@ async def test_unresolved_delete_unknown_probe_never_retries_or_cancels(runtime)
 async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(runtime, monkeypatch):
     monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
     runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
-    lookup = AsyncMock(side_effect=[[{"id": 42}], [{"id": 42}], []])
+    monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock())
+    lookup = AsyncMock(side_effect=[[{"id": 42}]] * 7 + [[]])
     monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     await retire.request(runtime, runtime.source)
     await retire.advance(runtime, runtime.source)
@@ -378,7 +382,7 @@ async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(r
     runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
     runtime._session_db.delete_telegram_topic_binding.assert_awaited_once_with(
         chat_id="100", thread_id="42", profile_name="default")
-    assert lookup.await_count == 3
+    assert lookup.await_count == 8  # recovery probe, 6 backoff readbacks, then the confirming one
     assert lookup.await_args is not None
     assert lookup.await_args.args[-3:] == ("@HermesBot", "--id", "42")
 
@@ -631,7 +635,7 @@ async def test_cancel_during_an_automatic_retry_wins(runtime, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unresolved_closing_note_is_never_retried_automatically(runtime, monkeypatch):
+async def test_unresolved_closing_note_is_retried_automatically_with_a_fresh_generation(runtime, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(retire.time, "time", lambda: clock[0])
     monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
@@ -642,7 +646,7 @@ async def test_unresolved_closing_note_is_never_retried_automatically(runtime, m
     await retire.save(runtime, runtime.source, failed)
     clock[0] += retire._AUTO_RETRY_MAX_SECONDS
     await retire.advance(runtime, runtime.source)
-    assert (await retire.load(runtime, runtime.source))["generation"] == failed["generation"]
+    assert (await retire.load(runtime, runtime.source))["generation"] != failed["generation"]
 
 
 @pytest.mark.asyncio
@@ -720,7 +724,7 @@ async def test_delete_readback_lag_is_retried_not_failed(setup_retire, monkeypat
     runner, source, adapter, _ = setup_retire
     sleeps = []
     monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock(side_effect=lambda s: sleeps.append(s)))
-    probes = iter([False, False, True, True])
+    probes = iter([False, False, False, True, True])  # recovery probe, then two lagging readbacks
     monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(side_effect=lambda *a, **k: next(probes)))
     await retire.request(runner, source)
     await retire.advance(runner, source)
@@ -747,16 +751,21 @@ async def test_unconfirmed_delete_stays_recoverable_without_failure_post(setup_r
 
 
 @pytest.mark.asyncio
-async def test_unresolved_closing_attempt_is_resent_and_recovers(setup_retire):
+async def test_unresolved_closing_attempt_is_resent_and_recovers(setup_retire, monkeypatch):
     """379149: an interrupted send left closing_attempt and a manual cancel was required."""
     runner, source, adapter, _ = setup_retire
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    runner._async_profile_scope_for_source = lambda _: nullcontext()
     await retire.request(runner, source)
     state = await retire.load(runner, source)
-    state.update(phase="failed", failed_at=1.0, closing_attempt=1.0)
+    state.update(phase="failed", failed_at=clock[0], closing_attempt=clock[0])
     await retire.save(runner, source, state)
+    clock[0] += retire._AUTO_RETRY_BASE_SECONDS
+    await retire.advance(runner, source)  # automatic retry starts a fresh generation
     await retire.advance(runner, source)
-    state = await retire.load(runner, source)
-    assert state["phase"] == "done"
+    final = await retire.load(runner, source)
+    assert final is not None and final["phase"] == "done"
     adapter.send.assert_awaited_once()
     assert retire._retryable({"failed_at": 1.0, "closing_attempt": 1.0})
     assert not retire._retryable({"failed_at": 1.0, "closing_receipt": {"message_id": "1"}})

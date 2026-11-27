@@ -5,12 +5,14 @@ import dataclasses
 import hashlib
 import json
 import logging
+import time
 
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.wake import WakeNotAccepted, admit_internal_event
+from gateway.wake import admit_internal_event
 from gateway.telegram_topic_sessions import TopicRequestError
 
 logger = logging.getLogger(__name__)
+_REWAKE_SECONDS = 300
 
 
 def validate_decision(existing, owners, generation):
@@ -57,7 +59,12 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
     admitted = getattr(runner, "_telegram_retire_preparations", None)
     if admitted is None:
         admitted = runner._telegram_retire_preparations = {}
-    if admitted.get(key) == fingerprint:
+    stamps = getattr(runner, "_telegram_retire_prepared_at", None)
+    if stamps is None:
+        stamps = runner._telegram_retire_prepared_at = {}
+    # An admitted wake can still be refused when its turn starts (max_concurrent_sessions), which
+    # drops it silently. An idle session is woken again once the admission is stale.
+    if admitted.get(key) == fingerprint and time.time() - stamps.get(key, 0.0) < _REWAKE_SECONDS:
         return False
     state.update(phase="waiting", questions=[], preparation={"items": items, "busy": busy})
     await save(runner, source, state)
@@ -100,15 +107,9 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
                   "gateway_session_strict": True, "retirement_generation": state["generation"]},
     )
     adapter = runner._delivery_adapter_for(source)
-    try:
-        await admit_internal_event(adapter, event)
-    except WakeNotAccepted as exc:
-        # The wake is a model turn, so the background-turn limit or max_concurrent_sessions can
-        # refuse it. That is "no slot yet", not a failed retirement: the saved waiting state stays,
-        # the fingerprint stays unrecorded, and housekeeping admits the wake again.
-        logger.info("Topic retirement preparation for %s waits for a free slot: %s", state["session_key"], exc)
-        return False
+    await admit_internal_event(adapter, event)
     admitted[key] = fingerprint
+    stamps[key] = time.time()
     return False
 
 
