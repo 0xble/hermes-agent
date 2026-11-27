@@ -11,7 +11,13 @@ from hermes_cli import goals
 
 
 def _row(rid: str, **extra) -> str:
-    return json.dumps({"id": rid, "sender": "a", "target": "b", **extra}) + "\n"
+    # Relay writes compact rows with ``id`` first; match that shape so the index takes its fast path.
+    return json.dumps({"id": rid, "sender": "a", "target": "b", **extra}, separators=(",", ":")) + "\n"
+
+
+def test_spaced_rows_fall_back_to_a_full_parse(_ledger):
+    _ledger.write_text(json.dumps({"id": "s", "n": 1}) + "\n", encoding="utf-8")
+    assert goals._relay_ledger_receipts(["s"])["s"]["n"] == 1
 
 
 @pytest.fixture(autouse=True)
