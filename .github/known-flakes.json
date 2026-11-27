@@ -4,11 +4,5 @@
     "owner_task": "d2120796-5d37-44bc-982c-b01c8f963178",
     "reason": "Hosted macos-26 native lane, Repository nightly 45945910884 attempt 2: the 10s synthetic wall includes process, import and SQLite startup under 4 concurrent files, so the success path can exceed it from startup alone. Fix in https://github.com/0xble/hermes-agent/pull/1417.",
     "expires": "2026-12-04"
-  },
-  {
-    "test_id": "tests/tools/test_browser_typed_card_privacy.py::test_output_echoes_never_touch_disk_with_daemon_held_handles[stdout-error-True]",
-    "owner_task": "a774db04-d115-4cfa-a5d4-ee4d3a7ff0c9",
-    "reason": "Hosted macos-26 native lane, Repository nightly 45945910884 attempt 2: the reader can see the daemon ack file before the writer fills it. Fix in https://github.com/0xble/hermes-agent/pull/1420.",
-    "expires": "2026-12-04"
   }
 ]
