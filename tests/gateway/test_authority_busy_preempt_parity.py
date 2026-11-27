@@ -255,17 +255,35 @@ async def test_pending_machine_turn_never_published_gets_one_queued_ack_and_no_i
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('case', ['steer-mode', 'photo'])
-async def test_steer_mode_and_media_keep_queue_semantics_behind_pending_machine_turn(tmp_path, monkeypatch, case):
-    """Only typed text in queue mode preempts, including while the agent is still pending."""
+@pytest.mark.parametrize('starting', [False, True], ids=['published', 'pending-then-published'])
+@pytest.mark.parametrize('message_type', [MessageType.VOICE, MessageType.PHOTO], ids=['voice', 'photo'])
+async def test_media_behind_machine_turn_is_soft_preempted_once(tmp_path, monkeypatch, starting, message_type):
+    """A voice note or photo cuts a machine turn in queue mode exactly as typed text does."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL if starting else agent)
+
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-media', publish_pending=starting, message_type=message_type,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-media', 'queued')]
+    assert steers == []
+    assert interrupts == [((None,), {'tool_reason': 'gateway user turn preemption'})], interrupts
+    assert len(sent) == 1 and 'Interrupting' in str(sent[0]), sent
+
+
+@pytest.mark.asyncio
+async def test_steer_mode_keeps_queue_semantics_behind_pending_machine_turn(tmp_path, monkeypatch):
+    """Steer mode never preempts, including while the agent is still pending."""
     from gateway.run import _AGENT_PENDING_SENTINEL
 
     def opener(runner, source, turn, agent):
         _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
 
-    kwargs = {'mode': 'steer'} if case == 'steer-mode' else {'message_type': MessageType.PHOTO}
+    case = 'steer-mode'
     rows, steers, interrupts, sent = await _queued_behind(
-        tmp_path, monkeypatch, opener, 'h-' + case, publish_pending=True, **kwargs,
+        tmp_path, monkeypatch, opener, 'h-' + case, publish_pending=True, mode='steer',
     )
     assert [(row['request_id'], row['status']) for row in rows] == [('h-' + case, 'queued')]
     assert interrupts == [] and steers == []
