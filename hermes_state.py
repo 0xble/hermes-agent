@@ -51,7 +51,10 @@ from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted
+from hermes_state_readpool import (
+    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, checkout_loop_reader, close_loop_reader_if_closed,
+    note_read_pool_exhausted, return_loop_reader,
+)
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin
 from hermes_state_portability import SessionPortabilityMixin
@@ -61,7 +64,7 @@ from hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
-from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
+from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread, on_loop_thread
 from hermes_state_write import WriterMutexTimeout, triage_write_corruption, write_site, writer_mutex_until
 from hermes_state_dbfile import (
     _chmod_pinned_inode, _connect_tracked_db, _fd_is_truly_unlinked, _is_operator_store_link,
@@ -711,6 +714,11 @@ class SessionDB(
         # Read-open failure backoff is a TIMESTAMP, not a sticky bool: the likeliest trigger
         # is transient EMFILE, and a permanent flag would demote every reader forever.
         self._read_open_failed_at = 0.0
+        # The gateway event loop's own reader, used only when the pool is at capacity: the writer
+        # fallback would freeze every adapter behind in-flight writes. One loop thread, so one
+        # connection that is never contended. Depth counts nested reads; close() defers to the last.
+        self._loop_reader: Optional[sqlite3.Connection] = None
+        self._loop_reader_depth = 0
         self._wal_active, self._write_count = False, 0
         # File identity of the opened state.db, compared on every write so an out-of-band
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
@@ -1049,7 +1057,9 @@ class SessionDB(
         """Yield a connection for read-only statements: a pooled read-only
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
-        degradation: slower beats EMFILE, which the supervisor cannot see. A search
+        degradation: slower beats EMFILE, which the supervisor cannot see. At the
+        ceiling the gateway event-loop thread reads on its own connection instead,
+        since waiting on writers there freezes every adapter. A search
         scope overrides that fallback for all of its reads, including hydration.
         ``reopen=False``: a read after ``close()`` raises instead of reopening the
         writer. Pinned snapshots and search operations retain their own connection.
@@ -1080,6 +1090,13 @@ class SessionDB(
                 yield conn
             finally:
                 self._return_read_conn(conn)
+            return
+        conn = checkout_loop_reader(self) if on_loop_thread() else None
+        if conn is not None:
+            try:
+                yield conn
+            finally:
+                return_loop_reader(self)
             return
         if pooled_only:
             yield None
@@ -1769,6 +1786,7 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
+        close_loop_reader_if_closed(self)  # a loop read in flight closes it on exit instead
         with self._checkpoint_lock, self._lock:  # an in-flight periodic checkpoint finishes first
             checkpoint_conn, self._checkpoint_conn = self._checkpoint_conn, None
             self._checkpoint_conn_writer = None
@@ -1880,9 +1898,15 @@ class SessionDB(
 
     def get_meta(self, key: str) -> Optional[str]:
         """Read state_meta[key] on self._lock (not _read_ctx): fts_rebuild_step reads progress before its
-        write transaction and a WAL reader would not see it."""
-        with self._lock:
-            row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        write transaction and a WAL reader would not see it. The gateway event loop never writes there,
+        so it reads committed state through ``_read_ctx`` instead of waiting on writers (goal, loop and
+        heartbeat snapshots read meta on the loop)."""
+        if on_loop_thread():
+            with self._read_ctx(reopen=False) as conn:  # closed raises, as the writer path did
+                row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        else:
+            with self._lock:
+                row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:

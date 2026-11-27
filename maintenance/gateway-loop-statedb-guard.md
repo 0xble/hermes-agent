@@ -28,6 +28,17 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   session-store restore through `restore_local_session_settled`, the async restore re-read once on a
   live-cache race and shared with cron. The loop guard named both sites 10 times each in the 2026-11-27
   Kanban test (`tests/gateway/test_session_kanban.py`).
+- At read-pool capacity, a read on the registered loop thread uses that `SessionDB`'s single loop reader
+  (`hermes_state_readpool.checkout_loop_reader`) instead of the locked writer connection. It's 1 extra
+  read-only connection per database with no pool permit, opened once and closed by `close()` after the
+  last in-flight loop read. A failed open backs off with the pool. `get_meta` on the loop thread reads
+  committed state through `_read_ctx`, while off the loop it keeps `self._lock` for `fts_rebuild_step`.
+  This covers every loop read the guard named on 2026-11-27: the typed-message admission re-read in
+  `_await_native_reply` (which stays synchronous, so a terminal row still proves settlement before the
+  waiter existed), `logical_owner`, `physical_target`, `control_snapshot` and the viewer automation meta
+  reads. Cron delivery builds its mount plan (state.db plus the session-store lock) through
+  `asyncio.to_thread` (`tests/hermes_state/test_loop_reader_at_pool_capacity.py`,
+  `tests/gateway/test_session_cron.py`).
 - Detached process-result routing (`gateway/session_detached.py::follow_detached_pin`) resolves
   store entries, logical owners, session rows and cold mounts through `asyncio.to_thread`.
   The live route is checked after the worker returns. This preserves completion delivery after
