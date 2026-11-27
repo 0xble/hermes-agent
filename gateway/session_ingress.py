@@ -105,11 +105,14 @@ async def _await_native_reply(authority, event, receipt, accepted):
         adopters[receipt.admission_id] = event
     # A drain already running can claim, run and settle the row before this caller resumes; one
     # that settled it already sent (or owes) the reply itself and resolves no waiter registered now.
+    # The read waits on the SessionDB writer lock, held for seconds under load, so it runs off the
+    # loop (2026-11-27: a typed message waited 2 minutes while the loop blocked here).
     from hermes_state_runtime import get_session_admission
-    row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+    row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=receipt.admission_id)
     status = 'terminal' if row is None else row['status']  # None: deleted with its chat, nothing owed
     note_busy_admitted(event, receipt.admission_id, status, None if row is None else row.get('outcome'))
-    if status in ('terminal', 'unknown'):
+    # A drain that settled the row during the read handed its reply to this waiter: return it.
+    if status in ('terminal', 'unknown') and not waiter.done():
         authority.native_waiters.discard(receipt.admission_id)
         if authority.waiters.get(receipt.admission_id) is waiter:
             del authority.waiters[receipt.admission_id]
@@ -126,7 +129,7 @@ async def _await_native_reply(authority, event, receipt, accepted):
         if internal_input(event):
             log_internal_refusal(authority.runner, event.source, exc.reason, exc.field)
             return None
-        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=receipt.admission_id)
         if row is not None and row['status'] == 'terminal':
             # The drain refused this head (``_refuse_head``): cancelled, not saved behind a pause.
             return (f'⚠️ Hermes did not answer this message ({exc.reason}): the conversation it was '

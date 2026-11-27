@@ -23,6 +23,10 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
   topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
   profile's handles (primed off the loop at startup and on hot-add).
+- The typed-message admission re-read in `gateway/session_ingress.py::_await_native_reply`, and its
+  pause-path re-read, run through `asyncio.to_thread`. A full read pool falls back to the locked writer
+  connection, which froze the loop for about 2 minutes on 2026-11-27. A reply that a drain hands to the
+  waiter during the read is returned, not dropped (`tests/gateway/test_admission_read_off_loop.py`).
 - Detached process-result routing (`gateway/session_detached.py::follow_detached_pin`) resolves
   store entries, logical owners, session rows and cold mounts through `asyncio.to_thread`.
   The live route is checked after the worker returns. This preserves completion delivery after
