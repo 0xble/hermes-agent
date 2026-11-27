@@ -78,6 +78,29 @@ def open_control(raw):
     return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped", "cancelled"}
 
 
+async def _fyi_task_resolved(runner, source, task_id, origin_address, original_assignment_id):
+    task = await cli(runner, source, "tasks", "--json", "show", task_id)
+    status = task.get("status") if isinstance(task, dict) and task.get("id") == task_id else None
+    if status in ("completed", "cancelled"):
+        return True
+    if status not in ("todo", "needs_review", "in_progress", "waiting", "blocked"):
+        raise RuntimeError(f"Task {task_id} has no exact lifecycle readback")
+
+    # The CLI returns assignments in ledger order. An earlier acceptance does
+    # not settle a newer offer, even though the offer changes the inbox route.
+    rows = await cli(runner, source, "tasks", "--json", "assignments", task_id)
+    if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip()
+            or not isinstance(row.get("assigned_to"), str) or not row["assigned_to"].strip()
+            or (row.get("accepted_at") is not None and not isinstance(row["accepted_at"], str))
+            for row in rows):
+        raise RuntimeError(f"Task {task_id} has no readable assignment history")
+    assignment_ids = {row["id"] for row in rows}
+    if len(assignment_ids) != len(rows) or (original_assignment_id and original_assignment_id not in assignment_ids):
+        raise RuntimeError(f"Task {task_id} has incomplete assignment history")
+    return bool(rows and rows[-1]["assigned_to"] != origin_address and (rows[-1].get("accepted_at") or "").strip())
+
+
 async def inventory(runner, source, state) -> list[dict]:
     from cron.jobs import list_jobs, is_terminal_job
     from tools.async_delegation import retirement_inventory
@@ -126,6 +149,21 @@ async def inventory(runner, source, state) -> list[dict]:
             raise RuntimeError("Task inventory returned an incomplete response")
         for task in tasks:
             items.append({"id": "task:" + str(task["id"]), "kind": "task", "title": task["title"], "record": task})
+    elif any("unassigned_task" in handoff for handoff in state.get("handoffs", {}).values()):
+        raise RuntimeError("tasks is unavailable; saved task FYIs cannot be reconciled")
+    # Saved FYIs are still obligations after a task leaves the inbox, including
+    # during passive absence recovery. Only exact ledger evidence clears them.
+    live_ids = {item["id"] for item in items}
+    for item_id, handoff in state.get("handoffs", {}).items():
+        if "unassigned_task" not in handoff:
+            continue
+        task_id, item = handoff["unassigned_task"], handoff["item"]
+        if (not isinstance(task_id, str) or not task_id or item["kind"] != "task"
+                or item_id != item["id"] or item_id != "task:" + task_id or str(item["record"]["id"]) != task_id):
+            raise RuntimeError("Saved task FYI has no exact task identity")
+        resolved = await _fyi_task_resolved(runner, source, task_id, origin_address, item["record"].get("assignment_id"))
+        if not resolved and item_id not in live_ids:
+            items.append(item)
     return items
 
 

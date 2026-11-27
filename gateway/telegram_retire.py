@@ -28,30 +28,23 @@ _TRANSIENT_MARKERS = (
     "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
 )
 _TRANSIENT_RETRY_LIMIT = 6
-# A closing attempt resumes automatically only within this window of its failure, so a failure
-# recorded before the resend existed cannot turn into a delete after a deploy. User retries are unaffected.
+# Automatic recovery must stay inside the original closing attempt's window. A failure
+# recorded before the resend existed cannot turn into a delete after a deploy.
 _AUTO_RETRY_FRESHNESS_SECONDS = 24 * 60 * 60
 # Telegram can keep answering for a topic it just deleted. Read the exact topic back with backoff
 # before calling a delete unconfirmed (2026-11-26: 375507 and 426261 were deleted, then reported failed).
 _DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
 
 
+class DeleteReadbackUnavailable(TopicRequestError):
+    """Exact readback is unavailable; do not proceed with deletion or recovery."""
+
+
 class DeleteUnconfirmed(RuntimeError):
     """The delete was dispatched but the exact-topic readback has not shown it gone yet."""
 
 
-async def _confirm_deleted(bot, source, runner, *, allow_send_probe=True):
-    if not _has_telegram_cli():
-        if not allow_send_probe:
-            return False
-        # The Bot API checks absence by posting. One attempt only; subsequent passes
-        # reconcile passively even if this send succeeded or its response was lost.
-        try:
-            return await _probe_deleted(bot, source, runner=runner)
-        except Exception as exc:
-            if _transient_delay(exc) is None:
-                raise
-            return False
+async def _confirm_deleted(bot, source, runner):
     for delay in (0, *_DELETE_VERIFY_DELAYS):
         if delay:
             await asyncio.sleep(delay)
@@ -97,20 +90,30 @@ def _schedule_retry(runner, source, delay: float) -> None:
 
 
 async def _retry_preparation_refusal(runner, source, state, exc, delay):
-    """Spend a generation's retry budget before any subsequent advance can re-admit it."""
-    attempts = int(state.get("transient_retries") or 0)
-    if attempts < _TRANSIENT_RETRY_LIMIT:
-        state.update(transient_retries=attempts + 1, preparation_retry_at=time.time() + delay)
-        await save(runner, source, state)
+    """Only the current waiting generation can spend a preparation retry."""
+    def transition(current):
+        if (not current or current["generation"] != state["generation"] or current["phase"] != "waiting"
+                or current["session_id"] != state["session_id"]
+                or current.get("preparation_retry_at", 0) > time.time()):
+            return None
+        attempts = int(current.get("transient_retries") or 0)
+        if attempts < _TRANSIENT_RETRY_LIMIT:
+            current.update(transient_retries=attempts + 1, preparation_retry_at=time.time() + delay)
+        else:
+            current.update(phase="failed", error=str(exc), failed_at=time.time(), preparation_retry_exhausted=True)
+        return current
+
+    updated = await _update_state(runner, source, transition)
+    if not updated:
+        return
+    if updated["phase"] == "waiting":
         _schedule_retry(runner, source, delay)
         return
-    state.update(phase="failed", error=str(exc), failed_at=time.time(), preparation_retry_exhausted=True)
-    await save(runner, source, state)
-    logger.warning("Topic retirement preparation for %s exhausted its retries: %s", state["session_key"], exc)
-    adapter = runner._delivery_adapter_for(source)
-    if adapter is not None and await _current(runner, source, state["generation"]):
-        await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc} Ask here to retry or cancel it.",
-                           metadata={"thread_id": str(source.thread_id)})
+    logger.warning("Topic retirement preparation for %s exhausted its retries: %s", updated["session_key"], exc)
+    await _post_failure_notice(runner, source, updated, " Ask here to retry or cancel it.")
+
+
+
 
 
 async def record_preparation_refusal(runner, event, limit_message):
@@ -146,23 +149,49 @@ class RetirementSuperseded(Exception):
     """A control request fenced an older executor generation."""
 
 
+async def _update_state(runner, source, update):
+    """Check the routed writer epoch and transition the topic in one SQLite transaction."""
+    from gateway.session_authorities import active_authority
+    from hermes_state_runtime import RuntimeStoreError, _epoch
+
+    db, key = runner._session_db, state_key(source)
+    authority = active_authority(runner)
+    epoch = authority.epoch if authority is not None else None
+    if authority is None and getattr(runner, "session_authorities", None) is not None:
+        raise RetirementSuperseded
+
+    def write(conn):
+        if epoch is not None:
+            try:
+                _epoch(conn, epoch)
+            except RuntimeStoreError as exc:
+                raise RetirementSuperseded from exc
+        elif conn.execute("SELECT 1 FROM runtime_epoch WHERE singleton = 1").fetchone():
+            raise RetirementSuperseded
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        state = update(json.loads(row[0]) if row else None)
+        if state is not None:
+            # SQLite holds the writer lock from the epoch/generation check to this upsert.
+            conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, json.dumps(state)))
+        return state
+
+    return await db._execute_write(write)
+
+
 async def save(runner, source, state, *, force=False, expected_generation="", retry_of=""):
-    locks = getattr(runner, "_telegram_retire_state_locks", None)
-    if locks is None:
-        locks = runner._telegram_retire_state_locks = {}
-    async with locks.setdefault(state_key(source), asyncio.Lock()):
-        current = await load(runner, source)
+    def transition(current):
         if expected_generation and (not current or current["generation"] != expected_generation
                                     or current["phase"] not in {"pending", "waiting"}):
             raise TopicRequestError("Retirement preparation was superseded. No topic was changed.")
         if not force and current and current["generation"] != state["generation"]:
             raise RetirementSuperseded
-        # An automatic retry replaces only the failed generation it read, never a cancel or a
-        # user retry that landed while it was being requested.
         if retry_of and (not current or current["generation"] != retry_of or current["phase"] != "failed"
-                         or current.get("user_active_at")):
+                         or current.get("user_active_at") or not _retryable(current)):
             raise RetirementSuperseded
-        await runner._session_db.set_meta(state_key(source), json.dumps(state))
+        return state
+
+    await _update_state(runner, source, transition)
 
 
 async def request(runner, source, *, target=None, now=False, cancel=False, owners=None, reason="", generation="", context="",
@@ -245,6 +274,8 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
             state["handoff_generation"] = previous.get("handoff_generation", previous["generation"])
         if auto_retries:
             state["auto_retries"] = auto_retries
+            if previous.get("closing_attempt"):
+                state["closing_attempt"] = previous["closing_attempt"]
     await save_decision(runner, source, state, previous, generation, retry_of)
     if now:
         adapter = runner._delivery_adapter_for(source)
@@ -322,15 +353,8 @@ async def _probe_deleted(bot, source, *, runner=None, read_only=False):
         return not topics
     if read_only:
         return False
-    # The Bot API has no getForumTopic. A thread-strict send is the documented
-    # absence probe. Never retry or fall back to the chat root.
-    try:
-        await bot.send_message(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), text=NOTICE)
-    except Exception as exc:
-        if "message thread not found" in str(exc).lower() or "topic_deleted" in str(exc).lower():
-            return True
-        raise
-    return False
+    # The Bot API has no exact, quiet topic lookup. Never post to test for absence.
+    raise DeleteReadbackUnavailable("Telegram CLI is required to reconcile topic deletion.")
 
 
 async def _cli_peer(bot, source):
@@ -434,7 +458,8 @@ async def _close_for_deletion(runner, source, state, adapter):
                 > _AUTO_RETRY_FRESHNESS_SECONDS):
             raise RuntimeError("Closing delivery is unresolved. Cancel retirement before retrying.")
         logger.info("Resending the interrupted closing note for %s", state["session_key"])
-    state["closing_attempt"] = time.time()
+    # An interrupted resend does not extend the original approval window.
+    state.setdefault("closing_attempt", time.time())
     await save(runner, source, state)
     from gateway.telegram_retire_prepare import closing_note
     state = await _current(runner, source, generation)
@@ -519,6 +544,8 @@ async def advance(runner, source):
                 elif state["phase"] == "deleting":
                     raise DeleteUnconfirmed("The previous delete was not confirmed")
                 return
+            if not _has_telegram_cli():
+                raise DeleteReadbackUnavailable("Telegram CLI is required for deletion readback; the topic was kept.")
             from gateway.telegram_retire_work import prepare
             # Inventory happens here, after the turn, not when retirement was requested.
             if await asyncio.to_thread(runner.session_store.peek_session_id, key) != state["session_id"]:
@@ -535,7 +562,6 @@ async def advance(runner, source):
             # separates the final fence from initiating the destructive request.
             if not await _current(runner, source, generation):
                 return
-            allow_send_probe = True
             try:
                 if await bot.delete_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id)) is not True:
                     raise RuntimeError("Telegram did not acknowledge topic deletion")
@@ -545,12 +571,11 @@ async def advance(runner, source):
                 if await _probe_deleted(bot, source, runner=runner):
                     await _unbind(runner, source, state)
                     return
-                allow_send_probe = False  # Reconciliation may already have sent the single probe.
                 from gateway.telegram_retire_work import cli
                 peer = await _cli_peer(bot, source)
                 await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
                           str(peer), str(source.thread_id))
-            if not await _confirm_deleted(bot, source, runner, allow_send_probe=allow_send_probe):
+            if not await _confirm_deleted(bot, source, runner):
                 raise DeleteUnconfirmed("Telegram still accepts messages in the topic after deletion")
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
@@ -597,26 +622,64 @@ async def advance(runner, source):
                             key, current["transient_retries"], delay, exc)
                 _schedule_retry(runner, source, delay)
                 return
-            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
-            if current:
-                current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
-                current["error"] = str(exc)
-                current["failed_at"] = time.time()
-                await save(runner, source, current)
-                retries = int(current.get("auto_retries") or 0)
-                retryable = current["phase"] == "failed" and _retryable(current) and await asyncio.to_thread(
-                    runner.session_store.peek_session_id, current["session_key"]) == current["session_id"]
-                if retryable and 0 < retries < _AUTO_RETRY_LIMIT:
-                    return  # An automatic retry failing again stays quiet until the retries run out.
-                if retryable and retries < _AUTO_RETRY_LIMIT:
-                    recovery = (" I'll retry it automatically unless you keep working here. "
-                                "Ask here to cancel it.")
-                elif retryable:
-                    recovery = f" {retries} automatic retries also failed. Ask here to retry or cancel it."
-                else:
-                    recovery = " Ask here to retry or cancel it."
-                await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
-                                   metadata={"thread_id": str(source.thread_id)})
+            await _record_failure(runner, source, generation, exc)
+
+
+async def _record_failure(runner, source, generation, exc):
+    def transition(current):
+        if not current or current["generation"] != generation or current["phase"] not in {
+                "pending", "waiting", "deleting"}:
+            return None  # A decision or another executor already settled this attempt.
+        current.update(phase="delete_unresolved" if current["phase"] == "deleting" else "failed",
+                       error=str(exc), failed_at=time.time())
+        if isinstance(exc, DeleteReadbackUnavailable):
+            current["delete_readback_unavailable"] = True
+        return current
+
+    try:
+        current = await _update_state(runner, source, transition)
+    except RetirementSuperseded:
+        return
+    if not current:
+        return
+    logger.warning("Topic retirement failed for %s: %s", current["session_key"], exc, exc_info=True)
+    retries = int(current.get("auto_retries") or 0)
+    retryable = current["phase"] == "failed" and _retryable(current) and await asyncio.to_thread(
+        runner.session_store.peek_session_id, current["session_key"]) == current["session_id"]
+    if retryable and 0 < retries < _AUTO_RETRY_LIMIT:
+        return  # An automatic retry failing again stays quiet until the retries run out.
+    if retryable and retries < _AUTO_RETRY_LIMIT:
+        recovery = " I'll retry it automatically unless you keep working here. Ask here to cancel it."
+    elif retryable:
+        recovery = f" {retries} automatic retries also failed. Ask here to retry or cancel it."
+    else:
+        recovery = " Ask here to retry or cancel it."
+    await _post_failure_notice(runner, source, current, recovery)
+
+
+async def _post_failure_notice(runner, source, state, recovery):
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is None:
+        return
+
+    def claim(current):
+        if (not current or current["generation"] != state["generation"] or current["phase"] != state["phase"]
+                or current.get("failure_notice_claimed")):
+            return None
+        # Claim before sending: a crash or lost reply cannot justify another post.
+        current["failure_notice_claimed"] = True
+        return current
+
+    try:
+        claimed = await _update_state(runner, source, claim)
+    except RetirementSuperseded:
+        return
+    if claimed:
+        await adapter.send(str(source.chat_id), f"Topic retirement failed: {claimed['error']}{recovery}",
+                           metadata={"thread_id": str(source.thread_id), "telegram_topic_retire_closing": True})
+
+
+
 
 
 def _retryable(state):
@@ -626,13 +689,15 @@ def _retryable(state):
     failed_at = float(state.get("failed_at") or 0.0)
     # Before closing_delivery_unconfirmed existed, a returned-but-unconfirmed send failed with this text.
     legacy_unconfirmed = str(state.get("error") or "").startswith("Closing reply was not fully acknowledged")
-    if (not failed_at or state.get("preparation_retry_exhausted")
+    if (not failed_at or state.get("preparation_retry_exhausted") or state.get("delete_readback_unavailable")
             or state.get("closing_receipt") or state.get("closing_delivery_unconfirmed")
             or legacy_unconfirmed):
         return False
     # Only a closing attempt can lead to a delete on resume: an old one is not today's approval (374814).
-    if state.get("closing_attempt") and time.time() - failed_at > _AUTO_RETRY_FRESHNESS_SECONDS:
-        return False
+    if state.get("closing_attempt"):
+        oldest = min(float(state["closing_attempt"]), failed_at)
+        if time.time() - oldest > _AUTO_RETRY_FRESHNESS_SECONDS:
+            return False
     return True
 
 

@@ -295,7 +295,8 @@ async def test_spawned_cap_refusal_backs_off_before_adapter_finalizer_reenters(r
     runner.config.max_concurrent_sessions = 1
     _occupy_session(runner)
     class RetirementAdapter(WakeAdapter):
-        _bot = SimpleNamespace(delete_forum_topic=AsyncMock())
+        _bot = SimpleNamespace(delete_forum_topic=AsyncMock(),
+                               get_me=AsyncMock(return_value=SimpleNamespace(username="HermesBot")))
 
     adapter = RetirementAdapter()
     adapter.gateway_runner = runner
@@ -305,7 +306,9 @@ async def test_spawned_cap_refusal_backs_off_before_adapter_finalizer_reenters(r
     monkeypatch.setattr(runner.session_store, 'peek_session_id', lambda _: 'old')
     monkeypatch.setattr(runner.session_store, 'lookup_by_session_key', lambda _: SimpleNamespace(session_id='old'))
     key = runner._session_key_for_source(r.source)
-    monkeypatch.setattr('hermes_platform.resolver.locate_command', lambda _: SimpleNamespace(command=()))
+    monkeypatch.setattr(retire, '_has_telegram_cli', lambda: True)
+    lookup = AsyncMock(return_value=[{"id": int(r.source.thread_id)}])
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(retire, 'time', SimpleNamespace(time=lambda: clock.now))
     delays = []
