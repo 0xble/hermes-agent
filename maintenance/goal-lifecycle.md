@@ -268,10 +268,11 @@ clears the goal once with one short notice, before dispute pause or timed backof
   `notification_origin=process_registry_synthetic` (also carried through queued
   follow-up chains as `queued_terminal_notification_origin`) pierces only this hold;
   judge waits and pid/session/delegation barriers stay authoritative. CLI/TUI
-  managers keep the gap off. (2) Completion fan-in: a successful process or
-  delegation result for a conversation that is mid-turn or started a turn within
-  `gateway.completion_notification_batch_window_seconds` (default 300, capped 3600,
-  `0` = same-tick 0.1s fan-in only) is held and delivered as one synthetic turn.
+  managers keep the gap off. (2) Completion fan-in: successful process and
+  delegation results are batched by route until the running turn releases its slot,
+  or for up to 10s from first arrival if idle. Both waits are capped by
+  `gateway.completion_notification_batch_window_seconds` (default 300, max 3600,
+  `0` = same-tick 0.1s fan-in only).
   Failures, non-zero or abnormal exits, failed delegations and results a parked
   goal waits on (session, pid, or delegations; the goal is followed through
   compression to the chain tip) are prompt and release the conversation's held

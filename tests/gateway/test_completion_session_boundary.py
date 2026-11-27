@@ -66,6 +66,7 @@ def _runner(adapter, *, session_db=...):
     runner._completion_deliveries_inflight = set()
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 2048
+    runner._completion_notification_batch_window = 0.0
     if session_db is not ...:
         runner._session_db = session_db
     return runner

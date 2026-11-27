@@ -503,7 +503,10 @@ class GatewayAgentCacheMixin:
                 release_soon(state.turn.lease)
             # One structured reset instead of a drifting pop-list. Turn-lease tokens are deliberately NOT
             # cleared here — _release_turn_lease owns them.
+            was_running = state.turn.agent is not None
             state.turn.clear()
+            if was_running:
+                self._release_held_completions(session_key)
             retired, state.turn.retired_agents = state.turn.retired_agents, []
             for agent in retired:
                 # Evicted mid-turn (a one-turn agent): its turn no longer uses it.

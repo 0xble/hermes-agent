@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import asyncio
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, cast
+
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
 
 
 logger = logging.getLogger('gateway.run')
@@ -64,7 +67,11 @@ class GatewayNotificationsMixin:
         self._ensure_completion_batch_state()
         if self._completion_notification_batches_stopping:
             return False
-        hold = min([await self._completion_hold_seconds(evt) for evt in group] or [0.0])
+        runner = cast("GatewayRunner", self)
+        window = min([await runner._completion_batch_window(evt) for evt in group])
+        if self._completion_notification_batches_stopping:
+            return False
+        hold = runner._completion_hold_seconds(group[0], window)
         key = self._event_route_key(group[0], self._ASYNC_GROUP_KEY_FIELDS)
         if hold <= 0:
             self._release_held_completions(str(group[0].get("session_key") or ""))
