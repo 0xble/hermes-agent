@@ -101,6 +101,93 @@ class GatewayUpdateNotificationsMixin:
             prompt=_hermes_home / ".update_prompt.json", response=_hermes_home / ".update_response",
         )
 
+    def _complete_unrouted_update(self, paths: _UpdatePaths, pending: dict, *, timed_out: bool,
+                                  clear_markers, authorization_adapter) -> bool:
+        from gateway.update_notifications import final_outcome
+
+        if not (pending.get("platform") and pending.get("chat_id")):
+            # Cron and CLI requests carry no chat to report back to. Hold the admission
+            # until the updater process has really exited, then release it; raising here
+            # kept the marker forever and refused every later update. Only the real
+            # process-exit sentinel proves the updater is gone (the launcher's own
+            # admission rule): a legacy marker's ``.update_exit_code`` is written before the
+            # gateway restart, and a watcher timeout says nothing about the process.
+            if not (paths.pending.parent / ".update_process_exit_code").exists():
+                return False
+            if final_outcome(paths.pending.parent, pending) is None and not timed_out:
+                return False
+            logger.info("Update %s finished with no notification route; releasing its admission",
+                        pending.get("request_id") or "<legacy>")
+            return clear_markers(paths, pending.get("session_key"), pending)
+        # Expire only a valid destination whose adapter never returned. Malformed
+        # metadata must not be mistaken for a confirmed transport outage.
+        platform = Platform(pending.get("platform"))
+        age = self._marker_age_seconds(pending)
+        if (pending.get("chat_id") and age is not None
+                and age > _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS
+                and authorization_adapter is not None
+                and not authorization_adapter(platform, self._marker_profile(pending))):
+            logger.warning(
+                "Post-update notification for %s:%s dropped after %.1fh: adapter never connected",
+                platform.value, pending["chat_id"], age / 3600.0)
+            clear_markers(paths, pending.get("session_key"), pending)
+            return True
+        return False
+
+    async def _admit_update_origin(self, home: Path, pending: dict, success: bool) -> bool:
+        """True only for a committed wake or a definitively retired origin."""
+        from gateway.session_authorities import active_authority, authority_for_home
+        from gateway.session_detached import route_entry
+        from gateway.session_route_wake import admit_route_wake_receipt
+        from gateway.update_notifications import update_wake_prompt
+        from hermes_cli.session_controls import _wake_session_matches
+        from hermes_state_runtime import ADMITTED_REQUEST_CONFLICT, RuntimeStoreError
+
+        authority = authority_for_home(self, home)
+        if authority is None or authority is not active_authority(self):
+            return False
+        runner = authority.runner
+        key, sid = pending["session_key"], pending["origin_session_id"]
+
+        def find_origin():
+            entry = route_entry(authority, key)
+            if entry is None:
+                tip = authority.db.get_compression_tip(sid) or sid
+                session = authority.db.get_session(tip)
+                return None, session is None or session.get("ended_at") is not None
+            with authority.db._read_ctx() as conn:
+                replaced = not _wake_session_matches(sid, entry.session_id, cursor=conn)
+            return entry, bool(replaced or entry.suspended)
+
+        entry, retired = await asyncio.to_thread(find_origin)
+        if retired:
+            logger.info("Update %s completed but the original session is no longer on its route", pending["request_id"])
+            return True
+        if entry is None:
+            return False
+        source = runner._restored_source(entry)
+        if source is None or runner._session_key_for_source(source) != key:
+            return False
+        adapter = runner._adapter_for_source(source)
+        if adapter is None:
+            return False
+        text = await asyncio.to_thread(update_wake_prompt, home, success)
+        event = runner._synthetic_prompt_event(source, text, internal=True, reply_expected=True)
+        event.metadata.update(gateway_session_key=key, gateway_session_id=sid, gateway_session_strict=True)
+        try:
+            receipt = await admit_route_wake_receipt(
+                self, adapter, source, text, "request-update", event=event,
+                identity=f"request-update:{pending['request_id']}",
+            )
+        except RuntimeStoreError as exc:
+            if exc.reason == "admission_conflict" and (exc.field, exc.detail) == (
+                ADMITTED_REQUEST_CONFLICT["field"], ADMITTED_REQUEST_CONFLICT["detail"],
+            ):
+                # A crash after commit can replay with different live health/version facts.
+                return True
+            raise
+        return receipt is not None
+
     @staticmethod
     def _marker_profile(data: dict) -> Optional[str]:
         """Owning profile of a persisted restart/update marker: explicit ``profile``, else the

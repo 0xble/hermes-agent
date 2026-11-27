@@ -12,6 +12,33 @@ from pathlib import Path
 _MARKER_LOCK = threading.RLock()
 
 
+def has_update_origin(pending: dict) -> bool:
+    return (pending.get("source") == "request_update" and pending.get("notification_version") == 2
+            and all(isinstance(pending.get(k), str) and pending[k]
+                    for k in ("origin_session_id", "session_key", "request_id")))
+
+
+def update_wake_prompt(home: Path, success: bool) -> str:
+    """Only report facts from finalization and the live, PID-matched runtime record."""
+    from gateway.status import live_gateway_pid_for_home, read_runtime_status
+
+    pid = live_gateway_pid_for_home(home)
+    runtime = read_runtime_status(home / "gateway_state.json") or {}
+    if pid is None or runtime.get("pid") != pid:
+        runtime = {}
+    version = runtime.get("code_version")
+    version = version if isinstance(version, str) and re.fullmatch(r"[a-zA-Z0-9.+_-]{1,80}", version) else "unknown"
+    sha = runtime.get("code_sha")
+    revision = sha[:12] if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", sha) else "unknown"
+    state = runtime.get("gateway_state")
+    health = {"running": "healthy (gateway running)", "degraded": "degraded", "starting": "starting",
+              "draining": "draining"}.get(state, "unverified") if isinstance(state, str) else "unverified"
+    outcome = "success (verified by the updater)" if success else "failed or could not be verified"
+    return (f"[Hermes request_update completion]\nOutcome: {outcome}.\n"
+            f"Live Hermes version: {version} (revision: {revision}).\nGateway health: {health}.\n"
+            "Report these results to the user in this session. Do not start another update or restart.")
+
+
 @contextmanager
 def locked_update_marker(home: Path):
     """Serialize admissions and marker writes across threads/processes; lock a stable sibling inode."""
@@ -333,6 +360,17 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
         return True, f"Update finalized and the running gateway revision was verified ({expected[:12]}). Interrupted work may still need recovery."
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return (False, _failed_update_detail(home, None, exit_code)) if exit_code else None
+
+
+def notification_outcome(home: Path, pending: dict, *, timed_out: bool) -> tuple[bool, str] | None:
+    outcome = final_outcome(home, pending)
+    if outcome is not None or not timed_out:
+        return outcome
+    # A watcher timeout is not completion while the updater still owns the request.
+    if has_update_origin(pending) and not (home / ".update_process_exit_code").exists():
+        return None
+    return False, ("Update finalization could not be verified before the notification deadline. "
+                   "Runtime state is unknown. Inspect the update output before retrying.")
 
 
 def _row_verdict(home: Path, row, expected: str) -> bool | None:

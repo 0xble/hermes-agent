@@ -1145,7 +1145,7 @@ class GatewayNotificationsMixin(
 
     async def _send_update_notification(self, *, timed_out: bool = False, original: Optional[dict] = None) -> bool:
         """One final send path for live watchers and startup; retain state on send failure."""
-        from gateway.update_notifications import final_outcome, notice, read_pending, save_pending
+        from gateway.update_notifications import has_update_origin, notice, notification_outcome, read_pending, save_pending
         if getattr(self, "_update_final_send_active", False):
             return False
         self._update_final_send_active = True
@@ -1160,44 +1160,29 @@ class GatewayNotificationsMixin(
             target = self._resolve_update_target(paths)
             marker, pending = current
             original = original if original is not None else pending.copy()
-            if target is None and not (pending.get("platform") and pending.get("chat_id")):
-                # Cron and CLI requests carry no chat to report back to. Hold the admission
-                # until the updater process has really exited, then release it; raising here
-                # kept the marker forever and refused every later update. Only the real
-                # process-exit sentinel proves the updater is gone (the launcher's own
-                # admission rule): a legacy marker's ``.update_exit_code`` is written before the
-                # gateway restart, and a watcher timeout says nothing about the process.
-                if not (paths.pending.parent / ".update_process_exit_code").exists():
-                    return False
-                if final_outcome(paths.pending.parent, pending) is None and not timed_out:
-                    return False
-                logger.info("Update %s finished with no notification route; releasing its admission",
-                            pending.get("request_id") or "<legacy>")
-                return self._clear_update_markers(paths, pending.get("session_key"), pending)
-            if target is None:
-                # Expire only a valid destination whose adapter never returned. Malformed
-                # metadata must not be mistaken for a confirmed transport outage.
-                platform = Platform(pending.get("platform"))
-                age = self._marker_age_seconds(pending)
-                if (pending.get("chat_id") and age is not None
-                        and age > _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS
-                        and not self._authorization_adapter(platform, self._marker_profile(pending))):
-                    logger.warning(
-                        "Post-update notification for %s:%s dropped after %.1fh: adapter never connected",
-                        platform.value, pending["chat_id"], age / 3600.0)
-                    self._clear_update_markers(paths, pending.get("session_key"), pending)
-                    return True
-                return False
+            origin = has_update_origin(pending)
+            if target is None and not origin:
+                return self._complete_unrouted_update(
+                    paths, pending, timed_out=timed_out, clear_markers=self._clear_update_markers,
+                    authorization_adapter=getattr(self, "_authorization_adapter", None),
+                )
             legacy_marker = pending.get("notification_version") != 2
-            if (not legacy_marker and target is not None and
+            if (not legacy_marker and
                     float(pending.get("notice_retry_at", 0)) > datetime.now(UTC).timestamp()):
                 return False
-            outcome = final_outcome(paths.pending.parent, pending)
+            outcome = notification_outcome(paths.pending.parent, pending, timed_out=timed_out)
             if outcome is None:
-                if not timed_out:
-                    return False
-                outcome = (False, "Update finalization could not be verified before the notification deadline. Runtime state is unknown. Inspect the update output before retrying.")
+                return False
             success, detail = outcome
+            if origin and target is None:
+                # A reset or a missing adapter must not turn a pinned wake into
+                # a direct notice or the legacy adapter-expiry path.
+                if not await self._admit_update_origin(paths.pending.parent, pending, success):
+                    self._defer_update_notice(marker, pending)
+                    return False
+                return self._clear_update_markers(paths, pending["session_key"], pending)
+            if target is None:
+                return False
             if pending.get("notification_version") == 2 and not pending.get("updating_notified"):
                 if not await self._send_update_phase("updating", original=original):
                     return False
@@ -1236,6 +1221,11 @@ class GatewayNotificationsMixin(
             if legacy_marker and output_sent:
                 self._clear_update_markers(paths, target.session_key, pending)
                 return True
+            if origin:
+                if not await self._admit_update_origin(paths.pending.parent, pending, success):
+                    self._defer_update_notice(marker, pending)
+                    return False
+                return self._clear_update_markers(paths, pending["session_key"], pending)
             if success:
                 heading, detail = self._update_result_heading(paths.pending.parent, pending, 0)
             else:
