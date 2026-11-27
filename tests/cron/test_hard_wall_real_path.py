@@ -46,6 +46,10 @@ class RecordingEmitter:
         pass
 emitter.get_emitter = lambda: RecordingEmitter()
 set_hermes_home_override(Path(home))
+# Match the detached worker: cold profile plugin discovery is bootstrap,
+# not part of the watchdog's execution budget.
+from hermes_cli.plugins import discover_plugins
+discover_plugins()
 job = json.loads(Path(job_file).read_text())
 assert executions.adopt_claimed_execution(job['execution_id'])
 fence = arm_hard_wall_timeout(job['execution_id'], home, float(wall))
@@ -108,11 +112,8 @@ sys.exit(0 if result else 2)
 '''
 
 
-# The watchdog starts before ``run_one_job`` and includes real process/import/SQLite
-# startup. Three seconds is enough on an idle workstation but is not enough budget
-# for this subprocess path when the native lane runs four files concurrently on
-# hosted macOS. Keep the synthetic cap short while leaving room for that startup;
-# all intentional race delays below scale from this value.
+# Bound the real script and completion path after worker bootstrap. The injected
+# race delays scale from the same cap so they still cross the relevant deadline.
 _TEST_WALL_SECONDS = 10.0
 
 
