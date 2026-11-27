@@ -874,7 +874,10 @@ def bounded_probe_run(
     """
     # detached-spawn: ok — awaited probe; a timeout or failure tree-kills its group (kill_and_drain)
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
-    job = None
+    owned = owned and not IS_WINDOWS
+    job = proc = None
+    gate_read = gate_write = None
+    command = list(argv)
     try:
         # Windows: contain the probe in a Job Object. `taskkill /T` walks LIVE parent pids, and a
         # Cygwin/MSYS `exec` lets the forked stub exit once the new image runs, so a Git Bash grandchild
@@ -882,20 +885,42 @@ def bounded_probe_run(
         # on windows-latest). KILL_ON_JOB_CLOSE reaches it regardless of ancestry.
         from hermes_cli.local_runtime.processes import spawn_server
 
+        if owned:
+            from hermes_cli.process_identity import own_process_groups, release_process_group_once_empty
+
+            # The CLI can exit while this daemon thread is between Popen and registration.
+            # On EOF the bootstrap exits without starting the command; after the go byte,
+            # exec retains the registered process group and the probe's original stdio.
+            gate_read, gate_write = os.pipe()
+            _popen_kwargs["pass_fds"] = (gate_read,)
+            command = [sys.executable, "-I", "-S", "-c",
+                       "import os, sys; fd = int(sys.argv[1]); go = os.read(fd, 1); os.close(fd); "
+                       "go == b'g' and os.execvp(sys.argv[2], sys.argv[2:])", str(gate_read), *argv]
         proc, job = spawn_server(
-            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
             text=True, encoding="utf-8", errors=errors,
             env=dict(env) if env is not None else None, cwd=cwd, **_popen_kwargs)
+        if gate_read is not None:
+            os.close(gate_read)
+            gate_read = None
+        if owned and gate_write is not None:
+            own_process_groups([proc.pid])
+            os.write(gate_write, b"g")
     except Exception:
+        if gate_write is not None:
+            os.close(gate_write)
+            gate_write = None
+        if proc is not None:
+            kill_and_drain(proc, 1)
         if raise_on_spawn_failure:
             raise
         return None
-    owned = owned and not IS_WINDOWS
-    if owned:
-        from hermes_cli.process_identity import own_process_groups, release_process_group_once_empty
-
-        own_process_groups([proc.pid])
+    finally:
+        if gate_read is not None:
+            os.close(gate_read)
+        if gate_write is not None:
+            os.close(gate_write)
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except Exception:
