@@ -60,7 +60,7 @@ async def test_a_large_roster_scan_lets_other_loop_work_run(monkeypatch):
     def restored(entry):  # returns None: nothing to group, this test is only about the scan
         seen_at.append(len(ticks))
 
-    runner = SimpleNamespace(session_store=SimpleNamespace(list_sessions=lambda: entries),
+    runner = SimpleNamespace(session_store=SimpleNamespace(list_sessions=lambda **_: entries),
                              _run_in_executor_with_context=asyncio.to_thread,
                              _restored_source=restored, _checkin_watch={})
     monkeypatch.setattr(run_checkins, "reconcile_turn", AsyncMock())
@@ -72,3 +72,18 @@ async def test_a_large_roster_scan_lets_other_loop_work_run(monkeypatch):
     assert len(seen_at) == len(entries)
     # Without a yield the ticker cannot run between the first and last entry of the scan.
     assert seen_at[-1] > seen_at[0]
+
+
+@pytest.mark.asyncio
+async def test_poll_reads_the_roster_unsorted(monkeypatch):
+    """Scope grouping is order-independent, so a poll must not pay the newest-first sort."""
+    asked = []
+
+    def list_sessions(*, newest_first=True):
+        asked.append(newest_first)
+        return []
+
+    runner = SimpleNamespace(session_store=SimpleNamespace(list_sessions=list_sessions),
+                             _run_in_executor_with_context=asyncio.to_thread, _checkin_watch={})
+    await run_checkins.poll_checkins(runner)
+    assert asked == [False]

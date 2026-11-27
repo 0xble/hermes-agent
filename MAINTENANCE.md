@@ -647,9 +647,9 @@ Fork patch identity: `gateway-reparse-cpu`.
 
 - **Load when:** changing gateway config or cron job-store read/write caching, cache signatures, lock-free cache hits, or their regressions.
 - **Behavior:** Reuse parsed config YAML and unchanged cron job-store data when file signatures are stable, while invalidating on atomic replacement, preserving secret-scope expansion, caller isolation, race safety, and semantic writes.
-- **Source surfaces:** `hermes_cli/config.py`, `hermes_cli/config_cache.py`, `cron/jobs.py`, `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`, and related cron/config tests.
-- **Contract tests:** `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`.
-- **Upstream status:** Fork-only gateway CPU repair; no equivalent upstream fix has been established.
+- **Source surfaces:** `hermes_cli/config.py`, `hermes_cli/config_cache.py`, `gateway/config_loader.py`, and `cron/jobs.py`.
+- **Contract tests:** `tests/hermes_cli/test_config_cache_signature.py`, `tests/gateway/test_read_yaml_layers_cache.py`, `tests/cron/test_jobs_cache.py`.
+- **Upstream status:** [NousResearch#149089](https://github.com/NousResearch/hermes-agent/pull/149089) proposes reusing the raw YAML cache in the gateway loader. The fork also probes readability on hits and retains the broader CLI/cron-store cache patch.
 - **Retirement:** Remove when upstream provides equivalent signature-aware config and cron-store caching with the same invalidation and isolation contract.
 - **Rollback:** Revert the commits carrying `Fork-Patch: gateway-reparse-cpu`.
 

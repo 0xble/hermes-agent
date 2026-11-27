@@ -28,7 +28,7 @@ def fixture(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.estop.paused_reply", lambda: None)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", user_id="7", thread_id="3", message_id="human")
     entry = SimpleNamespace(session_key="topic-route", session_id="owner", origin=source, suspended=False)
-    store = SimpleNamespace(list_sessions=lambda: [entry], lookup_by_session_key=lambda _: entry,
+    store = SimpleNamespace(list_sessions=lambda **_: [entry], lookup_by_session_key=lambda _: entry,
                             _db_for_key=lambda _: db)
     adapter = SimpleNamespace(_pending_messages={}, _text_batches={}, _active_sessions={})
     runner = SimpleNamespace(session_store=store, _draining=False, _is_session_running=lambda _: False,
@@ -165,7 +165,11 @@ async def test_send_and_streamed_edit_ack_reset_correct_topic_only(fixture):
     sibling = SessionSource(platform=Platform.TELEGRAM, chat_id="42", user_id="7", thread_id="4")
     f.db.create_session("sibling", source="telegram")
     other = SimpleNamespace(session_key="sibling-route", session_id="sibling", origin=sibling, suspended=False)
-    f.runner.session_store.list_sessions = lambda: [f.entry, other]
+    def list_sessions(*, newest_first):
+        assert not newest_first
+        return [f.entry, other]
+
+    f.runner.session_store.list_sessions = list_sessions
     f.runner._restored_source = lambda entry: entry.origin
     other_manager = CheckinManager(f.db, "sibling", CheckinConfig())
     f.manager.reconcile([1], now=100)

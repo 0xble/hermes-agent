@@ -42,7 +42,7 @@ async def test_seen_idle_poll_loads_config_and_enters_scope_once_per_profile(tmp
     # Interleave the homes so grouping cannot rely on contiguous source order.
     entries = [entry for pair in zip(entries[:12], entries[12:]) for entry in pair]
     runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),
-                             session_store=SimpleNamespace(list_sessions=lambda: entries),
+                             session_store=SimpleNamespace(list_sessions=lambda **_: entries),
                              _run_in_executor_with_context=asyncio.to_thread,
                              _restored_source=lambda entry: entry.origin,
                              _resolve_profile_home_for_source=lambda source: homes[source.profile],
@@ -141,7 +141,7 @@ async def test_non_oserror_in_one_profile_does_not_abort_other_profile(tmp_path,
         entries.append(SimpleNamespace(session_key=f"route-{name}", session_id=f"session-{name}",
                                        suspended=False, origin=source))
     runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),
-                             session_store=SimpleNamespace(list_sessions=lambda: entries),
+                             session_store=SimpleNamespace(list_sessions=lambda **_: entries),
                              _run_in_executor_with_context=asyncio.to_thread,
                              _restored_source=lambda entry: entry.origin,
                              _resolve_profile_home_for_source=lambda source: homes[source.profile],

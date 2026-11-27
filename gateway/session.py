@@ -1707,16 +1707,19 @@ class SessionStore(
         self._announce_route(session_key, new_entry)
         return new_entry
 
-    def list_sessions(self, active_minutes: Optional[int] = None) -> list[SessionEntry]:
-        """List all sessions, optionally filtered by activity."""
+    def list_sessions(
+        self, active_minutes: Optional[int] = None, *, newest_first: bool = True,
+    ) -> list[SessionEntry]:
+        """List sessions, optionally filtered by activity and normally newest first."""
         with self._lock:
             self._ensure_loaded_locked()
             entries = list(self._entries.values())
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
             entries = [e for e in entries if e.updated_at.timestamp() >= cutoff.timestamp()]
-        # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
-        entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
+        if newest_first:
+            # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
+            entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
         return entries
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:

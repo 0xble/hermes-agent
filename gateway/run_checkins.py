@@ -91,7 +91,10 @@ async def poll_checkins(runner):
         seen = runner._checkin_seen = {}
     scope_key = functools.partial(GatewayTurnMixin._profile_scope_key_for_source, runner)
     by_scope = {}
-    entries = await runner._run_in_executor_with_context(runner.session_store.list_sessions)
+    # Grouping by scope and reconciling each session is order-independent, so skip the
+    # newest-first sort of the whole roster (tens of thousands of routes) on every poll.
+    entries = await runner._run_in_executor_with_context(
+        functools.partial(runner.session_store.list_sessions, newest_first=False))
     for index, entry in enumerate(entries):
         if index and not index % _SCAN_YIELD_EVERY:
             await asyncio.sleep(0)  # the roster is every routed session: let the loop breathe
@@ -409,12 +412,19 @@ async def record_visible(runner, adapter, chat_id, thread_id=None, platform=None
     task = asyncio.current_task()
     owner = next((key for key, running in getattr(adapter, "_session_tasks", {}).items() if running is task), owner)
     now = time.time()
+    destination = (str(chat_id), str(thread_id or ""))
+
+    def matching_entries():
+        # Recency never selects a winner: an unowned send must be unambiguous.
+        # Filter the routing snapshot off the event loop before resolving scopes.
+        return [
+            entry for entry in runner.session_store.list_sessions(newest_first=False)
+            if entry.origin and not entry.suspended
+            and (str(entry.origin.chat_id), str(entry.origin.thread_id or "")) == destination
+        ]
+
     candidates = []
-    for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
-        origin = entry.origin
-        if (not origin or entry.suspended or str(origin.chat_id) != str(chat_id)
-                or str(origin.thread_id or "") != str(thread_id or "")):
-            continue
+    for entry in await runner._run_in_executor_with_context(matching_entries):
         source = runner._restored_source(entry)
         if source is None or (platform is not None and source.platform != platform):
             continue

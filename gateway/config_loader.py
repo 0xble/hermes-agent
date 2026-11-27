@@ -7,6 +7,7 @@ silently replaced by the nested one. Both overwrite whatever legacy gateway.json
 """
 
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -496,12 +497,19 @@ def read_yaml_layers(home: Path) -> dict:
     (``gateway.relay.relay_explicitly_disabled``) reads through here so it cannot disagree with
     ``load_gateway_config()`` on which files count.
     """
-    from hermes_cli.config_backend import config_exists, read_config_doc
+    from hermes_cli.config_backend import (
+        config_exists,
+        probe_config_readable,
+        read_config_doc_readonly,
+    )
 
     config_path = Path(home) / "config.yaml"
     yaml_cfg: dict = {}
     if config_exists(config_path):
-        yaml_cfg = read_config_doc(config_path) or {}
+        # A warm cache must not hide a config read failure. Cache only the raw
+        # document: the caller's secret scope and the managed overlay stay live.
+        probe_config_readable(config_path)
+        yaml_cfg = copy.deepcopy(read_config_doc_readonly(config_path) or {})
 
     from hermes_cli.config import _expand_env_vars
 
