@@ -537,15 +537,17 @@ class GatewaySessionControlsMixin:
             return f"◷ {record['notice']}. Requested by {requester}."
         verb = {
             "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
-            "replace": "replaced",
+            "revise": "revised", "replace": "replaced",
         }.get(action, action)
         change = (f"\n{cls._change_text(record)}"
                   if action == "replace" and record.get("affected_text") else "")
+        if kind == "loop" and action in {"revise", "replace"} and record.get("notice"):
+            change = f"\n{cls._clip(record['notice'], 500)}"
         from agent.notice_style import ContextNotice
         # Only committed no-action control outcomes opt in. Pending, pause and failures stay full.
         receipt = ContextNotice if status == "applied" and (kind, action) in {
             ("goal", "replace"), ("goal", "resume"), ("goal", "clear"),
-            ("loop", "resume"), ("loop", "stop"),
+            ("loop", "resume"), ("loop", "stop"), ("loop", "revise"), ("loop", "replace"),
         } else str
         authority = record.get("authority") or {}
         if authority.get("via") == "session":
