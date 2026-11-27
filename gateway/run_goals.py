@@ -759,7 +759,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
 
         # Probe only eligible goals, but before judging can spend a retired topic's turns.
-        if source is not None and not await automatic_route_available(self, source):
+        if source is not None and not await automatic_route_available(self, source, idle_backoff=True):
             return
 
         _bg_procs, _active_deleg = None, 0

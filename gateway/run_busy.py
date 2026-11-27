@@ -1283,6 +1283,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         is_redirect_mode = effective_mode == "interrupt" and redirected
         if (
             effective_mode == "interrupt" and not redirected
+            and not getattr(_steer, "machine_preempted", False)
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)

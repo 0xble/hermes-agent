@@ -1082,7 +1082,10 @@ class SessionAuthority:
         with live.event_stream.lock if live is not None else contextlib.nullcontext():
             self.adopted[session_id] = (generation, agent)
             clear = getattr(agent, 'clear_interrupt', None)
-            if self.delivered_stops.pop(session_id, generation) != generation and clear is not None:
+            # The stale-Stop wipe must not eat a soft machine-turn preemption published before adoption.
+            from agent.interrupt_control import interrupt_issuer
+            if (self.delivered_stops.pop(session_id, generation) != generation and clear is not None
+                    and interrupt_issuer(agent) != 'gateway_user_turn_preemption'):
                 clear()
             if self.pending_stops.get(session_id) == generation:
                 del self.pending_stops[session_id]

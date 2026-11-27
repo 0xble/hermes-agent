@@ -625,6 +625,17 @@ payload's closing bracket to be the final character. Assert the exact bounded
 output and framing terminator together. The nightly Linux failure was a stale
 test expectation, not a truncated-notice product defect.
 
+## Hosted room independence test lease
+
+The `fork-ci-reliability` identity also covers
+`tests/tui_gateway/test_hosted_room_driver_runtime.py::test_waiting_room_does_not_block_an_independent_room`.
+It ran the threaded runtime on a 0.4s wall-clock room lease and waited 1.0s for the waiting room's
+submit. If starting the task stalls for longer than the lease, the pre-submit renewal finds the
+lease expired and fences the attempt, which goes `indeterminate` and is never submitted, so the wait
+fails at any length. The test now uses a 30s lease, as `test_authority_loss_stops_terminal_commit`
+does, and a 5s submit bound. Product code is unchanged. Other tests in the file still run on the
+0.4s lease. Retire when upstream stops this test depending on lease expiry.
+
 ## Git fixture isolation
 
 The `fork-ci-reliability` identity also covers the real-Git fixtures in

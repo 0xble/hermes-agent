@@ -208,7 +208,10 @@ class TurnContext:
         self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
 
     def bind_agent_lifetime(self, agent: Any) -> None:
-        """Keep only drain fences on the agent, never the entire turn context."""
+        """Keep only drain fences on the agent, never the entire turn context. A soft machine-turn
+        preemption aimed at an earlier turn is dropped here, before this turn can run the agent."""
+        from gateway.run_turn_pending_preemption import settle_stale_preemption
+        settle_stale_preemption(agent, self)
         if self.agent_holder:
             self.agent_holder[0] = agent
         if self._worker is not None:

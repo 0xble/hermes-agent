@@ -2320,12 +2320,15 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def job_running_state(job: dict[str, Any]) -> dict:
-    """Best-effort visibility without booting the scheduler in listing/tool processes."""
+def job_running_state(job: dict[str, Any], **lookup: Any) -> dict:
+    """Best-effort visibility without booting the scheduler in listing/tool processes.
+
+    ``lookup`` forwards a prefetched ``detached_execution`` so listings issue one ledger query.
+    """
     if sys.modules.get("cron.scheduler") is not None:
         try:
             from cron.scheduler_control import running_job_state
-            return running_job_state(job)
+            return running_job_state(job, **lookup)
         except Exception:
             logger.debug("Cron running-state lookup unavailable", exc_info=True)
     claim = job.get("fire_claim") or {}
@@ -2339,16 +2342,16 @@ def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
+    ids = [job.get("id", "") for job in jobs]
     try:
         from cron.executions import latest_executions, live_executions
 
-        ids = [job.get("id", "") for job in jobs]
         latest, live = latest_executions(ids), live_executions(ids)
     except Exception:
         latest, live = {}, {}
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
-        running = job_running_state(job)
+        running = job_running_state(job, detached_execution=live.get(job.get("id", "")))
         job["running"] = running["was_running"]
         job["running_since"] = running["run_started_at"]
         job["live_execution"] = live.get(job.get("id", ""))

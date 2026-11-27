@@ -250,6 +250,42 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     assert not stderr_capture.exists()
 
 
+
+def test_external_worker_cancel_marker_sets_run_cancel_event(tmp_path, monkeypatch):
+    """A durable cancel marker for (job, execution) must reach the worker's run as cancel_event."""
+    from cron import scheduler
+    from cron.detached_authority import _cancel_path
+
+    payload = tmp_path / "payload.json"
+    ack = tmp_path / "exec-watch.ready"
+    payload.write_text(
+        json.dumps({
+            "job": {"id": "job-watch", "execution_id": "exec-watch"},
+            "profile_home": str(tmp_path / "profile"),
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cron.executions.adopt_claimed_execution",
+        lambda execution_id: {"id": execution_id, "status": "running"},
+    )
+    seen = {}
+
+    def run(job, *, cancel_event, **_kwargs):
+        assert not cancel_event.is_set()
+        marker = _cancel_path(job["id"], job["execution_id"])
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"cancelled": True}), encoding="utf-8")
+        # Same file cancel_detached writes; the worker's watcher must turn it into the event.
+        seen["cancelled"] = cancel_event.wait(5)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+
+    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert seen == {"cancelled": True}
+
+
 def test_external_worker_ack_is_never_observable_half_written(tmp_path, monkeypatch):
     """The gateway polls ``ack_path.exists()`` then reads it (#107184, #116164 form 1): the ack
     must appear atomically with its full body, or the parent logs "unreadable acknowledgement"

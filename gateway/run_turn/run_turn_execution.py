@@ -278,7 +278,10 @@ class GatewayTurnExecutionMixin:
             )
             return
         turn_state = self._session_state(session_key).turn
-        turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
+        # Waiters match the published generation, even when the context omitted it.
+        if run_generation is None:
+            run_generation = cast("GatewayRunner", self)._current_session_run_generation(session_key)
+        turn_state.publish_agent(agent_holder[0], turn_ctx, run_generation)
         if self._draining:
             self._update_runtime_status("draining")
 

@@ -712,6 +712,8 @@ class RestartRecoveryMixin:
             inflight.add(entry.session_key)
             state = self._session_state(entry.session_key)
             state.turn.agent = _AGENT_PENDING_SENTINEL
+            state.turn.agent_published_event = asyncio.Event()
+            state.turn.turn_ended_event = asyncio.Event()
             state.turn.started_ts = time.time()
             from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
             note_running_chat_owner(self, entry.session_key, source)
