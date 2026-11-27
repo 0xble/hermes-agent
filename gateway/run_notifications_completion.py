@@ -6,13 +6,57 @@ import logging
 import asyncio
 import contextlib
 import dataclasses
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, cast
 
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
 
 logger = logging.getLogger('gateway.run')
 
 
 class GatewayNotificationsMixin:
+    _DELEGATION_OK_STATUSES = frozenset({"completed", "success"})
+
+    @classmethod
+    def _completion_is_failure(cls, evt: dict) -> bool:
+        """Non-zero exits, abnormal ends and failed delegations wake promptly; unknown kinds too."""
+        if evt.get("task_failure_notice"):
+            return True
+        if evt.get("type") == "completion":
+            return evt.get("exit_code") != 0 or str(evt.get("completion_reason") or "exited") != "exited"
+        if evt.get("type") == "async_delegation":
+            statuses = [evt.get("status")] + [
+                r.get("status") for r in (evt.get("results") or []) if isinstance(r, dict)]
+            return any(str(s or "completed").lower() not in cls._DELEGATION_OK_STATUSES for s in statuses)
+        return True
+
+    @staticmethod
+    def _completion_awaited_by_goal(evt: dict) -> bool:
+        """Blocking: whether the session's active goal is explicitly parked on this result
+        (``/goal wait`` on its process session or pid, or a wait on live delegations)."""
+        from hermes_cli.goals import _get_session_db, load_goal
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        state = load_goal(parent_session_id)
+        if (state is None or state.status != "active") and parent_session_id:
+            # Compression migrates the goal to the continuation session and clears this row,
+            # while the event keeps the spawning id: follow the chain to its live tip.
+            db = _get_session_db()
+            tip = db.get_compression_tip(parent_session_id) if db is not None else None
+            if tip and tip != parent_session_id:
+                state = load_goal(tip)
+        if state is None or state.status != "active":
+            return False
+        if evt.get("type") == "async_delegation":
+            return state.waiting_on_delegations > 0
+        process_id = str(evt.get("session_id") or "")
+        if state.waiting_on_session:
+            return state.waiting_on_session == process_id
+        if state.waiting_on_pid is not None:
+            from tools.process_registry import process_registry
+            session = process_registry.get(process_id) if process_id else None
+            return session is not None and getattr(session, "pid", None) == state.waiting_on_pid
+        return False
+
     @dataclasses.dataclass
     class _CompletionClaim:
         """Pre-flight outcome for one completion delivery."""
@@ -622,10 +666,11 @@ class GatewayNotificationsMixin:
         self._ensure_completion_batch_state()
         if self._completion_notification_batches_stopping:
             return await self._deliver_completion_while_stopping(synth_text, evt)
-        window = await self._completion_batch_window(evt)
+        runner = cast("GatewayRunner", self)
+        window = await runner._completion_batch_window(evt)
         if self._completion_notification_batches_stopping:
             return await self._deliver_completion_while_stopping(synth_text, evt)
-        hold = self._completion_hold_seconds(evt, window)
+        hold = runner._completion_hold_seconds(evt, window)
         if hold <= 0:
             self._release_held_completions(str(evt.get("session_key") or ""))
         # A route key alone is not ownership: /new can leave old and new pins

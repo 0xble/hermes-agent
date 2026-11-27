@@ -18,7 +18,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 
 _UpdatePaths = Any
 _UpdateTarget = Any
@@ -39,6 +39,9 @@ from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixi
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 from gateway.watch_match_coalesce import coalesce_pending_watch_matches
+
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -281,7 +284,6 @@ class GatewayNotificationsMixin(
     _COMPLETION_BATCH_WINDOW_DEFAULT_S = 300.0
     _COMPLETION_BATCH_WINDOW_MAX_S = 3600.0
     _COMPLETION_SHUTDOWN_FLUSH_S = 5.0
-    _DELEGATION_OK_STATUSES = frozenset({"completed", "success"})
 
     def _completion_notification_batch_window_from_config(self) -> float:
         """Configured hold window; invalid or negative values keep the default rather than disable it."""
@@ -300,46 +302,6 @@ class GatewayNotificationsMixin(
         """Explicit runner override (tests), else the ambient profile's configured window."""
         value = getattr(self, "_completion_notification_batch_window", None)
         return self._completion_notification_batch_window_from_config() if value is None else float(value)
-
-    @classmethod
-    def _completion_is_failure(cls, evt: dict) -> bool:
-        """Non-zero exits, abnormal ends and failed delegations wake promptly; unknown kinds too."""
-        if evt.get("task_failure_notice"):
-            return True
-        if evt.get("type") == "completion":
-            return evt.get("exit_code") != 0 or str(evt.get("completion_reason") or "exited") != "exited"
-        if evt.get("type") == "async_delegation":
-            statuses = [evt.get("status")] + [
-                r.get("status") for r in (evt.get("results") or []) if isinstance(r, dict)]
-            return any(str(s or "completed").lower() not in cls._DELEGATION_OK_STATUSES for s in statuses)
-        return True
-
-    @staticmethod
-    def _completion_awaited_by_goal(evt: dict) -> bool:
-        """Blocking: whether the session's active goal is explicitly parked on this result
-        (``/goal wait`` on its process session or pid, or a wait on live delegations)."""
-        from hermes_cli.goals import _get_session_db, load_goal
-        parent_session_id = str(evt.get("parent_session_id") or "").strip()
-        state = load_goal(parent_session_id)
-        if (state is None or state.status != "active") and parent_session_id:
-            # Compression migrates the goal to the continuation session and clears this row,
-            # while the event keeps the spawning id: follow the chain to its live tip.
-            db = _get_session_db()
-            tip = db.get_compression_tip(parent_session_id) if db is not None else None
-            if tip and tip != parent_session_id:
-                state = load_goal(tip)
-        if state is None or state.status != "active":
-            return False
-        if evt.get("type") == "async_delegation":
-            return state.waiting_on_delegations > 0
-        process_id = str(evt.get("session_id") or "")
-        if state.waiting_on_session:
-            return state.waiting_on_session == process_id
-        if state.waiting_on_pid is not None:
-            from tools.process_registry import process_registry
-            session = process_registry.get(process_id) if process_id else None
-            return session is not None and getattr(session, "pid", None) == state.waiting_on_pid
-        return False
 
     async def _completion_batch_window(self, evt: dict) -> float:
         """Return the configured cap for this result; 0 means deliver promptly.
@@ -370,7 +332,7 @@ class GatewayNotificationsMixin(
         if window <= 0:
             return 0.0
         session_key = str(evt.get("session_key") or "").strip()
-        running = self._is_session_running(session_key)
+        running = cast("GatewayRunner", self)._is_session_running(session_key)
         hold = window if running else min(window, self._COMPLETION_IDLE_SETTLE_S)
         logger.info("Completion hold reason=%s hold_s=%g window_s=%g session_key=%s event=%s id=%s",
                     "running" if running else "idle_settle", hold, window, session_key,
