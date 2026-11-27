@@ -223,10 +223,14 @@ class GatewaySessionControlsMixin:
                 logger.warning("lifecycle wake injection failed for %s", key, exc_info=True)
                 accepted = False
             if accepted:
-                await self._run_in_executor_with_context(lifecycle_wakes.settle, key, "delivered")
+                await self._run_in_executor_with_context(
+                    lifecycle_wakes.settle, key, "delivered", record["created_at"],
+                )
             elif lifecycle_wakes.is_undeliverable(record):
                 logger.warning("lifecycle wake %s undeliverable for a day; settling as skipped", key)
-                await self._run_in_executor_with_context(lifecycle_wakes.settle, key, "skipped")
+                await self._run_in_executor_with_context(
+                    lifecycle_wakes.settle, key, "skipped", record["created_at"],
+                )
 
     async def _drain_target_notice(self, record: dict, session_controls, source, adapter):
         if record.get("target_notice_sent") or record.get("target_notice_skipped"):

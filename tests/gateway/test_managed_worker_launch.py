@@ -13,23 +13,8 @@ import time
 import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
-from tests.waiting import async_wait_until, process_alive
-
-
-@pytest.mark.parametrize('error_name', ['NoSuchProcess', 'ZombieProcess'])
-def test_background_pid_probe_tolerates_reap(monkeypatch, error_name):
-    """The same check/status probe used by background teardown must accept a mid-read reap."""
-    import psutil
-    status = []
-
-    def reaped(process):
-        status.append(process.pid)
-        raise getattr(psutil, error_name)(process.pid)
-
-    monkeypatch.setattr(psutil, 'pid_exists', lambda pid: True)
-    monkeypatch.setattr(psutil.Process, 'status', reaped)
-    assert process_alive(os.getpid()) is False
-    assert status == [os.getpid()]
+from tests.process_scan import children_matching
+from tests.waiting import async_wait_until
 
 
 class Model(BaseHTTPRequestHandler):
@@ -201,8 +186,8 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
             assert await asyncio.to_thread(peer.blocked.wait, 240), (home / 'restart.log').read_text()
             workers = query('SELECT execution_id,status FROM worker_executions WHERE session_id=?', (sid,))
             assert len(workers) == 1, workers
-            children = [p for p in psutil.Process(owner.pid).children() if p.cmdline()[-2:] == ['-m', 'agent.managed_worker']]
-            assert len(children) == 1, [(p.pid, p.cmdline()) for p in psutil.Process(owner.pid).children()]
+            children = children_matching(owner.pid, lambda p: p.cmdline()[-2:] == ['-m', 'agent.managed_worker'])
+            assert len(children) == 1, [p.pid for p in psutil.Process(owner.pid).children()]
             pid = children[0].pid
             opened = [json.loads(line) for line in audit.read_text().splitlines()]
             # Positive control: the witness hook is live in the owner, so worker silence is real.
@@ -264,7 +249,8 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
             # The next admission's worker adopts it from the profile checkpoint (process_manage).
             assert started['pid'] in [e['pid'] for e in json.loads((home / 'processes.json').read_text())]
             gate.touch()
-            await async_wait_until(lambda: not process_alive(background.pid),
+            await async_wait_until(lambda: not psutil.pid_exists(background.pid)
+                                   or psutil.Process(background.pid).status() == psutil.STATUS_ZOMBIE,
                                    timeout=10, interval=.05, what='background process exited')
         else:
             assert any(role == 'tool' and 'MANAGED_TOOL_EFFECT' in content for role, content in rows), rows

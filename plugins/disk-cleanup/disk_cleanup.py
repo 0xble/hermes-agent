@@ -19,7 +19,7 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ def _log(message: str) -> None:
     """Append to the audit log; never let it break the agent loop."""
     with contextlib.suppress(OSError):
         log_file = _state_file("cleanup.log")
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_under_hermes_home(log_file.parent)
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
@@ -135,7 +135,7 @@ def _log(message: str) -> None:
 def load_tracked() -> list[dict[str, Any]]:
     """Load tracked.json.  Restores from ``.bak`` on corruption."""
     tf = _state_file("tracked.json")
-    tf.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_under_hermes_home(tf.parent)
     if not tf.exists():
         return []
 
@@ -157,7 +157,7 @@ def load_tracked() -> list[dict[str, Any]]:
 def save_tracked(tracked: list[dict[str, Any]]) -> None:
     """Atomic write with a backup; the shared helper allocates a unique temp file per writer."""
     tf = _state_file("tracked.json")
-    tf.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_under_hermes_home(tf.parent)
     if tf.exists():
         shutil.copy2(tf, tf.with_suffix(".json.bak"))
     atomic_json_write(tf, tracked, indent=2)

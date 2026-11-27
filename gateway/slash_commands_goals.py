@@ -4,10 +4,8 @@ Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``."""
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from agent.i18n import t
-from agent.notice_style import ContextNotice
 from gateway.platforms.event import MessageEvent, MessageType
 
 # Log-record parity with gateway/run.py and the origin module.
@@ -52,33 +50,19 @@ class GatewayGoalCommandsMixin:
             return None
 
         def dispatch():
-            from gateway.session_context import scoped_current_session_id
-
-            # Slash controls bypass the turn that normally binds this identity. The event's
-            # physical row supplies caller authority, never an arbitrary manager's target.
-            with scoped_current_session_id(_session_entry.session_id):
-                before = mgr.state.to_json() if mgr.state is not None else None
-                result = dispatch_goal_command(
-                    mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
-                    render=lambda key, default, **values: t(key, **values),
-                    last_user_message=last_user_message_from_db(getattr(mgr, "session_id", None)),
-                )
-                after = mgr.state.to_json() if mgr.state is not None else None
-                return result, before != after
+            return dispatch_goal_command(
+                mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
+                render=lambda key, default, **values: t(key, **values),
+                last_user_message=last_user_message_from_db(getattr(mgr, "session_id", None)),
+            )
 
         # Drafting resolves profile-scoped credentials. Keep ContextVars across the
         # executor hop; manager I/O must also stay off the messaging event loop.
-        result, changed = await self._run_in_executor_with_context(dispatch)
-        if changed and not result.error:
-            from gateway.run_checkins import reconcile_turn
-            await reconcile_turn(self, event.source, _session_entry.session_key)
+        result = await self._run_in_executor_with_context(dispatch)
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(
-                event, result.prompt, label="command enqueue", kickoff=result.kickoff,
-                goal_session_id=mgr.session_id, goal_state=mgr.state,
-            )
+            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -90,18 +74,14 @@ class GatewayGoalCommandsMixin:
             logger.debug("goal %s: pending continuation cleanup failed: %s", verb, exc)
 
     def _enqueue_goal_turn(
-        self, event: MessageEvent, text: str, *, label: str, kickoff: bool,
-        goal_session_id: str = "", goal_state: Any = None,
+        self, event: MessageEvent, text: str, *, label: str, kickoff: bool
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
-        A kickoff answers the user's own ``/goal`` message, so it keeps that message's id, channel
-        prompt, bound skills, and reply contract. A resumed or refreshed continuation is
-        gateway-authored like every other goal continuation: it is built by the shared
-        synthetic-prompt constructor so a no-change tick may end on the silence marker and reuse
-        the pinned channel inputs. A local ``slash.exec`` returns the turn to the client as its
-        ``send`` directive instead (the client submits it with its own input id). Best-effort:
-        failures only logged.
+        A kickoff keeps the triggering message id / channel prompt / bound skills; a resume
+        continuation carries none. Best-effort: failures only logged. A local ``slash.exec`` returns
+        the turn to the client as its ``send`` directive instead (the client submits it with its own
+        input id).
         """
         from gateway.session_command_sink import active_sink
         if (sink := active_sink()) is not None:
@@ -112,25 +92,22 @@ class GatewayGoalCommandsMixin:
         try:
             adapter, quick_key = self._adapter_and_key_for(event)
             if text and adapter and quick_key:
-                if kickoff:
-                    turn = MessageEvent(
-                        text=text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        edit_revision=event.edit_revision if kickoff else None,  # an edited /goal: own admission id
-                        channel_prompt=event.channel_prompt,
-                        auto_skill=event.auto_skill,
-                        reply_expected=event.reply_expected,
-                    )
-                else:
-                    turn = self._synthetic_prompt_event(
-                        event.source, text, reply_expected=False, goal_continuation=True,
-                        goal_session_id=goal_session_id, goal_state=goal_state,
-                    )
-                    # Preserve the upstream pin-reuse contract while retaining the fork's
-                    # stamped synthetic goal-continuation metadata.
-                    turn.inherit_channel_pin = True
+                # A kickoff keeps the files the /goal was sent with (a photo caption), as /queue does.
+                media = kickoff and bool(event.media_urls)
+                turn = MessageEvent(
+                    text=text,
+                    message_type=event.message_type if media else MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id if kickoff else None,
+                    edit_revision=event.edit_revision if kickoff else None,  # an edited /goal: own admission id
+                    channel_prompt=event.channel_prompt if kickoff else None,
+                    auto_skill=event.auto_skill if kickoff else None,
+                    inherit_channel_pin=not kickoff,
+                    media_urls=list(event.media_urls) if media else [],
+                    media_types=list(event.media_types) if media else [],
+                    media_text_inlined=list(event.media_text_inlined) if media else [],
+                    media_filenames=list(event.media_filenames) if media else [],
+                )
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)
@@ -153,22 +130,20 @@ class GatewayGoalCommandsMixin:
 
         if not args or lower == "status":
             return mgr.status_line()
-        # Manager writes take the shared SessionDB lock: run them off the loop.
-        run = self._run_in_executor_with_context
         if lower == "pause":
-            state = await run(mgr.pause)
+            state = mgr.pause()
             return t("gateway.heartbeat.paused", prompt=state.prompt) if state else t("gateway.heartbeat.none_set")
         if lower == "resume":
-            state = await run(mgr.resume)
+            state = mgr.resume()
             if state is None:
                 return t("gateway.heartbeat.no_resume")
             _watch()
-            return ContextNotice(t("gateway.heartbeat.resumed", interval=format_interval(state.interval_seconds), prompt=state.prompt))
+            return t("gateway.heartbeat.resumed", interval=format_interval(state.interval_seconds), prompt=state.prompt)
         if lower in {"clear", "stop", "off"}:
-            had = await run(mgr.clear)
+            had = mgr.clear()
             if quick_key:
                 self._unregister_heartbeat_watch(quick_key)
-            return ContextNotice(t("gateway.heartbeat.cleared")) if had else t("gateway.heartbeat.none_set")
+            return t("gateway.heartbeat.cleared") if had else t("gateway.heartbeat.none_set")
 
         # Set: `/heartbeat every 10m <prompt>` (also accepts `10m <prompt>`).
         tokens = args.split(None, 2)
@@ -185,12 +160,11 @@ class GatewayGoalCommandsMixin:
             return t("gateway.heartbeat.interval_too_small", min_seconds=MIN_INTERVAL_SECONDS)
         if not prompt.strip():
             return t("gateway.heartbeat.prompt_required")
-        prefix = t("gateway.heartbeat.invalid_prefix")
-        state, err = await run(lambda: _mgr_call(prefix, mgr.set, prompt, interval, errors=(ValueError,)))
+        state, err = _mgr_call(t("gateway.heartbeat.invalid_prefix"), mgr.set, prompt, interval, errors=(ValueError,))
         if err:
             return err
         _watch()
-        return ContextNotice(t("gateway.heartbeat.set", interval=format_interval(state.interval_seconds), prompt=state.prompt))
+        return t("gateway.heartbeat.set", interval=format_interval(state.interval_seconds), prompt=state.prompt)
 
     def _idle_cached_agent_or_error(self, event: MessageEvent, verb: str):
         """``(session_key, cached_agent, None)`` for /refine and /review, or ``(_, _, error_text)``:
@@ -302,11 +276,6 @@ class GatewayGoalCommandsMixin:
         mgr, _session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
-        return await self._run_in_executor_with_context(lambda: self._apply_subgoal_command(mgr, args))
-
-    @staticmethod
-    def _apply_subgoal_command(mgr, args: str) -> str:
-        """The /subgoal body; manager writes take the shared SessionDB lock, so it runs off the loop."""
         if not mgr.has_goal():
             return t("gateway.subgoal.no_goal")
         if not args:
@@ -324,19 +293,19 @@ class GatewayGoalCommandsMixin:
             removed, err = _mgr_call(
                 "/subgoal remove", mgr.remove_subgoal, idx, errors=(IndexError, RuntimeError)
             )
-            return err or ContextNotice(t("gateway.subgoal.removed", index=idx, text=removed))
+            return err or t("gateway.subgoal.removed", index=idx, text=removed)
         if verb == "clear":
             prev, err = _mgr_call("/subgoal clear", mgr.clear_subgoals, errors=(RuntimeError,))
             if err:
                 return err
             if not prev:
                 return t("gateway.subgoal.none_to_clear")
-            return ContextNotice(t("gateway.subgoal.cleared_one" if prev == 1 else "gateway.subgoal.cleared_other", count=prev))
+            return t("gateway.subgoal.cleared_one" if prev == 1 else "gateway.subgoal.cleared_other", count=prev)
         text, err = _mgr_call("/subgoal", mgr.add_subgoal, args)
         if err:
             return err
         idx = len(mgr.state.subgoals) if mgr.state else 0
-        return ContextNotice(t("gateway.subgoal.added", index=idx, text=text))
+        return t("gateway.subgoal.added", index=idx, text=text)
 
     async def _handle_loop_command(self, event: MessageEvent) -> str:
         """Handle /loop — recurring in-session wakeups, via ``dispatch_loop_command`` (CLI mirror)."""
@@ -356,6 +325,8 @@ class GatewayGoalCommandsMixin:
         sid = getattr(session_entry, "session_id", None) or ""
         if not sid:
             return t("gateway.loop.no_session")
+        mgr = LoopManager(session_id=sid)
+
         # New loops capture the event's routing so the idle loop-wakeup watcher can inject ticks
         # here after a restart; best-effort, empty fields dropped. ``profile`` pins the wakeup to this
         # session's own bot under multiplex (the watcher must never fire it through the default bot).
@@ -365,18 +336,13 @@ class GatewayGoalCommandsMixin:
             if src is not None:
                 platform = getattr(src, "platform", "")
                 route = {"platform": platform.value if hasattr(platform, "value") else str(platform or "")}
-                for key in ("chat_id", "chat_type", "thread_id", "user_id", "user_name", "profile", "scope_id"):
+                for key in ("chat_id", "chat_type", "thread_id", "user_id", "user_name", "profile"):
                     route[key] = str(getattr(src, key, "") or "")
                 route = {k: v for k, v in route.items() if v}
         except Exception:
             route = {}
-        def _dispatch():
-            # Loop and goal state load and save through the shared SessionDB lock: off the loop.
-            mgr = LoopManager(session_id=sid)
-            result = dispatch_loop_command(mgr, (event.get_command_args() or "").strip(), route=route)
-            output = result.get("output") or ""
-            if result.get("created") and _quiet_bool(lambda: goal_blocks_loop_tick(mgr.session_id)):
-                output += t("gateway.loop.goal_defers_note")
-            return output
-
-        return await self._run_in_executor_with_context(_dispatch)
+        result = dispatch_loop_command(mgr, (event.get_command_args() or "").strip(), route=route)
+        output = result.get("output") or ""
+        if result.get("created") and _quiet_bool(lambda: goal_blocks_loop_tick(mgr.session_id)):
+            output += t("gateway.loop.goal_defers_note")
+        return output

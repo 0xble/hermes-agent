@@ -134,7 +134,7 @@ async def test_restore_local_session_yields_while_store_lock_is_held(monkeypatch
         seen_threads.append(threading.current_thread().name)
         return prepared
 
-    monkeypatch.setattr(recovery, "_read_local_session", read_local)
+    monkeypatch.setattr(recovery, "prepare_local_session", read_local)
     monkeypatch.setattr(recovery, "_local_restore_adapter", lambda _authority: adapter)
     monkeypatch.setattr(recovery, "_check_restored_live", lambda *args: None)
     monkeypatch.setattr(recovery, "_restore_local_entry", restore_entry)

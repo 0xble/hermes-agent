@@ -9,11 +9,16 @@ Tests cover:
 """
 
 from tests.tui_gateway._thread_fixtures import patch_server_threads
+import contextlib
 import threading
 import time
 import types
 from unittest.mock import MagicMock, patch
 
+from tests.fixtures.storage_holder import raw_holder
+from tests.fixtures.storage_read import session_row
+from tests.fixtures.storage_seed import seed_messages, seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 # ===========================================================================
@@ -21,10 +26,8 @@ from unittest.mock import MagicMock, patch
 # ===========================================================================
 
 def _make_session_db(tmp_path):
-    """Create a real SessionDB for integration-style tests."""
-    from hermes_state import SessionDB
-    db_path = tmp_path / "test_state.db"
-    return SessionDB(db_path=db_path)
+    """A storage interface handle on ``tmp_path``'s state.db for integration-style tests."""
+    return storage_handle(tmp_path)
 
 
 def _tui_session(agent=None, session_key="session-key-old", **extra):
@@ -65,12 +68,12 @@ class TestFinalizeSessionUsesAgentSessionId:
         db = _make_session_db(tmp_path)
 
         # Create two sessions: parent (already ended by compression) and continuation
-        db.create_session(session_id="parent-session", source="tui", model="test")
-        db.end_session("parent-session", "compression")
+        seed_session(db, "parent-session", "tui", model="test", end_reason="compression")
 
-        db.create_session(
-            session_id="continuation-session",
-            source="tui",
+        seed_session(
+            db,
+            "continuation-session",
+            "tui",
             model="test",
             parent_session_id="parent-session",
         )
@@ -95,7 +98,7 @@ class TestFinalizeSessionUsesAgentSessionId:
                 server._finalize_session(session, end_reason="tui_close")
 
         # The continuation session should be ended
-        continuation = db.get_session("continuation-session")
+        continuation = session_row(db, "continuation-session")
         assert continuation["ended_at"] is not None, (
             "_finalize_session should end the agent's current session (continuation), "
             "not the already-ended parent"
@@ -120,6 +123,7 @@ class TestPendingTitleValueError:
 
     def test_valueerror_clears_pending_title(self, monkeypatch):
         """ValueError from set_session_title should drop pending_title."""
+        from persistence.conversation.sessions import TitleConflict
         from tui_gateway import server
 
         mock_db = MagicMock()
@@ -141,6 +145,10 @@ class TestPendingTitleValueError:
         )
 
         monkeypatch.setattr(server, "_get_db", lambda: mock_db)
+        persistence = MagicMock()
+        persistence.runtime.pending_ledger_status.return_value = None  # no ledger holds work
+        persistence.sessions.set_title.side_effect = TitleConflict("My Title", "other-session")
+        monkeypatch.setattr(server, "_persistence_for", lambda _db: contextlib.nullcontext(persistence))
         monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -262,31 +270,30 @@ class TestFinalizeOrphanedCompressionSessions:
         db = _make_session_db(tmp_path)
 
         # Parent session (ended by compression — this is the key condition)
-        db.create_session(session_id="parent", source="tui", model="test")
-        db.end_session("parent", "compression")
+        seed_session(db, "parent", "tui", model="test", end_reason="compression")
 
         # Ghost continuation (has messages, never finalized)
-        db.create_session(
-            session_id="ghost-cont",
-            source="tui",
+        seed_session(
+            db,
+            "ghost-cont",
+            "tui",
             model="test",
             parent_session_id="parent",
         )
-        db.append_message("ghost-cont", role="user", content="hello")
-        db.append_message("ghost-cont", role="assistant", content="hi")
+        seed_messages(db, "ghost-cont", {"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"})
 
         # Make it old enough (fake started_at)
-        db._execute_write(
+        raw_holder(db)._execute_write(
             lambda conn: conn.execute(
                 "UPDATE sessions SET started_at = ? WHERE id = ?",
                 (time.time() - 800000, "ghost-cont"),  # ~9 days old
             )
         )
 
-        count = db.finalize_orphaned_compression_sessions()
+        count = db.lineage.finalize_orphaned_compression_children()
         assert count == 1
 
-        session = db.get_session("ghost-cont")
+        session = session_row(db, "ghost-cont")
         assert session["ended_at"] is not None
         assert session["end_reason"] == "orphaned_compression"
 

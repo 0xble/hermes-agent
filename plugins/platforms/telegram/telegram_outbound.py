@@ -4,7 +4,6 @@ mode and the visually-empty guard, so both lanes make the same decision for the 
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 
@@ -62,66 +61,19 @@ def _metadata(thread_id, notify) -> dict:
     return {**({"thread_id": str(thread_id)} if thread_id is not None else {}), **({"notify": True} if notify else {})}
 
 
-async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, thread_id=None, notify=None,
-                               thread_kwargs=None):
-    """One standalone rich send using the gateway's eligibility, payload and refusal rules.
-
-    Only a definite stale-topic refusal or one short flood wait permits a repeated rich
-    request. Ambiguous failures stop before legacy text or attachments. ``thread_kwargs``
-    is the caller's routing, so dropping a stale topic also affects any legacy fallback.
-    """
-    from gateway.platforms.base import SendResult
-    from plugins.platforms.telegram.adapter import (
-        _FLOOD_INLINE_WAIT_CAP_SECS, _TEXT_SEND_DEADLINE, _await_with_thread_deadline,
-        _normalize_dollar_entities, _redact_telegram_error_text, _telegram_retry_after)
-    try:
-        adapter = _standalone_adapter(bot, extra)
-        content = _normalize_dollar_entities(content)
-        if not adapter._should_attempt_rich(content):
-            return None
-    except Exception as exc:  # health: allow BLE001 -- no request has started; safe legacy fallback
-        logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _redact_telegram_error_text(exc))
-        return None
-    if thread_kwargs is None:
-        routing = adapter._compute_single_send_routing(chat_id, None, _metadata(thread_id, notify), thread_id)
-        if routing is None:
-            return None
-        _, thread_kwargs = routing
-        thread_kwargs = {**{k: v for k, v in thread_kwargs.items() if v is not None},
-                         **notification_kwargs(adapter._notifications_mode, notify)}
-    payload = {**adapter._rich_payload_base(chat_id, content), **thread_kwargs}
-    flood_retried = False
-    while True:
-        try:
-            response = await _await_with_thread_deadline(
-                bot.do_api_request("sendRichMessage", api_kwargs=dict(payload)),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
-            break
-        except Exception as exc:  # health: allow BLE001 -- only definite refusals permit another send
-            wait = _telegram_retry_after(exc)
-            if wait is not None and not flood_retried and wait <= _FLOOD_INLINE_WAIT_CAP_SECS:
-                flood_retried = True
-                logger.warning("Telegram rich send rate-limited, retrying once in %.1fs: %s",
-                               wait, _redact_telegram_error_text(exc))
-                await asyncio.sleep(max(wait, 0.0))
-                continue
-            if "thread not found" in str(exc).lower() and payload.get("message_thread_id") is not None:
-                logger.warning("Thread %s not found in rich Telegram send, retrying without message_thread_id",
-                               payload.pop("message_thread_id"))
-                thread_kwargs.pop("message_thread_id", None)
-                continue
-            if adapter._rich_rejected(exc, "sendRichMessage", "MarkdownV2"):
-                return None
-            return SendResult(success=False, error=_redact_telegram_error_text(exc))
-    if isinstance(response, dict):
-        message_id = response.get("message_id")
-        if message_id is None:
-            message_id = (response.get("result") or {}).get("message_id")
-    else:
-        message_id = getattr(response, "message_id", None)
-    if message_id is not None:
-        await adapter._record_rich_sent(chat_id, message_id, content)
-    return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
+async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, thread_id=None, notify=None):
+    """The gateway's ``sendRichMessage`` fast-path for an out-of-process send: the same gates
+    (``rich_messages`` opt-in, constructs MarkdownV2 degrades, Desktop crash/garble shapes, size cap
+    per part, capability latch) and routing; an oversized rich message goes out in rich parts. ``None`` = not eligible or permanently rejected, so the caller
+    sends legacy MarkdownV2; otherwise the adapter's ``SendResult`` (``sent_as_file`` when a message
+    past the split cap went out as one file). A transient failure is returned, not resent as legacy,
+    because the rich request may have landed."""
+    from gateway.platforms.helpers import send_long_reply_as_file
+    from plugins.platforms.telegram.rich_parts import send_rich_parts
+    adapter, metadata = _standalone_adapter(bot, extra), _metadata(thread_id, notify)
+    # Past MAX_SPLIT_MESSAGES the whole message goes out as one file, as the gateway's own send does (#152012).
+    as_file = await send_long_reply_as_file(adapter, str(chat_id), content, metadata=metadata)
+    return as_file or await send_rich_parts(adapter, str(chat_id), content, None, metadata)
 
 
 async def send_album_standalone(bot, extra: dict, chat_id, paths: list[str], *, thread_id=None, notify=None):

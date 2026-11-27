@@ -2,7 +2,7 @@
 
 A loop stops when the agent ends a wakeup reply with ``LOOP_COMPLETE`` on its own line, when
 ``--times N`` ticks have fired, when the ``--until`` judge rules the condition met, or when the
-``loops.max_ticks`` backstop pauses it. State lives in SessionDB ``state_meta`` (same contract as
+``loops.max_ticks`` backstop pauses it. State lives in the session store's ``state_meta`` (same contract as
 ``hermes_cli/goals.py``); CLI, gateway, and TUI all drive it through :class:`LoopManager`.
 """
 
@@ -450,8 +450,8 @@ def loop_control_generation(session_id: str, default: Optional[int] = 0) -> Opti
 
 
 def _get_session_db() -> Optional[Any]:
-    """The goals module's cached SessionDB, so goals/loops/heartbeats share one connection and
-    its off-loop bootstrap (a cold cache on the loop thread never runs ``SessionDB()`` inline).
+    """The goals module's cached store handle, so goals/loops/heartbeats share one handle and
+    its off-loop bootstrap (a cold cache on the loop thread never opens the store inline).
 
     The previous copy here did, which froze the loop for the init duration and dropped the first ``loop:*``
     write (the /goal bug class, #88965).
@@ -459,13 +459,13 @@ def _get_session_db() -> Optional[Any]:
     try:
         from hermes_cli.goals import _get_session_db as _goals_db
     except Exception as exc:  # pragma: no cover
-        logger.debug("LoopManager: SessionDB bootstrap failed (%s)", exc)
+        logger.debug("LoopManager: store bootstrap failed (%s)", exc)
         return None
     return _goals_db()
 
 
 def _db_op(label: str, fn, default=None):
-    """Run one SessionDB call; any error is logged at debug and yields ``default``."""
+    """Run one store call; any error is logged at debug and yields ``default``."""
     try:
         return fn()
     except Exception as exc:
@@ -489,10 +489,9 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
     if db is None:
         return None
     if cursor is not None:
-        row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
-        raw = row[0] if row else None
+        raw = cursor.get(_meta_key(session_id))
     else:
-        raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
+        raw = _db_op("get_meta", lambda: db.state_meta.get(_meta_key(session_id)))
     state = _parse_state(raw, session_id) if raw else None
     _remember_control_generation(session_id, state)
     return state
@@ -542,8 +541,8 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
     key = _meta_key(session_id)
 
     def write(conn):
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        stored = _parse_state(row[0]) if row and row[0] else None
+        raw = conn.get(key)
+        stored = _parse_state(raw) if raw else None
         original = stored.to_json() if stored is not None else None
         live = _parse_state(original) if original is not None else None
         result = apply(live) if apply is not None else None
@@ -553,12 +552,12 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
                 session_id, stored, updated, tick_lifecycle=tick_lifecycle)
             # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
             updated.mutation_id = uuid.uuid4().hex
-            db.set_meta(key, updated.to_json(), cursor=conn)
+            conn.set(key, updated.to_json())
         return updated, result
 
     # Transaction owners must see failures, not acknowledge an unapplied control.
     saved = write(cursor) if cursor is not None else _db_op(
-        "set_meta", lambda: db._execute_write(write))
+        "set_meta", lambda: db.state_meta.write_lifecycle(write))
     if saved is not None:
         _remember_control_generation(session_id, saved[0])
     return saved
@@ -596,9 +595,9 @@ def list_active_loops() -> list[tuple[str, LoopState]]:
     if db is None:
         return []
     out: list[tuple[str, LoopState]] = []
-    for key, raw in _db_op("list_meta_prefix", lambda: db.list_meta_prefix(_META_PREFIX), []):
-        session_id = key[len(_META_PREFIX):]
-        state = _parse_state(raw) if session_id and raw else None
+    for entry in _db_op("list_meta_prefix", lambda: db.state_meta.list_prefix(_META_PREFIX), ()):
+        session_id = entry.key[len(_META_PREFIX):]
+        state = _parse_state(entry.value) if session_id and entry.value else None
         if state is not None and state.status == "active":
             out.append((session_id, state))
     return out
@@ -608,8 +607,8 @@ def store_has_active_loop(db: Any) -> bool:
     """True when *db* holds an ACTIVE ``loop:*`` row — or a row that cannot be parsed (unknown, so the
     caller keeps its full scan). Unlike :func:`list_active_loops` this takes the store explicitly and
     propagates read errors, so an idle gate can tell "empty" from "unavailable"."""
-    for key, raw in db.list_meta_prefix(_META_PREFIX):
-        state = _parse_state(raw, key[len(_META_PREFIX):]) if raw else None
+    for entry in db.state_meta.list_prefix(_META_PREFIX):
+        state = _parse_state(entry.value, entry.key[len(_META_PREFIX):]) if entry.value else None
         if state is None or state.status == "active":
             return True
     return False
@@ -640,8 +639,7 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
             # the child or clear a newer parent. Both writes share this stored-row transaction.
             current = load_loop(old_session_id, cursor=conn)
             if (current is None or current.to_json() != expected
-                    or conn.execute("SELECT value FROM state_meta WHERE key = ?",
-                                    (_meta_key(new_session_id),)).fetchone() is not None):
+                    or conn.get(_meta_key(new_session_id)) is not None):
                 return False
             save_loop(new_session_id, current, cursor=conn)
             retired = LoopState.from_json(expected)
@@ -650,7 +648,7 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
             save_loop(old_session_id, retired, cursor=conn)
             return True
 
-        if not db._execute_write(migrate):
+        if not db.state_meta.write_lifecycle(migrate):
             return False
         logger.debug(
             "LoopManager: migrated loop %s -> %s (%s)",

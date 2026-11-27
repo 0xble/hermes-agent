@@ -319,14 +319,6 @@ def _bound_session_value(name: str) -> Any:
     return _UNSET if var is None else var.get()
 
 
-def get_session_env(name: str, default: str = "") -> str:
-    """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
-    ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""
-    if (value := _bound_session_value(name)) is not _UNSET:
-        return value
-    return os.getenv(name, default)
-
-
 def bound_session_env(name: str, default: str = "") -> str:
     """Like :func:`get_session_env`, but for identity that crosses a trust boundary: once any
     session has been bound in this process the ContextVar is authoritative and an unbound var is
@@ -336,6 +328,14 @@ def bound_session_env(name: str, default: str = "") -> str:
     if (value := var.get()) is not _UNSET:
         return value
     return default if _session_context_engaged else os.getenv(name, default)
+
+
+def get_session_env(name: str, default: str = "") -> str:
+    """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
+    ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""
+    if (value := _bound_session_value(name)) is not _UNSET:
+        return value
+    return os.getenv(name, default)
 
 
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/

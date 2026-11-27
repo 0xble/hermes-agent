@@ -64,6 +64,7 @@ from hermes_cli.goals_authoring_refs import (
 )
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
+from persistence.conversation.messages import TranscriptAudit
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
 
 logger = logging.getLogger(__name__)
@@ -445,7 +446,7 @@ _EVIDENCE_EXCLUDED_TOOLS = frozenset({
     "memory", "session_search", "todo", "todo_list", "clarify", "goal_set",
 })
 _EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
-# Passed to the SessionDB finders so exclusions apply before their row limits.
+# Filter during the audit read so bookkeeping does not crowd out eligible rows.
 _EVIDENCE_EXCLUSION_KW = {"exclude_tools": tuple(sorted(_EVIDENCE_EXCLUDED_TOOLS)),
                           "exclude_prefixes": _EVIDENCE_EXCLUDED_TOOL_PREFIXES}
 
@@ -1194,7 +1195,7 @@ class GoalState:
             self.last_continuation_notice_key = None
 
 
-# ── Persistence (SessionDB state_meta) ────────────────────────────────
+# ── Persistence (state_meta) ──────────────────────────────────────────
 
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
@@ -1205,7 +1206,7 @@ _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: dict[str, threading.Event] = {}
 
 # How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap before degrading to None.
-# Normal SessionDB init is ~10-100ms so a mid-bootstrap call usually picks the cached instance up;
+# A normal store open is ~10-100ms so a mid-bootstrap call usually picks the cached handle up;
 # a contended init (locked state.db mid-migration) exceeds it and degrades. Far under the
 # watchdog's probe window.
 _DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
@@ -1218,11 +1219,11 @@ _DB_BOOTSTRAP_INIT_WAIT_S = 1.5
 
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
-    """Construct SessionDB off-loop and populate the cache (worker thread)."""
+    """Open the store handle off-loop and populate the cache (worker thread)."""
     try:
         db = _acquire_session_db(home)
     except Exception as exc:  # pragma: no cover
-        logger.debug("GoalManager: background SessionDB() raised (%s)", exc)
+        logger.debug("GoalManager: background store open raised (%s)", exc)
         db = None
     with _DB_BOOTSTRAP_LOCK:
         if db is not None and home not in _DB_CACHE:
@@ -1235,9 +1236,9 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
 
 
 def _get_session_db() -> Optional[Any]:
-    """Cached SessionDB per HERMES_HOME (profile switches pick the right DB); None on any failure.
+    """Cached store handle per HERMES_HOME (profile switches pick the right store); None on any failure.
 
-    Never constructs SessionDB on an event-loop thread: a cache miss there kicks a one-shot background
+    Never opens the store on an event-loop thread: a cache miss there kicks a one-shot background
     bootstrap and waits a bounded grace window (the kick call waits ``_DB_BOOTSTRAP_INIT_WAIT_S`` so a
     healthy cold init completes and the first write isn't dropped).
     """
@@ -1246,18 +1247,12 @@ def _get_session_db() -> Optional[Any]:
 
         home = str(get_hermes_home())
     except Exception as exc:  # pragma: no cover
-        logger.debug("GoalManager: SessionDB bootstrap failed (%s)", exc)
+        logger.debug("GoalManager: store bootstrap failed (%s)", exc)
         return None
 
+    # ``hermes profile delete`` force-closes every store under the profile home before rmtree; a
+    # cached handle opens the store again on its next touch, so a same-name recreate writes a live store.
     cached = _DB_CACHE.get(home)
-    if cached is not None and _registry_tore_down(cached):
-        # ``hermes profile delete`` force-closes every handle under the profile home
-        # (``hermes_state_registry.close_all_under``) before rmtree; a same-name recreate in this
-        # process must acquire a fresh handle, not keep writing into the torn-down one.
-        with _DB_BOOTSTRAP_LOCK:
-            if _DB_CACHE.get(home) is cached:
-                del _DB_CACHE[home]
-        cached = None
     if cached is not None:
         return cached
 
@@ -1286,7 +1281,7 @@ def _get_session_db() -> Optional[Any]:
     try:
         db = _acquire_session_db(home)
     except Exception as exc:  # pragma: no cover
-        logger.debug("GoalManager: SessionDB() raised (%s)", exc)
+        logger.debug("GoalManager: store open raised (%s)", exc)
         return None
     with _DB_BOOTSTRAP_LOCK:
         existing = _DB_CACHE.get(home)
@@ -1299,26 +1294,18 @@ def _get_session_db() -> Optional[Any]:
 
 
 def _acquire_session_db(home: str):
-    """The registry's shared handle for ``home/state.db``. A bare ``SessionDB()`` here was a SECOND
-    writer per profile beside the gateway's registry handle — its own token-writer thread and
-    close-time checkpoint (the #90837 corruption shape), doubled under multiplexing."""
-    from hermes_state_registry import acquire
-    return acquire(Path(home) / "state.db")
+    """A handle on ``home``'s process-shared store, the one writer per profile every handle shares (a
+    second writer beside the gateway's carries its own close-time checkpoint, the #90837 corruption
+    shape). The store opens here, on the calling thread, so an unopenable store raises here."""
+    from persistence_assembly import open_persistence, profile_scope
+    return open_persistence(profile_scope(home=Path(home)), eager=True)
 
 
 def _release_session_db(db) -> None:
-    from hermes_state_registry import release_or_close
     try:
-        release_or_close(db)
+        db.close()
     except Exception:
         pass
-
-
-def _registry_tore_down(db) -> bool:
-    """True once the registry force-closed *db* (``close_all`` / ``close_all_under`` clear the
-    shared-owned flag at teardown); every handle cached here was acquired through the registry, so a
-    cleared flag means the connection is gone and the cache entry is stale."""
-    return getattr(db, "_shared_registry_owned", True) is False
 
 
 def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
@@ -1350,10 +1337,9 @@ def load_goal(session_id: str, *, cursor=None, db=None) -> Optional[GoalState]:
         return None
     try:
         if cursor is not None:
-            row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
-            raw = row[0] if row else None
+            raw = cursor.get(_meta_key(session_id))
         else:
-            raw = db.get_meta(_meta_key(session_id))
+            raw = db.state_meta.get(_meta_key(session_id))
     except Exception as exc:
         if cursor is not None:
             raise
@@ -1372,24 +1358,23 @@ def load_goal(session_id: str, *, cursor=None, db=None) -> Optional[GoalState]:
     # atomically.
     if cursor is not None:
         state.mutation_id = uuid.uuid4().hex
-        cursor.execute("UPDATE state_meta SET value = ? WHERE key = ?",
-                       (state.to_json(), _meta_key(session_id)))
+        cursor.set(_meta_key(session_id), state.to_json())
         return state
 
     def _txn(conn) -> Optional[GoalState]:
         # Never overwrite a command or verdict that raced the initial read.
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
-        if row is None or not row[0]:
+        raw = conn.get(_meta_key(session_id))
+        if not raw:
             return None
-        live = GoalState.from_json(row[0])
+        live = GoalState.from_json(raw)
         migrated = _migrate_legacy_revision_requirements(live)
         if migrate_autonomous_goal(live) or migrated:
             live.mutation_id = uuid.uuid4().hex
-            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (live.to_json(), _meta_key(session_id)))
+            conn.set(_meta_key(session_id), live.to_json())
         return live
 
     try:
-        return db._execute_write(_txn)
+        return db.state_meta.write_lifecycle(_txn)
     except Exception as exc:
         # The row existed and the migration was computed successfully. Returning None here makes
         # GoalManager believe there is no goal, so a following /goal <text> can overwrite the
@@ -1414,9 +1399,9 @@ def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
     try:
         state.mutation_id = uuid.uuid4().hex
         if cursor is None:
-            db.set_meta(_meta_key(session_id), state.to_json())
+            db.state_meta.set(_meta_key(session_id), state.to_json())
         else:
-            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
+            cursor.set(_meta_key(session_id), state.to_json())
     except Exception as exc:
         if cursor is not None:
             raise
@@ -1434,20 +1419,20 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> tuple[boo
     key = _meta_key(session_id)
 
     def _txn(conn) -> tuple[bool, Optional[GoalState]]:
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if row is None or not row[0]:
+        raw = conn.get(key)
+        if not raw:
             return False, None
-        state = GoalState.from_json(row[0])
+        state = GoalState.from_json(raw)
         has_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False) or state.waiting_until
         if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
             return False, state
         state.clear_wait(preserve_notice_key=True)
         state.mutation_id = uuid.uuid4().hex
-        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        conn.set(key, state.to_json())
         return True, state
 
     try:
-        return db._execute_write(_txn)
+        return db.state_meta.write_lifecycle(_txn)
     except Exception as exc:
         logger.warning("GoalManager: conditional wait clear failed for %s: %s", session_id, exc)
         return False, None
@@ -1658,7 +1643,7 @@ def list_parked_goals() -> list[tuple[str, GoalState]]:
         return []
     out: list[tuple[str, GoalState]] = []
     try:
-        rows = db.list_meta_prefix("goal:")
+        rows = [(entry.key, entry.value) for entry in db.state_meta.list_prefix("goal:")]
     except Exception as exc:
         logger.debug("GoalManager: list_meta_prefix failed: %s", exc)
         return []
@@ -1678,7 +1663,7 @@ def list_parked_goals() -> list[tuple[str, GoalState]]:
 def store_has_parked_goal(db: Any) -> bool:
     """True when *db* holds an active goal with a wait barrier. Propagates read errors so an idle
     gate can tell "empty" from "unavailable" (callers fail open)."""
-    for _key, raw in db.list_meta_prefix("goal:"):
+    for _key, raw in [(entry.key, entry.value) for entry in db.state_meta.list_prefix("goal:")]:
         if raw and ('"active"' in raw or goal_autonomy_enabled()):
             try:
                 state = GoalState.from_json(raw)
@@ -1900,7 +1885,13 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     if db is None:
         return []
     try:
-        rows = db.get_messages(session_id, limit=_EVIDENCE_SCAN_ROWS + 1, latest=True)
+        from persistence.conversation.messages import TranscriptRead
+
+        rows = [
+            row.as_wire_row() for row in db.messages.read_transcript(
+                session_id, TranscriptRead(limit=_EVIDENCE_SCAN_ROWS + 1, latest=True),
+            )
+        ]
     except Exception as exc:
         logger.debug("goal evidence: message read failed: %s", exc)
         return []
@@ -2056,24 +2047,65 @@ def last_visible_report(session_id: Optional[str], since: float = 0.0) -> str:
     Hidden rows, compression summaries and tool-call commentary are not visible reports.
     """
     db = _get_session_db()
-    reader = getattr(db, "messages_by_role", None) if db is not None else None
-    if not session_id or since <= 0 or db is None or reader is None:
+    if not session_id or since <= 0 or db is None:
         return ""
     try:
-        for row in reader(session_id, "assistant", since=since, limit=500):
-            content = row.get("content")
-            if not isinstance(content, str) or not content.strip() or row.get("compressed_summary") or row.get("display_kind") == "hidden":
+        for row in db.messages.audit_transcript(session_id, TranscriptAudit("assistant", since=since, limit=500)):
+            content = row.content
+            if (not isinstance(content, str) or not content.strip() or row.compressed_summary
+                    or row.display_kind == "hidden" or row.tool_calls):
                 continue
-            if is_intentional_silence_response(content):
-                continue
-            # The role audit includes assistant tool-call rows. Only final prose
-            # is a visible report; consult the original row, not a display summary.
-            original = db.get_messages_around(session_id, row["id"], window=0).get("window") or []
-            if original and not original[0].get("tool_calls"):
+            if not is_intentional_silence_response(content):
                 return content
     except Exception as exc:
         logger.debug("goal last visible report: message read failed: %s", exc)
     return ""
+
+
+def _decoded_argument_values(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _decoded_argument_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _decoded_argument_values(item)
+
+
+def _cited_tool_calls(messages, session_id: str, needle: str, since: float) -> list[dict[str, Any]]:
+    """Audit the matching serialized calls, then bind their decoded arguments to result rows."""
+    probe = max(re.split(r'["\\\x00-\x1f\x7f-\U0010ffff]', needle), key=len)
+    if len(probe) < 4:
+        return []
+    rows = messages.audit_transcript(
+        session_id, TranscriptAudit("assistant", since=since, tool_calls_contain=probe, limit=200),
+    )
+    arguments_by_id: dict[str, str] = {}
+    for row in rows:
+        if len(arguments_by_id) >= 4:
+            break
+        for call in row.tool_calls or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict) or not call.get("id"):
+                continue
+            if _evidence_tool_excluded(str(function.get("name") or "")):
+                continue
+            arguments = str(function.get("arguments") or "")
+            try:
+                decoded = "\n".join(_decoded_argument_values(json.loads(arguments)))
+            except (ValueError, RecursionError):
+                decoded = ""
+            if needle in arguments or needle in decoded:
+                arguments_by_id[str(call["id"])] = arguments
+    if not arguments_by_id:
+        return []
+    results = messages.audit_transcript(
+        session_id, TranscriptAudit("tool", tool_call_ids=tuple(arguments_by_id), limit=4, **_EVIDENCE_EXCLUSION_KW),
+    )
+    return [dict(row.as_wire_row(), arguments=arguments_by_id[row.tool_call_id]) for row in results]
 
 
 def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> dict[str, Any]:
@@ -2087,10 +2119,14 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
     if not session_id or not needles:
         return empty
     db = _get_session_db()
-    finder = getattr(db, "find_messages_containing", None) if db is not None else None
-    call_finder = getattr(db, "find_tool_results_for_call", None) if db is not None else None
-    if finder is None:
+    if db is None:
         return empty
+
+    def find(variant: str, role: str) -> list[dict[str, Any]]:
+        exclusions = _EVIDENCE_EXCLUSION_KW if role == "tool" else {}
+        request = TranscriptAudit(role, since=since, text_contains=variant, limit=4, **exclusions)
+        return [row.as_wire_row() for row in db.messages.audit_transcript(session_id, request)]
+
     try:
         from agent.redact import redact_sensitive_text
     except Exception:  # pragma: no cover - redaction module is part of the runtime
@@ -2109,14 +2145,12 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
             continue
         try:
             # A cited command resolves to what running it returned; anything else to where it appears.
-            if call_finder is not None and len(needle) >= 8 and not needle.endswith(("…", "...")):
-                matches += [(r, needle, True) for r in call_finder(session_id, needle, since=since, limit=4,
-                                                                   **_EVIDENCE_EXCLUSION_KW)]
+            if len(needle) >= 8 and not needle.endswith(("…", "...")):
+                matches += [(r, needle, True) for r in _cited_tool_calls(db.messages, session_id, needle, since)]
             for variant in variants:
                 if len(matches) >= _CITATION_ROWS_PER_NEEDLE * 2:
                     break
-                matches += [(r, variant, False) for r in finder(session_id, variant, role="tool", since=since,
-                                                                limit=4, **_EVIDENCE_EXCLUSION_KW)]
+                matches += [(r, variant, False) for r in find(variant, "tool")]
         except Exception as exc:
             logger.debug("goal evidence: citation lookup failed: %s", exc)
             return empty
@@ -2129,8 +2163,7 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
                     if variant != needle and needle.startswith(("https://", "http://")) and \
                             re.search(r"/commit/[0-9a-fA-F]{7,40}$", needle):
                         continue
-                    notices = [r for r in finder(session_id, variant, role="user", since=since, limit=4)
-                               if _runtime_notice_label(r)]
+                    notices = [row for row in find(variant, "user") if _runtime_notice_label(row)]
                     if notices:
                         matches = [(dict(r, tool_name=_runtime_notice_label(r)), variant, False)
                                    for r in notices]
@@ -2348,16 +2381,18 @@ def last_user_message_content(history: Any) -> Any:
 
 
 def last_user_message_from_db(session_id: Optional[str]) -> Any:
-    """Newest user message of ``session_id`` from the SessionDB (gateway/TUI surfaces have no live
+    """Newest user message of ``session_id`` from the session store (gateway/TUI surfaces have no live
     history object at slash-command time); ``""`` on any error."""
     if not session_id:
         return ""
     try:
+        from persistence.conversation.messages import TranscriptRead
+
         db = _get_session_db()
         if db is None:
             return ""
-        rows = db.get_messages(str(session_id), limit=20, latest=True)
-        return last_user_message_content(rows)
+        rows = db.messages.read_transcript(str(session_id), TranscriptRead(limit=20, latest=True))
+        return last_user_message_content([row.as_wire_row() for row in rows])
     except Exception:
         return ""
 
@@ -2497,7 +2532,8 @@ def _authenticated_relay_sender(db: Any, relay: dict[str, Any], goal_session_id:
     if row_id is None or str(row_id) != str(relay.get("id")):
         return None
     try:
-        info = db.get_session(sender[1]) or {}
+        session = db.sessions.get(sender[1])
+        info = session.as_session_row() if session is not None else None
     except Exception:
         return None
     if not info or str(info.get("source") or "") in _NON_HUMAN_SESSION_SOURCES:
@@ -2567,8 +2603,7 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
     """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). Page raw rows
     until the typed bound is satisfied, so runtime rows cannot evict an approval from the window."""
     db = _get_session_db()
-    reader = getattr(db, "messages_by_role", None) if db is not None else None
-    if not session_id or reader is None:
+    if not session_id or db is None:
         return []
     try:
         wanted = max(int(limit), 1)
@@ -2580,7 +2615,7 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
                                     "current_only": True}
             if until > 0:
                 kwargs["until"] = until
-            page = reader(session_id, "user", **kwargs)
+            page = db.state_meta.read_lifecycle(lambda read: read.user_messages(session_id, **kwargs))
             typed.extend(row for row in page if _is_user_typed(row))
             if len(page) < page_size:
                 break
@@ -2603,8 +2638,10 @@ def _relay_rows(db: Any, session_id: str, since: float, *, limit: Optional[int] 
     relays: list[dict[str, Any]] = []
     while wanted is None or len(relays) < wanted:
         try:
-            page = db.messages_by_role(session_id, "user", since=since, limit=page_size,
-                                       before_id=before_id, current_only=True)
+            page = db.state_meta.read_lifecycle(
+                lambda read: read.user_messages(session_id, since=since, limit=page_size,
+                                                before_id=before_id, current_only=True),
+            )
         except Exception as exc:
             logger.debug("goal judge: relay row read failed: %s", exc)
             break
@@ -2649,7 +2686,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
             continue
         title = None
         try:
-            title = db.get_session_title(sender_session)
+            title = db.sessions.get_title(sender_session)
         except Exception:
             pass
         label = title or sender_session
@@ -2845,7 +2882,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
                 self._save()
             return result
         db = _get_session_db() if self.session_id else None
-        if db is None or not hasattr(db, "_execute_write"):
+        if db is None and self._cursor is None:
             result = mutate(self._state)
             if self._state is not None:
                 save_goal(self.session_id, self._state)   # warns on a dropped write
@@ -2855,16 +2892,16 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
         def _txn(conn):
             seen.clear()
-            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            raw = conn.get(key)
             try:
-                live = _parse_goal_row(self.session_id, row[0]) if row and row[0] else None
+                live = _parse_goal_row(self.session_id, raw) if raw else None
             except GoalRowCorrupt:
                 if not discard_corrupt:
                     raise
                 # A cleared tombstone keeps the instance fence monotonic for the next /goal set.
                 tombstone = GoalState(goal="", status="cleared", created_at=time.time(),
                                       mutation_id=uuid.uuid4().hex)
-                conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (tombstone.to_json(), key))
+                conn.set(key, tombstone.to_json())
                 return None, None
             # Compare normalized JSON so a no-op command never mints a token (which would
             # needlessly interrupt an in-flight evaluation).
@@ -2880,7 +2917,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
                 raise _GoalMutationRefused(exc) from exc   # rolls the transaction back
             if live is not None and live.to_json() != original:
                 live.mutation_id = uuid.uuid4().hex
-                conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (live.to_json(), key))
+                conn.set(key, live.to_json())
             return live, result
 
         if self._cursor is not None:
@@ -2899,7 +2936,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             return result
 
         try:
-            live, result = db._execute_write(_txn)
+            live, result = db.state_meta.write_lifecycle(_txn)
         except _GoalMutationRefused as refused:
             if seen:
                 self._adopt(seen[0])

@@ -1,5 +1,4 @@
-"""Hosted Group Chat rooms (``groups.*``), cross-connection bot relay (``bot_relay.*``),
-and the authenticated dashboard browser controller (``browser.controller.*``).
+"""Hosted Group Chat rooms (``groups.*``) and cross-connection bot relay (``bot_relay.*``).
 
 Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py``. Room / event / page shapes are produced by
 ``gateway/hosted_rooms.py`` (``_room_from_row`` / ``_event_from_row`` / ``read_events``) and
@@ -10,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OkResult, OpenModel, ProfileParams
@@ -277,9 +276,12 @@ class RoomContext(Result):
 
 
 class GroupsStateResult(Result):
+    """``change_events``: this backend broadcasts ``groups.changed`` when the room moves, so a client's poll is
+    only a backstop (absent on older backends: keep polling at the old rate)."""
     room: Room
     driver_status: RoomDriverStatus | None = None
     context: RoomContext | None = None
+    change_events: bool | None = None
 
 
 method("groups.state", params=GroupsStateParams, result=GroupsStateResult,
@@ -641,6 +643,7 @@ method("bot_relay.outbox.drain", params=BotRelayOutboxDrainParams, result=BotRel
 class BotRelayDeliverParams(Params):
     """``profile`` here is the TARGET profile on this gateway (also what the desktop route wrapper adds)."""
 
+    id: str
     profile: str
     message: str
     from_profile: str | None = None
@@ -649,11 +652,34 @@ class BotRelayDeliverParams(Params):
 
 
 class BotRelayDeliverResult(Result):
-    reply: str
+    """A delivery's receipt from the target profile's authority (``gateway/session_bot.py``), the same
+    on the canonical door and across this relay bridge. It names its admission, unless ``refused``: a
+    terminal ``failed`` receipt for a delivery that was never admitted (refused by the FIFO, or settled
+    as not sent), which the relay settles as the sender's answer."""
+
+    status: str
+    delivery_id: str
+    profile_home: str
+    session_id: str
+    admission_id: str | None = None
+    refused: Literal[True] | None = None
+    message: str
+    reply: str | None = None
+    retry_admission_id: str | None = None
+    error: str | None = None
+    reason: str | None = None
+    # The target Bot Chat's live state at answer time (``gateway/session_bot_state.py``); never stored.
+    target_state: Literal['idle', 'working', 'waiting_approval', 'waiting_clarify', 'paused'] | None = None
+
+    @model_validator(mode='after')
+    def _admitted_or_refused(self):
+        if (self.admission_id is None) != (self.refused is True) or (self.refused and self.status != 'failed'):
+            raise ValueError('a deliver result names its admission, or is a refused failed receipt without one')
+        return self
 
 
 method("bot_relay.deliver", params=BotRelayDeliverParams, result=BotRelayDeliverResult,
-       doc="Deliver a relayed DM into a Bot Chat on this gateway and return the one-turn reply (blocking).")
+       doc="Forward an identified DM to the target profile's authority and return its delivery receipt.")
 
 
 class BotRelayReplyParams(ProfileParams):
@@ -667,69 +693,44 @@ method("bot_relay.reply", params=BotRelayReplyParams, result=OkResult,
        doc="Write a relayed reply and/or typed error for an envelope so the sender-side waiter resolves.")
 
 
-# ── browser controller ────────────────────────────────────────────────────────────────────────
+# ── teammate deliveries a bot is waiting on ───────────────────────────────────────────────────
 
 
-class BrowserControllerParams(Params):
-    """Every controller call names the session the controller is attached to."""
-
-    session_id: str
+class BotDeliveryListParams(ProfileParams):
+    """``profile`` is the SENDER bot; it routes the call to that profile's connection."""
 
 
-class BrowserControllerRegisterParams(BrowserControllerParams):
-    controller_id: str
-    browser_profile_id: str
-    capabilities: list[str] | None = None
-    protocol_version: JsonValue | None = None  # checked exactly by the handler (an int today)
-    # Ignored: the principal is derived from the server-minted identity, never client-supplied.
-    principal_id: str | None = None
+class BotDeliveryState(WireEnum):
+    queued = "queued"
+    claimed = "claimed"
+    working = "working"
+    waiting_on_you = "waiting_on_you"
+    failed = "failed"
 
 
-class ControllerScope(Result):
-    principal_id: str
-    profile_id: str
-    session_id: str
-    controller_id: str
-    browser_profile_id: str
-    transport_family: str
-    capabilities: list[str]
+class BotDeliveryRow(Result):
+    """``tools/bot_delivery_status.py::list_sender_deliveries``. ``since`` is the receipt's last
+    write (epoch seconds); ``waiting_on`` is set for ``waiting_on_you``, ``reason`` (+ ``error``)
+    for ``failed`` — ``unknown_outcome`` means the target may have acted: never resend it."""
+
+    delivery_id: str
+    target: str
+    target_handle: str
+    state: BotDeliveryState
+    since: float
+    preview: str
+    waiting_on: str | None = None
+    reason: str | None = None
+    error: str | None = None
 
 
-class BrowserControllerRegisterResult(Result):
-    scope: ControllerScope
+class BotDeliveryListResult(Result):
+    sender: str
+    deliveries: list[BotDeliveryRow]
 
 
-method("browser.controller.register", params=BrowserControllerRegisterParams,
-       result=BrowserControllerRegisterResult,
-       doc="Attach this connection as the browser controller for one session; fails closed (4403).")
-
-
-class BrowserControllerResultParams(BrowserControllerParams):
-    command_id: str
-    ok: JsonValue | None = None  # only the exact ``true`` counts as success
-    result: JsonValue | None = None
-    error: JsonValue | None = None
-
-
-class BrowserControllerResultResult(Result):
-    accepted: bool
-
-
-method("browser.controller.result", params=BrowserControllerResultParams,
-       result=BrowserControllerResultResult,
-       doc="Deliver one command result to the broker; accepted is false for unknown or settled command ids.")
-
-
-method("browser.controller.heartbeat", params=BrowserControllerParams, result=OkResult,
-       doc="Acknowledge a heartbeat only for this transport's own attached controller.")
-
-
-class BrowserControllerDetachResult(Result):
-    detached: bool = True
-
-
-method("browser.controller.detach", params=BrowserControllerParams, result=BrowserControllerDetachResult,
-       doc="Hard-detach only the controller owned by this authenticated transport.")
+method("bot_delivery.list", params=BotDeliveryListParams, result=BotDeliveryListResult,
+       doc="Read-only: this bot's unsettled message_agent deliveries to local teammates, newest first.")
 
 
 __all__ = [

@@ -129,7 +129,7 @@ def _replace_from_durable_row(manager: Any, **kwargs: Any) -> dict[str, Any]:
         return not_saved
     for _ in range(_USER_REPLACE_ATTEMPTS):
         try:
-            raw = db.get_meta(_meta_key(manager.session_id))
+            raw = db.state_meta.get(_meta_key(manager.session_id))
         except Exception:
             logger.warning("Goal replace could not read %s", manager.session_id, exc_info=True)
             return not_saved

@@ -98,7 +98,7 @@ async def test_capture_io_off_loop_live_snapshot_and_publication_on_loop(local_o
     owner, ref = local_owner
     event = _event(owner, ref)
     loop_thread, checks = threading.get_ident(), []
-    for module, name in [(automation, '_owner'), (recovery, '_read_local_session'),
+    for module, name in [(automation, '_owner'), (recovery, 'prepare_local_session'),
                          (recovery, '_restore_local_entry')]:
         original = getattr(module, name)
         def checked(*args, _original=original, _name=name, **kwargs):
@@ -125,7 +125,7 @@ async def test_capture_io_off_loop_live_snapshot_and_publication_on_loop(local_o
     assert first.admission_id == replay.admission_id
     rows = await asyncio.to_thread(list_session_admissions, owner.db, session_id=ref.session_id)
     assert len(rows) == 1 and rows[0]['payload']['text'] == 'real completion output'
-    assert set(checks) == {'_owner', '_read_local_session', '_restore_local_entry',
+    assert set(checks) == {'_owner', 'prepare_local_session', '_restore_local_entry',
                            'snapshot_automation', '_publish_local_session', 'pending'}
 
 

@@ -5,8 +5,6 @@ the one-off commands.  run.py helpers are imported lazily."""
 
 from __future__ import annotations
 
-from agent.notice_style import ContextNotice
-
 import asyncio
 import contextlib
 import dataclasses
@@ -17,7 +15,7 @@ import re
 import shlex
 import sys
 import time
-from datetime import datetime, timezone, UTC
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -25,10 +23,8 @@ from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
-from gateway.platforms.typing_state import resume_typing_after_prompt
-from gateway.session import AsyncSessionStore, SessionSource
+from gateway.session import AsyncSessionStore
 from gateway.session_transcript import TranscriptReadError
-from gateway.slash_commands_attend import GatewayAttendCommandsMixin
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin
 from gateway.slash_commands_session import GatewaySessionCommandsMixin
@@ -36,6 +32,7 @@ from gateway.slash_commands_login import GatewayLoginCommandsMixin
 from gateway.slash_commands_status import GatewayStatusCommandsMixin, history_unreadable
 from hermes_cli.config import atomic_config_write, cfg_get
 from utils import atomic_json_write, is_truthy_value
+from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger("gateway.run")
 
@@ -77,11 +74,10 @@ output_path, exit_code_path, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
 env = dict(os.environ, PYTHONUNBUFFERED="1")
 with open(output_path, "wb") as f:
     rc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env).wait(timeout=3600)
-# Publish atomically: readers poll for existence, so the marker must never be visible empty.
-temporary = exit_code_path + ".tmp"
-with open(temporary, "w", encoding="utf-8") as f:
+# Temp + replace: the gateway watcher polls the exit code and reads an empty file as failure.
+with open(exit_code_path + ".tmp", "w", encoding="utf-8") as f:
     f.write(str(rc))
-os.replace(temporary, exit_code_path)
+os.replace(exit_code_path + ".tmp", exit_code_path)
 """.strip()
 
 
@@ -130,71 +126,38 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     return data
 
 
-def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
-    """Place an updater outside the gateway service cgroup when systemd supervises us."""
-    try:
-        if sys.platform == "win32":
-            return argv, None
-        supervised = bool(os.environ.get("INVOCATION_ID"))
-        if not supervised:
-            try:
-                from tools.process_registry import _is_supervised_gateway_process
-                supervised = bool(_is_supervised_gateway_process())
-            except Exception:
-                supervised = False
-        if not supervised:
-            return argv, None
-        from tools.process_registry import _systemd_run_user_scope_available, systemd_user_bus_env
-        if not _systemd_run_user_scope_available():
-            return argv, None
-        import shutil
-        binary = shutil.which("systemd-run")
-        if not binary:
-            return argv, None
-        return [binary, "--user", "--scope", "--quiet", "--collect",
-                "--unit", "hermes-gateway-update.scope", "--", *argv], systemd_user_bus_env()
-    except Exception:
-        return argv, None
-
-
 def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
-    ``--gateway`` enables file-based IPC and the process-exit marker lets the watcher distinguish
-    updater completion from a stale legacy exit file."""
+    setsid is portable (works where ``systemd-run --user`` lacks a D-Bus session); ``--gateway``
+    enables file-based IPC so interactive prompts are forwarded; PYTHONUNBUFFERED lets the gateway
+    stream output live.  Windows has no setsid: an inline helper runs the updater as a module under
+    this interpreter (not venv\\Scripts\\hermes.exe — that shim holds its own file open, and the
+    update must replace it), redirects both outputs to one file and writes the exit code."""
     import shutil
     import subprocess
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
-            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
-             *hermes_cmd, "update", "--gateway"],
+            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
+             sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
             # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
-    process_exit = exit_code_path.parent / ".update_process_exit_code"
-    process_exit_tmp = shlex.quote(str(process_exit) + ".tmp")
     update_cmd = (
         f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
-        # Write then rename: a `>` redirect creates the marker empty before printf fills it, and
-        # readers poll for existence, so publish the marker only once it is complete.
-        f"rc=$?; printf '%s' \"$rc\" > {process_exit_tmp}; mv -f {process_exit_tmp} {shlex.quote(str(process_exit))}; "
-        f"rm -f {shlex.quote(str(exit_code_path))}")
+        # Temp + mv: the gateway watcher polls the exit code and reads an empty file as failure.
+        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path) + '.tmp')}"
+        f" && mv -f {shlex.quote(str(exit_code_path) + '.tmp')} {shlex.quote(str(exit_code_path))}")
     # Preferred: setsid creates a new session, fully detached; fallback start_new_session=True
     # calls os.setsid() in the child.
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
-    scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
     # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
-    if scoped_env is not None:
-        subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, env=scoped_env)  # detached-spawn: ok — updater outlives the gateway it restarts
-    else:
-        subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)  # detached-spawn: ok — updater outlives the gateway it restarts
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _home_thread_from_source(source) -> Optional[str]:
@@ -210,13 +173,9 @@ def _home_thread_from_source(source) -> Optional[str]:
     return None if synthetic else str(thread_id)
 
 
-from gateway.slash_commands_incognito import GatewayIncognitoCommandsMixin
-
-
 class GatewaySlashCommandsMixin(
-    GatewayLoginCommandsMixin, GatewayAttendCommandsMixin,
+    GatewayLoginCommandsMixin,
     GatewayModelCommandsMixin,
-    GatewayIncognitoCommandsMixin,
     GatewaySessionCommandsMixin,
     GatewayStatusCommandsMixin,
     GatewayGoalCommandsMixin):
@@ -256,7 +215,7 @@ class GatewaySlashCommandsMixin(
 
     @staticmethod
     def _session_db_unavailable_reply() -> str:
-        from hermes_state import format_session_db_unavailable
+        from storage_user_copy import format_session_db_unavailable
         return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
     def _reply_metadata(self, event: MessageEvent):
@@ -279,7 +238,7 @@ class GatewaySlashCommandsMixin(
         from gateway.run import _checkpoint_agent_kwargs, _load_gateway_config
         from gateway.session_authorities import active_authority
         from gateway.session_policy import policy_for_source
-        from tools.checkpoint_manager import CheckpointManager
+        from agent.checkpoints.manager import CheckpointManager
         policy = policy_for_source(self, source) if source is not None else None
         cp = _checkpoint_agent_kwargs(policy.config(active_authority(self), secrets=False) if policy
                                       else _load_gateway_config())
@@ -318,8 +277,7 @@ class GatewaySlashCommandsMixin(
         source = event.source
         adapter = self._delivery_adapter_for(source)  # the receiving bot, not the default profile's
         if adapter:
-            resume_typing_after_prompt(adapter, self._session_key_for_source(source), source.chat_id,
-                                       self._event_thread_metadata(event, source))
+            adapter.resume_typing_for_chat(source.chat_id)  # agent is about to continue
         if getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False) is not True:
             return confirmation_text
         if adapter:
@@ -388,7 +346,7 @@ class GatewaySlashCommandsMixin(
             return head + t("gateway.whoami.tier_admin")
         # Non-admin: floor first (mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS), then operator
         # additions, deduped in order.
-        runnable = list(dict.fromkeys(["help", "whoami"] + sorted(policy.user_allowed_commands)))
+        runnable = list(dict.fromkeys(["help", "whoami"] + sorted(policy.user_runnable_commands)))
         runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else t("gateway.shared.none_marker")
         return head + t("gateway.whoami.tier_user", commands=runnable_str)
 
@@ -475,35 +433,16 @@ class GatewaySlashCommandsMixin(
         never checking _interrupt_requested) is caught by the early intercept in _handle_message();
         this handler runs via normal dispatch or as a fallback, and force-cleans the session lock in
         all cases.  The session is preserved so the user can continue."""
+        event.accept_interrupt()  # past admission and slash access: the adapter may cancel the turn
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         await self._hm_stop_owner_turn(session_key)  # also between turns, before the next claim (N53)
 
-        async def _source_for_key(key: str) -> SessionSource:
-            """Recover the delivery source that owns a sibling run.
-
-            Chat-scoped stops can interrupt a run whose key carries another participant or
-            thread.  Reusing the caller's source would send that run's goal-pause notice to the
-            wrong thread.  Active turns cache their source, while the routing entry is the durable
-            fallback for runs that predate the cache.
-            """
-            if key == session_key:
-                return source
-            cached = self._get_cached_session_source(key)
-            if cached is not None:
-                return cached
-            try:
-                entry = await self.async_session_store.lookup_by_session_key(key)
-            except Exception:
-                entry = None
-            return getattr(entry, "origin", None) or source
-
         async def _stop(key: str, invalidation_reason: str) -> None:
-            stop_source = await _source_for_key(key)
             await self._interrupt_and_clear_session(
-                key, stop_source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
         # A turn the app started while the chat was elsewhere still runs on its own key (/resume).
         from gateway.session_detached import chat_running_key
@@ -542,14 +481,11 @@ class GatewaySlashCommandsMixin(
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
-        # Between turns, /stop still means stop: hold the completions it produces and pause the goal
-        # so a queued continuation or a judge-resumed goal cannot start the next turn.
-        self._latch_user_stop(session_key)
         from tools.async_delegation import interrupt_for_session
-        interrupted = interrupt_for_session(session_key=session_key, reason="stop_command",
-                                            parent_session_id=str(getattr(session_entry, "session_id", "") or ""))
-        goal_paused = await self._pause_goal_for_stop(session_key, source)
-        if interrupted or goal_paused:
+        if await asyncio.to_thread(
+            interrupt_for_session, session_key=session_key, reason="stop_command",
+            parent_session_id=str(getattr(session_entry, "session_id", "") or ""),
+        ):
             return EphemeralReply(t("gateway.stop.stopped"))
         # A platform status indicator can still be stuck —
         # e.g. Slack's persistent assistant.threads.setStatus survives a gateway restart or a turn
@@ -641,9 +577,15 @@ class GatewaySlashCommandsMixin(
             return data
 
         def _dedup_payload() -> dict:
-            # Platform + update_id of the triggering /restart, for redelivery detection.
+            from gateway.session_identity import transport_profile_of
+
+            # Scope the update counter to the bot that received /restart, even if its
+            # session executes in a different (or shared) runtime profile.
             data = {"platform": event.source.platform.value if event.source.platform else None,
                     "requested_at": time.time()}
+            transport_profile = transport_profile_of(event.source)
+            if transport_profile is not None:
+                data["transport_profile"] = transport_profile
             if event.platform_update_id is not None:
                 data["update_id"] = event.platform_update_id
             return data
@@ -664,13 +606,7 @@ class GatewaySlashCommandsMixin(
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
         from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
-        # Test/embedded callers may provide explicit environment-cleared restart context. Do not
-        # infer container service mode from the host's ambient container marker when the caller has
-        # deliberately cleared all supervisor signals.
-        explicit_supervisor = any(os.getenv(name) for name in (
-            "INVOCATION_ID", "XPC_SERVICE_NAME", "HERMES_S6_SUPERVISED_CHILD",
-            "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"))
-        via_service = explicit_supervisor and (is_gateway_supervisor_process() or is_container_restart_context())
+        via_service = is_gateway_supervisor_process() or is_container_restart_context()
         self.request_restart(detached=not via_service, via_service=via_service)
         return None if sent else ack
 
@@ -697,7 +633,7 @@ class GatewaySlashCommandsMixin(
         # policy_for_source treats None as ungated.
         policy = policy_for_runner_source(self, source)
         if policy.enabled and not policy.is_admin(source.user_id if source else None):
-            return {"allowed_commands": {"help", "whoami", *policy.user_allowed_commands}}
+            return {"allowed_commands": {"help", "whoami", *policy.user_runnable_commands}}
         return {}
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
@@ -811,7 +747,7 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
-        from tools.checkpoint_manager import format_checkpoint_list
+        from agent.checkpoints.manager import format_checkpoint_list
         mgr = self._checkpoint_manager(event.source)
         if mgr is None:
             return t("gateway.rollback.not_enabled")
@@ -833,7 +769,7 @@ class GatewaySlashCommandsMixin(
             return t("gateway.rollback.none_found", cwd=cwd)
 
         # Restore by number or hash (a short hash can be all digits)
-        from tools.checkpoint_refs import resolve_checkpoint_ref
+        from agent.checkpoints.refs import resolve_checkpoint_ref
         try:
             target_hash = resolve_checkpoint_ref(checkpoints, arg)
         except ValueError:
@@ -912,29 +848,18 @@ class GatewaySlashCommandsMixin(
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def _background_reply_route(self, event: MessageEvent):
-        """Route a background reply into a recovered topic without quoting its lobby message."""
-        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
-        changed_topic = source.thread_id != event.source.thread_id
-        if changed_topic:
-            source = dataclasses.replace(source, message_id=None)
-        anchor = None if changed_topic else self._reply_anchor_for_event(event)
-        return source, anchor
-
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /bg <prompt> — run a prompt in a background thread with its own session; the
         result is sent to the same chat without touching the active session's history."""
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
-        source, reply_anchor = await self._background_reply_route(event)
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
         self._track_background_task(self._run_background_task(
-            prompt, source, task_id,
-            event_message_id=reply_anchor,
+            prompt, event.source, task_id, event_message_id=self._reply_anchor_for_event(event),
             # Forward image/audio attachments so the background agent can see them.
             media_urls=list(event.media_urls or []), media_types=list(event.media_types or [])))
-        return ContextNotice(t("gateway.background.started", preview=_preview(prompt), task_id=task_id))
+        return t("gateway.background.started", preview=_preview(prompt), task_id=task_id)
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:
         """Handle /btw <question> — one-shot auxiliary LLM call on a transcript snapshot; live history
@@ -952,7 +877,7 @@ class GatewaySlashCommandsMixin(
         if not history:
             return t("gateway.btw.no_history")
         try:
-            model, rt = await self._resolve_session_agent_runtime_async(source=source)
+            model, rt = self._resolve_session_agent_runtime(source=source)
         except Exception:
             model, rt = None, {}
         if not rt.get("api_key"):
@@ -970,8 +895,7 @@ class GatewaySlashCommandsMixin(
             parent_agent = self._cached_agent_for(self._session_key_for_source(source))
         except Exception:
             parent_agent = None
-        reply_source, reply_anchor = await self._background_reply_route(event)
-        _thread_metadata = self._thread_metadata_for_source(reply_source, reply_anchor)
+        _thread_metadata = self._reply_metadata(event)
         adapter = self._delivery_adapter_for(source)
         preview = _preview(question)
 
@@ -1086,7 +1010,7 @@ class GatewaySlashCommandsMixin(
         description = t(f"gateway.verbose.mode_{new_mode}")
         try:
             _write_raw_config_leaf(config_path, ("display", "platforms", platform_key, "tool_progress"), new_mode)
-            return ContextNotice(f"{description}\n" + t("gateway.verbose.saved_suffix", platform=platform_key))
+            return f"{description}\n" + t("gateway.verbose.saved_suffix", platform=platform_key)
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{description}\n" + t("gateway.verbose.save_failed", error=e)
@@ -1122,7 +1046,7 @@ class GatewaySlashCommandsMixin(
         adapter = self._delivery_adapter_for(event.source)
         if adapter is not None:
             adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
-        return EphemeralReply(ContextNotice(t("gateway.busy.set", mode=arg, behavior=t(_BUSY_MODE_BEHAVIOR[arg][1]))))
+        return EphemeralReply(t("gateway.busy.set", mode=arg, behavior=t(_BUSY_MODE_BEHAVIOR[arg][1])))
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer."""
@@ -1156,13 +1080,19 @@ class GatewaySlashCommandsMixin(
             return t("gateway.config_save_failed", error=e)
         example = ""
         if new_state:
-            # Show a preview using current agent state if available.
+            # Preview the model the next turn runs: the turn's own resolver (session /model >
+            # channel_overrides > config.yaml); an unresolvable route still previews the config model.
+            try:
+                preview_model, _ = self._resolve_session_agent_runtime(source=event.source, user_config=user_config)
+            except Exception:  # health: allow BLE001 -- a broken route must not break /footer on
+                logger.debug("Footer preview: session runtime unresolvable", exc_info=True)
+                preview_model = _resolve_gateway_model(user_config)
             preview = format_runtime_footer(
-                model=_resolve_gateway_model(user_config) or None, context_tokens=0, context_length=None,
+                model=preview_model or None, context_tokens=0, context_length=None,
                 fields=effective.get("fields") or ["model", "context_pct", "cwd"])
             if preview:
                 example = t("gateway.footer.example_line", preview=preview)
-        return ContextNotice(t("gateway.footer.saved", state=_state(new_state), example=example))
+        return t("gateway.footer.saved", state=_state(new_state), example=example)
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reload-mcp — reconnect MCP servers and rebuild the cached agent. Reloading
@@ -1275,21 +1205,25 @@ class GatewaySlashCommandsMixin(
         return "\n".join(lines + ["", t("gateway.bundles.invoke_hint")])
 
     def _blocking_approval_or_stale(self, event: MessageEvent, stale_key: str, none_key: str,
-                                    resolve_all: bool = False):
+                                    resolve_all: bool = False, choice: str = "once"):
         """``(session_key, None, request_ids)`` when an agent thread is blocked on approval and the
-        sender may answer the approvals this command selects, else ``(session_key, reply, [])``.
+        sender may answer the approvals this command selects (*choice* names its ``/approve`` or
+        ``/deny`` for the chat's slash policy: the bare-word "always" lands here without dispatch's
+        gate), else ``(session_key, reply, [])``.
         A pending-approvals entry with no blocked thread is a stale prompt: drop it and say so."""
         from tools.approval import has_blocking_approval
         session_key = self._session_key_for_source(event.source)
         if has_blocking_approval(session_key):
+            from gateway.relay.admitted_authors import answer_admitted
             from gateway.approval_actor import answerable_request_ids, refusal_text
             from gateway.slash_access import policy_for_runner_source
             ids, requester = answerable_request_ids(
-                session_key, event.sender_id(), resolve_all=resolve_all,
-                admin_ids=policy_for_runner_source(self, event.source).admin_user_ids)
+                session_key, event.sender_id(), resolve_all=resolve_all, choice=choice,
+                admin_ids=policy_for_runner_source(self, event.source), admitted=answer_admitted(event))
             return (session_key, refusal_text(requester), []) if requester else (session_key, None, ids)
-        if session_key in self._pending_approvals:
-            self._pending_approvals.pop(session_key)
+        _approval_state = self._peek_session_state(session_key)
+        if _approval_state is not None and _approval_state.persistent.approvals is not None:
+            _approval_state.persistent.approvals = None
             return session_key, t(stale_key), []
         return session_key, t(none_key), []
 
@@ -1327,7 +1261,7 @@ class GatewaySlashCommandsMixin(
         tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
         session_key, stale, request_ids = self._blocking_approval_or_stale(
-            event, "gateway.deny.stale", "gateway.deny.no_pending", resolve_all=resolve_all)
+            event, "gateway.deny.stale", "gateway.deny.no_pending", resolve_all=resolve_all, choice="deny")
         if stale:
             return stale
         reason = (raw_args[len(tokens[0]):].strip() if resolve_all else raw_args)[:280].strip()
@@ -1364,32 +1298,44 @@ class GatewaySlashCommandsMixin(
         return await self._run_in_executor_with_context(_run)
 
     async def _handle_debug_command(self, event: MessageEvent) -> str:
-        """Handle /debug — upload ONLY the summary (system info + log tails), never full logs, to
-        protect privacy; ``hermes debug share`` from the CLI does full uploads."""
+        """Handle /debug — bare: privacy notice only; ``upload``: upload ONLY the allowlisted public
+        summary (no log or message text); full logs go to private storage via
+        ``hermes debug share --nous`` from the CLI."""
         from hermes_cli.debug import (_GATEWAY_PRIVACY_NOTICE, _best_effort_sweep_expired_pastes,
-                                      _capture_dump, _is_dpaste_url, _schedule_auto_delete,
-                                      collect_debug_report, upload_to_pastebin)
+                                      _is_dpaste_url, _schedule_auto_delete, upload_to_pastebin)
         from hermes_cli.debug_redaction import redact_debug_support_text
+        from hermes_cli.debug_summary import collect_public_summary
 
-        wants_local = "local" in {w.lower() for w in (event.get_command_args() or "").split()}
-        if wants_local and getattr(event.source, "platform", None) != Platform.LOCAL:
+        words = {w.lower() for w in (event.get_command_args() or "").split()}
+        wants_local = "local" in words
+        is_local_session = getattr(event.source, "platform", None) == Platform.LOCAL
+        if not wants_local and ("upload" not in words or words - {"upload", "nous"}):
+            # Notice first, upload only on the explicit `/debug upload` (#94876): a bare /debug is
+            # not consent to publish this session's logs, nor is `/debug do not upload`.
+            hint = t("gateway.debug.upload_hint_local" if is_local_session else "gateway.debug.upload_hint")
+            return f"{_GATEWAY_PRIVACY_NOTICE}\n\n{hint}"
+        if wants_local and not is_local_session:
             # From a chat the report can't stay on the machine; `/debug local` must never fall
-            # through to the public paste. Bare `/debug` is the upload form.
+            # through to the public paste. `/debug upload` is the upload form.
             return t("gateway.debug.local_refused")
         if wants_local:
             # A local session's `/debug local` (main's CLI form) asks for the report on this machine:
             # return the redacted report for the client to show, with no network call at all (not
-            # even the expired-paste sweep). Uploading stays on the explicit `/debug` form (T7).
+            # even the expired-paste sweep). Uploading stays on the explicit `/debug upload` form (T7).
             from hermes_cli.debug import collect_share_bundle
 
             def _collect_local():
                 return collect_share_bundle(log_lines=200)["report"]
 
             return await self._run_in_executor_with_context(_collect_local)
+        if "nous" in words:
+            # `/debug nous upload` consents to private Nous storage; the gateway only has the public
+            # paste, so refuse rather than publish under a consent that named another destination.
+            return t("gateway.debug.nous_refused")
 
         def _collect_and_upload():  # blocking I/O (dump capture, log reads, uploads) -> thread
             _best_effort_sweep_expired_pastes()
-            report = collect_debug_report(log_lines=200, dump_text=_capture_dump())
+            report = collect_public_summary(log_lines=200)
             try:
                 urls = {t("gateway.debug.report_label"): upload_to_pastebin(report)}
             except Exception as exc:
@@ -1413,7 +1359,9 @@ class GatewaySlashCommandsMixin(
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update — spawn ``hermes update`` detached (``setsid``) so it survives the gateway
         restart it may trigger; marker files let this or the next gateway process notify the user."""
-        from gateway.run import _hermes_home, _resolve_update_hermes_bin
+        import json
+        from gateway.approval_actor import opener_authority
+        from gateway.run import _hermes_home, _resolve_hermes_bin
         from hermes_cli.config import is_managed, format_managed_message
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
         # allow_update_command=True are also allowed.
@@ -1426,12 +1374,10 @@ class GatewaySlashCommandsMixin(
                     return t("gateway.update.platform_not_messaging")
             except Exception:
                 return t("gateway.update.platform_not_messaging")
-        if self._draining:
-            return t("gateway.restart.in_progress")
         if is_managed():
             return f"✗ {format_managed_message(t('gateway.update.managed_action'))}"
 
-        project_root = Path(__file__).parent.parent.resolve()
+        project_root = Path(project_root_str())
 
         # Not a git-managed install (docker/nix/desktop-app/source): refuse
         # with the steward's own update mechanism instead of git-pulling a
@@ -1449,30 +1395,35 @@ class GatewaySlashCommandsMixin(
         except Exception:
             pass  # config unreadable — fall through to the .git check below
 
-        try:
-            hermes_cmd = _resolve_update_hermes_bin(_hermes_home)
-        except (RuntimeError, OSError, ValueError) as exc:
-            return f"✗ {exc}"
-        if not hermes_cmd:
+        git_dir = project_root / '.git'
+
+        if not git_dir.exists():
             return t("gateway.update.not_git_repo")
+        hermes_cmd = _resolve_hermes_bin()
+        if not hermes_cmd:
+            return t("gateway.update.hermes_cmd_not_found")
+        if self._update_in_flight():  # before any write: the marker names who answers its prompts
+            return t("gateway.update.already_running")
+        pending_path = _hermes_home / ".update_pending.json"
+        output_path = _hermes_home / ".update_output.txt"
+        exit_code_path = _hermes_home / ".update_exit_code"
         pending = {
             "platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
             "user_id": src.user_id, "session_key": self._session_key_for_source(src),
-            "timestamp": datetime.now(UTC).isoformat()}
+            "timestamp": datetime.now().isoformat(), "authority": opener_authority(event)}  # who answers its prompts
         # ``profile``: the update watcher (possibly the NEXT gateway process) must answer through the
         # requester's own profile bot, not the default profile's adapter for the same platform.
         pending.update({k: v for k, v in (("thread_id", src.thread_id), ("message_id", event.message_id),
                                           ("profile", getattr(src, "profile", None))) if v})
-        # The detached wrapper reports completion only through ``.update_process_exit_code``, so the
-        # request must use the same v2 lifecycle as agent-requested updates: a legacy marker would
-        # wait on ``.update_exit_code``, which the wrapper deletes.
-        from gateway.update_launcher import launch_native_update
+        _tmp_pending = pending_path.with_suffix(".tmp")
+        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
+        _tmp_pending.replace(pending_path)
+        exit_code_path.unlink(missing_ok=True)
         try:
-            result = launch_native_update(home=_hermes_home, hermes_cmd=hermes_cmd, pending=pending,
-                                          spawn=_spawn_detached_update)
+            _spawn_detached_update(hermes_cmd, output_path, exit_code_path)
         except Exception as e:
+            pending_path.unlink(missing_ok=True)
+            exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
-        if not result["started"]:
-            return t("gateway.update.start_failed", error="an update is already in progress")
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")

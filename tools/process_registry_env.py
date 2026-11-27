@@ -14,9 +14,11 @@ class EnvironmentProcessMixin:
     def _kill_nonhost_targets(self, targets, kill_one) -> int:
         if any(session.pid_scope == "ssh" for session in targets):
             from concurrent.futures import ThreadPoolExecutor
+            from contextvars import copy_context
             from tools.process_registry import _SWEEP_MAX_WORKERS
             with ThreadPoolExecutor(max_workers=min(_SWEEP_MAX_WORKERS, len(targets)), thread_name_prefix="process-kill") as pool:
-                return sum(bool(future.result()) for future in [pool.submit(kill_one, s) for s in targets])
+                futures = [pool.submit(copy_context().run, kill_one, session) for session in targets]
+                return sum(bool(future.result()) for future in futures)
         # Opaque registry-only records retain the legacy serial kill contract.
         return sum(bool(kill_one(session)) for session in targets)
 

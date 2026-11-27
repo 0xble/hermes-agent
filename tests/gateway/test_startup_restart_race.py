@@ -76,9 +76,7 @@ def make_startup_runner(tmp_path):
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._stop_task = None
     runner._running_agents = {}
-    runner._running_agents_ts = {}
     runner._pending_messages = {}
-    runner._pending_approvals = {}
     runner._background_tasks = set()
     runner._failed_platforms = {}
     runner._voice_mode = {}
@@ -237,11 +235,10 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     class AbortedStartupRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self.persistence = self.session_store.persistence
+            self._session_db = self.persistence
             self._draining = False
             self.config = config
             self.adapters = {}
@@ -260,7 +257,6 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
 
         async def stop(self):
             self.session_store.close_all_db_handles()
-            self._session_db.close()
 
     def fail_if_cron_starts(*args, **kwargs):
         nonlocal cron_started
@@ -300,11 +296,10 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
     class AbortedStartupRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self.persistence = self.session_store.persistence
+            self._session_db = self.persistence
             self._draining = False
             self.config = config
             self.adapters = {}
@@ -324,7 +319,6 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
 
         async def stop(self):
             self.session_store.close_all_db_handles()
-            self._session_db.close()
 
     def fail_if_cron_starts(*args, **kwargs):
         nonlocal cron_started
@@ -360,11 +354,10 @@ async def test_start_gateway_classifies_startup_signal_exit(
     class AbortedStartupRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self.persistence = self.session_store.persistence
+            self._session_db = self.persistence
             self._draining = False
             self.config = config
             self.adapters = {}
@@ -386,7 +379,6 @@ async def test_start_gateway_classifies_startup_signal_exit(
 
         async def stop(self):
             self.session_store.close_all_db_handles()
-            self._session_db.close()
 
     def capture_signal_state(runner, state):
         nonlocal signal_state

@@ -6,16 +6,13 @@ state model and the drain loop that calls into these."""
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
-import json
 import logging
 import time
 from typing import Any, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
-from gateway.stream_recovery import _REPLACEMENT_PREVIEW_PREFIX, _SPLIT_PREVIEW_PREFIX
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -24,20 +21,12 @@ logger = logging.getLogger("gateway.stream_consumer")
 # until the interval elapses, so honouring a 30s Telegram retry_after costs nothing but a
 # stale preview; anything longer is left to the strike counter and the fallback send path.
 _MAX_EDIT_BACKOFF_SECS = 30.0
-_JOURNAL_WARNING_INTERVAL_SECS = 60.0
-_last_journal_warning = float("-inf")
 
 
 class StreamTransportMixin:
     """Send/edit/frame primitives and the transport-ordered ``_send_or_edit``."""
 
     _MIN_NEW_MSG_CHARS = 4
-
-    def _record_first_reply(self, text, result=None, *, kind="text_send"):
-        from gateway.reply_latency import record_first_reply
-        if self.cfg.cursor:
-            text = text.replace(self.cfg.cursor, "")
-        record_first_reply(getattr(self, "_reply_latency_receipt", None), text, result, kind=kind)
 
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
@@ -52,11 +41,7 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        from gateway.reply_latency import delivery_scope
-        with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_edit"):
-            result = await self.adapter.edit_message(**kwargs)
-        self._record_first_reply(content, result, kind="text_edit")
-        return result
+        return await self.adapter.edit_message(**kwargs)
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
@@ -178,8 +163,15 @@ class StreamTransportMixin:
             logger.debug("supports_native_streaming probe raised", exc_info=True)
             return False
 
+    def _should_push_draft(self) -> bool:
+        """Client animation consumes snapshots; a full buffer must never bypass cadence."""
+        now = time.monotonic()
+        return bool(self._accumulated) and now >= self._draft_retry_until and (
+            self._last_edit_time == 0.0
+            or now - self._last_edit_time >= self._current_edit_interval)
+
     async def _send_draft_frame(self, text: str) -> bool:
-        """Emit one draft frame; any failure permanently disables drafts for this run.
+        """Emit a draft frame; budget deferrals and flood cooldowns keep drafts enabled.
         Drafts have no message_id and clear on the client when the final send lands."""
         if self._draft_id is None:
             # Should never happen (set in tandem with _use_draft_streaming in run()).
@@ -193,8 +185,12 @@ class StreamTransportMixin:
             logger.debug("send_draft raised, disabling draft transport for this run: %s", e)
         else:
             if getattr(result, "success", False):
-                self._record_first_reply(text, result)
+                raw_response = getattr(result, "raw_response", None)
+                if isinstance(raw_response, dict) and raw_response.get("skipped"):
+                    self._defer_draft_retry(result)
+                    return True
                 self._last_sent_text = text  # parity with the edit-based no-op skip
+                self._draft_retry_until = 0.0
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
             # merely "drafts are unusable". Disabling drafts alone routes the
@@ -209,59 +205,38 @@ class StreamTransportMixin:
                     "is not approved for this connection)"
                 )
                 self._egress_declined = True
+            elif self._defer_draft_retry(result):
+                return True
             logger.debug("send_draft returned success=False, disabling draft transport: %s",
                          getattr(result, "error", "unknown"))
         self._draft_failures += 1
         self._use_draft_streaming = False
         return False
 
-    async def _finish_transports(self) -> None:
-        """Close unfinished output before releasing any pending flush barriers."""
-        try:
-            if not self._final_content_delivered and not self._native_stream_abandoned:
-                abandon_task = asyncio.create_task(
-                    self._abandon_native_stream(reconcile=self._run_still_current())
-                )
-                try:
-                    await asyncio.wait_for(asyncio.shield(abandon_task), timeout=5.0)
-                except TimeoutError:
-                    abandon_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await abandon_task
-                    logger.debug("abandon_open_draft timed out during transport cleanup")
-                except asyncio.CancelledError:
-                    abandon_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await abandon_task
-                    raise
-                except Exception:
-                    logger.debug("abandon_open_draft failed during transport cleanup", exc_info=True)
-        finally:
-            # Flush waiters must be released even when cancellation or a connector hang interrupts
-            # draft cleanup. A stale stream is recoverable; a blocked turn queue is not.
-            self._wake_flush_waiters()
+    def _defer_draft_retry(self, result) -> bool:
+        """Keep the latest snapshot pending during a server-requested cooldown."""
+        retry_after = getattr(result, "retry_after", None)
+        if not isinstance(retry_after, (int, float)) or retry_after <= 0:
+            return False
+        self._draft_retry_until = max(
+            self._draft_retry_until, time.monotonic() + float(retry_after))
+        return True
 
-    async def _abandon_native_stream(self, *, reconcile: bool = True) -> None:
+    async def _abandon_native_stream(self) -> None:
         """Seal an orphaned draft stream on turn death (stale exit / cancel): else the live
         indicator stays forever and armed interception state leaks into the next turn.
-        Never sets delivery flags; stale exits must not expose a reconciliation target."""
-        if self._native_stream_abandoned:
-            return
+        Never sets delivery flags. The edit transport has no draft to seal, but its preview still
+        ends in the live cursor: re-edit the text already on screen without it."""
         if not self._use_draft_streaming:
+            if self.cfg.cursor and self.cfg.cursor in (self._last_sent_text or ""):
+                await self._try_strip_cursor()
             return
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
             return
         try:
-            result = await self.adapter.abandon_open_draft(
+            await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
-                metadata={**(self._draft_metadata() or {}), "_draft_id": self._draft_id})
-            if not getattr(result, "success", False):
-                return
-            self._native_stream_abandoned = True
-            if reconcile and getattr(result, "success", False) and getattr(result, "message_id", None):
-                # A sealed preview is editable, not yet a confirmed final.
-                self._message_id = result.message_id
-                self._abandoned_draft_message_id = result.message_id
+                metadata=self._draft_metadata())
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
 
@@ -293,6 +268,7 @@ class StreamTransportMixin:
         for mid in (getattr(result, "message_id", None),
                     *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ())):
             self._track_preview_id(mid)
+        self._ceiling_observe(result)
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Adapter's prefers_fresh_final_streaming hook (Telegram's richer send path);
@@ -331,47 +307,35 @@ class StreamTransportMixin:
         if self._turn_split_delivery:
             return False
         stale_ids = self._stale_preview_ids()
-        # The old row must stop naming the editable preview before a replacement
-        # send is issued.  If the process dies after the platform accepts the new
-        # message but before its ACK can be journaled, recovery treats this as an
-        # uncertain fresh send instead of editing the retired preview.
-        replacement_intent = _REPLACEMENT_PREVIEW_PREFIX + json.dumps({
-            "text": text,
-            "stale_ids": list(stale_ids),
-        })
-        await self._journal_preview(replacement_intent, self._message_id, force=True)
         try:
-            from gateway.reply_latency import delivery_scope
-            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
-                result = await self.adapter.send(
-                    chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+            result = await self.adapter.send(
+                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
-            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
-            return False
+            if not await self._uncertain_send_fully_shown(e):
+                return False
+            result = e  # a raised timeout may have landed too: same handling as a returned one
         if not getattr(result, "success", False):
-            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
-            return False
-        self._record_first_reply(text, result)
+            if not await self._uncertain_send_fully_shown(result):
+                return False
+            # The fresh final may be on screen with no id: editing the preview up to the same
+            # text would show the answer twice. Keep the preview (no id to clean up against).
+            logger.warning("Fresh-final send may have landed; not re-delivering it by edit")
+            self._edit_supported = False
+            self._delivery_ambiguous = is_turn_final
+            stale_ids, result = (), None
         new_message_id = getattr(result, "message_id", None)
-        # Journal the replacement before deleting what the old row points at.
-        await self._journal_preview(text, new_message_id, force=True)
-        # Best-effort preview cleanup; never delete the message just sent.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
-        self._preview_message_ids = set()
+        self._ceiling_observe(result)
+        if stale_ids:  # best-effort preview cleanup; never delete the message just sent
+            await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+            self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
-        self._adopted_unconfirmed = None
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
             self._record_turn_final_payload(text)
         return True
-
-    def _adoption_unconfirmed(self) -> bool:
-        """An adopted crash preview is still the edit target and no edit to it has landed."""
-        adopted = getattr(self, "_adopted_unconfirmed", None)
-        return bool(adopted) and getattr(self, "_message_id", None) == adopted
 
     def _adopt_message_id(self, message_id) -> None:
         """Retarget edits at ``message_id``; None → "__no_edit__" sentinel so we never edit it."""
@@ -383,12 +347,13 @@ class StreamTransportMixin:
             self._message_created_ts = None
 
     @stops_reply_clock
-    async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
+    async def _send_or_edit(self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+                            redacted: bool = False) -> bool:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
         last edit.  Transport order: native frame → draft frame → edit existing → first
-        send; a transport returns None to fall through to the next."""
-        text = self._clean_for_display(text)
+        send; a transport returns None to fall through to the next.  ``redacted``: an interim
+        frame already redacted up to its settled boundary; a finalize is redacted whole regardless."""
+        text = self._display_text(text) if redacted and not finalize else self._clean_for_display(text)
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
         # connector re-appends the whole snapshot.  The final is still fence-closed.
@@ -435,7 +400,7 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(text, finalize=finalize, raw_text=pre_fence_text)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -468,13 +433,10 @@ class StreamTransportMixin:
         # strand final_content_delivered=False and duplicate the send (docs/rca-wecom-
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
         if finalize:
-            self._mark_final_delivered(record=text, confirmed=False)  # stale frame can't suppress
+            self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
-            # Native-frame success is confirmed delivery, unlike the optimistic finalize above.
-            self._record_first_reply(text)
             self._already_sent = True
-            self._adopted_unconfirmed = None  # a landed frame supersedes any adopted text
             self._last_sent_text = text
             self._native_last_pushed_len = len(text)
             if finalize:
@@ -510,54 +472,29 @@ class StreamTransportMixin:
         stream_is_msg = self._stream_is_message()
         if finalize and not (stream_is_msg and not is_turn_final):
             return None
-        frame_text = pre_fence_text if stream_is_msg else text
-        # Strip the cursor: native streams render their own indicator, and
-        # "...text▉" is never a prefix of "...text more▉", which forces the
-        # connector's whole-text re-append on EVERY tick (stacked copies).
+        # An adapter that previews drafts as raw text (Telegram ``plain_drafts``) gets the
+        # pre-fence text too: a synthetic closing fence would make each frame a non-prefix.
+        preserve_prefix = stream_is_msg or (
+            getattr(self.adapter, "DRAFT_STREAM_PREFIX_STABLE", False) is True)
+        # Strip the cursor BEFORE any display fence closes: native streams render their own
+        # indicator, and "...text▉" is never a prefix of "...text more▉", which forces the
+        # connector's whole-text re-append on EVERY tick (stacked copies). Inside an open code
+        # block the closed text ends in the fence, so a later strip left the cursor in the frame.
+        frame_text = pre_fence_text
         if self.cfg.cursor and frame_text.endswith(self.cfg.cursor):
             frame_text = frame_text[: -len(self.cfg.cursor)]
+        if not preserve_prefix and text != pre_fence_text:
+            frame_text = ensure_closed_code_fences(frame_text)
         if frame_text == self._last_sent_text:
             return True
         # Deliberately NOT _already_sent on success: the gateway's fallback final
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _journal_preview(self, text: str, message_id=None, *, force: bool = False) -> None:
-        """Best-effort crash journal: a failure is logged and never changes delivery."""
-        global _last_journal_warning
-        on_preview = getattr(self, "_on_preview", None)
-        if on_preview is None or (getattr(self, "_turn_split_delivery", False) and not force):
-            return
-        if self.cfg.cursor:
-            text = text.removesuffix(self.cfg.cursor).rstrip()
-        try:
-            await on_preview(text, message_id)
-        except Exception as err:
-            # A locked state DB fails every edit of every stream: warn at most once a minute.
-            now = time.monotonic()
-            if now - _last_journal_warning >= _JOURNAL_WARNING_INTERVAL_SECS:
-                _last_journal_warning = now
-                logger.warning("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
-            else:
-                logger.debug("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
-
-    async def _journal_split_delivery(self, message_ids) -> None:
-        """Record accepted sealed heads while a split send is still in flight."""
-        await self._journal_preview(
-            _SPLIT_PREVIEW_PREFIX + json.dumps([str(mid) for mid in message_ids if mid]),
-            None,
-            force=True,
-        )
-
-    async def _enter_split_delivery(self) -> None:
-        """Mark the turn split and forget its preview row: the row names a now-sealed head,
-        which a crash recovery must never adopt and overwrite with the whole answer."""
-        self._turn_split_delivery = True
-        await self._journal_preview("", force=True)
-        self._split_delivery_journal_pending = False
-
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
-        """First send, threaded to the user's message (correct topic/thread)."""
+    async def _first_send(self, text: str, *, finalize: bool, raw_text: Optional[str] = None,
+                          ) -> bool:
+        """First send, threaded to the user's message (correct topic/thread). ``raw_text`` is
+        ``text`` before display-only fence closing."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
             # _send_draft_frame). This is where every fallback path converges,
@@ -567,20 +504,21 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        await self._journal_preview(text)
-        from gateway.reply_latency import delivery_scope
-        with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+        try:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
                 metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
-        if not result.success:
-            await self._journal_preview("")
+        except Exception as exc:
+            logger.error("Stream first send error: %s", exc, exc_info=True)
+            if await self._uncertain_send_fully_shown(exc):
+                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize)
             self._edit_supported = False
             return False
-        self._record_first_reply(text, result)
-        if result.message_id:
-            # The write-ahead row already holds (text, None): only a new ID is worth a write.
-            await self._journal_preview(text, result.message_id)
+        if not result.success:
+            if await self._uncertain_send_fully_shown(result):
+                return self._hold_ambiguous_first_send(text, raw_text, finalize=finalize)
+            self._edit_supported = False
+            return False
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:
@@ -588,6 +526,7 @@ class StreamTransportMixin:
             self._track_preview_ids_from_result(result)
         else:
             # No editable id: fallback mode + sentinel so we don't re-enter first-send.
+            self._ceiling_note_unknown()
             self._enter_fallback_mode(self._visible_prefix())
             self._message_id = "__no_edit__"
         self._notify_new_message()
@@ -597,10 +536,7 @@ class StreamTransportMixin:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
         # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
         # unchanged; everyone else short-circuits.
-        # An adopted crash preview's text is write-ahead: the platform may never have shown
-        # it, so the first edit after adoption always goes out, even byte-identical.
-        if (text == self._last_sent_text and not self._adoption_unconfirmed()
-                and not (finalize and self._adapter_requires_finalize)):
+        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
         # the adapter prefers it (Telegram's send path renders richer markdown).  An
@@ -615,25 +551,18 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
-        if not getattr(self, "_split_delivery_journal_pending", False):
-            await self._journal_preview(text, self._message_id)
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
         if not result.success:
-            if not getattr(self, "_split_delivery_journal_pending", False):
-                await self._journal_preview(self._last_sent_text, self._message_id)
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
         raw_response = getattr(result, "raw_response", None)
         if isinstance(raw_response, dict) and raw_response.get("skipped"):
             # Adapter deferred the edit (Telegram's shared send+edit slot was busy): nothing
             # changed on screen, so the visible prefix and flood state stay as they were and the
-            # next tick retries with the newer text. An in-flight split seal keeps its fence row.
-            if not getattr(self, "_split_delivery_journal_pending", False):
-                await self._journal_preview(self._last_sent_text, self._message_id)
+            # next tick retries with the newer text.
             return True
         self._already_sent = True
-        self._adopted_unconfirmed = None
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset
@@ -641,13 +570,39 @@ class StreamTransportMixin:
         if ((getattr(result, "continuation_message_ids", ()) or ())
                 and result.message_id and result.message_id != self._message_id):
             self._last_edit_overflowed = True
-            await self._enter_split_delivery()
+            self._turn_split_delivery = True
             self._adopt_message_id(str(result.message_id))
             self._last_sent_text = ""
             self._notify_new_message()
         else:
             self._last_sent_text = text
         self._flood_strikes = 0
+        return True
+
+    def _hold_ambiguous_first_send(self, text: str, raw_text: Optional[str], *, finalize: bool,
+                                   ) -> bool:
+        """A first send failed in a way that may still have landed: count ``text`` as shown and
+        never open a second message with it. A preview leaves only its unseen tail for got_done;
+        a final is the turn's delivery, and ``_delivery_ambiguous`` keeps the gateway's normal
+        final send from repeating it."""
+        logger.warning("Stream send may have landed (timed out after the request left); "
+                       "treating it as shown instead of sending it again")
+        self._ceiling_note_unknown()
+        self._last_sent_text = text
+        if finalize:
+            self._delivery_ambiguous = True
+        else:
+            self._preview_uncertain = True
+            # The seen prefix is the RAW stream: a fence closed only for display is not in the
+            # final, so a prefix carrying it never matches and the whole answer would go again.
+            raw = raw_text if raw_text is not None else text
+            if self.cfg.cursor and raw.endswith(self.cfg.cursor):
+                raw = raw[: -len(self.cfg.cursor)]
+            self._enter_fallback_mode(raw)
+        self._edit_supported = False
+        self._already_sent = True
+        # Sentinel so a later finalize does not call _first_send again.
+        self._message_id = "__no_edit__"
         return True
 
     def _enter_fallback_mode(self, prefix: str) -> None:
@@ -696,6 +651,10 @@ class StreamTransportMixin:
             self._message_id = str(raw_response.get("last_message_id") or result.message_id
                                    or self._message_id)
             delivered_prefix = raw_response.get("delivered_prefix")
+            # A prefix that counts a timed-out part as shown is a guess: the ledger owns redelivery,
+            # and when that part was the last one nothing is resent (``_fallback_when_nothing_unseen``).
+            if raw_response.get("delivery_uncertain"):
+                self._delivery_uncertain = self._preview_uncertain = True
             if isinstance(delivered_prefix, str) and delivered_prefix:
                 self._last_sent_text = delivered_prefix
                 self._fallback_preserve_partial_messages = text.startswith(delivered_prefix)

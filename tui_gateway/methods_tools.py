@@ -5,15 +5,10 @@ bodies reference server globals bare (``_ok``, ``_err``, ``_sessions``, ...).
 Helper names must not collide with server.py's own (``_cmd_`` / ``_toolset_`` / ``_mcp_`` prefixes).
 """
 
-from tui_gateway.methods_tools_plugin_settings import (
-    _plugins_onboarding, _plugins_presence, _plugins_settings
-)
-
 import contextlib
 import sys
 from pathlib import Path
 
-from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -71,8 +66,8 @@ def _profile_scoped_rpc(
             try:
                 with scope:
                     return body(*args)
-            except ProfileUnavailableError:
-                raise  # a body that binds ``profile`` itself (_session_home_scope) reports 4064 via dispatch
+            except (ProfileUnavailableError, SessionNotOwned):
+                raise  # dispatch answers both: 4064 (a body binding ``profile`` itself), 4090 (chat taken)
             except Exception as e:
                 return _err(rid, fail_code, f"{prefix}{e}")
         handler.__doc__ = body.__doc__
@@ -164,7 +159,7 @@ def _session_key_or_err(rid, session, module: str, label: str):
 
 def _user_turn_indices(session):
     """(history, indices of user-originated turns) minus ephemeral scaffolding. Call under history_lock."""
-    is_user = _tools_mod("agent.context_compressor").user_originated_turn_view
+    is_user = _tools_mod("session_rules.turns").user_originated_turn_view
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
     return history, [i for i, m in enumerate(history) if is_user(m) is not None]
 
@@ -184,6 +179,8 @@ def _rewind_or_err(rid, session, keep: int, value_err: tuple, fail_prefix: str, 
     other exceptions → 5008 ``fail_prefix`` + message."""
     try:
         return _rewind_active_session_history(session, keep, **kw), None
+    except SessionNotOwned as exc:
+        return None, _session_not_owned_err(rid, exc)
     except ValueError as exc:
         return None, _err(rid, value_err[0], f"{value_err[1]}{exc}")
     except Exception as exc:
@@ -484,6 +481,8 @@ def _dispatch_quick(rid, params, session, name, arg):
     if qc is None:
         return None
     if qc.get("type") == "exec":
+        if refused := _tools_mod("hermes_cli.profiles_run_elsewhere").run_elsewhere_refusal():
+            return _err(rid, 4018, refused)  # the backend a plugin runs elsewhere starts this profile's commands
         # Sanitized env: the TUI server process holds every API key in os.environ.
         env = _tools_mod("tools.environments.local").build_subprocess_env()
         r = subprocess.run(qc.get("command", ""), shell=True, env=env, **_capture_run_kwargs(30))
@@ -493,35 +492,6 @@ def _dispatch_quick(rid, params, session, name, arg):
             return _err(rid, 4018, output or f"quick command failed with exit code {r.returncode}")
         return _exec_out(rid, output)
     return _ok(rid, {"type": "alias", "target": qc.get("target", "")}) if qc.get("type") == "alias" else None
-
-
-def _plugin_command_handler(name: str):
-    try:
-        return _tools_mod("hermes_cli.plugins").get_plugin_command_handler(name)
-    except Exception:
-        return None
-
-
-def _run_plugin_command(handler, arg: str, session=None, sid: str = "") -> str:
-    """Run a plugin slash-command handler under the session's ``HERMES_SESSION_*`` binding.
-
-    Plugin handlers read ``get_session_env()`` for the chat/session they serve; these RPCs run on
-    the socket/worker thread where nothing upstream binds it (only the turn path does), so a handler
-    saw ``""`` or the launch process's inherited values. Same class as the messaging gateway's
-    #108698; ``_set_session_context`` is the turn path's own seam."""
-    plugins = _tools_mod("hermes_cli.plugins")
-    invoke = _tools_mod("hermes_cli.plugin_command_dispatch").invoke_plugin_command
-    key = str(session.get("session_key") or "") if session else ""
-    tokens = _set_session_context(key, cwd=str(session.get("cwd") or "")) if session else []
-    context = {"source": None, "session_key": key, "platform": _session_source(session),
-               "session_id": getattr(session.get("agent"), "session_id", None) or key if session else ""}
-    # ctx.ask_choice: the ``clarify`` server request this backend's clarify tool sends.
-    choices = _tools_mod("hermes_cli.plugin_choices")
-    try:
-        with choices.bind_asker(choices.clarify_asker(lambda questions: _clarify_block(sid, questions))):
-            return str(plugins.resolve_plugin_command_result(invoke(handler, arg, **context)) or "")
-    finally:
-        _clear_session_context(tokens)
 
 
 @contextlib.contextmanager
@@ -595,10 +565,10 @@ def _is_registry_command(base: str) -> bool:
 
 
 def _dispatch_plugin(rid, params, session, name, arg):
-    if handler := _plugin_command_handler(name):
-        with contextlib.suppress(Exception):
-            return _ok(rid, {"type": "plugin", "output": _run_plugin_command(
-                handler, arg, session, params.get("session_id", ""))})
+    with contextlib.suppress(Exception):
+        if (output := _dispatch_plugin_in_profile_scope(
+                name, arg, session, params.get("session_id", ""), _str_arg(params, "profile") or None)) is not None:
+            return _ok(rid, {"type": "plugin", "output": output})
     return None
 
 
@@ -713,29 +683,13 @@ def _cmd_moa(rid, params, session, name, arg):
         if not session:
             return _err(rid, 4001, "no active session")
         preset = moa.normalize_moa_config(_load_cfg().get("moa") or {})["default_preset"]
-        # A running turn owns the live agent. Queue the one-shot state alongside the
-        # prompt instead of switching that agent under its worker thread (#moa-busy-defer).
+        # Record the live identity for post-turn restore, then swap the agent's client in
+        # place: session["model_override"] alone never switches an already-built agent.
         agent = session.get("agent")
-        if session.get("running"):
-            # The token is the only MoA state a client may carry. Preset and restore data remain
-            # in the session-owned record so edits, retries, and isolated turns cannot choose a model.
-            # The restore snapshot is intentionally empty here: claim-time capture runs after a
-            # preceding /model --once turn has restored its temporary model.
-            record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
-            queue_token = record["token"]
-            notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
-            return _ok(rid, {"type": "send", "display": f"/moa {arg}", "queued": True,
-                             "moa_token": queue_token, "notice": notice, "message": arg})
-        # Record the live identity for post-turn restore in the same session-owned record used
-        # by busy turns. Clients never receive the preset or restore snapshot. Claim-time capture
-        # is after any completed one-turn restore and before applying the MoA model.
-        record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
-        queue_token = record["token"]
-        pending_moa.claim(
-            session, queue_token,
-            restore=pending_moa.restore_snapshot(session, agent=agent),
-        )
-        session["_active_moa_token"] = queue_token
+        # See #53444.
+        session["moa_one_shot_restore"] = {
+            "override": session.get("model_override"), "model": getattr(agent, "model", None),
+            "provider": getattr(agent, "provider", None)}
         if agent is not None:
             try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml
                 _apply_model_switch(
@@ -743,8 +697,7 @@ def _cmd_moa(rid, params, session, name, arg):
                     confirm_expensive_model=False, pin_session_override=True, persist_override=False,
                     count_switch=False)
             except Exception:
-                pending_moa.cancel(session, queue_token)
-                session.pop("_active_moa_token", None)
+                session.pop("moa_one_shot_restore", None)
                 raise
         else:  # lazy/fresh session: the override is consumed by the first build
             session["model_override"] = {
@@ -752,6 +705,8 @@ def _cmd_moa(rid, params, session, name, arg):
                 "api_key": "moa-virtual-provider", "api_mode": "chat_completions"}
         notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
         return _ok(rid, {"type": "send", "notice": notice, "message": arg})
+    except SessionNotOwned as exc:
+        return _session_not_owned_err(rid, exc)
     except Exception as exc:
         return _err(rid, 5030, f"moa unavailable: {exc}")
 
@@ -780,8 +735,7 @@ def _cmd_retry(rid, params, session, name, arg):
         return _err(rid, 4001, "no active session to retry")
     if busy := _busy_error(rid, session, "retry"):
         return busy
-    cc = _tools_mod("agent.context_compressor")
-    from agent.context_compressor_retry import retryable_user_text
+    cc = _tools_mod("session_rules.turns")
     with session["history_lock"]:
         if busy := _busy_error(rid, session, "retry"):
             return busy
@@ -792,15 +746,14 @@ def _cmd_retry(rid, params, session, name, arg):
             return err
         _prefix, live_view = cc.history_before_user_originated_turn(history, user_indices[-1])
         try:
-            content = retryable_user_text(live_view.get("content"))
+            content = cc.retryable_user_text(live_view.get("content"))
         except ValueError as exc:
             return _err(rid, 4018, str(exc))
         rewound, err = _rewind_or_err(
             rid, session, len(user_indices) - 1, (4018, ""), "retry: failed to persist history: ", require_retryable=True)
         if err:
             return err
-        assert rewound is not None
-        content = retryable_user_text(rewound[1].get("content"))
+        content = cc.retryable_user_text(rewound[1].get("content"))
     _tui_model_friction("retry", session)
     return _ok(rid, {"type": "send", "message": content})
 
@@ -827,18 +780,15 @@ def _cmd_goal(rid, params, session, name, arg):
         if err:
             return err
         try:
-            value = (_load_cfg().get("goals") or {}).get("max_turns", 20)
-            max_turns = goals.normalize_goal_max_turns(value)
+            max_turns = int((_load_cfg().get("goals") or {}).get("max_turns", 20) or 20)
         except Exception:
             max_turns = 20
         mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
         from hermes_cli.goal_command import dispatch_goal_command
-        from gateway.session_context import scoped_current_session_id
-        with scoped_current_session_id(sid_key):
-            result = dispatch_goal_command(
-                mgr, arg, authorize_gate=lambda: None,
-                last_user_message=goals.last_user_message_from_db(sid_key),
-            )
+        result = dispatch_goal_command(
+            mgr, arg, authorize_gate=lambda: None,
+            last_user_message=goals.last_user_message_from_db(sid_key),
+        )
         if result.error:
             return _err(rid, 4004, result.output)
         if not result.prompt:
@@ -856,6 +806,11 @@ def _cmd_loop(rid, params, session, name, arg):
         return err
     result = loops.dispatch_loop_command(loops.LoopManager(session_id=sid_key), arg)
     output = result.get("output") or ""
+    if result.get("created"):
+        with contextlib.suppress(Exception):
+            if loops.goal_blocks_loop_tick(sid_key):
+                output += ("\nNote: an active /goal is driving this session — loop "
+                           "wakeups defer until the goal finishes, pauses, or parks.")
     return _exec_out(rid, output)
 
 
@@ -884,7 +839,7 @@ def _cmd_undo(rid, params, session, name, arg):
         if err:
             return err
         active, live_view, rewound_count = rewound
-        target_text = _tools_mod("agent.message_content").flatten_message_text(live_view.get("content"))
+        target_text = _tools_mod("session_rules.turns").flatten_message_text(live_view.get("content"))
     # Notify memory providers (same hook /branch fires) with rewound=True so cached per-turn state invalidates.
     agent = session.get("agent")
     if agent is not None:
@@ -937,6 +892,8 @@ def _cmd_compress(rid, params, session, name, arg):
         return _exec_out(rid, output)
     except CompressionBusy as exc:  # a turn won the race after the unlocked pre-check above
         return _err(rid, 4009, str(exc))
+    except SessionNotOwned as exc:
+        return _session_not_owned_err(rid, exc)
     except Exception as exc:
         _tools_mod("agent.conversation_compression").finalize_context_engine_compression_notification(
             session["agent"], committed=False)
@@ -1038,7 +995,7 @@ def _(rid, params: dict) -> dict:
     # must resolve against the SAME profile or a secondary-only skill is routed here and then
     # not found (#110695).
     stages = (_dispatch_quick, _dispatch_plugin, _dispatch_bundle, _dispatch_skill, _SLASH_BUILTINS.get(name))
-    with _session_home_scope(session):
+    with _session_home_scope(session, profile=_str_arg(params, "profile") or None):
         for stage in filter(None, stages):
             res = stage(rid, params, session, name, arg)
             if res is not None:
@@ -1046,6 +1003,30 @@ def _(rid, params: dict) -> dict:
                     _publish_session_control_snapshot(params.get("session_id", ""), session)
                 return res
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
+
+
+def _slash_worker_for(rid, sid: str, session: dict):
+    """(worker, None) — the session's slash worker, spawned on first use — or (None, 5030 error)."""
+    if worker := session.get("slash_worker"):
+        return worker, None
+    # slash.exec runs on the RPC pool: two concurrent commands could both see slash_worker=None
+    # and each fork a full MCP-fleet worker (the loser leaks). Serialize first-use spawn.
+    with _sessions_lock:
+        spawn_lock = session.setdefault("_slash_spawn_lock", threading.Lock())
+    with spawn_lock:
+        if worker := session.get("slash_worker"):
+            return worker, None
+        agent = session.get("agent")
+        try:
+            worker = _SlashWorker(
+                session["session_key"], getattr(agent, "model", _resolve_model()),
+                profile_home=session.get("profile_home"), provider=getattr(agent, "provider", None) or None,
+                base_url=getattr(agent, "base_url", None) or None)
+            _attach_worker(sid, session, worker)
+        except Exception as e:
+            logger.warning("slash worker start failed for %s", sid, exc_info=True)
+            return None, _err(rid, 5030, f"slash worker start failed: {e}")
+    return worker, None
 
 
 @method("slash.exec")
@@ -1085,32 +1066,22 @@ def _(rid, params: dict) -> dict:
         # run it. Anything else might be the skill the scan failed to see.
         if (dispatched.get("result") or {}).get("type") or not _is_registry_command(base):
             return dispatched
-    if plugin_handler := _plugin_command_handler(base) if base else None:
+    if base:
         try:
-            return _ok(rid, {"output": _run_plugin_command(plugin_handler, arg, session, params.get("session_id", ""))
-                             or "(no output)"})
+            plugin_output = _dispatch_plugin_in_profile_scope(base, arg, session, params.get("session_id", ""))
+            if plugin_output is not None:
+                return _ok(rid, {"output": plugin_output or "(no output)"})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
-    worker = session.get("slash_worker")
-    if not worker:
-        # slash.exec runs on the RPC pool: two concurrent commands could both see slash_worker=None
-        # and each fork a full MCP-fleet worker (the loser leaks). Serialize first-use spawn.
-        with _sessions_lock:
-            spawn_lock = session.setdefault("_slash_spawn_lock", threading.Lock())
-        with spawn_lock:
-            worker = session.get("slash_worker")
-            if not worker:
-                try:
-                    worker = _SlashWorker(
-                        session["session_key"], getattr(session.get("agent"), "model", _resolve_model()),
-                        profile_home=session.get("profile_home"),
-                        provider=getattr(session.get("agent"), "provider", None) or None,
-                        base_url=getattr(session.get("agent"), "base_url", None) or None)
-                    _attach_worker(sid, session, worker)
-                except Exception as e:
-                    return _err(rid, 5030, f"slash worker start failed: {e}")
+    worker, err = _slash_worker_for(rid, sid, session)
+    if err:
+        return err
+    # A transcript-writing slash (/model X, /compress) claims the chat BEFORE the worker runs: the worker's CLI
+    # writes the session row first, and the live mirror's gate would refuse only after that.
+    writes = base in {"compress", "compact"} or (base == "model" and bool(arg.strip()))
     try:
-        output = worker.run(cmd)
+        with _transcript_claim(session) if writes and session else contextlib.nullcontext():
+            output = worker.run(cmd)
         if seed := (worker.pop_seed() if hasattr(worker, "pop_seed") else ""):
             # /prompt//blueprint composed a next-turn prompt in the worker; route it as a
             # send dispatch (both Desktop and TUI clients already handle {type:"send"}).
@@ -1121,6 +1092,8 @@ def _(rid, params: dict) -> dict:
         if base in _SESSION_CONTROL_SLASHES:
             _publish_session_control_snapshot(sid, session)
         return _ok(rid, payload)
+    except SessionNotOwned as e:  # the live mirror (/model, /compress) refused: the worker is healthy
+        return _session_not_owned_err(rid, e)
     except Exception as e:
         if _worker_refused_skill(e):
             # Refused before process_command; the worker is still healthy.
@@ -1137,12 +1110,14 @@ def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
     # ``profile`` selects that profile's store; the launch handle is never the fallback for a
     # scoped call (a foreign first touch used to pin the process-wide handle, #102526).
-    with _profile_db(params) as db:
-        if db is None:
+    from persistence.conversation.sessions import SessionQuery, SessionWindow
+    with _profile_db(params) as db, _persistence_for(db) as persistence:
+        if persistence is None:
             return _db_unavailable_error(rid, code=5017)
         cutoff = time.time() - days * 86400
-        rows = [s for s in db.list_sessions_rich(limit=500, compact_rows=True) if (s.get("started_at") or 0) >= cutoff]
-    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.get("message_count", 0) for s in rows)})
+        entries = persistence.sessions.list_sessions(SessionQuery(), SessionWindow(limit=500), compact_rows=True)
+        rows = [e.session for e in entries if (e.session.started_at or 0) >= cutoff]
+    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.message_count for s in rows)})
 
 
 @_rpc("rollback.list", live_session=True, fail_code=5020)
@@ -1175,7 +1150,7 @@ def _(rid, params: dict, session) -> dict:
             return {"success": False, "error": reason}
         # A whole-tree restore keeps the user's hand-edits unless ``all`` (main's --all), as on the owner.
         commit = _resolve_checkpoint_hash(mgr, cwd, target)
-        taken = _tools_mod("tools.checkpoint_undo_hint").checkpoint_taken_at(cwd, commit)
+        taken = _tools_mod("agent.checkpoints.undo_hint").checkpoint_taken_at(cwd, commit)
         result = mgr.restore(cwd, commit, file_path=file_path or None,
                              safe=not file_path and params.get("all") is not True)
         if result.get("success") and not file_path:
@@ -1183,14 +1158,19 @@ def _(rid, params: dict, session) -> dict:
             with session["history_lock"]:
                 history, user_indices = _user_turn_indices(session)
                 # Not a turn /undo kept: only one that made or followed this checkpoint.
-                if _tools_mod("tools.checkpoint_undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
+                if _tools_mod("agent.checkpoints.undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
                     try:
                         removed = _rewind_active_session_history(session, len(user_indices) - 1)[2]
+                    except SessionNotOwned:
+                        raise
                     except Exception as exc:
                         raise RuntimeError(f"checkpoint restored, but session history rewind failed: {exc}") from exc
             result["history_removed"] = removed
         return result
-    return _ok(rid, _with_checkpoints(session, go))
+    # A whole-tree restore may rewind the transcript, so it claims the chat BEFORE touching the workspace: a chat
+    # another surface took answers 4090 with neither files nor history changed (its turns may have just edited them).
+    with contextlib.nullcontext() if file_path else _transcript_claim(session):
+        return _ok(rid, _with_checkpoints(session, go))
 
 
 @_rpc("rollback.diff", live_session=True, fail_code=5022)
@@ -1231,12 +1211,9 @@ def _container_checkpoint_refusal(session, mgr, cwd) -> str | None:
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     action = params.get("action", "status")
-    if action in {"status", "use"}:
-        from tools.browser_use_cli import is_browser_use_cli_mode, set_browser_use_mode
-        if action == "use":
-            set_browser_use_mode(params.get("enabled", True) is not False)
+    if action == "status":
         url = _resolve_browser_cdp_url()
-        return _ok(rid, {"connected": bool(url), "url": url, "browser_use": is_browser_use_cli_mode()})
+        return _ok(rid, {"connected": bool(url), "url": url})
     if action == "disconnect":
         return _browser_disconnect(rid)
     if action == "connect":
@@ -1255,7 +1232,7 @@ def _(rid, params: dict) -> dict:
         {"title": "Model", "rows": [
             ["Model", _resolve_model()], ["Base URL", base_url or "(default)"], ["API Key", masked]]},
         {"title": "Agent", "rows": [
-            ["Max Turns", str(_cfg_max_turns(cfg, 500))],
+            ["Max Turns", _tools_mod("hermes_cli.config_turn_limit").turn_limit_label(_cfg_max_turns(cfg))],
             ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
             ["Verbose", str(cfg.get("verbose", False))]]},
         {"title": "Environment", "rows": [["Working Dir", os.getcwd()], ["Config File", str(_active_config_path())]]},
@@ -1885,6 +1862,38 @@ def _plugins_remove(rid, params):
     return _ok(rid, result) if result.get("ok") else _err(rid, 5026, result.get("error") or "remove failed")
 
 
+def _plugins_settings(rid, params):
+    """Write manifest-declared settings (``values`` = ``{key: value}``) through the same writer as
+    ``ctx.set_config``; secrets are refused here (the client stores them via the ``.env`` route)."""
+    key = (params.get("key") or params.get("name") or "").strip()
+    values = params.get("values")
+    if not key or not isinstance(values, dict):
+        return _err(rid, 4019, "plugins.settings requires a 'key' and a 'values' mapping")
+    pc = _tools_mod("hermes_cli.plugins_cmd")
+    found = pc._find_plugin_entry(key)
+    if found is None:
+        return _err(rid, 4020, f"plugin '{key}' not found")
+    _name, _version, _desc, _source, plugin_dir, canonical = found
+    try:
+        written = _tools_mod("hermes_cli.plugins_settings").save_plugin_settings(
+            canonical, Path(str(plugin_dir)) if plugin_dir else None, values)
+    except (ValueError, PermissionError) as e:
+        return _err(rid, 4021, str(e))
+    row = next((r for r in _plugin_rows() if r["key"] == canonical), None)
+    # A Desktop half applies its own preferences (a status-bar chip on/off) without polling.
+    events = _tools_mod("hermes_cli.plugin_events")
+    if events._PLUGIN_ID_RE.match(canonical):  # category keys (``image_gen/fal``) form no event name
+        events.broadcast_plugin_event(canonical, "settings.changed", {"written": written})
+    # A secret the form just stored may feed the plugin's MCP server env (``${MESHY_API_KEY}``): bounce
+    # only servers whose resolved launch inputs changed, off the RPC thread (an npx start takes seconds).
+    if plugin_dir and pc._is_portable_plugin_dir(plugin_dir):
+        servers = _portable_server_names(Path(str(plugin_dir)), canonical)
+        if servers:
+            from agent.memory_provider import spawn_context_thread  # keeps this request's profile scope
+            discovery = _tools_mod("tools.mcp_tool_discovery")
+            spawn_context_thread(discovery.restart_mcp_servers_with_new_inputs, args=(servers,),
+                                 name=f"plugin-settings-mcp-{canonical}").start()
+    return _ok(rid, {"ok": True, "name": canonical, "written": written, "plugin": row})
 
 
 def _portable_server_names(plugin_dir: Path, key: str) -> set[str]:
@@ -1912,8 +1921,14 @@ def _plugins_auto_update(rid, params):
         return _err(rid, 4021, str(e))
 
 
+def _plugins_onboarding(rid, params):
+    """Catalog plugins curated for the onboarding card that this OS runs, each with its app state."""
+    return _ok(rid, {"onboarding": _tools_mod("hermes_cli.plugin_catalog_presence").onboarding_entries()})
 
 
+def _plugins_presence(rid, params):
+    """Named catalog plugins this OS runs, in the order asked, each with its app state and disclosure."""
+    return _ok(rid, {"presence": _tools_mod("hermes_cli.plugin_catalog_presence").presence_for(params.get("names") or [])})
 
 
 _PLUGINS_ACTIONS = {"list": _plugins_list, "onboarding": _plugins_onboarding, "presence": _plugins_presence,
@@ -1970,3 +1985,6 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Rebind this module's helpers + handlers onto ``server`` and register the handlers."""
     bind_module(globals(), server, skip=("_",))
+    from . import methods_tools_plugin_commands  # the plugin-command stage's helpers, same namespace
+
+    methods_tools_plugin_commands.register(server)

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { posix } from 'node:path'
 import { load } from 'js-yaml'
 import { expect, it } from 'vitest'
 
@@ -8,6 +9,10 @@ const setup = action('../.github/actions/setup-pm/action.yml')
 // Evaluates the Actions expression subset these gates use, so the tests pin
 // how a gate behaves rather than how it is spelled. Status functions default
 // to a healthy, uncancelled run; `status` overrides them.
+const functions = {
+  // Actions compares case-insensitively.
+  startsWith: (text, prefix) => String(text).toLowerCase().startsWith(String(prefix).toLowerCase()),
+}
 const value = (expression, { status = {}, ...context } = {}) => {
   const lookup = path => path.split('.').reduce(
     (value, key) => (value !== null && typeof value === 'object' ? value[key] : undefined), context) ?? ''
@@ -15,7 +20,7 @@ const value = (expression, { status = {}, ...context } = {}) => {
   const body = String(expression).trim().replace(/^\$\{\{/, '').replace(/\}\}$/, '')
     .replace(/\b(?:inputs|steps|needs|github)(?:\.[\w-]+)+/g, path => JSON.stringify(lookup(path)))
     .replace(/\b(always|success|failure|cancelled)\(\)/g, (_, name) => String(statuses[name]))
-  return Function(`"use strict"; return (${body})`)()
+  return Function(...Object.keys(functions), `"use strict"; return (${body})`)(...Object.values(functions))
 }
 const evaluate = (expression, context) => Boolean(value(expression, context))
 

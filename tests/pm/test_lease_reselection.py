@@ -51,16 +51,18 @@ def test_lock_timeout_reader_skips_activation_without_lease(generations, monkeyp
     activate_dependencies(repo)
 
     assert json.loads((state / "facts.json").read_text(encoding="utf-8"))["packages"]["venv"]["environment"] == str(first)
-    assert not any((generation / ".leases").exists() and any((generation / ".leases").iterdir())
-                   for generation in (first.parent, state / "environments" / "second"))
+    assert not any(lease.exists() and any(lease.iterdir())
+                   for generation in (first.parent, state / "environments" / "second")
+                   for lease in runtime_state.lease_dirs(generation))
 
 
 def test_release_removes_the_lease_file(generations):
-    from hermes_cli.runtime_state import lease_generation
+    from hermes_cli.runtime_state import lease_dirs, lease_generation
 
     _, _state, select = generations
     environment = select("first")
     release = lease_generation(environment)
-    assert list((environment.parent / ".leases").iterdir())
+    leases = lease_dirs(environment.parent)[0]
+    assert list(leases.iterdir())
     release()
-    assert not list((environment.parent / ".leases").iterdir())
+    assert not list(leases.iterdir())

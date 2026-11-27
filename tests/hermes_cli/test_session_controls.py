@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import pytest
 
+from persistence.conversation.messages import NewMessage
+from persistence.conversation.sessions import NewSession
+from persistence_assembly import open_persistence, profile_scope
+
 
 @pytest.fixture
 def state(tmp_path, monkeypatch):
@@ -11,20 +15,21 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     from hermes_cli import goals
     goals._DB_CACHE.clear()
-    from hermes_state_registry import acquire
-    db = acquire(home / "state.db")
-    for sid in ("requester", "target", "other"):
-        db.create_session(sid, "telegram", profile_name="default", chat_id=sid,
-                          chat_type="private", session_key=f"agent:main:telegram:dm:{sid}")
-    goals._DB_CACHE[str(home)] = db
-    yield db
-    goals._DB_CACHE.clear()
-    from hermes_state_registry import release_or_close
-    release_or_close(db)
+    with open_persistence(profile_scope(home=home), eager=True) as db:
+        for sid in ("requester", "target", "other"):
+            db.sessions.create(NewSession(
+                sid, "telegram", chat_id=sid, chat_type="private",
+                session_key=f"agent:main:telegram:dm:{sid}",
+            ))
+        goals._DB_CACHE[str(home)] = db
+        try:
+            yield db
+        finally:
+            goals._DB_CACHE.pop(str(home), None)
 
 
 def _user(db, sid, text, *, display_kind=""):
-    db.append_message(sid, "user", text, display_kind=display_kind)
+    db.messages.append_batch(sid, [NewMessage("user", text, display_kind=display_kind or None)])
 
 
 @pytest.mark.parametrize("quoted", [False, True])
@@ -382,13 +387,13 @@ def test_expire_request_uses_transaction_and_is_consume_once(state):
 
     request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
     key = session_controls._record_key(request["id"])
-    record = json.loads(state.get_meta(key))
+    record = json.loads(state.state_meta.get(key))
     record["expires_at"] = 0
-    state.set_meta(key, json.dumps(record))
+    state.state_meta.set(key, json.dumps(record))
     expired = session_controls.expire_request(request["id"])
     assert expired["status"] == "expired"
     assert session_controls.expire_request(request["id"]) is None
-    assert json.loads(state.get_meta(key))["status"] == "expired"
+    assert json.loads(state.state_meta.get(key))["status"] == "expired"
 
 
 def test_resolve_request_reports_expired_record_for_callback_feedback(state):
@@ -397,15 +402,15 @@ def test_resolve_request_reports_expired_record_for_callback_feedback(state):
 
     request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
     key = session_controls._record_key(request["id"])
-    record = json.loads(state.get_meta(key))
+    record = json.loads(state.state_meta.get(key))
     record["expires_at"] = 0
-    state.set_meta(key, json.dumps(record))
+    state.state_meta.set(key, json.dumps(record))
 
     resolved = session_controls.resolve_request(request["id"], "approve", "admin")
 
     assert resolved is not None
     assert resolved["status"] == "expired"
-    assert json.loads(state.get_meta(key))["status"] == "expired"
+    assert json.loads(state.state_meta.get(key))["status"] == "expired"
 
 
 def test_session_controls_do_not_pollute_goal_or_loop_revisions(state):
@@ -462,7 +467,7 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     from hermes_cli.loops import LoopManager
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
 
-    state.append_message("requester", "user", "Please pause the target goal right now")
+    _user(state, "requester", "Please pause the target goal right now")
     quoted = apply_control(
         "goal", "pause", "target", requester_sid="requester",
         user_quote="pause the target goal right now",
@@ -471,13 +476,13 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     assert quoted["error"] == "nothing_to_pause"
 
     GoalManager("target").set("temporary")
-    state.append_message("requester", "user", "Please clear the target goal now")
+    _user(state, "requester", "Please clear the target goal now")
     cleared = apply_control(
         "goal", "clear", "target", requester_sid="requester",
         user_quote="clear the target goal now",
     )
     assert cleared["status"] == "applied"
-    state.append_message("requester", "user", "Please clear the target goal again")
+    _user(state, "requester", "Please clear the target goal again")
     repeated = apply_control(
         "goal", "clear", "target", requester_sid="requester",
         user_quote="clear the target goal again",
@@ -506,10 +511,10 @@ def test_cross_session_goal_change_can_apply_to_a_local_target(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, request_control
 
-    state.create_session(
+    state.sessions.create(NewSession(
         "cli-target", "cli", profile_name="default", chat_id=None,
         session_key="agent:main:cli:cli-target",
-    )
+    ))
     GoalManager("cli-target").set("watch the build")
     direct = request_control("goal", "clear", "cli-target", requester_sid="requester")
     assert direct["error_code"] == "target_unroutable"
@@ -523,7 +528,7 @@ def test_goal_replace_records_continuation_prompt(state):
     from hermes_cli.session_controls import apply_control
 
     GoalManager("target").set("old")
-    state.append_message("requester", "user", "Please replace the target goal with ship now")
+    _user(state, "requester", "Please replace the target goal with ship now")
     result = apply_control(
         "goal", "replace", "target", requester_sid="requester",
         user_quote="replace the target goal with ship now",
@@ -767,8 +772,8 @@ def test_request_control_refuses_target_without_approval_surface(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, request_control
 
-    state.create_session("slack-target", "slack", profile_name="default", chat_id="C1",
-                         chat_type="channel", session_key="agent:main:slack:channel:C1")
+    state.sessions.create(NewSession("slack-target", "slack", profile_name="default", chat_id="C1",
+                         chat_type="channel", session_key="agent:main:slack:channel:C1"))
     GoalManager("slack-target").set("watch the build")
     assert request_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
         == "target_unapprovable"
@@ -875,7 +880,7 @@ def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, 
     manager_type("target").set("old definition")
     request = session_controls.request_control(kind, action, "target", requester_sid="requester")
     key = f"{kind}:target"
-    replacement = json.loads(state.get_meta(key))
+    replacement = json.loads(state.state_meta.get(key))
     replacement["goal" if kind == "goal" else "prompt"] = "new definition"
     replacement["created_at"] += 1
     script = (
@@ -887,7 +892,7 @@ def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, 
 
     def at_boundary(*args, **kwargs):
         attempt = subprocess.run(
-            [sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
+            [sys.executable, "-c", script, str(state.scope.profile_dir / "state.db"), key, json.dumps(replacement)],
             capture_output=True, text=True, timeout=10, check=False,
         )
         attempts.append(attempt)
@@ -902,7 +907,7 @@ def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, 
     assert load("target").status == "cleared"
     assert getattr(load("target"), "goal" if kind == "goal" else "prompt") == "old definition"
     # The other process can replace after commit; approval cannot subsequently clear its row.
-    subprocess.run([sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
+    subprocess.run([sys.executable, "-c", script, str(state.scope.profile_dir / "state.db"), key, json.dumps(replacement)],
                    check=True, capture_output=True, timeout=10)
     assert load("target").status == "active"
 
@@ -933,13 +938,13 @@ def test_approval_binds_whole_definition(state, kind, field, value):
         LoopManager("target").set("same text", interval_seconds=30)
     request = session_controls.request_control(kind, "pause", "target", requester_sid="requester")
     key = f"{kind}:target"
-    revised = json.loads(state.get_meta(key))
+    revised = json.loads(state.state_meta.get(key))
     assert revised.get(field) != value, "regression setup must change the bound definition"
     revised[field] = value
-    state.set_meta(key, json.dumps(revised))
+    state.state_meta.set(key, json.dumps(revised))
     resolved = session_controls.resolve_request(request["id"], "approve", "admin")
     assert (resolved["status"], resolved["error"]) == ("failed", "target_changed")
-    assert json.loads(state.get_meta(key))["status"] == "active"
+    assert json.loads(state.state_meta.get(key))["status"] == "active"
 
 
 def test_approval_binds_description_and_definition_from_single_snapshot(state, monkeypatch):
@@ -949,20 +954,22 @@ def test_approval_binds_description_and_definition_from_single_snapshot(state, m
 
     GoalManager("target").set("old definition")
     key = "goal:target"
-    old = state.get_meta(key)
+    old = state.state_meta.get(key)
     changed = json.loads(old)
     changed["goal"] = "different definition"
     changed["created_at"] += 1
-    original = state.get_meta
+    from persistence.sqlite.housekeeping.state_meta import _SQLiteLifecycle
+
+    original = _SQLiteLifecycle.get
     reads = []
 
-    def inconsistent_read(name):
+    def inconsistent_read(reader, name):
         if name != key:
-            return original(name)
+            return original(reader, name)
         reads.append(name)
         return old if len(reads) == 1 else json.dumps(changed)
 
-    monkeypatch.setattr(state, "get_meta", inconsistent_read)
+    monkeypatch.setattr(_SQLiteLifecycle, "get", inconsistent_read)
     request = session_controls.request_control("goal", "pause", "target", requester_sid="requester")
     assert request["affected_text"] == "goal: old definition"
     assert request["target_fingerprint"] == session_controls._definition_fingerprint("goal", old)
@@ -1012,19 +1019,20 @@ def test_control_transaction_does_not_reenter_read_pool(state, monkeypatch, kind
     from hermes_cli.loops import LoopManager
 
     (GoalManager if kind == "goal" else LoopManager)("target").set("old definition")
-    state.set_session_title("target", "The target")
-    state.set_session_title("requester", "The requester")
+    state.sessions.set_title("target", "The target")
+    state.sessions.set_title("requester", "The requester")
     _user(state, "requester", f"Please {action} the target {kind} right now")
-    original = state._read_ctx
+    holder = state.state_meta._store.holder()
+    original = holder._read_ctx
 
     @contextmanager
-    def no_nested_reads():
+    def no_nested_reads(*args, **kwargs):
         # WAL read-pool fallback owns the same non-reentrant writer lock.
-        assert not state._conn.in_transaction, "read-pool fallback would deadlock the transaction"
-        with original() as conn:
+        assert not holder._conn.in_transaction, "read-pool fallback would deadlock the transaction"
+        with original(*args, **kwargs) as conn:
             yield conn
 
-    monkeypatch.setattr(state, "_read_ctx", no_nested_reads)
+    monkeypatch.setattr(holder, "_read_ctx", no_nested_reads)
     if authority == "quote":
         result = session_controls.apply_control(kind, action, "target", requester_sid="requester",
                                                 user_quote=f"{action} the target {kind} right now")
@@ -1047,12 +1055,12 @@ def test_approval_allows_progress_without_overwriting_it(state, kind):
     (GoalManager if kind == "goal" else LoopManager)("target").set("old definition")
     request = session_controls.request_control(kind, "pause", "target", requester_sid="requester")
     key, counter = f"{kind}:target", "turns_used" if kind == "goal" else "ticks_fired"
-    progressed = json.loads(state.get_meta(key))
+    progressed = json.loads(state.state_meta.get(key))
     progressed[counter] = 9
-    state.set_meta(key, json.dumps(progressed))
+    state.state_meta.set(key, json.dumps(progressed))
     record = session_controls.resolve_request(request["id"], "approve", "admin")
     assert record["status"] == "applied"
-    assert json.loads(state.get_meta(key))[counter] == 9
+    assert json.loads(state.state_meta.get(key))[counter] == 9
 
 
 def test_replace_refuses_done_goal_before_quote_and_approval_paths(state):
@@ -1137,7 +1145,7 @@ def test_quote_may_name_the_target_by_its_title(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Eval Pipeline")
+    state.sessions.set_title("target", "Eval Pipeline")
     GoalManager("target").set("watch the build")
     _user(state, "requester", "Please clear the Eval Pipeline goal now")
     result = apply_control("goal", "clear", "target", requester_sid="requester",
@@ -1235,10 +1243,10 @@ def test_title_must_name_the_target_unambiguously(state, message, quote):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.create_session("deploy-v2", "telegram", profile_name="default", chat_id="v2",
-                         chat_type="private", session_key="agent:main:telegram:dm:v2")
-    state.set_session_title("target", "Deploy")
-    state.set_session_title("deploy-v2", "Deploy v2")
+    state.sessions.create(NewSession("deploy-v2", "telegram", profile_name="default", chat_id="v2",
+                         chat_type="private", session_key="agent:main:telegram:dm:v2"))
+    state.sessions.set_title("target", "Deploy")
+    state.sessions.set_title("deploy-v2", "Deploy v2")
     GoalManager("target").set("watch the build")
     GoalManager("deploy-v2").set("ship v2")
     _user(state, "requester", message)
@@ -1252,10 +1260,10 @@ def test_longer_title_still_names_its_own_session(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.create_session("deploy-v2", "telegram", profile_name="default", chat_id="v2",
-                         chat_type="private", session_key="agent:main:telegram:dm:v2")
-    state.set_session_title("target", "Deploy")
-    state.set_session_title("deploy-v2", "Deploy v2")
+    state.sessions.create(NewSession("deploy-v2", "telegram", profile_name="default", chat_id="v2",
+                         chat_type="private", session_key="agent:main:telegram:dm:v2"))
+    state.sessions.set_title("target", "Deploy")
+    state.sessions.set_title("deploy-v2", "Deploy v2")
     GoalManager("deploy-v2").set("ship v2")
     _user(state, "requester", "Clear the Deploy v2 goal now")
     result = apply_control("goal", "clear", "deploy-v2", requester_sid="requester",
@@ -1283,7 +1291,7 @@ def test_quote_refused_unless_the_whole_message_is_a_plain_instruction(state, me
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Target")
+    state.sessions.set_title("target", "Target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", message)
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
@@ -1305,7 +1313,7 @@ def test_any_other_sentence_in_the_message_falls_back_to_approval(state, message
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Target")
+    state.sessions.set_title("target", "Target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", message)
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
@@ -1317,7 +1325,7 @@ def test_replace_followed_by_a_line_break_correction_falls_back_to_approval(stat
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Target")
+    state.sessions.set_title("target", "Target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", "Please replace the target goal with writing docs\nActually, keep the current goal")
     result = apply_control("goal", "replace", "target", requester_sid="requester",
@@ -1342,7 +1350,7 @@ def test_replace_with_a_correcting_clause_falls_back_to_approval(state, message,
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Target")
+    state.sessions.set_title("target", "Target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", message)
     result = apply_control("goal", "replace", "target", requester_sid="requester", user_quote=quote,
@@ -1357,7 +1365,7 @@ def test_plain_replace_with_a_new_objective_still_applies(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Target")
+    state.sessions.set_title("target", "Target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", "Please replace the target goal with writing the deploy docs")
     result = apply_control("goal", "replace", "target", requester_sid="requester",
@@ -1383,8 +1391,8 @@ def test_quote_must_be_a_direct_instruction_to_this_target(state, message, quote
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "target")
-    state.set_session_title("other", "other")
+    state.sessions.set_title("target", "target")
+    state.sessions.set_title("other", "other")
     GoalManager("target").set("watch the build")
     GoalManager("other").set("ship it")
     _user(state, "requester", message)
@@ -1468,7 +1476,7 @@ def test_quoted_or_ambiguous_text_never_authorizes(state, message, quote, refusa
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "target")
+    state.sessions.set_title("target", "target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", message)
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
@@ -1480,7 +1488,7 @@ def test_unambiguous_reply_pointer_is_still_stripped(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "target")
+    state.sessions.set_title("target", "target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", '[Replying to: "the deploy finished"]\n\nClear the target goal now')
     result = apply_control("goal", "clear", "target", requester_sid="requester",
@@ -1493,13 +1501,12 @@ def test_rewound_instruction_never_authorizes(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "target")
+    state.sessions.set_title("target", "target")
     GoalManager("target").set("watch the build")
     _user(state, "requester", "Sounds good")
+    state.messages.append_batch("requester", [NewMessage("assistant", "Acknowledged")])
     _user(state, "requester", "Clear the target goal now")
-    rows = state.messages_by_role("requester", "user")
-    state._execute_write(lambda conn: conn.execute(
-        "UPDATE messages SET active = 0 WHERE id = ?", (rows[0]["id"],)))
+    assert state.messages.rewind_user_turn("requester", 1).turns_undone == 1
     result = apply_control("goal", "clear", "target", requester_sid="requester",
                            user_quote="Clear the target goal now")
     assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_not_found")
@@ -1524,8 +1531,8 @@ def test_unicode_case_variant_titles_are_ambiguous(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control
 
-    state.set_session_title("target", "Café search")
-    state.set_session_title("other", "CAFÉ search")
+    state.sessions.set_title("target", "Café search")
+    state.sessions.set_title("other", "CAFÉ search")
     GoalManager("target").set("find a cafe")
     _user(state, "requester", "Please pause the Café search goal immediately")
     result = apply_control("goal", "pause", "target", requester_sid="requester",

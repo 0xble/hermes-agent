@@ -429,12 +429,24 @@ _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after 
 _RETIRING = frozenset({"idle_exit", "replaced"})
 
 
+def run_elsewhere_verdict(home: str | Path) -> GatewayDiscovery | None:
+    """``inaccessible``/``profile_runs_elsewhere`` when a plugin runs the profile at *home* elsewhere."""
+    from hermes_cli.profiles_run_elsewhere import run_elsewhere_for_home
+    if (elsewhere := run_elsewhere_for_home(home)) is None:
+        return None
+    return GatewayDiscovery("inaccessible", reason_code="profile_runs_elsewhere", detail=elsewhere.message()[:500])
+
+
 def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path],
                              *, client_lease_token: str | None = None) -> GatewayDiscovery:
     """Discovery, except that a gateway an older Hermes left on this home is stopped once (like
-    ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy."""
+    ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy.
+    A profile a plugin runs elsewhere is refused before discovery, so ``ensure`` neither starts it
+    nor attaches to a host gateway that has not dropped it yet."""
     from hermes_cli.gateway_runtime_service import remaining
     kwargs = {"client_lease_token": client_lease_token} if client_lease_token is not None else {}
+    if (refused := run_elsewhere_verdict(home)) is not None:
+        return refused
     observed = discover_gateway_endpoint(home, timeout=remaining(deadline), **kwargs)
     if observed.state != "incompatible" or observed.reason_code != "runtime_protocol":
         return observed
@@ -461,7 +473,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     this install's own home (``incompatible``/``runtime_protocol``, the upgrade case): it is stopped
     the way ``hermes gateway stop`` stops it, once, and the current one started like any absent
     owner. Another install's or a newer Hermes's gateway stays refused, with the reason in ``detail``
-    (``hermes_cli.gateway_runtime_replace``).
+    (``hermes_cli.gateway_runtime_replace``). A profile a plugin runs elsewhere is never started or
+    attached to (``inaccessible``/``profile_runs_elsewhere``, the profile and plugin in ``detail``).
 
     A successful service command or Popen is not session readiness. After an
     owner/start request is observed this invocation never launches another.
@@ -510,7 +523,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
             own_child = live_client_child(child, client_lease, status)
-            observed = _observe_replacing_stale(home, deadline, replaced, **own_child)
+            # The home as given too: resolving a link can lead out of the root, past its marker.
+            observed = run_elsewhere_verdict(profile_home) or _observe_replacing_stale(home, deadline, replaced, **own_child)
             if observed.reason_code == "control_timeout":
                 continue
             wait_for_exit, finite_owner = retirement_wait(observed, finite_owner, retiring=retiring)
@@ -520,6 +534,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
                 time.sleep(min(0.1, remaining(deadline)))
                 continue
             if observed.state not in {"absent", "starting"}:
+                from hermes_cli.gateway_runtime_service import refresh_ready_owner_launcher
+                refresh_ready_owner_launcher(home, observed)
                 return observed
             reserved = _starting_multiplexer_root(home) if observed.state == "absent" else None
             if status is not None and observed.state == "absent" and reserved is None:
@@ -580,7 +596,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
     except TimeoutError:
         return deadline_verdict(finite_owner)
     except RuntimeStartError as exc:
-        return GatewayDiscovery(exc.state, reason_code=exc.reason)
+        return GatewayDiscovery(exc.state, reason_code=exc.reason, detail=exc.detail)
     except PermissionError:
         return _refused(home)
     except OSError:

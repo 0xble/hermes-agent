@@ -53,6 +53,15 @@ def _fresh_onepassword_listing_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_prompt_cache_misses(monkeypatch):
+    """A keep-alive miss is remembered per session id for the process; test chats reuse ids."""
+    from collections import OrderedDict
+
+    from agent.prompt_cache_lifecycle import warmer
+    monkeypatch.setattr(warmer, "_MISSED_ROUTES", OrderedDict())
+
+
+@pytest.fixture(autouse=True)
 def _fast_retry_backoff(request, monkeypatch):
     """Short-circuit retry backoff for all tests in this directory.
 

@@ -12,11 +12,7 @@ def _env_model_seed() -> str:
 def _resolve_model() -> str:
     if env := _env_model_seed():
         return env
-    cfg = _load_cfg()
-    route = _default_route(cfg)
-    if route is not None and route.model:
-        return route.model
-    m = cfg.get("model", "")
+    m = _load_cfg().get("model", "")
     if isinstance(m, dict):
         return str(m.get("default", "") or "").strip()
     if isinstance(m, str) and m:
@@ -28,24 +24,6 @@ def _resolve_model() -> str:
     # Data-only module (no heavy imports), so this holds when the lookup above fails.
     from hermes_cli.models_catalog_static import PREFERRED_SILENT_DEFAULT_MODEL
     return PREFERRED_SILENT_DEFAULT_MODEL
-
-
-def _default_route(cfg: dict):
-    """Concrete default route, or None when the config has no preset to resolve.
-
-    A literal ``@cf/...`` model id is not an alias reference and stays as written.
-    An unknown alias fails open here: startup still has the raw config to read.
-    """
-    with contextlib.suppress(Exception):
-        from hermes_cli.model_alias_runtime import resolve_default_route
-        from hermes_cli.model_alias_runtime import ModelAliasError
-        try:
-            route = resolve_default_route(cfg)
-        except ModelAliasError:
-            return None
-        if route.model:
-            return route
-    return None
 
 
 def _resolve_session_platform() -> str:
@@ -68,16 +46,8 @@ def _resolve_agent_platform(source: str | None) -> str:
 def _config_model_target() -> tuple[str, str]:
     """(model, provider) selected by config.yaml — and ONLY config: the HERMES_MODEL launch seed fed into
     the per-turn sync would be replayed as a /model switch and persisted globally, or pin the session so
-    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync.
-
-    Upstream aliases resolve to their current model and provider.
-    """
-    cfg = _load_cfg()
-    route = _default_route(cfg)
-    if route is not None and route.name and route.model:
-        provider = route.provider
-        return route.model, "" if provider.lower() == "auto" else provider
-    cfg_model = cfg.get("model")
+    dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync."""
+    cfg_model = _load_cfg().get("model")
     if isinstance(cfg_model, dict):
         provider = str(cfg_model.get("provider") or "").strip()
         return str(cfg_model.get("default", "") or "").strip(), "" if provider.lower() == "auto" else provider
@@ -157,8 +127,6 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     composer pick while the profile model it diverged from remains unchanged."""
     if not row:
         return {}
-    from agent.fallback_session_route import fallback_restored_row
-    row = fallback_restored_row(row) or {}  # a fallback's route is turn-scoped, also across a reload (#152333)
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
     _row_title = str(row.get("title") or "").strip()
     room_plumbing = model_config.get("room_plumbing") or (row.get("hidden") and _row_title.startswith("Group:"))
@@ -170,12 +138,13 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
     overrides: dict = {}
-    model = str(row.get("model") or model_config.get("model") or "").strip()
-    # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
-    # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
-    from hermes_state import SessionDB
-    route = SessionDB.session_gateway_runtime(row)
-    provider, base_url, api_mode = (str(route.get(k) or "").strip() for k in ("provider", "base_url", "api_mode"))
+    # Canonical model + route readers shared with CLI --resume: the pick, not a fallback that rewrote the
+    # billing column; then nested ``gateway_runtime`` before the TUI's top-level keys, then a routable
+    # ``billing_provider`` (#125942).
+    from persistence.gateway.routing import resume_route
+    model, route = resume_route(model_config, model=row.get("model"), billing_provider=row.get("billing_provider"),
+                                billing_base_url=row.get("billing_base_url"))
+    provider, base_url, api_mode = (str(value or "").strip() for value in (route.provider, route.base_url, route.api_mode))
     service_tier = str(model_config.get("service_tier") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     from hermes_cli.runtime_provider import is_foreign_provider_endpoint
@@ -203,10 +172,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
-            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None,
-            "_model_pinned": bool(model_config.get("model_pinned", False)),
-        }
-    if provider and provider.lower() not in _BARE_BILLING_PROVIDERS:
+            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
+    if provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config
@@ -222,13 +189,24 @@ def _scoped_session_provider(agent, session: dict) -> str:
         return _runtime_model_config(agent).get("provider") or "custom"
 
 
+def _session_route_view(agent):
+    """The agent as the SESSION's own route: a voice turn's route and a turn-scoped provider fallback both
+    leave the live fields on another model until the next turn restores the primary, so a settings save in
+    between must persist the primary snapshot, never the route standing in for it."""
+    from agent.voice_turn_route import _SessionRuntimeView, session_runtime_view
+    view = session_runtime_view(agent)
+    primary = getattr(agent, "_primary_runtime", None)
+    if getattr(agent, "_provider_fallback_active", False) is True and isinstance(primary, dict) and primary.get("model"):
+        view = _SessionRuntimeView(view, {"snapshot": primary, "reasoning_config": getattr(view, "reasoning_config", None)})
+    return view
+
+
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     """Merge the agent's CURRENT runtime identity onto the row's persisted ``model_config``. Falsy agent
     attributes DELETE the key rather than skip the write: resume reads provider/endpoint from this JSON
     (model column written separately), so a stale provider would route the resumed chat to the wrong endpoint."""
     config = dict(existing or {})
-    from agent.voice_turn_route import session_runtime_view
-    agent = session_runtime_view(agent)
+    agent = _session_route_view(agent)
     attr = lambda k: str(getattr(agent, k, "") or "").strip()
     model, base_url = attr("model"), attr("base_url")
     from hermes_cli.runtime_provider_custom import session_provider_identity
@@ -245,6 +223,11 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             config[key] = value
         else:
             config.pop(key, None)
+    if isinstance(nested := config.get("gateway_runtime"), dict) and nested.get("provider"):
+        # Resume reads the nested route first, and its model before the top-level pick: an older CLI or
+        # gateway route left in place would undo this pick on reopen, so it takes the live pair too.
+        config["gateway_runtime"] = {k: v for k, v in (
+            ("provider", provider), ("base_url", base_url), ("api_mode", attr("api_mode")), ("model", model)) if v}
     return config
 
 
@@ -254,27 +237,20 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if live is None:
         return
     agent, session_key, db = live
+    from persistence.conversation.sessions import ReplaceSessionConfig
     try:
-        row = db.get_session(session_key) or {}
-        model_config = _runtime_model_config(agent, _parse_model_config(row.get("model_config")))
-        if not getattr(agent, "_provider_fallback_active", False):
-            # The live route is the session's own (a pick, or the restored primary), not a fallback's.
-            from agent.fallback_session_route import clear_fallback_markers
-            clear_fallback_markers(model_config)
-        if isinstance(composer_profile := session.get("composer_override_profile"), dict):
-            model_config["composer_override_profile"] = composer_profile
-        elif "composer_override_profile" in session:
-            model_config.pop("composer_override_profile", None)
-        if (tier_override := session.get("create_service_tier_override")) is not None:
-            # agent.service_tier is None for explicit normal; without this the distinction is erased on every persist.
-            model_config["service_tier"] = tier_override or "normal"
-        if "model_pinned" in session:
-            model_config["model_pinned"] = bool(session["model_pinned"])
-        model = str(model_config.get("model") or "").strip()
-        if hasattr(db, "update_session_meta"):
-            db.update_session_meta(session_key, json.dumps(model_config), model or None)
-        elif model and hasattr(db, "update_session_model"):
-            db.update_session_model(session_key, model)
+        with _persistence_for(db) as persistence:
+            row = persistence.sessions.get(session_key)
+            model_config = _runtime_model_config(agent, row.model_config if row is not None else None)
+            if isinstance(composer_profile := session.get("composer_override_profile"), dict):
+                model_config["composer_override_profile"] = composer_profile
+            elif "composer_override_profile" in session:
+                model_config.pop("composer_override_profile", None)
+            if (tier_override := session.get("create_service_tier_override")) is not None:
+                # agent.service_tier is None for explicit normal; without this the distinction is erased on every persist.
+                model_config["service_tier"] = tier_override or "normal"
+            model = str(model_config.get("model") or "").strip()
+            persistence.sessions.replace_session_config(session_key, ReplaceSessionConfig(model_config, model or None))
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
 
@@ -311,10 +287,10 @@ def _display_mouse_tracking(display: dict) -> str:
 
 
 def _load_reasoning_config(model: str = "") -> dict | None:
-    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config`.
+    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config` (per-model override >
+    global ``agent.reasoning_effort``; YAML False = disabled).
 
-    Precedence lives there: the default route's declared preset effort, then the
-    per-model override, then global ``agent.reasoning_effort``. YAML False = disabled.
+    Closes #21256.
     """
     from hermes_constants import resolve_reasoning_config
     return resolve_reasoning_config(_load_cfg(), model)
@@ -547,7 +523,7 @@ def _tool_lifecycle_required_for_ui(name: str) -> bool:
     """
     return name in _TOOL_LIFECYCLE_UI_TOOLS
 
-def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned_model: str | None = None) -> _RuntimeFallbackResolution:
+def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _RuntimeFallbackResolution:
     """Resolve the primary runtime or one complete provider/model fallback. Provider-only fallback entries
     are skipped so the unavailable primary model can never leak into a different runtime."""
     from hermes_cli.auth import AuthError
@@ -555,47 +531,25 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
-        chain = _load_fallback_model() or []
-        if pinned_model:
-            from hermes_cli.fallback_config import same_model_fallbacks
-            chain = same_model_fallbacks(chain, pinned_model)
-        for entry in chain:
+        for entry in _load_fallback_model() or []:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
             if not fb_provider or not fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-                fb_kwargs: dict = {"requested": fb_provider, "target_model": fb_model,
-                                   **({"explicit_base_url": entry["base_url"]} if entry.get("base_url") else {})}
-                if fb_api_key := resolve_entry_api_key(entry):
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
+                from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs
+                runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so the session/UI shows the provider name, matching the manual-switch path (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
                 from hermes_cli.auth import primary_failure_wording
                 logging.getLogger(__name__).warning(
-                    "Primary %s for model %s (%s), falling back to %s model %s",
-                    primary_failure_wording(primary_exc)[0], (resolve_kwargs or {}).get("target_model"),
-                    primary_exc, fb_provider, fb_model)
-                runtime["_preflight_fallback"] = {
-                    "requested_model": (resolve_kwargs or {}).get("target_model"),
-                    "fallback_model": fb_model,
-                    "fallback_reason": "rate_limit" if primary_failure_wording(primary_exc)[0].startswith("rate-limited")
-                    else "credentials_unavailable",
-                }
+                    "Primary %s (%s), falling back to %s model %s",
+                    primary_failure_wording(primary_exc)[0], primary_exc, fb_provider, fb_model)
                 return _RuntimeFallbackResolution(runtime, fb_model, True)
             except Exception:
                 continue
         raise
-
-
-def _has_model_pin(model_override: dict | str | None) -> bool:
-    if isinstance(model_override, dict) and "_model_pinned" in model_override:
-        return bool(model_override["_model_pinned"])
-    explicit_model = model_override.get("model") if isinstance(model_override, dict) else model_override
-    return bool(str(explicit_model or "").strip() or _env_model_seed())
 
 
 def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str, dict]:
@@ -633,8 +587,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
             requested_provider = provider_override
         resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
         overrides = {}
-    resolution = (_resolve_runtime_with_fallback(resolve_kwargs, pinned_model=model)
-                  if _has_model_pin(model_override) else _resolve_runtime_with_fallback(resolve_kwargs))
+    resolution = _resolve_runtime_with_fallback(resolve_kwargs)
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
@@ -697,7 +650,7 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
+    cwd_override: str | None = None, auth_user_id: str | None = None, persistence=None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -717,16 +670,13 @@ def _make_agent(
     system_prompt = _startup_system_prompt(cfg, session_id or key)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
-    preflight_fallback = runtime.pop("_preflight_fallback", None)
     _pr = _load_provider_routing()
     platform = _resolve_agent_platform(platform_override)
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
     with _sessions_lock:
         session = _sessions.get(sid)
-        if session is not None and _has_model_pin(model_override):
-            session["model_pinned"] = True
     agent = AIAgent(
-        model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+        model=model, max_iterations=_cfg_max_turns(cfg), provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
@@ -736,7 +686,8 @@ def _make_agent(
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
         enabled_toolsets=onboarding_toolsets(_load_enabled_toolsets(platform),
-                                             session_db if session_db is not None else _get_db(), session_id or key),
+                                             session_db if session_db is not None else _get_db(), session_id or key,
+                                             persistence=persistence if session_db is not None else _launch_persistence()),
         disabled_toolsets=_load_disabled_toolsets(),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
@@ -746,21 +697,20 @@ def _make_agent(
         # The dashboard login identity reaches memory providers as the runtime user, like a gateway user id.
         # Builds that run before the record exists (branch, eager resume, compute host) pass it explicitly.
         user_id=auth_user_id if auth_user_id is not None else _session_auth_user_id(session),
-        session_db=session_db if session_db is not None else _get_db(), ephemeral_system_prompt=system_prompt or None,
+        session_db=session_db if session_db is not None else _get_db(),
+        persistence=persistence if session_db is not None else _launch_persistence(),
+        ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
-        model_pinned=_has_model_pin(model_override),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
-    if preflight_fallback is not None:
-        agent._preflight_fallback = preflight_fallback
     if fallback_notice:
-        # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
+        # Emitted once at the start of the next turn via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice
     return agent
 

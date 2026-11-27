@@ -33,6 +33,14 @@ def _key(session_id: str, section: str, message: str) -> str:
     return f"{_PREFIX}{session_id}:{digest}"
 
 
+def _decode(raw: Optional[str]) -> Optional[dict[str, Any]]:
+    try:
+        value = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def record_stall(*, session_key: str, session_id: str, section: str, message: str) -> bool:
     """Queue one wake for this stall card. False when the same card already woke recently."""
     db = _db()
@@ -40,22 +48,17 @@ def record_stall(*, session_key: str, session_id: str, section: str, message: st
         return False
     key, now = _key(session_id, section, message), time.time()
 
-    def write(conn):
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if row is not None:
-            try:
-                existing = json.loads(row[0])
-            except (TypeError, ValueError):
-                existing = {}
-            if now - float(existing.get("created_at") or 0) < REWAKE_AFTER_SECONDS:
-                return False
-        db.set_meta(key, json.dumps({
+    def decide(raw):
+        existing = _decode(raw)
+        if existing and now - float(existing.get("created_at") or 0) < REWAKE_AFTER_SECONDS:
+            return raw
+        return json.dumps({
             "key": key, "session_key": session_key, "session_id": session_id, "section": section,
             "message": str(message), "created_at": now, "settled": None,
-        }, ensure_ascii=False), cursor=conn)
-        return True
+        }, ensure_ascii=False)
 
-    return bool(db._execute_write(write))
+    changed, _ = db.state_meta.update(key, decide)
+    return changed
 
 
 def pending() -> list[dict[str, Any]]:
@@ -63,40 +66,31 @@ def pending() -> list[dict[str, Any]]:
     db = _db()
     if db is None:
         return []
-    out, stale, now = [], [], time.time()
-    for key, raw in db.list_meta_prefix(_PREFIX):
-        try:
-            record = json.loads(raw)
-        except (TypeError, ValueError):
-            stale.append(key)
-            continue
-        if record.get("settled"):
-            if now - float(record.get("created_at") or 0) >= REWAKE_AFTER_SECONDS:
-                stale.append(key)
-            continue
-        out.append(record)
-    if stale:
-        db._execute_write(lambda conn: conn.executemany(
-            "DELETE FROM state_meta WHERE key = ?", [(key,) for key in stale]))
+    out, now = [], time.time()
+    for entry in db.state_meta.list_prefix(_PREFIX):
+        record = _decode(entry.value)
+        if record is not None and not record.get("settled"):
+            out.append(record)
+        elif record is None or now - float(record.get("created_at") or 0) >= REWAKE_AFTER_SECONDS:
+            db.state_meta.update(entry.key, lambda raw: None if raw == entry.value else raw)
     return out
 
 
-def settle(key: str, outcome: str) -> Optional[dict[str, Any]]:
+def settle(key: str, outcome: str, created_at: Optional[float] = None) -> Optional[dict[str, Any]]:
     """Mark a wake ``delivered`` or ``skipped``. The row stays to block a rewake in the window."""
     db = _db()
     if db is None:
         return None
 
-    def write(conn):
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return None
-        record = json.loads(row[0])
+    def decide(raw):
+        record = _decode(raw)
+        if record is None or record.get("settled") or (created_at is not None and record.get("created_at") != created_at):
+            return raw
         record["settled"] = outcome
-        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
-        return record
+        return json.dumps(record, ensure_ascii=False)
 
-    return db._execute_write(write)
+    changed, saved = db.state_meta.update(key, decide)
+    return _decode(saved) if changed else None
 
 
 def is_undeliverable(record: dict[str, Any]) -> bool:

@@ -20,6 +20,7 @@ from typing import Any, Iterator, Mapping, Optional
 from agent.delegation_provider import (
     RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
+from tools.delegate_tool_config import _resolve_delegation_credentials
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -39,7 +40,9 @@ class TaskRoute:
     label: Optional[str] = None
     backend: str = "default"
     error: Optional[str] = None
-    reasoning_cfg: Optional[dict[str, Any]] = None
+    # The task's provider-declared parameters this route came from (no secrets): what a continue after a restart
+    # re-routes with. None for an internal caller's explicit route (``route_for_config``), which cannot be rebuilt.
+    request: Optional[dict[str, Any]] = None
 
     def report(self) -> Optional[dict[str, Any]]:
         """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route)."""
@@ -94,104 +97,6 @@ def schema_extension(config: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any
     return _declared_parameters(provider, config), addendum.strip() if isinstance(addendum, str) else ""
 
 
-#: Backend label of a task the caller pinned to a ``model_aliases`` entry with the core ``model`` field.
-ALIAS_BACKEND = "model_alias"
-#: Levels the core per-task ``reasoning_effort`` field accepts.
-TASK_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh")
-
-
-def _full_config() -> dict[str, Any]:
-    from hermes_cli.config import load_config_readonly
-    return dict(load_config_readonly() or {})
-
-
-def _alias_names(full_config: Mapping[str, Any]) -> list[str]:
-    """The aliases ``/model`` resolves (``model_aliases`` plus ``model.aliases``), from the same loader."""
-    from hermes_cli.model_switch import _load_direct_aliases
-    return sorted(_load_direct_aliases(dict(full_config)))
-
-
-def core_task_parameters() -> dict[str, dict[str, Any]]:
-    """Core per-task ``model`` (a configured alias) and ``reasoning_effort`` properties, read from config
-    whenever the schema is built, so a new alias is offered to delegation with no second list."""
-    try:
-        aliases = _alias_names(_full_config())
-    except Exception:  # a config the loader cannot read costs the alias field, never the delegate_task tool
-        logger.warning("model aliases unavailable for the delegate_task schema", exc_info=True)
-        aliases = []
-    params: dict[str, dict[str, Any]] = {}
-    if aliases:
-        params["model"] = {
-            "type": "string", "enum": aliases,
-            "description": "Model alias for this subagent. Set it only when the user explicitly asks for a "
-                           "specific model; otherwise omit it and choose a role.",
-        }
-    params["reasoning_effort"] = {
-        "type": "string", "enum": list(TASK_REASONING_EFFORTS),
-        "description": "Reasoning effort for this subagent. Omit to use the model alias's or role's default.",
-    }
-    return params
-
-
-def _task_effort(index: int, task: Mapping[str, Any]) -> Any:
-    """The task's explicit ``reasoning_effort`` as a final reasoning config, or ``None`` when unset. It beats the
-    route's, the delegation section's and the parent's level, so it is never re-resolved downstream."""
-    effort = task.get("reasoning_effort")
-    if effort is None or effort == "":
-        return None
-    level = effort.strip().lower() if isinstance(effort, str) else ""
-    if level not in TASK_REASONING_EFFORTS:
-        raise DelegationRouteError(f"Task {index}: 'reasoning_effort' must be one of "
-                                   f"{', '.join(TASK_REASONING_EFFORTS)} (got {effort!r}).")
-    from hermes_constants import parse_reasoning_effort
-    from tools.delegate_tool_config import ResolvedReasoning
-    return ResolvedReasoning(parse_reasoning_effort(level))
-
-
-def _alias_route(index: int, task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
-    """The route for a task naming a model alias (``None`` without one). The alias wins over any role, and only
-    its own ``fallback_providers`` back it: an explicit model never borrows the delegation chain."""
-    alias = task.get("model")
-    if alias is None or alias == "":
-        return None
-    full = _full_config()
-    names = _alias_names(full)
-    key = alias.strip().lower() if isinstance(alias, str) else ""
-    if key not in names:
-        known = f"Use one of: {', '.join(names)}" if names else "No model aliases are configured"
-        raise DelegationRouteError(f"Task {index}: unknown model alias {alias!r}. {known} "
-                                   f"(model_aliases in config.yaml).")
-    entry = _alias_entry(full, key)
-    chain = entry.get("fallback_providers") if isinstance(entry, Mapping) else None
-    if isinstance(chain, list):
-        from hermes_cli.fallback_config import same_model_fallbacks
-        from hermes_cli.model_alias_runtime import resolve_model_alias
-        resolved_model = resolve_model_alias(key, full, required=True).model
-        chain = same_model_fallbacks(chain, resolved_model)
-    # The bare alias key is the route's model: `_resolve_route` expands it, as for any stored alias, into the
-    # entry's live model, provider and endpoint. The default effort is read here from the same entry as the chain,
-    # because the alias resolver reads it only from `model_aliases`.
-    route: dict[str, Any] = {"model": key, "label": key,
-                             "fallback_providers": list(chain) if isinstance(chain, list) else []}
-    effort = entry.get("reasoning_effort") if isinstance(entry, Mapping) else None
-    if effort not in (None, ""):
-        route["reasoning_effort"] = effort
-    return route
-
-
-def _alias_entry(full_config: Mapping[str, Any], key: str) -> Optional[Mapping[str, Any]]:
-    """The alias's own config entry, from the surface ``/model`` reads it from: ``model_aliases`` first, then
-    dict-shaped ``model.aliases`` (a string entry there carries no fallback chain)."""
-    model_section = full_config.get("model")
-    for section in (full_config.get("model_aliases"),
-                    model_section.get("aliases") if isinstance(model_section, Mapping) else None):
-        if isinstance(section, Mapping):
-            entry = next((v for k, v in section.items() if str(k).strip().lower() == key), None)
-            if isinstance(entry, Mapping):
-                return entry
-    return None
-
-
 def _param_error(index: int, name: str, value: Any, schema: Mapping[str, Any]) -> Optional[str]:
     enum = schema.get("enum")
     if isinstance(enum, list) and value not in enum:
@@ -227,6 +132,7 @@ def delegated_profile_scope(home: Any) -> Iterator[None]:
     from agent.secret_scope import (
         reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope,
     )
+    from gateway.hosted_room_execution_policy import bind_profile_routed, reset_profile_routed
     from hermes_cli.env_loader import hydrate_profile_secret_sources
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
@@ -239,6 +145,11 @@ def delegated_profile_scope(home: Any) -> Iterator[None]:
     with contextlib.ExitStack() as stack:
         stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
         stack.callback(reset_secret_scope, set_secret_scope(owner_secret_scope(home), profile_home=str(home)))
+        # This route's own scope marks the child: a hosted room's execution
+        # policy was signed for the delegating member's profile and must not
+        # govern this differently-profiled child's approval decisions, and the
+        # parent's "session" grants do not cover this profile (any route).
+        stack.callback(reset_profile_routed, bind_profile_routed())
         if routed:
             stack.callback(reset_multiplex_context, set_multiplex_context(True))
         stack.callback(reset_terminal_scope, install_profile_terminal_scope(home))
@@ -332,45 +243,19 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
     if route.get("profile"):
         return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
-    if route.get("model"):
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.model_alias_runtime import alias_name, resolve_model_alias
-        config = load_config_readonly() or {}
-        required_alias = backend == "model_map" and route.get("label") == route["model"]
-        if required_alias or alias_name(route["model"], config):
-            alias = resolve_model_alias(route["model"], config, required=True)
-            # A stored alias owns its current endpoint and provider. Old expanded fields
-            # must not pin an earlier alias definition or borrow its credential.
-            route = {**route, "model": alias.model, "provider": alias.provider}
-            for key in ("base_url", "api_key", "api_mode"):
-                route.pop(key, None)
-            if alias.base_url:
-                route.update(base_url=alias.base_url, api_key=alias.api_key)
-                if not alias.api_key:
-                    # This alias owns the endpoint but has no credential. Do not let child construction
-                    # inherit the parent's key across an endpoint boundary.
-                    route["_no_parent_api_key"] = True
-            elif alias.api_key:
-                # A keyed alias with no URL routes by its provider label, as /model does, with its own key.
-                route["api_key"] = alias.api_key
-            if "reasoning_effort" not in route and alias.reasoning_effort != "":
-                route["reasoning_effort"] = alias.reasoning_effort
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
         creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
-    return TaskRoute(creds, route, route.get("reasoning_effort") if backend != "default" else None, None, None, backend)
+    return TaskRoute(creds, route, route.get("reasoning_effort"), None, None, backend)
 
 
 def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[str, TaskRoute],
                          config: Optional[Mapping[str, Any]] = None, backend: str = "default") -> TaskRoute:
     label = route.get("label") if isinstance(route.get("label"), str) else None
-    route = _with_inherited_fallback(route, {} if label == "inherit" else config or {})
-    # The label is display-only: two labels on one route (or one profile) resolve once. The backend is part of the
-    # key, so an explicit alias and a role resolving to the same route each keep their own backend.
-    key = json.dumps({"backend": backend, "route": {k: v for k, v in route.items() if k != "label"}},
-                     sort_keys=True, default=str)
+    route = _with_inherited_fallback(route, config or {})
+    # The label is display-only: two labels on one route (or one profile) resolve once.
+    key = json.dumps({k: v for k, v in route.items() if k != "label"}, sort_keys=True, default=str)
     if key not in cache:
         cache[key] = _resolve_route(route, parent_agent, backend)
     return replace(cache[key], label=label)
@@ -439,49 +324,26 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     from agent.delegation_backends import pinned_backend
     if pinned := pinned_backend(parent_agent):
         config = {**config, "backend": pinned}
-    # A task naming a model alias never consults the backend, so only tasks without one need it to be runnable.
-    needs_backend = [not task.get("model") for task in task_list]
-    provider: Optional[DelegationProvider] = None
-    backend_error: Optional[str] = None
-    declared: dict[str, dict[str, Any]] = {}
-    if any(needs_backend):
-        try:
-            provider = _active_provider(config)
-            declared = _declared_parameters(provider, config)
-        except DelegationRouteError as exc:
-            if all(needs_backend):
-                return [], str(exc)
-            backend_error = str(exc)
+    try:
+        provider = _active_provider(config)
+    except DelegationRouteError as exc:
+        return [], str(exc)
+    declared = _declared_parameters(provider, config)
     cache: dict[str, TaskRoute] = {}
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
-        backend = ALIAS_BACKEND if not needs_backend[i] else provider.name if provider else "unavailable"
         try:
-            effort = _task_effort(i, task)
-            route = _alias_route(i, task)
-            if route is None:
-                if provider is None:
-                    raise DelegationRouteError(f"Task {i}: {backend_error}")
-                if provider.name == "model_map" and not task.get("option"):
-                    default = provider.settings(config).get("default")
-                    options = declared.get("option", {}).get("enum", [])
-                    if default and default not in options:
-                        raise DelegationRouteError(f"Unknown default model_map route {default!r}; no child started.")
-                route = _route_one(provider, declared, i, task, config)
+            route = _route_one(provider, declared, i, task, config)
             _check_backend_effort(i, route, config)
-            resolved = _route_to_task_route(route, parent_agent, cache, config, backend)
-            routing_cfg = dict(resolved.routing_cfg)
-            if route.get("label") != "inherit" and (route.get("model") or route.get("profile")):
-                routing_cfg["_model_pinned"] = True
-            resolved = replace(resolved, routing_cfg=routing_cfg, reasoning_cfg=dict(resolved.routing_cfg))
-            routes.append(resolved if effort is None else replace(resolved, reasoning_effort=effort))
+            request = {name: task[name] for name in declared if task.get(name) is not None}
+            routes.append(replace(_route_to_task_route(route, parent_agent, cache, config, provider.name),
+                                  request=request))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
-            routes.append(TaskRoute({}, {}, backend=backend, error=str(exc)))
+            routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None
 
 
 def route_for_config(routing_cfg: dict[str, Any], parent_agent: Any) -> TaskRoute:
     """The route an internal caller's explicit config block describes (``/review`` ->
     ``auxiliary.review``); bypasses the provider, as those callers own their route."""
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     return TaskRoute(_resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)

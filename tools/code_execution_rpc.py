@@ -7,7 +7,6 @@ files via ``env.execute()``.
 """
 
 import base64
-from contextvars import ContextVar
 import json
 import logging
 import secrets
@@ -22,36 +21,18 @@ from tools.registry import tool_error
 # Logger name kept as the origin module's so existing log expectations hold.
 logger = logging.getLogger("tools.code_execution_tool")
 
-# Host monotonic deadline, never supplied by sandbox code. Context follows each
-# cell through CellAuthority or the per-cell remote RPC thread.
-cell_deadline: ContextVar[float | None] = ContextVar("execute_code_cell_deadline", default=None)
-
 # Terminal parameters that must not be used from ephemeral sandbox scripts.
-_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release", "survive_restart"}
+_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
 
 
-def nested_tool_call_id(task_id) -> str:
-    """A unique ``tool_call_id`` for one tool call made from inside execute_code.
-
-    Nested calls have no model-issued id. Without one, concurrent nested calls share the hook
-    gate's missing-id key, so a fail-closed ``pre_tool_call`` guard blocks the second as
-    "still running". Shared by the remote RPC loop and the local session kernel."""
-    return f"execute_code:{task_id}:{secrets.token_urlsafe(18)}"
-
-
-def _default_dispatch(task_id):
+def _default_dispatch(task_id, session_id=None, turn_id=None, conversation_id=None):
     from model_tools import handle_function_call
-    from tools.web_search_attribution import search_call_context
+    from tools.file_tools_read_tracking import programmatic_file_read
 
     def dispatch(tool_name, tool_args):
-        with search_call_context("execute_code_rpc"):
-            return handle_function_call(
-                tool_name,
-                tool_args,
-                task_id=task_id,
-                tool_call_id=nested_tool_call_id(task_id),
-            )
-
+        with programmatic_file_read():
+            return handle_function_call(tool_name, tool_args, task_id=task_id, session_id=session_id,
+                                        turn_id=turn_id, conversation_id=conversation_id)
     return dispatch
 
 
@@ -109,15 +90,6 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
     )
 
 
-def _dispatch_sandbox_read(dispatch, tool_name: str, tool_args: dict):
-    """Dispatch nested tools with a real read for sandbox read_file calls."""
-    if tool_name != "read_file":
-        return dispatch(tool_name, tool_args)
-    from tools.file_tools import sandbox_read_context
-    with sandbox_read_context():
-        return dispatch(tool_name, tool_args)
-
-
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
                         where: str) -> str:
@@ -137,7 +109,7 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     # Silence handler status prints so they don't leak into the CLI spinner.
     try:
         with thread_scoped_silence():
-            result = _dispatch_sandbox_read(dispatch, tool_name, tool_args)
+            result = dispatch(tool_name, tool_args)
     except Exception as exc:
         logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
         result = tool_error(str(exc))
@@ -232,12 +204,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str, deadline: float | None = None):
+                   rpc_token: str, session_id=None, turn_id=None, conversation_id=None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
-    cell_deadline.set(deadline)
-    dispatch = _default_dispatch(task_id)
+    dispatch = _default_dispatch(task_id, session_id, turn_id, conversation_id)
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
@@ -255,10 +226,6 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                 call_start = time.monotonic()
                 quoted_req_file = shlex.quote(req_file)
                 read_result = env.execute(f"cat {quoted_req_file}", cwd="/", timeout=10)
-                # A cell can settle while the transport is reading. Its retired poller
-                # must not dispatch a late request under the old cell's authority.
-                if stop_event.is_set():
-                    break
                 try:
                     request = json.loads(read_result.get("output", ""))
                 except (json.JSONDecodeError, ValueError):
@@ -287,8 +254,8 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                 _remote_write(env, f"{rpc_dir}/res_{seq:06d}", tool_result,
                               atomic=True, timeout=60)
                 env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-        except Exception:  # health: allow BLE001 -- keep polling after arbitrary transport/tool errors without leaking request or result contents.
+        except Exception as e:
             if not stop_event.is_set():
-                logger.debug("RPC poll failed (details omitted)")
+                logger.debug("RPC poll error: %s", e, exc_info=True)
         if not stop_event.is_set():
             stop_event.wait(poll_interval)

@@ -26,7 +26,7 @@ from pathlib import Path
 from agent.i18n import t
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
-from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.delivery import looks_like_telegram_private_chat_id, prime_revived_egress
 from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
 from gateway.run_restart_recovery import RestartRecoveryMixin, ResumeCandidates
 from gateway.run_startup_secrets import GatewayStartupSecretsMixin
@@ -43,10 +43,12 @@ from gateway.restart import (
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
-    DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
-    DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
+    DEFAULT_HEARTBEAT_INTERVAL_S, loop_heartbeat_forever,
 )
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
+if TYPE_CHECKING:
+    from gateway.status_report.reporter import StatusReporter
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -685,44 +687,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
 
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
-        try:
-            with self.session_store._lock:
-                self.session_store._ensure_loaded_locked()
-                candidates = ResumeCandidates([
-                    entry for entry in self.session_store._entries.values()
-                    if entry.resume_pending
-                    and not entry.suspended
-                    and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or getattr(entry.origin, "platform", None) == platform)
-                ])
-        except Exception as exc:
-            logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
-            return None
-        # Only boots with restart-interrupted sessions count. Shutdown stamps one-shot planned
-        # intent after draining; recent chat/home notification markers remain a fallback.
-        # The guard gives the first planned boot one chain-local allowance; repeated planned boots count.
-        candidates.breaker_tripped = bool(getattr(self, "_restart_resume_breaker_tripped", False))
-        if record_boot:
-            try:
-                from gateway import restart_loop_guard as _rlg
-                from gateway.run import _hermes_home, _planned_restart_notification_path
-                _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                _planned_exit = _rlg.consume_planned_exit(_window, max_gap_seconds=_max_gap)
-                if not candidates:
-                    return candidates
-                _planned_restart = _planned_exit or _rlg.planned_marker_is_recent(
-                    _hermes_home / ".restart_notify.json", window_seconds=_window,
-                    max_gap_seconds=_max_gap, use_mtime=True,
-                ) or _rlg.planned_marker_is_recent(
-                    _planned_restart_notification_path(), window_seconds=_window, max_gap_seconds=_max_gap,
-                )
-                candidates.breaker_tripped = _rlg.check_and_record(
-                    _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
-                )
-            except Exception as exc:
-                logger.debug("Restart-loop guard check skipped: %s", exc)
-        return candidates
+        from gateway.run_restored_delivery import resume_pending_candidates
+        return resume_pending_candidates(self, platform, record_boot=record_boot)
 
     async def _resume_pending_candidates_async(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries without running the state.db load on the gateway loop."""
@@ -836,35 +802,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         return True
 
     def _start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Arm the selector floor and out-of-loop watchdog before adapters. Disabled entirely with
-        ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
-
-        See #69089.
-        """
-        from gateway.shutdown_watchdog import _arm_loop_floor_timer, session_store_lock_snapshot, start_loop_liveness_watchdog
-        config = getattr(self, "config", None)
-        if config is not None and not getattr(config, "loop_watchdog", True):
-            return
-        if getattr(self, "_loop_floor_timer_handle", None) is None:
-            with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
-                self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
-        watchdog = getattr(self, "_loop_liveness_watchdog", None)
-        if watchdog is None or not watchdog.is_alive():
-            try:
-                # getattr defaults cover config=None test paths; loaded values are already clamped.
-                self._loop_liveness_watchdog = start_loop_liveness_watchdog(
-                    loop,
-                    probe_interval=float(getattr(
-                        config, "loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S
-                    )),
-                    probe_timeout=float(getattr(
-                        config, "loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
-                    )),
-                    max_strikes=int(getattr(config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES)),
-                    store_snapshot_fn=lambda: session_store_lock_snapshot(self),
-                )
-            except Exception:
-                logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        from gateway.run_startup_liveness import start_loop_liveness_guards
+        start_loop_liveness_guards(self, loop)
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
@@ -1199,10 +1138,12 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         "MATTERMOST", "MATRIX", "DINGTALK", "FEISHU", "WECOM", "WECOM_CALLBACK", "WEIXIN",
         "BLUEBUBBLES", "QQ", "YUANBAO",
     )
+
     _BUILTIN_ALLOWED_USERS_VARS = tuple(f"{p}_ALLOWED_USERS" for p in _ALLOWLIST_ENV_PLATFORMS) + (
         "SIGNAL_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS",
         "TELEGRAM_GROUP_ALLOWED_CHATS", "GATEWAY_ALLOWED_USERS",
     )
+
     _BUILTIN_ALLOW_ALL_VARS = tuple(f"{p}_ALLOW_ALL_USERS" for p in _ALLOWLIST_ENV_PLATFORMS)
 
     def _start_check_access_policy(self) -> bool:
@@ -1921,9 +1862,10 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
     )
+
     _POST_RECONNECT_WATCHERS = (
-        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_session_control_watcher", "_profile_reconcile_watcher",
-    )
+        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_session_control_watcher",
+        "_profile_reconcile_watcher", "_delegation_auto_resume_watcher")
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
@@ -1959,6 +1901,7 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         except Exception:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
         self._start_zero_cut_busy_watcher()
+        self._start_status_report_watcher()
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
@@ -2231,8 +2174,33 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
                         handoff_profile = resolved
             except Exception:
                 logger.debug("Handoff: could not resolve profile namespace", exc_info=True)
+        from gateway.session_dm_threads import dm_thread_key_source, session_db_for_source
+        store = getattr(self.async_session_store, "_store", self.async_session_store)
         return build_session_key(
-            dest.source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            dm_thread_key_source(dest.source, extra, lambda: session_db_for_source(store, dest.source)),
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
+
+    _status_reporter: Optional[StatusReporter] = None
+
+    def _start_status_report_watcher(self) -> None:
+        """Only when the launch environment carries the stamp; ``reporter`` is imported only then."""
+        from gateway.status_report.target import STATUS_REPORT_URL_ENV
+        if not os.environ.get(STATUS_REPORT_URL_ENV, "").strip():
+            return
+        from gateway.status_report.reporter import INTERVAL_S, status_reporter_from_launch_env
+        reporter = self._status_reporter = status_reporter_from_launch_env()
+        if reporter is not None:
+            logger.info("status report: on, reporting gateway status about every %.0fs", INTERVAL_S)
+            self._spawn_supervised(lambda: reporter.run(lambda: self._running), "status_report_watcher")
+
+    async def _suspend_after_status_goodbye(self, lever, *args) -> bool:
+        reporter = self._status_reporter
+        if reporter is not None:
+            try:
+                reporter.goodbye()
+            except Exception:
+                logger.debug("status report: goodbye not started", exc_info=True)
+        return await asyncio.to_thread(lever, *args)
     

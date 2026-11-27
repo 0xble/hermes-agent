@@ -264,6 +264,15 @@ class MessageEvent:
     # Run-owned identity of a queued chain's terminal turn, for the chain's single post-turn judge.
     _post_turn_goal_identity: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
 
+    def accept_interrupt(self) -> None:
+        """The runner's stop/reset handler ran (past admission and slash access): the receiving adapter
+        may cancel the session's turn. Marks every event this one was rewritten from, since the adapter
+        checks the event it dispatched, not a ``pre_gateway_dispatch`` rewrite's copy."""
+        event: Optional[MessageEvent] = self
+        while event is not None:
+            event._interrupt_accepted = True
+            event = getattr(event, "_rewritten_from", None)
+
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other*: addressed human input wins over autonomous unknown input."""
         self_goal = bool((self.metadata or {}).get(GOAL_CONTINUATION_METADATA_KEY))

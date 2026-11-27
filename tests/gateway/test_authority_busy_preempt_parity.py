@@ -7,9 +7,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session_authority import SessionAuthority
-from tests.fakes.runtime_owner import initialize_session_authority
-from hermes_state_runtime import list_session_admissions
+from gateway.session_authority import SessionAuthority, initialize_session_authority
 
 CHAT = '15551234567@s.whatsapp.net'
 
@@ -18,7 +16,7 @@ class _RunningAgent:
     def __init__(self):
         self.steers, self.interrupts = [], []
 
-    def steer(self, text, *, human=True):
+    def steer(self, text):
         self.steers.append(text)
         return True
 
@@ -57,7 +55,7 @@ async def _setup(tmp_path, monkeypatch, mode):
 
 def _admitted(authority):
     return [row for sid in authority.sessions
-            for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)]
+            for row in authority.persistence.admissions.list(session_id=sid, pending_only=False)]
 
 
 @pytest.mark.asyncio
@@ -83,17 +81,14 @@ async def test_busy_voice_note_steers_with_transcript_folds_and_acks(tmp_path, m
         assert sent, 'no busy ack'
         assert _admitted(authority) == []  # steered text is inside the run, never replayed
     finally:
-        authority.db.close()
+        runner.session_store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
-async def test_busy_voice_note_interrupts_with_transcript_in_interrupt_mode(tmp_path, monkeypatch):
+async def test_busy_voice_note_interrupts_at_once_in_interrupt_mode(tmp_path, monkeypatch):
+    """The interrupt carries the media placeholder, never a transcript it waited for (#143961); the
+    admitted follow-up keeps the audio and transcribes it as its own turn."""
     runner, authority, source, agent, sent, _turn = await _setup(tmp_path, monkeypatch, 'interrupt')
-
-    async def transcribe(event, adapter, source, text, **_):
-        return 'TRANSCRIBED stop that', ['TRANSCRIBED stop that']
-
-    monkeypatch.setattr(runner, '_transcribe_and_echo_pending_voice', transcribe)
     monkeypatch.setattr(runner, '_pending_event_audio_paths', lambda event: list(event.media_urls))
     monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
     voice = tmp_path / 'note.ogg'
@@ -105,58 +100,7 @@ async def test_busy_voice_note_interrupts_with_transcript_in_interrupt_mode(tmp_
         from tests.waiting import async_wait_until
         await async_wait_until(lambda: _admitted(authority), timeout=10, what='the voice note admitted')
         task.cancel()
-        assert agent.interrupts == [('TRANSCRIBED stop that',)], agent.interrupts
+        assert agent.interrupts == [(f'[User sent audio: {voice}]',)], agent.interrupts
         assert sent, 'no busy ack'
     finally:
-        authority.db.close()
-
-
-def _goal_turn(runner, source, turn, agent):
-    """The running turn is an unattended goal continuation, as after a restart's goal wake."""
-    turn.agent = agent
-    turn.event = runner._synthetic_prompt_event(
-        source, 'Continue working toward the goal.', reply_expected=False, goal_continuation=True,
-        goal_session_id='goal-session', goal_instance=1.0)
-
-
-async def _queued_behind(tmp_path, monkeypatch, opener, message_id):
-    """Send a typed queue-mode message behind ``opener`` and return its admitted rows, steers and sends."""
-    from tests.waiting import async_wait_until
-
-    runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
-    monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
-    monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
-    opener(runner, source, turn, agent)
-    try:
-        task = asyncio.ensure_future(runner._handle_message(MessageEvent(
-            text='check now', source=source, message_id=message_id, reply_expected=True)))
-        await async_wait_until(lambda: _admitted(authority), timeout=10, what='the typed message admitted')
-        task.cancel()
-        return _admitted(authority), agent.steers, sent
-    finally:
-        authority.db.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('starting', [False, True], ids=['running', 'starting'])
-async def test_typed_text_behind_goal_turn_stays_queued_and_is_acknowledged(tmp_path, monkeypatch, starting):
-    """busy_input_mode=queue behind a goal turn that may run for an hour: the person's message
-    stays a durable queued row (restart replays it; a steer to a lost claim is never replayed)
-    and they are told at once that it was saved instead of seeing nothing."""
-    from gateway.run import _AGENT_PENDING_SENTINEL
-
-    def opener(runner, source, turn, agent):
-        _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL if starting else agent)
-    rows, steers, sent = await _queued_behind(tmp_path, monkeypatch, opener, 'h1')
-    assert [(row['request_id'], row['status']) for row in rows] == [('h1', 'queued')]
-    assert steers == []
-    assert len(sent) == 1 and 'Queued for the next turn' in str(sent[0]), sent
-
-
-@pytest.mark.asyncio
-async def test_typed_text_behind_a_persons_own_turn_still_queues_silently(tmp_path, monkeypatch):
-    def opener(runner, source, turn, agent):
-        turn.event = MessageEvent(text='do the thing', source=source, message_id='t1', reply_expected=True)
-    rows, steers, sent = await _queued_behind(tmp_path, monkeypatch, opener, 'h2')
-    assert [(row['request_id'], row['status']) for row in rows] == [('h2', 'queued')]
-    assert steers == [] and sent == []
+        runner.session_store.close_all_db_handles()

@@ -18,6 +18,11 @@ class DiagnosticText(str):
         return instance
 
 
+class TerminalFailureText(DiagnosticText):
+    """The turn-ending provider failure status: the failed turn's final reply repeats it, so chat
+    surfaces drop this copy whatever its length or shape (#72131)."""
+
+
 def is_warning_status(event_type: str, message: str) -> bool:
     return event_type == "warn" or isinstance(message, DiagnosticText)
 

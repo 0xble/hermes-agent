@@ -5,8 +5,9 @@ import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_contract import SessionActor, SessionRef, Submission
-from hermes_state import SessionDB
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from persistence.core.errors import AuthorityRefusal
+from tests.fixtures.storage_seed import seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 from tests.fakes.runtime_owner import begin_runtime_epoch
 
 PNG = b'\x89PNG\r\n\x1a\n' + b'\x00' * 8
@@ -14,11 +15,12 @@ PNG = b'\x89PNG\r\n\x1a\n' + b'\x00' * 8
 
 def _authority(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(db_path=tmp_path / 'state.db')
-    db.create_session('s', source='test')
-    epoch = begin_runtime_epoch(db, instance_id='current')
+    db = storage_handle(tmp_path)
+    seed_session(db, 's', 'test')
+    epoch = db.runtime.begin_epoch(instance_id='current')
     authority = SessionAuthority(SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False)),
-                                 profile_id='owned', instance_id='current', db=db, epoch=epoch)
+                                 profile_id='owned', instance_id='current', epoch=epoch,
+                                 persistence=db)
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human'), 'route')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     return db, authority
@@ -45,9 +47,9 @@ async def test_attachment_cap_is_per_admission_not_per_file(tmp_path, monkeypatc
     with db:
         files = [_staged(tmp_path, f'part{i}.png', 2 * 1024) for i in range(2)]
         # Each file is under the cap; together they are not.
-        with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        with pytest.raises(AuthorityRefusal, match='invalid_params'):
             await _submit(authority, 'too-big', files)
-        assert list_session_admissions(db, session_id='s', pending_only=False) == []
+        assert db.admissions.list(session_id='s', pending_only=False) == []
         receipt = await _submit(authority, 'fits', files[:1])
         assert receipt.status == 'queued'
 
@@ -62,8 +64,8 @@ async def test_retained_bytes_are_released_after_cancel_and_settlement(tmp_path,
         shared = _staged(tmp_path, 'shared.png', 64)
         first = await _submit(authority, 'first', [shared])
         second = await _submit(authority, 'second', [shared])
-        row = next(r for r in list_session_admissions(db, session_id='s') if r['admission_id'] == first.admission_id)
-        retained = admission_media_references(row['payload'])[0]['path']
+        row = next(r for r in db.admissions.list(session_id='s') if r.admission_id == first.admission_id)
+        retained = admission_media_references(row.payload)[0]['path']
         from pathlib import Path
         assert Path(retained).parent.parent == _media_root() and Path(retained).exists()
         # Same digest, two live rows: cancelling one must keep the bytes the other still needs.
@@ -76,9 +78,9 @@ async def test_retained_bytes_are_released_after_cancel_and_settlement(tmp_path,
             return 'done'
         monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
         await authority._drain(ref)
-        settled = next(r for r in list_session_admissions(db, session_id='s', pending_only=False)
-                       if r['admission_id'] == second.admission_id)
-        assert settled['status'] == 'terminal' and settled['outcome'] == 'completed'
+        settled = next(r for r in db.admissions.list(session_id='s', pending_only=False)
+                       if r.admission_id == second.admission_id)
+        assert settled.status == 'terminal' and settled.outcome == 'completed'
         # Released by the owner's queued cleanup, off the FIFO path, once the drain settled it.
         from gateway.session_ingress_media import media_releases_idle
         await media_releases_idle(authority)

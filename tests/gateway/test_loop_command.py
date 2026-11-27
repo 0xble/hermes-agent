@@ -55,7 +55,6 @@ def _make_runner():
     )
     runner.session_store = _FakeSessionStore()
     runner.adapters = {}
-    runner._queued_events = {}
     return runner
 
 
@@ -473,11 +472,11 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 @pytest.mark.asyncio
 async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydration(loop_env, monkeypatch, tmp_path):
     """Loop discovery reads the owning store without hydrating secrets before tick admission."""
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence, profile_scope
 
     work_home = tmp_path / "profiles" / "work"
     work_home.mkdir(parents=True)
-    work_db = SessionDB(db_path=work_home / "state.db")
+    work_db = open_persistence(profile_scope(home=work_home))
     goals._DB_CACHE[str(work_home)] = work_db
 
     scopes = [(None, None), ("work", work_home)]
@@ -542,9 +541,9 @@ async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydra
 
         # An ACTIVE loop row in the work profile's store opens the gate.
         await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
-        raw = loops._get_session_db().get_meta("loop:sid-gateway-loop")
+        raw = loops._get_session_db().state_meta.get("loop:sid-gateway-loop")
         assert raw
-        work_db.set_meta("loop:sid-work-loop", raw)
+        work_db.state_meta.set("loop:sid-work-loop", raw)
         await _run_one_tick()
         assert entered == [], f"secret hydration preceded admission: {entered}"
         assert admitted == [
@@ -556,7 +555,7 @@ async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydra
         entered.clear()
         cleared = loops.LoopState.from_json(raw)
         cleared.status = "cleared"
-        work_db.set_meta("loop:sid-work-loop", cleared.to_json())
+        work_db.state_meta.set("loop:sid-work-loop", cleared.to_json())
         admitted.clear()
         await _run_one_tick()
         assert entered == [], f"cleared loop row must not open the gate; got {entered}"

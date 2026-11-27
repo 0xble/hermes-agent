@@ -17,7 +17,6 @@ async def _classic_wake_holding_the_slot(monkeypatch):
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
     from gateway.wake import deliver_wake
-    from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
@@ -60,8 +59,8 @@ async def _classic_wake_holding_the_slot(monkeypatch):
     sid = runner.session_store.peek_session_id(key)
 
     def rows():
-        return [(r['request_id'], r['status'], r['outcome'])
-                for r in list_session_admissions(authority.db, session_id=sid, pending_only=False)]
+        return [(r.request_id, r.status, r.outcome)
+                for r in authority.persistence.admissions.list(session_id=sid, pending_only=False)]
     await async_wait_until(lambda: rows(), what='B to be admitted')
     return runner, adapter, source, key, release, started, fallback, rows
 

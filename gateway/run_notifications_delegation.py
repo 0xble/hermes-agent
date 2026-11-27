@@ -378,7 +378,7 @@ class GatewayNotificationsMixin:
                     await asyncio.to_thread(dr.mark_terminal_reported, delegation_id, claim)
                     return
                 # A completed result is user-visible only when no parent conversation can receive it.
-                verdict = (await self._classify_completion_target(parent_session_id, settle_ended_tip=True)
+                verdict = (await self._classify_completion_target(parent_session_id, str(action.get("session_key") or ""))
                            if parent_session_id else "terminal")
                 if verdict != "terminal":
                     settle = dr.mark_terminal_reported if verdict == "deliver" else dr.release_terminal_report
@@ -402,7 +402,9 @@ class GatewayNotificationsMixin:
                     logger.info("Delegation %s: reported undeliverable result to the user", delegation_id)
                 return
             parent_session_id = str(action.get("parent_session_id") or "").strip()
-            if parent_session_id and await self._classify_completion_target(parent_session_id) == "terminal":
+            if parent_session_id and await self._classify_completion_target(
+                parent_session_id, str(action.get("session_key") or ""),
+            ) == "terminal":
                 # The owning conversation is gone (/new, closed): nobody can dispatch; settle it terminal.
                 await asyncio.to_thread(dr.mark_retry_terminal, delegation_id, claim,
                                         "its conversation ended before the retry could run")
@@ -466,7 +468,9 @@ class GatewayNotificationsMixin:
 
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
-        from gateway.run_notifications import asyncio, claim_off_loop
+        import asyncio
+
+        from gateway.run_notifications_ledger import claim_off_loop
         async with self._completion_event_scope(evt):
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             from tools.delegation_resume import (

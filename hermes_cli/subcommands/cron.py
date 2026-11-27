@@ -26,6 +26,20 @@ def _add_catch_up(parser) -> None:
              "cron.catch_up_missed for recurring jobs; one-shots skip.")
 
 
+def _add_wrap_response(parser, *, allow_inherit: bool = False) -> None:
+    parser.add_argument(
+        "--wrap-response", dest="wrap_response", action="store_const", const=True, default=None,
+        help="Wrap this job's output in the cron header/footer ('Cronjob Response: ...' / "
+             "'To stop or manage this job...'), overriding the global cron.wrap_response.")
+    parser.add_argument(
+        "--no-wrap-response", dest="wrap_response", action="store_const", const=False,
+        help="Deliver this job's output raw, without the cron header/footer.")
+    if allow_inherit:
+        parser.add_argument(
+            "--inherit-wrap-response", dest="wrap_response", action="store_const", const="inherit",
+            help="Remove this job's override so it follows the global cron.wrap_response again.")
+
+
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     """Attach the ``cron`` subcommand (and its sub-actions) to ``subparsers``."""
     cron_parser = subparsers.add_parser(
@@ -56,6 +70,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     _flag(cron_create, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     _add_catch_up(cron_create)
+    _add_wrap_response(cron_create)
     cron_create.add_argument("--priority", choices=("live", "production", "background"),
         help="Business-impact lane when due jobs compete: live starts first, production is ordinary work, background is best-effort. Unset = production.")
     cron_create.add_argument("--skill", dest="skills", action="append",
@@ -143,6 +158,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     _flag(cron_edit, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     _add_catch_up(cron_edit)
+    _add_wrap_response(cron_edit, allow_inherit=True)
     cron_edit.add_argument("--priority", choices=("live", "production", "background", ""),
         help="Business-impact lane: live, production or background. Pass an empty string to clear back to unset/production.")
     cron_edit.add_argument("--skill", dest="skills", action="append",

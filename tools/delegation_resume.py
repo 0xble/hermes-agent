@@ -34,8 +34,10 @@ import os
 import sqlite3
 import time
 import uuid
-from contextlib import ExitStack, contextmanager
 from typing import Any, Dict, List, Optional, Tuple
+
+from persistence.authority.coordination import DelegationRetryChange
+from persistence.core.errors import StoreContention
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +130,7 @@ def _batch_recovery_candidates(record: dict[str, Any]) -> list[dict[str, Any]]:
     for index in indexes:
         entry = recorded.get(index) or {}
         status = str(entry.get("status") or "unknown").lower()
-        if status in {"completed", "success", "succeeded"}:
+        if status in {"completed", "success", "succeeded"} or _child_already_resuming(entry):
             continue
         candidates.append({
             "task_index": index,
@@ -268,120 +270,71 @@ def _eligibility(record: dict[str, Any]) -> Optional[str]:
 
 
 def inspect_resumable(delegation_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """``(record, None)`` when *delegation_id* is resumable, else ``(record_or_None, reason)``.
-
-    Read-only: takes no claim. The claim is taken separately by
-    :func:`claim_resume`, which re-checks every condition inside one transaction.
-    """
+    """Read the recovery record and check eligibility without claiming it."""
     ad = _ad()
-    if not delegation_id:
+    if not delegation_id or not ad._ledger_exists():
         return None, INELIGIBLE_NO_ROW
-    with ad._DB_LOCK, ad._transaction() as conn:
-        record = _load(conn, delegation_id)
-    if record is None:
-        return None, INELIGIBLE_NO_ROW
-    return record, _eligibility(record)
+    with ad._ledger() as store:
+        record = store.coordination.delegation_recovery_record(delegation_id)
+    return (record, _eligibility(record)) if record is not None else (None, INELIGIBLE_NO_ROW)
 
 
 def list_boot_candidates(limit: int = 32) -> list[dict[str, Any]]:
-    """Return bounded, single-task rows eligible for a parent-facing boot notice.
-
-    This is read-only. The durable trigger claim is taken later, immediately before
-    injection, after the gateway has proved that the original parent is live and
-    routable. Repeated gateways therefore cannot manufacture duplicate notices.
-    """
+    """Find eligible routed parents. The boot watcher claims separately, immediately before admission."""
     limit = max(0, int(limit))
-    if limit == 0:
-        return []
     ad = _ad()
-    now = time.time()
-    candidates = []
-    with ad._DB_LOCK, ad._transaction() as conn:
-        rows = conn.execute(
-            _RETRY_SELECT + """ WHERE state IN ('unknown', 'interrupted', 'stalled')
-                AND retry_state='none'
-                AND parent_session_id IS NOT NULL AND parent_session_id != ''
-                AND (auto_resume_state='none' OR
-                     (auto_resume_state='claimed' AND auto_resume_claimed_at < ?))
-              ORDER BY updated_at ASC, delegation_id ASC""",
-            (now - AUTO_RESUME_CLAIM_TTL_SECONDS,),
-        )
-        # Stream until the eligible result limit, not the raw-row limit. Otherwise
-        # old unresumable rows permanently starve later recoverable work on every boot.
-        for row in rows:
-            record = _retry_record(row)
-            if _eligibility(record) is not None:
-                continue
-            if not (record["session_key"] or record["origin_session_id"]):
-                continue
-            candidates.append(record)
-            if len(candidates) >= limit:
-                break
-    return candidates
+    if not limit or not ad._ledger_exists():
+        return []
+    with ad._ledger() as store:
+        return list(store.coordination.list_delegation_boot_candidates(
+            stale_before=time.time() - AUTO_RESUME_CLAIM_TTL_SECONDS, limit=limit,
+            eligible=lambda record: _eligibility(record) is None,
+        ))
+
+
+def _boot_eligibility(record: dict[str, Any]) -> Optional[str]:
+    if reason := _eligibility(record):
+        return reason
+    if not record["parent_session_id"] or not (record["session_key"] or record["origin_session_id"]):
+        return INELIGIBLE_STATELESS
+    return None
 
 
 def claim_auto_resume_trigger(record_or_id: dict[str, Any] | str,
                               consumer: str = "gateway-boot") -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Take the one durable claim for a boot notice, never the explicit resume claim."""
-    ad = _ad()
+    """Claim a parent notice without consuming the explicit resume claim."""
     delegation_id = (record_or_id.get("delegation_id") if isinstance(record_or_id, dict)
                      else str(record_or_id or ""))
-    if not delegation_id:
+    ad = _ad()
+    if not delegation_id or not ad._ledger_exists():
         return None, INELIGIBLE_NO_ROW
-    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     now = time.time()
-    stale_before = now - AUTO_RESUME_CLAIM_TTL_SECONDS
-    with ad._DB_LOCK, ad._transaction() as conn:
-        record = _load(conn, delegation_id)
-        if record is None:
-            return None, INELIGIBLE_NO_ROW
-        reason = _eligibility(record)
-        if reason is not None:
-            return record, reason
-        if not record["parent_session_id"] or not (record["session_key"] or record["origin_session_id"]):
-            return record, INELIGIBLE_STATELESS
-        changed = conn.execute(
-            """UPDATE async_delegations
-                  SET auto_resume_state=?, auto_resume_claim=?, auto_resume_claimed_at=?, updated_at=?
-                WHERE delegation_id=?
-                  AND (auto_resume_state=? OR
-                       (auto_resume_state=? AND auto_resume_claimed_at < ?))""",
-            (AUTO_RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id,
-             AUTO_RESUME_STATE_NONE, AUTO_RESUME_STATE_CLAIMED, stale_before),
-        ).rowcount
-        if changed != 1:
-            if record["auto_resume_state"] == AUTO_RESUME_STATE_DELIVERED:
-                return record, "already_triggered"
-            return record, "already_triggered"
-    record["auto_resume_state"] = AUTO_RESUME_STATE_CLAIMED
-    record["auto_resume_claim"] = claim_id
-    record["auto_resume_claimed_at"] = now
-    return record, None
+    with ad._ledger() as store:
+        record, reason, _ = store.coordination.claim_delegation_recovery(
+            delegation_id, claim=f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}",
+            now=now, eligible=_boot_eligibility, boot_stale_before=now - AUTO_RESUME_CLAIM_TTL_SECONDS,
+        )
+    return record, reason
+
+
+def _settle_boot_claim(delegation_id: str, claim_id: str, *, delivered: bool) -> bool:
+    ad = _ad()
+    if not claim_id or not ad._ledger_exists():
+        return False
+    with ad._ledger() as store:
+        return store.coordination.settle_delegation_boot_claim(
+            delegation_id, claim=claim_id, delivered=delivered, now=time.time(),
+        )
 
 
 def release_auto_resume_trigger(delegation_id: str, claim_id: str) -> bool:
     """Refund a boot trigger when parent admission fails."""
-    ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        return conn.execute(
-            """UPDATE async_delegations SET auto_resume_state=?, auto_resume_claim=NULL,
-                      auto_resume_claimed_at=NULL, updated_at=?
-                WHERE delegation_id=? AND auto_resume_state=? AND auto_resume_claim=?""",
-            (AUTO_RESUME_STATE_NONE, time.time(), delegation_id,
-             AUTO_RESUME_STATE_CLAIMED, claim_id),
-        ).rowcount == 1
+    return _settle_boot_claim(delegation_id, claim_id, delivered=False)
 
 
 def complete_auto_resume_trigger(delegation_id: str, claim_id: str) -> bool:
-    """Make an accepted boot notice terminal so later boots do not repeat it."""
-    ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        return conn.execute(
-            """UPDATE async_delegations SET auto_resume_state=?, updated_at=?
-                WHERE delegation_id=? AND auto_resume_state=? AND auto_resume_claim=?""",
-            (AUTO_RESUME_STATE_DELIVERED, time.time(), delegation_id,
-             AUTO_RESUME_STATE_CLAIMED, claim_id),
-        ).rowcount == 1
+    """Make an accepted notice terminal so later boots do not repeat it."""
+    return _settle_boot_claim(delegation_id, claim_id, delivered=True)
 
 
 AUTO_RESUME_NOTICE_OPEN = "[IMPORTANT: An interrupted single-task background delegation "
@@ -402,70 +355,32 @@ def build_auto_resume_notice(record: dict[str, Any]) -> str:
 
 
 def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Durably take the ONE recovery claim for *delegation_id*.
-
-    Returns ``(record, None)`` on success — the record snapshot as it was when
-    claimed — or ``(record_or_None, reason)`` when the row is missing, ineligible,
-    or already claimed. Re-reads and re-checks eligibility inside the same
-    transaction as the UPDATE, so two racing callers cannot both win, and the
-    guarded UPDATE (``resume_state='none' AND resume_attempts=0``) is the
-    authority even if the read raced.
-    """
+    """Take the explicit one-shot claim for an interrupted single-task delegation."""
     ad = _ad()
-    if not delegation_id:
+    if not delegation_id or not ad._ledger_exists():
         return None, INELIGIBLE_NO_ROW
-    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
-    now = time.time()
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        record = _load(conn, delegation_id)
-        if record is None:
-            return None, INELIGIBLE_NO_ROW
-        reason = _eligibility(record)
-        if reason is not None:
-            return record, reason
-        changed = conn.execute(
-            """UPDATE async_delegations
-               SET resume_state=?, resume_attempts=resume_attempts+1,
-                   resume_claim=?, resume_claimed_at=?, updated_at=?
-               WHERE delegation_id=? AND resume_state=? AND resume_attempts=0""",
-            (RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id, RESUME_STATE_NONE),
-        ).rowcount
-        if changed != 1:
-            return record, INELIGIBLE_CLAIMED
-    record["resume_claim"] = claim_id
-    record["resume_state"] = RESUME_STATE_CLAIMED
-    record["resume_attempts"] = 1
-    return record, None
+    with ad._ledger() as store:
+        record, reason, _ = store.coordination.claim_delegation_recovery(
+            delegation_id, claim=f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}",
+            now=time.time(), eligible=_eligibility,
+        )
+    return record, reason
 
 
 def claim_batch_resume(delegation_id: str, consumer: str = "delegate_task") -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Claim each unfinished child of a batch exactly once."""
+    """Claim each unfinished child of a fan-out exactly once."""
     ad = _ad()
-    if not delegation_id:
+    if not delegation_id or not ad._ledger_exists():
         return None, INELIGIBLE_NO_ROW
-    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
-    now = time.time()
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        record = _load(conn, delegation_id)
-        if record is None:
-            return None, INELIGIBLE_NO_ROW
-        reason = _batch_resume_eligibility(record)
-        if reason is not None:
-            return record, reason
-        changed = conn.execute(
-            """UPDATE async_delegations SET resume_state=?, resume_attempts=resume_attempts+1,
-                      resume_claim=?, resume_claimed_at=?, updated_at=?
-               WHERE delegation_id=? AND resume_state=? AND resume_attempts=0""",
-            (RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id, RESUME_STATE_NONE),
-        ).rowcount
-        if changed != 1:
-            return record, INELIGIBLE_CLAIMED
-        indexes = _claim_batch_children(conn, record, claim_id)
-    record["resume_state"] = RESUME_STATE_CLAIMED
-    record["resume_attempts"] = 1
-    record["resume_claim"] = claim_id
-    record["recovery_tasks"] = _batch_recovery_tasks(record, indexes)
-    return record, None
+    with ad._ledger() as store:
+        record, reason, indexes = store.coordination.claim_delegation_recovery(
+            delegation_id, claim=f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}",
+            now=time.time(), eligible=_batch_resume_eligibility,
+            children=lambda row: [child["task_index"] for child in _batch_recovery_candidates(row)],
+        )
+    if reason is None and record is not None:
+        record["recovery_tasks"] = _batch_recovery_tasks(record, indexes)
+    return record, reason
 
 
 _STATE_PHRASE = {
@@ -624,6 +539,12 @@ def _child_results(record: dict[str, Any]) -> list:
     return [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
 
 
+def _child_already_resuming(entry: dict[str, Any]) -> bool:
+    from tools.delegate_tool_auto_resume import waiting_on_resume
+
+    return entry.get("status") == "waiting_to_resume" or waiting_on_resume(entry)
+
+
 def _texts(record: dict[str, Any]) -> str:
     parts = [record["result"].get("error"), record["result"].get("summary"), record["event"].get("error")]
     for r in _child_results(record):
@@ -728,37 +649,18 @@ def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", or
     ``all_sessions`` cancels owed retries everywhere, but a claimed legacy recovery
     (``retry_state='none'``) belongs to the session that claimed it: it is revoked only by
     ``delegation_id`` or by the stopping session's selectors, never by an unscoped stop."""
-    selectors = [(field, value) for field, value in (
-        ("origin_session", session_key), ("origin_ui_session_id", origin_ui_session_id),
-        ("parent_session_id", parent_session_id)) if value]
-    cancel_reason = str(reason or "stop_command")
-    session_scope = "(" + " OR ".join(field + "=?" for field, _ in selectors) + ")"
-    session_values = [value for _, value in selectors]
-    placeholders = ",".join("?" for _ in RETRY_PENDING_STATES)
-    pending = f"retry_state IN ({placeholders})"
-    legacy = "(retry_state=? AND resume_state=? AND COALESCE(retry_replacement, '')='')"
-    pending_values, legacy_values = list(RETRY_PENDING_STATES), [RETRY_NONE, RESUME_STATE_CLAIMED]
-    if delegation_id:
-        where = f"({pending} OR {legacy}) AND delegation_id=?"
-        values = [*pending_values, *legacy_values, delegation_id]
-    elif all_sessions and selectors:
-        where = f"({pending} OR ({legacy} AND {session_scope}))"
-        values = [*pending_values, *legacy_values, *session_values]
-    elif all_sessions:
-        where, values = pending, pending_values
-    elif selectors:
-        where = f"({pending} OR {legacy}) AND {session_scope}"
-        values = [*pending_values, *legacy_values, *session_values]
-    else:
-        return set()  # an empty session selector never means everyone
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason=?,
-                       retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
-                       WHERE {where} RETURNING delegation_id""",
-                            (cancel_reason, time.time(), *values)).fetchall()
-    return {row[0] for row in rows}
-
+    if not (delegation_id or session_key or origin_ui_session_id or parent_session_id or all_sessions):
+        return set()
+    if not ad._ledger_exists():
+        return set()
+    with ad._ledger() as store:
+        return store.coordination.cancel_delegation_retries(
+            delegation_id=delegation_id, origin_session=session_key,
+            origin_ui_session_id=origin_ui_session_id, parent_session_id=parent_session_id,
+            all_sessions=all_sessions, reason=str(reason or "stop_command"), now=time.time(),
+            pending_states=RETRY_PENDING_STATES,
+        )
 
 def retry_action_is_current(action: dict[str, Any]) -> bool:
     """Collected actions lose authority when /stop clears their durable claim."""
@@ -786,10 +688,17 @@ def classify_outcome(record: dict[str, Any]) -> tuple[str, str]:
     if not (record["parent_session_id"] or record["origin_session_id"]):
         return RETRY_NONE, "stateless origin"  # cron/one-shot: no chat owns a recovery
     results = _child_results(record)
-    failed = [r for r in results if r.get("status") not in _OK_STATUSES]
+    if record["result"].get("waiting_to_resume") or record["event"].get("waiting_to_resume"):
+        return RETRY_NONE, "native child resume already scheduled"
+    if results and all(_child_already_resuming(entry) for entry in results):
+        return RETRY_NONE, "native child resume already scheduled"
+    if not results and _child_already_resuming(record["result"]):
+        return RETRY_NONE, "native child resume already scheduled"
+    failed = [r for r in results if r.get("status") not in _OK_STATUSES and not _child_already_resuming(r)]
     if state == "completed" and not failed:
         return RETRY_NONE, REASON_COMPLETED
-    if state in _LOST_OWNER_STATES and results and not failed and len(results) >= _goal_count(task):
+    if (state in _LOST_OWNER_STATES and results and len(results) >= _goal_count(task)
+            and all(r.get("status") in _OK_STATUSES for r in results)):
         # Every child durably finished before the owner died: deliver that result, never rerun the work.
         return RETRY_NONE, REASON_COMPLETED_BEFORE_OWNER_EXIT
     text = _texts(record)
@@ -837,69 +746,63 @@ def _backoff(attempt: int) -> float:
     return min(MAX_BACKOFF_S, BASE_BACKOFF_S * (2 ** max(0, attempt)))
 
 
-def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
-    """Classify one terminal ``armed`` row exactly once. Returns the plan, or None when not applicable."""
-    ad = _ad()
+_ACTIVE_RETRY_ORIGIN_STATES = frozenset({"new", "queued", "admitted", "running", "stalling", "finalizing"})
+
+
+def _classify_retry(record, now, routes, available_at):
+    if (record["retry_state"] != RETRY_ARMED or record["state"] in _ACTIVE_RETRY_ORIGIN_STATES
+            or _recovery_admission_error(record) == INELIGIBLE_SEALED):
+        return None
+    verdict, reason = classify_outcome(record)
+    due = None
+    attempt = record["retry_attempt"]
+    root_start = float(record["retry_root_started_at"] or now)
+    if verdict == "retry":
+        if attempt >= MAX_RETRY_ATTEMPTS:
+            verdict, reason = RETRY_TERMINAL, f"retry budget exhausted after {attempt} retries ({reason})"
+        elif now - root_start >= MAX_LINEAGE_AGE_S:
+            verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
+        else:
+            candidates = []
+            if (available_at is not None and _route_chain(record) == routes
+                    and 0 < available_at - now <= MAX_LINEAGE_AGE_S):
+                candidates.append(available_at - now)
+            if reset_delay := _reset_delay(_texts(record), now):
+                candidates.append(reset_delay)
+            reset_wait = min(candidates) + 30.0 if candidates else 0.0
+            due = now + max(_backoff(attempt), reset_wait)
+            if due >= root_start + MAX_LINEAGE_AGE_S:
+                verdict, reason, due = RETRY_TERMINAL, "retry budget exhausted (24h)", None
+            else:
+                verdict = RETRY_SCHEDULED
+    return DelegationRetryChange(verdict, reason, due, None, None, record["retry_notices"])
+
+
+def schedule_retry(
+    delegation_id: str, *, now: Optional[float] = None, best_effort: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Classify one terminal armed row. Provider cooldown reads take place outside the writer."""
     now = time.time() if now is None else now
-    # The route cooldown read loads config and takes a cross-process file lock with no timeout.
-    # Do it before BEGIN IMMEDIATE so it never stretches the ledger's writer transaction.
-    with ad._DB_LOCK, ad._transaction() as conn:
-        preview = _load(conn, delegation_id)
-    routes = _route_chain(preview) if preview is not None and preview["retry_state"] == RETRY_ARMED else []
+    preview = retry_status(delegation_id)
+    if not preview or preview["retry_state"] != RETRY_ARMED or preview["state"] in _ACTIVE_RETRY_ORIGIN_STATES:
+        return None
+    routes = _route_chain(preview)
     available_at = None
     if routes:
         from agent.shared_primary_cooldown import earliest_available
         _, available_at = earliest_available(routes, now=now)
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        record = _load(conn, delegation_id)
-        if (record is None or record["retry_state"] != RETRY_ARMED
-                or _recovery_admission_error(record) == INELIGIBLE_SEALED):
-            return None
-        if record["state"] in {"new", "queued", "admitted", "running", "stalling", "finalizing"}:
-            return None
-        verdict, reason = classify_outcome(record)
-        due = None
-        if verdict == "retry":
-            if record["retry_attempt"] >= MAX_RETRY_ATTEMPTS:
-                verdict, reason = RETRY_TERMINAL, f"retry budget exhausted after {record['retry_attempt']} retries ({reason})"
-            elif now - float(record["retry_root_started_at"] or now) >= MAX_LINEAGE_AGE_S:
-                verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
-            else:
-                verdict = RETRY_SCHEDULED
-                if _route_chain(record) != routes:
-                    available_at = None  # the chain changed after the read: its cooldown is unknown
-                # A route with no record is unknown: the store only records primary-route
-                # outages in production. Combine every recorded active reset with the provider
-                # hint, then apply the normal exponential backoff floor.
-                candidates = []
-                if available_at is not None and 0 < available_at - now <= MAX_LINEAGE_AGE_S:
-                    candidates.append(available_at - now)
-                if reset_delay := _reset_delay(_texts(record), now):
-                    candidates.append(reset_delay)
-                # Avoid racing the provider's reset, but never park beyond the lineage budget.
-                reset_wait = min(candidates) + 30.0 if candidates else 0.0
-                deadline = float(record["retry_root_started_at"] or now) + MAX_LINEAGE_AGE_S
-                wait = max(_backoff(record["retry_attempt"]), reset_wait)
-                if now + wait >= deadline:
-                    # claim_retry_dispatch/_expire_retry treats the deadline as expired. Do not
-                    # create a row that can only become terminal after waiting until that deadline.
-                    verdict = RETRY_TERMINAL
-                    reason = _expire_retry(
-                        conn, record, now,
-                        forced_reason=_retry_budget_reason(record, deadline, check_attempts=False),
-                    )
-                else:
-                    due = now + wait
-        conn.execute(
-            """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
-               WHERE delegation_id=? AND retry_state=?""",
-            (verdict, reason, due, now, delegation_id, RETRY_ARMED))
-    if verdict == RETRY_NONE:
+    with _ad()._ledger() as store:
+        rows = store.coordination.change_delegation_retries(
+            [delegation_id], now=now, best_effort=best_effort,
+            decide=lambda record: _classify_retry(record, now, routes, available_at),
+        )
+    if not rows or rows[0]["retry_state"] == RETRY_NONE:
         return None
-    return {"delegation_id": delegation_id, "retry_state": verdict, "reason": reason, "due_at": due,
-            "cut_reason": _cut_reason(record),
+    record = rows[0]
+    verdict = record["retry_state"]
+    return {"delegation_id": delegation_id, "retry_state": verdict, "reason": record["retry_reason"],
+            "due_at": record["retry_due_at"], "cut_reason": _cut_reason(record),
             "attempt": record["retry_attempt"] + (1 if verdict == RETRY_SCHEDULED else 0)}
-
 
 def _action(record: dict[str, Any], kind: str, claim: str) -> dict[str, Any]:
     task = record["task"]
@@ -912,278 +815,195 @@ def _action(record: dict[str, Any], kind: str, claim: str) -> dict[str, Any]:
     }
 
 
-def _claim(conn, record: dict[str, Any], expected: str, new: str, now: float, **extra) -> Optional[str]:
-    claim = f"retry:{os.getpid()}:{uuid.uuid4().hex}"
-    sets = "".join(f", {k}=?" for k in extra)
-    changed = conn.execute(
-        f"""UPDATE async_delegations SET retry_state=?, retry_claim=?, retry_claimed_at=?, updated_at=?{sets}
-            WHERE delegation_id=? AND retry_state=? AND COALESCE(retry_claim,'')=?""",
-        (new, claim, now, now, *extra.values(), record["delegation_id"], expected, record["retry_claim"])).rowcount
-    return claim if changed == 1 else None
-
-
 def classify_armed(*, now: Optional[float] = None, limit: int = 64) -> int:
-    """Classify terminal rows still ``armed`` (owner died, classification crashed, or a restart)."""
+    """Classify orphaned terminal rows and recover successful results whose delivery was dropped."""
     ad = _ad()
-    now = time.time() if now is None else now
-    try:
-        with ad._DB_LOCK, ad._transaction() as conn:
-            armed = [r[0] for r in conn.execute(
-                """SELECT delegation_id FROM async_delegations WHERE retry_state='armed'
-                   AND state NOT IN ('new','queued','admitted','running','stalling','finalizing') LIMIT ?""", (limit,))]
-            dropped_where = f"""retry_state='none' AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})
-                     AND (delivery_state='dropped' OR EXISTS (
-                          SELECT 1 FROM async_delegation_events e
-                          WHERE e.delegation_id=async_delegations.delegation_id
-                            AND e.event_kind='terminal_fallback' AND e.delivery_state='dropped'))"""
-            dropped = [r[0] for r in conn.execute(
-                f"SELECT delegation_id FROM async_delegations WHERE {dropped_where} LIMIT ?",
-                (*SUCCESS_REASONS, limit))]
-            if dropped:
-                conn.execute(
-                    f"""UPDATE async_delegations SET retry_state='terminal', retry_reason=?, retry_due_at=NULL, updated_at=?
-                        WHERE delegation_id IN ({",".join("?" for _ in dropped)}) AND {dropped_where}""",
-                    (RESULT_UNDELIVERABLE, now, *dropped, *SUCCESS_REASONS))
-    except sqlite3.OperationalError as exc:
-        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
-            raise
+    if not ad._ledger_exists():
         return 0
-    for delegation_id in armed:
-        schedule_retry(delegation_id, now=now)
+    now = time.time() if now is None else now
+    with ad._ledger_reader() as store:
+        armed = store.coordination.list_delegation_retries(
+            states=(RETRY_ARMED,), limit=limit, terminal_armed=True,
+        )
+        dropped = store.coordination.list_delegation_retries(
+            states=(RETRY_NONE,), limit=limit, dropped_success_reasons=SUCCESS_REASONS,
+        )
+    if dropped:
+        with ad._ledger() as store:
+            store.coordination.change_delegation_retries(
+                [row["delegation_id"] for row in dropped], now=now, best_effort=True,
+                decide=lambda row: DelegationRetryChange(
+                    RETRY_TERMINAL, RESULT_UNDELIVERABLE, None, None, None, row["retry_notices"],
+                ) if row["retry_state"] == RETRY_NONE and row["retry_reason"] in SUCCESS_REASONS else None,
+            )
+    for row in armed:
+        schedule_retry(row["delegation_id"], now=now, best_effort=True)
     return len(armed)
 
 
-def _retry_candidate_ids(conn, now: float, limit: int) -> list[str]:
-    """Read retry candidates without opening a writer transaction."""
-    stale = now - RETRY_CLAIM_TTL_S
-    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
-    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
-             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
-             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
-             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
-           AND (event_json IS NULL OR delivery_state != 'pending')
-           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
-                           WHERE e.delegation_id=async_delegations.delegation_id
-                             AND e.delivery_state='pending')
-           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
-                                           json_extract(result_json, '$.cut_reason')))
-                    AND (delivery_state='delivered' OR retry_notices > 0)
-                    AND retry_state IN ('scheduled','notified')
-                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
-           """
-    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
-    return [row[0] for row in conn.execute(
-        "SELECT delegation_id FROM async_delegations" + where + " ORDER BY updated_at ASC LIMIT ?",
-        (*params, limit)).fetchall()]
+def _retry_ready(record, now):
+    state = record["retry_state"]
+    due = record["retry_due_at"]
+    claimed_at = record["retry_claimed_at"]
+    if state == RETRY_SCHEDULED:
+        return due is not None and due <= now
+    if state == RETRY_TERMINAL:
+        return due is None or due <= now
+    if state in (RETRY_NOTIFIED, RETRY_DISPATCHING):
+        return claimed_at is not None and claimed_at <= now - NOTICE_GRACE_S
+    if state in (RETRY_NOTICING, RETRY_REPORTING):
+        return claimed_at is not None and claimed_at <= now - RETRY_CLAIM_TTL_S
+    return False
 
 
-def _claimable_retry_rows(conn, now: float, limit: int, candidate_ids=None) -> list:
-    """Re-read and claim only selected ids after acquiring the writer transaction."""
-    stale = now - RETRY_CLAIM_TTL_S
-    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
-    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
-             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
-             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
-             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
-           AND (event_json IS NULL OR delivery_state != 'pending')
-           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
-                           WHERE e.delegation_id=async_delegations.delegation_id
-                             AND e.delivery_state='pending')
-           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
-                                           json_extract(result_json, '$.cut_reason')))
-                    AND (delivery_state='delivered' OR retry_notices > 0)
-                    AND retry_state IN ('scheduled','notified')
-                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
-           """
-    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
-    if candidate_ids is None:
-        candidate_ids = _retry_candidate_ids(conn, now, limit)
-    if not candidate_ids:
-        return []
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    return conn.execute(
-        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidate_ids)})"
-        + " ORDER BY updated_at ASC", (*params, *candidate_ids)).fetchall()
+def _restart_wake_already_delivered(record):
+    return is_trusted_restart_cut(_cut_reason(record)) and (
+        record["delivery_state"] == "delivered" or record["retry_notices"] > 0
+    )
 
 
+def _retry_candidate(record, now):
+    state = record["retry_state"]
+    if state not in (RETRY_TERMINAL, RETRY_REPORTING) and _recovery_admission_error(record) == INELIGIBLE_SEALED:
+        return False
+    return not (
+        state in (RETRY_SCHEDULED, RETRY_NOTIFIED)
+        and not _recovery_stopped(record)
+        and _restart_wake_already_delivered(record)
+        and record["retry_root_started_at"] + MAX_LINEAGE_AGE_S > now
+    )
 
-def _read_retry_candidate_ids(ad, now: float, limit: int) -> list[str]:
-    """Read retry candidates through a deferred transaction before writer admission."""
-    with ad._DB_LOCK, ad._transaction() as conn:
-        return _retry_candidate_ids(conn, now, limit)
 
+def _sweep_change(record, now):
+    if not _retry_ready(record, now) or not _retry_candidate(record, now):
+        return None
+    state = record["retry_state"]
+    reason = record["retry_reason"]
+    due = record["retry_due_at"]
+    notices = record["retry_notices"]
+    release_children = state == RETRY_DISPATCHING
+    stopped = _recovery_stopped(record)
+    if stopped and state not in (RETRY_TERMINAL, RETRY_REPORTING):
+        return DelegationRetryChange(RETRY_CANCELLED, "stopped by user", None, None, None,
+                                     notices, release_children)
+    if stopped and state == RETRY_REPORTING:
+        due = None
+    if state in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
+        if budget_reason := _retry_budget_reason(record, now):
+            state, reason, due = RETRY_TERMINAL, budget_reason, None
+    if not stopped and _restart_wake_already_delivered(record):
+        # The cut completion owns the one parent wake. Recovery is explicit.
+        if state == RETRY_TERMINAL:
+            return DelegationRetryChange(RETRY_REPORTED, reason, None, None, None, notices, release_children)
+        if state == RETRY_DISPATCHING:
+            return DelegationRetryChange(
+                RETRY_SCHEDULED, reason, record["retry_root_started_at"] + MAX_LINEAGE_AGE_S,
+                None, None, notices, release_children=True,
+            )
+        if state in (RETRY_SCHEDULED, RETRY_NOTIFIED):
+            return None
+    if state in (RETRY_NOTIFIED, RETRY_DISPATCHING) and notices >= MAX_RETRY_NOTICES:
+        state, reason = RETRY_TERMINAL, f"the parent did not dispatch the retry ({reason})"
+    claimed_state = RETRY_REPORTING if state in (RETRY_TERMINAL, RETRY_REPORTING) else RETRY_NOTICING
+    claim = f"retry:{os.getpid()}:{uuid.uuid4().hex}"
+    return DelegationRetryChange(claimed_state, reason, due, claim, now, notices, release_children)
 
-@contextmanager
-def _best_effort_retry_transaction(ad):
-    """Yield no connection when the idle sweep cannot begin under writer contention."""
-    with ExitStack() as stack:
-        try:
-            conn = stack.enter_context(ad._transaction(immediate=True))
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
-                raise
-            yield None
-            return
-        yield conn
 
 def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
-    """Claim due retry work only after the original completion/outbox delivery settles.
-
-    The failure-delivery outbox owns its original payload and exactly-once replay;
-    a retry notice or terminal report must never race that still-pending delivery.
-    """
+    """Claim due notices and reports after the original completion/outbox settles."""
     ad = _ad()
+    if limit <= 0 or not ad._ledger_exists():
+        return []
     now = time.time() if now is None else now
-    classify_armed(now=now, limit=limit)
-    actions = []
-    candidate_ids = _read_retry_candidate_ids(ad, now, limit)
-    with ad._DB_LOCK, _best_effort_retry_transaction(ad) as conn:
-        if conn is None:
-            return RetrySweepDeferred()
-        rows = _claimable_retry_rows(conn, now, limit, candidate_ids)
-        for row in rows:
-            record = _retry_record(row)
-            # An execution seal blocks recovery work, not an already-owed
-            # terminal delivery. Reporting cannot admit a replacement driver.
-            if (_recovery_admission_error(record) == INELIGIBLE_SEALED
-                    and record["retry_state"] not in (RETRY_TERMINAL, RETRY_REPORTING)):
-                continue
-            dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
-            stopped = _recovery_stopped(record)
-            if stopped:
-                # A user stop revokes recovery, but an already-owed terminal
-                # report still gets one settlement pass. Pending retry notices
-                # are cancelled with an explicit reason and no stale claim.
-                if record["retry_state"] in (RETRY_TERMINAL, RETRY_REPORTING):
-                    if record["retry_state"] == RETRY_REPORTING:
-                        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_claim=NULL, "
-                                     "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
-                                     (now, record["delegation_id"]))
-                        record.update(retry_state=RETRY_TERMINAL, retry_claim="", retry_claimed_at=None)
-                else:
-                    conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_reason=?, "
-                                 "retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? "
-                                 "WHERE delegation_id=?",
-                                 ("stopped by user", now, record["delegation_id"]))
-                    if dispatch_claim is not None:
-                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
-                    continue
-            if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
-                _expire_retry(conn, record, now)
-            state = record["retry_state"]
-            if (not stopped and is_trusted_restart_cut(_cut_reason(record))
-                    and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0)):
-                # The cut completion/accepted continuation notice owns the one
-                # parent wake. Recovery is explicit, not an automatic rerun.
-                if state == RETRY_TERMINAL:
-                    conn.execute("UPDATE async_delegations SET retry_state='reported', retry_claim=NULL, "
-                                 "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
-                                 (now, record["delegation_id"]))
-                elif state == RETRY_DISPATCHING:
-                    conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
-                                 "retry_claimed_at=NULL, retry_due_at=?, updated_at=? WHERE delegation_id=? "
-                                 "AND retry_state='dispatching' AND retry_claim=?",
-                                 (record["retry_root_started_at"] + MAX_LINEAGE_AGE_S, now,
-                                  record["delegation_id"], dispatch_claim))
-                if dispatch_claim is not None:
-                    _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
-                continue
-            if state == RETRY_NOTICING:  # crashed mid-injection: same notice again
-                state, record["retry_state"] = RETRY_SCHEDULED, RETRY_NOTICING
-            if state == RETRY_REPORTING:
-                state = RETRY_TERMINAL
-            if state in (RETRY_NOTIFIED, RETRY_DISPATCHING) and record["retry_notices"] >= MAX_RETRY_NOTICES:
-                reason = f"the parent did not dispatch the retry ({record['retry_reason']})"
-                conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_reason=?, updated_at=? "
-                             "WHERE delegation_id=? AND retry_state=?",
-                             (reason, now, record["delegation_id"], record["retry_state"]))
-                record.update(retry_state=RETRY_TERMINAL, retry_reason=reason)
-                state = RETRY_TERMINAL
-            if state == RETRY_TERMINAL:
-                claim = _claim(conn, record, record["retry_state"], RETRY_REPORTING, now)
-                if claim:
-                    actions.append(_action(record, "terminal", claim))
-            else:
-                claim = _claim(conn, record, record["retry_state"], RETRY_NOTICING, now)
-                if claim:
-                    if dispatch_claim is not None:
-                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
-                    actions.append(_action(record, "notice", claim))
-    return actions
+    try:
+        classify_armed(now=now, limit=limit)
+        with ad._ledger_reader() as store:
+            candidates = store.coordination.list_delegation_retries(
+                states=RETRY_PENDING_STATES[1:], limit=limit, after_delivery=True,
+                ready_at=(now, now - NOTICE_GRACE_S, now - RETRY_CLAIM_TTL_S),
+                eligible=lambda record: _retry_candidate(record, now),
+            )
+        if not candidates:
+            return []
+        with ad._ledger() as store:
+            claimed = store.coordination.change_delegation_retries(
+                [row["delegation_id"] for row in candidates], now=now, after_delivery=True,
+                best_effort=True, decide=lambda row: _sweep_change(row, now),
+            )
+    except StoreContention:
+        return RetrySweepDeferred()
+    kinds = {RETRY_NOTICING: "notice", RETRY_REPORTING: "terminal"}
+    return [_action(row, kinds[row["retry_state"]], row["retry_claim"])
+            for row in claimed if row["retry_state"] in kinds]
 
 
-def _settle(delegation_id: str, claim: str, expected: str, sql_set: str, params: tuple) -> bool:
+def _settle(
+    delegation_id: str, claim: str, expected: str, state: str, *,
+    now: Optional[float] = None, reason: Optional[str] = None,
+    accepted: bool = False, retry_report: bool = False,
+) -> bool:
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        return conn.execute(
-            f"UPDATE async_delegations SET {sql_set}, updated_at=? WHERE delegation_id=? AND retry_state=? AND retry_claim=?",
-            (*params, time.time(), delegation_id, expected, claim)).rowcount == 1
+    if not claim or not ad._ledger_exists():
+        return False
+    now = time.time() if now is None else now
+
+    def decide(row):
+        if row["retry_state"] != expected or row["retry_claim"] != claim:
+            return None
+        notices = row["retry_notices"]
+        due = row["retry_due_at"]
+        preserve_claim = state in (RETRY_NOTIFIED, RETRY_REPORTED)
+        if retry_report:
+            due = now + _backoff(min(notices, MAX_RETRY_ATTEMPTS))
+        return DelegationRetryChange(
+            state, reason if reason is not None else row["retry_reason"], due,
+            claim if preserve_claim else None,
+            now if accepted else row["retry_claimed_at"] if preserve_claim else None,
+            notices + int(accepted or retry_report),
+        )
+
+    with ad._ledger() as store:
+        return bool(store.coordination.change_delegation_retries([delegation_id], now=now, decide=decide))
 
 
 def mark_notice_accepted(delegation_id: str, claim: str, *, now: Optional[float] = None) -> bool:
     """The parent turn was admitted; start its dispatch grace window."""
-    now = time.time() if now is None else now
-    return _settle(delegation_id, claim, RETRY_NOTICING,
-                   "retry_state='notified', retry_notices=retry_notices+1, retry_claimed_at=?", (now,))
+    return _settle(delegation_id, claim, RETRY_NOTICING, RETRY_NOTIFIED, now=now, accepted=True)
 
 
 def release_notice(delegation_id: str, claim: str) -> bool:
-    """Injection failed or parent route not ready: retry the notice on a later sweep."""
-    return _settle(delegation_id, claim, RETRY_NOTICING, "retry_state='scheduled', retry_claim=NULL", ())
+    """Injection failed or parent route not ready: offer the notice on a later sweep."""
+    return _settle(delegation_id, claim, RETRY_NOTICING, RETRY_SCHEDULED)
 
 
 def mark_retry_terminal(delegation_id: str, claim: str, reason: str) -> bool:
-    """Parent conversation is gone: settle the retry as terminal without another parent wake."""
-    return _settle(delegation_id, claim, RETRY_NOTICING,
-                   "retry_state='terminal', retry_claim=NULL, retry_reason=?", (reason,))
+    """The parent conversation disappeared. Settle the retry without waking it again."""
+    return _settle(delegation_id, claim, RETRY_NOTICING, RETRY_TERMINAL, reason=reason)
 
 
 def mark_terminal_reported(delegation_id: str, claim: str) -> bool:
-    """Settle a terminal action after its notice was sent or deliberately kept quiet."""
-    return _settle(delegation_id, claim, RETRY_REPORTING, "retry_state='reported'", ())
+    return _settle(delegation_id, claim, RETRY_REPORTING, RETRY_REPORTED)
 
 
 def suppress_terminal_report(delegation_id: str, claim: str) -> bool:
-    """A revoked target must never receive this report, even after a later reconnect."""
-    return _settle(delegation_id, claim, RETRY_REPORTING,
-                   "retry_state='cancelled', retry_reason='authorization_revoked', retry_claim=NULL", ())
+    return _settle(delegation_id, claim, RETRY_REPORTING, RETRY_CANCELLED, reason="authorization_revoked")
 
 
 def suppress_retry_notice(delegation_id: str, claim: str) -> bool:
-    """A revoked target must never trigger autonomous recovery work or receive a parent reply."""
-    return _settle(delegation_id, claim, RETRY_NOTICING,
-                   "retry_state='cancelled', retry_reason='authorization_revoked', retry_claim=NULL", ())
+    return _settle(delegation_id, claim, RETRY_NOTICING, RETRY_CANCELLED, reason="authorization_revoked")
 
 
 def release_terminal_report(delegation_id: str, claim: str) -> bool:
-    """Unsent reports remain owed, with bounded backoff; only a receipt may mark them reported."""
-    ad = _ad()
-    now = time.time()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        row = conn.execute("SELECT retry_notices FROM async_delegations "
-                           "WHERE delegation_id=? AND retry_state='reporting' AND retry_claim=?",
-                           (delegation_id, claim)).fetchone()
-        if row is None:
-            return False
-        due = now + _backoff(min(int(row[0] or 0), MAX_RETRY_ATTEMPTS))
-        return conn.execute(
-            """UPDATE async_delegations SET retry_notices=retry_notices+1, retry_claim=NULL, updated_at=?,
-                      retry_state='terminal', retry_due_at=?
-               WHERE delegation_id=? AND retry_state='reporting' AND retry_claim=?""",
-            (now, due, delegation_id, claim)).rowcount == 1
+    """Unsent reports remain owed, with bounded backoff."""
+    return _settle(delegation_id, claim, RETRY_REPORTING, RETRY_TERMINAL, retry_report=True)
 
-
-def _retry_child_claim_eligibility(conn, record: dict[str, Any]) -> Optional[str]:
-    """Share the unspent-child gate between notices and atomic retry admission."""
+def _retry_child_claim_eligibility(record: dict[str, Any], existing: dict) -> Optional[str]:
+    """Check whether a fan-out still has unclaimed unfinished work."""
     if _goal_count(record.get("task") or {}) <= 1:
         return None
     candidates = _batch_recovery_candidates(record)
     if not candidates:
         return INELIGIBLE_PARTIAL
-    existing = dict(conn.execute(
-        "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
-        "WHERE delegation_id=?", (record["delegation_id"],)))
     # Consumed claims allow recovery of remaining siblings; an unspent claim
     # belongs to its current consumer and must not be advertised again.
     if any(child["task_index"] in existing and not existing[child["task_index"]] for child in candidates):
@@ -1193,15 +1013,14 @@ def _retry_child_claim_eligibility(conn, record: dict[str, Any]) -> Optional[str
     return None
 
 
-def _resume_available_in(conn, delegation_id: str) -> bool:
-    record = _load(conn, delegation_id)
+def _resume_available_record(record: Optional[dict], children: dict) -> bool:
     if record is None or _recovery_admission_error(record):
         return False
     if record["retry_state"] in RETRY_PENDING_STATES + (RETRY_DISPATCHED, RETRY_REPORTED):
         return (record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED)
                 and not _recovery_stopped(record)
                 and _retry_budget_reason(record, time.time()) is None
-                and _retry_child_claim_eligibility(conn, record) is None)
+                and _retry_child_claim_eligibility(record, children) is None)
     reason = _eligibility(record)
     if reason == INELIGIBLE_BATCH:
         reason = _batch_resume_eligibility(record)
@@ -1211,8 +1030,11 @@ def _resume_available_in(conn, delegation_id: str) -> bool:
 def resume_available(delegation_id: str) -> bool:
     """Read-only cut-notice admission; the control action rechecks before claiming."""
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        return _resume_available_in(conn, delegation_id)
+    if not delegation_id or not ad._ledger_exists():
+        return False
+    with ad._ledger_reader() as store:
+        record = store.coordination.delegation_recovery_record(delegation_id, include_children=True)
+    return _resume_available_record(record, (record or {}).get("child_replacements", {}))
 
 
 def stamp_resume_availability(evt: dict[str, Any], conn=None) -> None:
@@ -1229,7 +1051,11 @@ def stamp_resume_availability(evt: dict[str, Any], conn=None) -> None:
         if not delegation_id:
             available = False
         elif conn is not None:
-            available = _resume_available_in(conn, delegation_id)
+            children = dict(conn.execute(
+                """SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery
+                   WHERE delegation_id=?""", (delegation_id,),
+            ))
+            available = _resume_available_record(_load(conn, delegation_id), children)
         else:
             available = resume_available(delegation_id)
     except Exception:
@@ -1240,33 +1066,34 @@ def stamp_resume_availability(evt: dict[str, Any], conn=None) -> None:
 
 
 def claim_retry_dispatch(delegation_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Atomically take the one dispatch claim for a retry-pending row (concurrent callers: one winner)."""
+    """Atomically take the one dispatch claim for a retry-pending row."""
     ad = _ad()
-    if not delegation_id:
+    if not delegation_id or not ad._ledger_exists():
         return None, INELIGIBLE_NO_ROW
     now = time.time()
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        record = _load(conn, delegation_id)
-        if record is None:
-            return None, INELIGIBLE_NO_ROW
-        if record["retry_state"] not in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED):
-            return record, INELIGIBLE_CLAIMED if record["retry_state"] in (RETRY_DISPATCHING, RETRY_DISPATCHED) \
-                else INELIGIBLE_STATE
-        if reason := _recovery_admission_error(record):
-            return record, reason
-        if reason := _expire_retry(conn, record, now):
-            return record, reason
-        if reason := _retry_child_claim_eligibility(conn, record):
-            return record, reason
-        claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
-        if claim is None:
-            return record, INELIGIBLE_CLAIMED
-        child_indexes = _claim_batch_children(conn, record, claim)
-    record.update(retry_state=RETRY_DISPATCHING, retry_claim=claim, retry_claimed_at=now)
-    if child_indexes:
-        record["recovery_tasks"] = _batch_recovery_tasks(record, child_indexes)
-    return record, None
 
+    def eligible(record):
+        if record["retry_state"] in (RETRY_DISPATCHING, RETRY_DISPATCHED):
+            return INELIGIBLE_CLAIMED, False
+        if record["retry_state"] not in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED):
+            return INELIGIBLE_STATE, False
+        if reason := _recovery_admission_error(record):
+            return reason, False
+        if reason := _retry_budget_reason(record, now):
+            return reason, True
+        if _goal_count(record["task"]) > 1 and not _batch_recovery_candidates(record):
+            return INELIGIBLE_PARTIAL, False
+        return None, False
+
+    with ad._ledger() as store:
+        record, reason, indexes = store.coordination.claim_delegation_retry_dispatch(
+            delegation_id, claim=f"retry:{os.getpid()}:{uuid.uuid4().hex}", now=now, eligible=eligible,
+            children=lambda row: ([child["task_index"] for child in _batch_recovery_candidates(row)]
+                                  if _goal_count(row["task"]) > 1 else []),
+        )
+    if indexes:
+        record["recovery_tasks"] = _batch_recovery_tasks(record, indexes)
+    return record, reason
 
 def _has_recovery_claim(record: dict[str, Any]) -> bool:
     return (record["retry_state"] == RETRY_DISPATCHING
@@ -1277,15 +1104,19 @@ def _has_recovery_claim(record: dict[str, Any]) -> bool:
 
 def claimed_retry_source(record: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Return the recovery row whose claim authorizes this recovery spawn."""
-    ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        prior = _replacement_source(conn, record, str(record.get("context") or ""))
-    return prior if prior and _has_recovery_claim(prior) else None
+    prior = retry_status(recovery_source_id(record.get("context")) or "")
+    if prior is None or not _has_recovery_claim(prior):
+        return None
+    if not ((record.get("session_key") and record["session_key"] == prior["session_key"])
+            or (record.get("parent_session_id") and record["parent_session_id"] in
+                (prior["parent_session_id"], prior["origin_session_id"]))):
+        return None
+    return prior
 
 
 def recovery_source_id(context: Any) -> Optional[str]:
     """Current brief's source; ancestor headings in ORIGINAL CONTEXT are evidence only."""
-    match = _RECOVERY_HEADING_RE.search(str(context or ""))
+    match = _RECOVERY_HEADING_RE.match(str(context or "").lstrip())
     return match.group(1) if match else None
 
 
@@ -1295,49 +1126,65 @@ def is_recovery_spawn(record: dict[str, Any]) -> bool:
     return bool(source and source != record.get("delegation_id"))
 
 
-def _release_unspent_batch_children(conn, delegation_id: str, claim: str) -> None:
-    """Re-arm only unspent children owned by this exact row claim.
+def recovery_replacement(contexts):
+    """Decode the current recovery brief(s) before starting a detached unit."""
+    from persistence.authority.coordination import DelegationReplacement
+    import re
 
-    Consumed children remain durable one-shot evidence, even if a sibling failed
-    to persist. Call only inside the guarded row transition's transaction.
-    """
-    conn.execute("DELETE FROM async_delegation_child_recovery WHERE delegation_id=? "
-                 "AND claim=? AND replacement_delegation_id IS NULL", (delegation_id, claim))
+    contexts = tuple(str(context or "").lstrip() for context in contexts)
+    sources = [recovery_source_id(context) for context in contexts]
+    if not any(sources):
+        return None
+    if len(set(sources)) != 1:
+        raise RetryAdmissionError("a recovery unit must contain only briefs from the same delegation")
+    source_id = sources[0]
+    marker = re.compile(rf"^RECOVERY CHILD INDEX: {re.escape(source_id)}:(\d+)\s*$", re.MULTILINE)
+    indexes = []
+    for context in contexts:
+        matches = marker.findall(context)
+        if len(matches) == 1:
+            indexes.append(int(matches[0]))
+        elif len(contexts) > 1 or matches:
+            raise RetryAdmissionError("each recovered batch task must name exactly one claimed child index")
+    if len(indexes) != len(set(indexes)):
+        raise RetryAdmissionError("a claimed child cannot be dispatched twice in one unit")
+    return DelegationReplacement(source_id, tuple(indexes))
+
+
+def recovery_dispatch_refusal(record: dict[str, Any], now: float) -> tuple[Optional[str], bool]:
+    """Recheck the durable cut and retry budget at the replacement's insertion boundary."""
+    if reason := _recovery_admission_error(record):
+        return reason, False
+    if record["retry_state"] == RETRY_DISPATCHING:
+        reason = _retry_budget_reason(record, now)
+        return reason, reason is not None
+    return None, False
 
 
 def release_retry_dispatch(record: dict[str, Any]) -> bool:
     """Return a failed persist and its unspent recovery claims to the scheduler."""
     ad = _ad()
-    did = record["delegation_id"]
-    if (record.get("retry_state") == RETRY_NONE
-            and record.get("resume_state") == RESUME_STATE_CLAIMED):
-        claim = record.get("resume_claim", "")
+    if not ad._ledger_exists():
+        return False
+    did, now = record["delegation_id"], time.time()
+    with ad._ledger() as store:
+        if record.get("retry_state") == RETRY_NONE and record.get("resume_state") == RESUME_STATE_CLAIMED:
+            return store.coordination.release_delegation_resume_claim(
+                did, claim=record.get("resume_claim", ""), now=now,
+            )
+        claim = record.get("retry_claim")
         if not claim:
             return False
-        now = time.time()
-        with ad._DB_LOCK, ad._transaction() as conn:
-            changed = conn.execute(
-                "UPDATE async_delegations SET resume_state=?, resume_attempts=0, resume_claim=NULL, "
-                "resume_claimed_at=NULL, updated_at=? "
-                "WHERE delegation_id=? AND resume_state=? AND resume_claim=?",
-                (RESUME_STATE_NONE, now, did, RESUME_STATE_CLAIMED, claim),
-            ).rowcount
-            if changed:
-                _release_unspent_batch_children(conn, did, claim)
-            return changed == 1
 
-    now = time.time()
-    due = now + _backoff(int(record.get("retry_attempt") or 0))
-    claim = record.get("retry_claim", "")
-    with ad._DB_LOCK, ad._transaction() as conn:
-        changed = conn.execute(
-            "UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
-            "retry_claimed_at=NULL, retry_due_at=?, updated_at=? "
-            "WHERE delegation_id=? AND retry_state='dispatching' AND retry_claim=?",
-            (due, now, did, claim)).rowcount
-        if changed:
-            _release_unspent_batch_children(conn, did, claim)
-        return changed == 1
+        def decide(row):
+            if row["retry_state"] != RETRY_DISPATCHING or row["retry_claim"] != claim:
+                return None
+            return DelegationRetryChange(
+                RETRY_SCHEDULED, row["retry_reason"], now + _backoff(row["retry_attempt"]),
+                None, None, row["retry_notices"], release_children=True,
+            )
+
+        return bool(store.coordination.change_delegation_retries([did], now=now, decide=decide))
 
 
 def _replacement_source(conn, new: dict[str, Any], task_text: str) -> Optional[dict[str, Any]]:
@@ -1423,12 +1270,20 @@ def replacement_admission_error(conn, new: dict[str, Any], task_text: str) -> Op
 def retry_submission_error(delegation_id: str) -> Optional[str]:
     """Queued retries must not start after the lineage deadline when a pool slot frees."""
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        record = _load(conn, delegation_id)
-        if record is None or not record["retry_attempt"]:
-            return None
+    now = time.time()
+    preview = retry_status(delegation_id)
+    if not preview or not preview["retry_attempt"] or not _retry_budget_reason(preview, now, check_attempts=False):
+        return None
+
+    def expire(record):
         # Attempt six may execute; only the next claim is barred by the attempt ceiling.
-        return _expire_retry(conn, record, time.time(), check_attempts=False)
+        if record["retry_attempt"] and (reason := _retry_budget_reason(record, now, check_attempts=False)):
+            return DelegationRetryChange(RETRY_TERMINAL, reason, None, None, None, record["retry_notices"])
+        return None
+
+    with ad._ledger() as store:
+        rows = store.coordination.change_delegation_retries([delegation_id], now=now, decide=expire)
+    return rows[0]["retry_reason"] if rows else None
 
 
 def link_replacement(conn, new: dict[str, Any], task_text: str) -> None:
@@ -1476,20 +1331,21 @@ def link_replacement(conn, new: dict[str, Any], task_text: str) -> None:
 
 def retry_status(delegation_id: str) -> Optional[dict[str, Any]]:
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        record = _load(conn, delegation_id)
-    return record
+    if not delegation_id or not ad._ledger_exists():
+        return None
+    with ad._ledger_reader() as store:
+        return store.coordination.delegation_recovery_record(delegation_id)
 
 
 def list_retry_pending(limit: int = 50) -> list:
     """Rows Hermes is still retrying or reporting; for delegate_task action=list."""
     ad = _ad()
-    with ad._DB_LOCK, ad._transaction() as conn:
-        rows = conn.execute(_RETRY_SELECT + """ WHERE retry_state IN
-            ('scheduled','noticing','notified','dispatching','terminal','reporting') ORDER BY updated_at DESC LIMIT ?""",
-                            (limit,)).fetchall()
-    return [_retry_record(r) for r in rows]
-
+    if not ad._ledger_exists():
+        return []
+    with ad._ledger_reader() as store:
+        return list(store.coordination.list_delegation_retries(
+            states=RETRY_PENDING_STATES[1:], limit=limit, newest_first=True,
+        ))
 
 def _when(ts: Optional[float]) -> str:
     return time.strftime("%H:%M", time.localtime(ts)) if ts else "soon"

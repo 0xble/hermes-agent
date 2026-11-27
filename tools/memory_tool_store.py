@@ -227,6 +227,9 @@ class MemoryStore:
         live lists keep the raw text so the user can see and remove poisoned entries
         (dropping them silently would hide the attack)."""
         from tools.threat_patterns import scan_for_threats
+        from tools.hosted_tool_policy import host_feature_enabled
+        if not host_feature_enabled("builtin_memory"):
+            return  # hosted: this profile's MEMORY.md/USER.md are never the agent's
 
         def _sanitize(entry, filename):
             # Strict scope, same as writes; empty / already-blocked entries pass through.
@@ -242,7 +245,8 @@ class MemoryStore:
             path = self._path_for(target)
             from hermes_constants import mkdir_under_hermes_home
 
-            mkdir_under_hermes_home(path.parent)
+            if not self.read_only:
+                mkdir_under_hermes_home(path.parent)
             # Deduplicate (order-preserving, first occurrence wins).
             entries = list(dict.fromkeys(self._read_file(path)))
             self._set_entries(target, entries)
@@ -359,6 +363,9 @@ class MemoryStore:
         convention) — e.g. the full text a replace overwrote (#117952). ANY dict the closure
         returns is passed through verbatim and nothing is persisted: error dicts, or the
         success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``)."""
+        from tools.hosted_tool_policy import host_feature_enabled
+        if not host_feature_enabled("builtin_memory"):
+            return {"success": False, "error": "Memory is not available to a hosted agent."}
         from agent.incognito import is_incognito
         if self.read_only or is_incognito():
             return _error("Memory writes are disabled in incognito mode.", "incognito")
@@ -391,48 +398,12 @@ class MemoryStore:
                     if bak.endswith(_BACKUP_FAILED):  # no copy, no delete of possibly glued text
                         return _drift_error(path, bak)
                     extra_fields["drift_backup"] = bak
+            self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
-            from tools.memory_transactions import MemoryTransaction, observe_memory_transaction
-
-            after = ENTRY_DELIMITER.join(result[0])
-            if raw != after:
-                with observe_memory_transaction(MemoryTransaction(target, path, raw, after)):
-                    self._write_file(path, result[0])
-            self._set_entries(target, result[0])
+            self._write_file(path, result[0])
             return self._success_response(target, result[1], **extra_fields)
-
-    def compare_and_restore(self, target: str, *, expected: str, replacement: str,
-                            metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        """Restore an exact trusted snapshot under the same lock as ordinary writes.
-
-        Native/plugin callers own snapshot authorization. This is not a model tool.
-        Observers may reject stale transaction metadata before any write. Prompt
-        snapshots remain frozen, as with ordinary memory mutations.
-        """
-        from agent.incognito import is_incognito
-        if self.read_only or is_incognito():
-            return _error("Memory writes are disabled in incognito mode.", "incognito")
-        if target not in {"memory", "user"}:
-            return _error("Invalid memory target", "invalid_args")
-        from tools.memory_transactions import MemoryTransaction, observe_memory_transaction
-
-        path = self._path_for(target)
-        with self._file_lock(path):
-            raw, readable = self._read_raw_checked(path)
-            if not readable:
-                return _read_failed_error(path)
-            if raw != expected:
-                return _error("Memory changed after the snapshot", "stale_undo", error_code="stale_undo")
-            transaction = MemoryTransaction(target, path, raw, replacement, dict(metadata or {}))
-            with observe_memory_transaction(transaction):
-                try:
-                    atomic_write_text(path, replacement, tmp_prefix=".mem_", fsync_dir=True)
-                except OSError as exc:
-                    raise RuntimeError(f"Failed to write memory file {path}: {exc}") from exc
-            self._set_entries(target, self._parse_entries(replacement))
-            return self._success_response(target, "Snapshot restored.")
 
     def add(self, target: str, content: str) -> dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
@@ -622,9 +593,7 @@ class MemoryStore:
         ops = [op or {} for op in operations]
         # Scan every add/replace content BEFORE touching disk -- one poisoned op rejects the batch.
         for i, op in enumerate(ops):
-            # Scan exactly the text _apply_batch_op will persist: ``new_text`` is accepted as an alias.
-            op_text = op.get("content") or op.get("new_text")
-            scan_error = op.get("action") in {"add", "replace"} and op_text and _scan_memory_content(op_text)
+            scan_error = op.get("action") in {"add", "replace"} and op.get("content") and _scan_memory_content(op["content"])
             if scan_error:
                 return _error(f"Operation {i + 1}: {scan_error}", "scan_blocked")
 
@@ -751,7 +720,7 @@ class MemoryStore:
         hold ``_file_lock`` (via ``_mutate``): a bare write from an earlier snapshot
         drops concurrent entries (#119668)."""
         try:
-            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_", fsync_dir=True)
+            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_")
         except OSError as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 

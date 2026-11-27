@@ -59,29 +59,27 @@ class GoalContractCommandsMixin:
             return {"error_code": "evidence_not_recorded",
                     "error": "evidence must appear in a recorded tool result"}
         try:
-            # get_messages() returns tool_name provenance (messages_by_role() does not), so the
-            # bookkeeping exclusion actually applies. include_inactive keeps archived results.
-            reader = getattr(db, "get_messages", None)
-            if reader is not None:
-                rows = [row for row in reader(self.session_id, include_inactive=True)
-                        if row.get("role") == "tool"
-                        and float(row.get("timestamp") or 0.0) >= float(state.created_at or 0.0)]
-                found_negated = False
-                for row in rows:
-                    if _evidence_tool_excluded(str(row.get("tool_name") or "")):
+            from persistence.conversation.messages import TranscriptAudit
+
+            rows = db.messages.audit_transcript(
+                self.session_id, TranscriptAudit("tool", since=float(state.created_at or 0.0)),
+            )
+            found_negated = False
+            for row in rows:
+                if _evidence_tool_excluded(str(row.tool_name or "")):
+                    continue
+                raw_content = str(row.content or "")
+                content = _recorded_result_text(raw_content)
+                if _bounded_evidence_match(raw_evidence, content):
+                    # Decoded punctuation must not remove an existing envelope veto.
+                    if any(_evidence_is_negated(candidate, raw_evidence, include_no=goal_autonomy_enabled())
+                           for candidate in (raw_content, content)):
+                        found_negated = True
                         continue
-                    raw_content = str(row.get("content") or "")
-                    content = _recorded_result_text(raw_content)
-                    if _bounded_evidence_match(raw_evidence, content):
-                        # Decoded punctuation must not remove an existing envelope veto.
-                        if any(_evidence_is_negated(candidate, raw_evidence, include_no=goal_autonomy_enabled())
-                               for candidate in (raw_content, content)):
-                            found_negated = True
-                            continue
-                        return None
-                if found_negated:
-                    return {"error_code": "evidence_negated",
-                            "error": "the recorded evidence is negated or preserves the earlier requirement"}
+                    return None
+            if found_negated:
+                return {"error_code": "evidence_negated",
+                        "error": "the recorded evidence is negated or preserves the earlier requirement"}
         except Exception as exc:
             logger.debug("goal revise: evidence lookup failed: %s", exc, exc_info=True)
         return {"error_code": "evidence_not_recorded",

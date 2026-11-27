@@ -5,8 +5,10 @@ from tests.tui_gateway._thread_fixtures import patch_server_threads
 from types import SimpleNamespace
 
 from agent.turn_context import _stage_turn_user_message
-from hermes_state import SessionDB
+from persistence.conversation.messages import ConversationRequest, TranscriptRead, TranscriptView
+from persistence_assembly import open_persistence, profile_scope
 from run_agent import AIAgent
+from tests.fixtures.storage_read import conversation, transcript_rows
 from tui_gateway import server
 
 
@@ -23,7 +25,7 @@ def _desktop_session(monkeypatch, db):
 def _flush_agent(db, key):
     """Agent shell owning the real flush (the crash persist at turn start runs this same code)."""
     agent = SimpleNamespace(
-        _session_db=db, _session_db_created=True, _persist_disabled=False, session_id=key,
+        _session_db=db, persistence=db, _session_db_created=True, _persist_disabled=False, session_id=key,
         _session_persist_lock=None, _flushed_db_message_ids=set(), _flushed_db_message_session_id=None,
         _last_flushed_db_idx=0, _persist_user_message_idx=None, _persist_user_message_override=None,
         _persist_user_message_timestamp=None, _pending_cli_user_message=None)
@@ -34,7 +36,7 @@ def _flush_agent(db, key):
 
 
 def test_user_message_is_durable_at_submit_before_any_agent_turn(monkeypatch, tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     try:
@@ -43,16 +45,16 @@ def test_user_message_is_durable_at_submit_before_any_agent_turn(monkeypatch, tm
             server._start_inflight_turn(session, "please refactor the login page")
         assert server._persist_session_row_for_submit("rid", session, "please refactor the login page", None) is None
         # The agent build has not even started: the transcript already resumes with the sent message.
-        assert [(r["role"], r["content"]) for r in db.get_messages_as_conversation(key)] == [
+        assert [(r["role"], r["content"]) for r in conversation(db, key)] == [
             ("user", "please refactor the login page")]
-        assert db.get_session(key)["message_count"] == 1
+        assert db.sessions.get(key).message_count == 1
     finally:
         server._sessions.pop(sid, None)
         db.close()
 
 
 def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkeypatch, tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
 
@@ -73,7 +75,7 @@ def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkey
             session["running"] = False
             replies.append(server.handle_request({"id": "p", "method": "prompt.submit", "params": {
                 "session_id": sid, "text": "same prompt"}})["result"])
-        rows = db.get_messages_as_conversation(key, include_row_ids=True)
+        rows = conversation(db, key, ConversationRequest(include_row_ids=True))
         assert [reply.get("user_row_id") for reply in replies] == [row["_row_id"] for row in rows]
         assert replies[0]["user_row_id"] != replies[1]["user_row_id"]
     finally:
@@ -82,7 +84,7 @@ def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkey
 
 
 def test_turn_adopts_the_submit_row_and_writes_no_duplicate(monkeypatch, tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     try:
@@ -101,7 +103,7 @@ def test_turn_adopts_the_submit_row_and_writes_no_duplicate(monkeypatch, tmp_pat
         agent._persist_user_message_idx = 0
         agent._flush_messages_to_session_db(messages, [])  # the turn-start crash persist
         agent._flush_messages_to_session_db(messages + [{"role": "assistant", "content": "done"}], [])  # turn end
-        rows = db.get_messages_as_conversation(key, include_inactive=True)
+        rows = conversation(db, key, ConversationRequest(view=TranscriptView.ALL))
         assert [(r["role"], r["content"]) for r in rows] == [("user", expanded), ("assistant", "done")]
     finally:
         server._sessions.pop(sid, None)
@@ -111,7 +113,7 @@ def test_turn_adopts_the_submit_row_and_writes_no_duplicate(monkeypatch, tmp_pat
 def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch, tmp_path):
     from tui_gateway.prompt_turn import _TurnRun
 
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
@@ -128,7 +130,7 @@ def test_completion_receipt_covers_only_committed_current_turn_rows(monkeypatch,
                       result={"messages": messages, "final_response": "same"})
         agent._flush_messages_to_session_db(messages, old)
         payload, _, _ = server._complete_turn_payload(session, st, None, 80)
-        rows = db.get_messages_as_conversation(key, include_row_ids=True)
+        rows = conversation(db, key, ConversationRequest(include_row_ids=True))
         assert payload.get("persisted_turn") == {
             "user_row_id": rows[-2]["_row_id"],
             "row_ids": [row["_row_id"] for row in rows[-2:]],
@@ -165,7 +167,7 @@ def test_failed_build_drops_the_staged_row_and_a_later_turn_never_adopts_it(monk
     """The submit-time row is the durable record of THAT send only. A turn that ends before the agent runs
     (build failed / bounded wait expired) must drop the staging dict, and a later turn without a matching
     prompt.submit (wake-up, auto-continue, queued drain) must not rewrite the user's row to its own text."""
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = open_persistence(profile_scope(home=tmp_path))
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
@@ -188,7 +190,7 @@ def test_failed_build_drops_the_staged_row_and_a_later_turn_never_adopts_it(monk
         server._adopt_submit_user_row(session, agent, synthesized, synthesized)
         assert "_submit_user_row" not in session
         assert agent._pending_cli_user_message is None
-        rows = db.get_messages_as_conversation(key, include_inactive=True)
+        rows = conversation(db, key, ConversationRequest(view=TranscriptView.ALL))
         assert [(r["role"], r["content"]) for r in rows] == [
             ("user", "please refactor the login page"), ("user", "please refactor the login page")]
     finally:
@@ -199,8 +201,8 @@ def test_failed_build_drops_the_staged_row_and_a_later_turn_never_adopts_it(monk
 def test_the_staged_submit_row_carries_the_uid_its_db_row_was_written_with(monkeypatch, tmp_path):
     """The turn adopts the staged dict as its user message; if it lacked the row's uid, the next host copy
     (in-place compaction) would mint a second identity for the same message."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    sid, _key = _desktop_session(monkeypatch, db)
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     try:
         with session["history_lock"]:
@@ -208,8 +210,8 @@ def test_the_staged_submit_row_carries_the_uid_its_db_row_was_written_with(monke
             server._start_inflight_turn(session, "please refactor the login page")
         assert server._persist_session_row_for_submit("rid", session, "please refactor the login page", None) is None
         staged = session["_submit_user_row"]
-        stored = db._conn.execute("SELECT message_uid FROM messages WHERE id = ?", (staged["_row_id"],)).fetchone()
-        assert staged.get("message_uid") == stored[0]
+        stored = next(r for r in transcript_rows(db, key, TranscriptRead(view=TranscriptView.ALL)) if r["id"] == staged["_row_id"])
+        assert staged.get("message_uid") == stored["message_uid"]
     finally:
         server._sessions.pop(sid, None)
         db.close()

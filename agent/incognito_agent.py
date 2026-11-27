@@ -34,6 +34,7 @@ def private_init(method):
                 # Leaving restores the built-in compressor's store. A configured external
                 # engine was never built for this agent, so owners should rebuild it.
                 agent._incognito_engine_db = getattr(agent, "_incognito_session_db", None)
+                agent._incognito_engine_persistence = getattr(agent, "_incognito_persistence", None)
                 agent._incognito_born = True
             return result
     return wrapped
@@ -85,10 +86,12 @@ class IncognitoMixin:
                 ("save_trajectories", "skip_background_review", "compression_checkpoint_required", "_persist_disabled")
             }
             self._incognito_session_db = getattr(self, "_session_db", None)
+            self._incognito_persistence = getattr(self, "persistence", None)
             checkpoint = getattr(self, "_checkpoint_mgr", None)
             self._incognito_checkpoint_enabled = getattr(checkpoint, "enabled", False)
             engine = getattr(self, "context_compressor", None)
             self._incognito_engine_db = getattr(engine, "_session_db", None)
+            self._incognito_engine_persistence = getattr(engine, "_persistence", None)
             # A third-party context engine can own opaque persistent stores. Use
             # RAM compaction rather than dispatching content to one while private.
             self._incognito_context_engine = engine
@@ -101,9 +104,11 @@ class IncognitoMixin:
                 )
             if engine is not None and hasattr(engine, "_session_db"):
                 engine._session_db = None
+            if engine is not None and hasattr(engine, "_persistence"):
+                engine._persistence = None
             self.incognito = True
             register_session(getattr(self, "session_id", ""), True)
-            self._session_db = None
+            self._session_db = self.persistence = None
             self._persist_disabled = True
             self.save_trajectories = False
             self.skip_background_review = True
@@ -132,6 +137,7 @@ class IncognitoMixin:
             for name, value in getattr(self, "_incognito_snapshot", {}).items():
                 setattr(self, name, value)
             self._session_db = getattr(self, "_incognito_session_db", None)
+            self.persistence = getattr(self, "_incognito_persistence", None)
             settings = getattr(self, "_incognito_settings", None) or {
                 "_persist_disabled": False, "save_trajectories": False,
                 "skip_background_review": False, "compression_checkpoint_required": False,
@@ -145,9 +151,11 @@ class IncognitoMixin:
             self.context_compressor = engine
             if engine is not None and hasattr(engine, "_session_db"):
                 engine._session_db = getattr(self, "_incognito_engine_db", None)
+            if engine is not None and hasattr(engine, "_persistence"):
+                engine._persistence = getattr(self, "_incognito_engine_persistence", None)
             self.incognito = False
             register_session(getattr(self, "session_id", ""), False)
             self._incognito_snapshot = None
-            self._incognito_session_db = None
+            self._incognito_session_db = self._incognito_persistence = None
             # The snapshot restored the frozen prompt, and read-only memory
             # never changed. Reloading either here would invalidate its prefix.

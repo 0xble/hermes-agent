@@ -42,8 +42,9 @@ from cron.jobs import (
     resume_job,
     trigger_job,
     update_job)
-from tools.cronjob_prompt_scan import _scan_cron_prompt
-from tools.cronjob_job_args import (
+from cron.constants import NOT_RUNNABLE_ERROR
+from cron.prompt_scan import _scan_cron_prompt
+from cron.job_args import (
     _apply_continuity,
     _canonical_skills,
     _clean_str_list,
@@ -61,6 +62,7 @@ from tools.cronjob_job_args import (
     _validate_context_from_refs,
     _validate_cron_base_url,
     _validate_cron_script_path)
+from tools.delegate_tool_config import _get_max_async_children
 from tools.registry import registry, tool_error
 
 
@@ -127,6 +129,8 @@ def _forward_relay_fronted_run(job: dict[str, Any], extra_prompt: Optional[str] 
     JSON result string when forwarding engages, else None (normal in-process run)."""
     if not _relay_fronted_delivery_platforms(job):
         return None
+    if not is_job_runnable(job):  # the gateway's trigger_job would resume it; a local run can't deliver
+        return _dumps({"success": False, "error": NOT_RUNNABLE_ERROR})
     from agent.secret_scope import get_secret
     key = get_secret("API_SERVER_KEY", "") or ""
     try:
@@ -246,7 +250,7 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         if refreshed is None:
             reason = "Job no longer exists; nothing to run."
         elif not is_job_runnable(refreshed):
-            reason = "Job is paused/disabled; resume it before running."
+            reason = NOT_RUNNABLE_ERROR
         else:
             reason = "Job is already being fired by the scheduler; not run again."
         return None, {"claimed": False, "success": False, "error": reason}
@@ -317,32 +321,6 @@ def _run_heartbeat(job_name: str):
             thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
 
 
-def _wait_for_manual_execution(execution_id: str) -> Optional[dict[str, Any]]:
-    """Keep the existing runner alive until the exact durable attempt settles.
-
-    A bounded scheduler waiter can return while its detached worker still owns
-    the execution. The scheduler's recovery owns dead workers, not this adapter.
-    """
-    from cron.executions import _TERMINAL_STATES, get_execution
-
-    while True:
-        execution = get_execution(execution_id)
-        if execution is None or execution.get("status") in _TERMINAL_STATES:
-            return execution
-        time.sleep(1.0)
-
-
-def _execution_delivery_status(execution: dict[str, Any]) -> str:
-    """Read both scheduler outcomes and detached delivery receipts for this attempt."""
-    status = execution.get("delivery_status")
-    outcome = execution.get("delivery_outcome")
-    # Gateway-owned runs record only the outcome. Detached queue receipts can
-    # resolve later, but a recorded failure must never be reported as success.
-    if "failed" in (status, outcome):
-        return "failed"
-    return status or outcome or "unverified"
-
-
 def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) -> dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body (split from
     ``_execute_job_now`` so the background path can claim synchronously and hand the run
@@ -366,10 +344,6 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         if not try_register_running_job(
             job_id, owner=registration_owner, future=running_future,
         ):
-            if job.get("execution_id"):
-                from cron.executions import finish_execution
-                finish_execution(str(job["execution_id"]), success=False,
-                                 error=_ALREADY_RUNNING_ERROR)
             return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}
         _registered = True
 
@@ -397,10 +371,9 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             # A credentialless shared-bot satellite borrows the primary's bot for ROUTED targets
             # only — the same grant the ticker's ``tick_adapters_for`` makes, never the full map.
             if getattr(runner, "_is_shared_bot_satellite", lambda _p: False)(profile):
-                from cron.scheduler_preflight import (
-                    SharedRouteAdapters, _primary_profile_routes_for_current_home)
+                from cron.scheduler_preflight import shared_route_adapters_for_current_home
 
-                adapters = SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+                adapters = shared_route_adapters_for_current_home(adapters)
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
         try:
             # run_one_job records last_run_at/last_status via mark_job_run; `job` is the
@@ -410,17 +383,13 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         finally:
             _registered = False
             release_running_job(job_id, owner=registration_owner)
+        refreshed = get_job(job_id) or {}
+        execution = None
         execution_id = job.get("execution_id")
         if execution_id:
-            with _run_heartbeat(str(job.get("name") or job_id)):
-                execution = _wait_for_manual_execution(str(execution_id)) or {}
-            state = execution.get("status") or "unknown"
-            delivery_failed = _execution_delivery_status(execution) == "failed"
-            error = execution.get("error")
-            if not error and (state != "completed" or delivery_failed):
-                error = "Delivery failed for this execution." if delivery_failed else f"Execution outcome is {state}."
-            return {"claimed": True, "success": state == "completed" and not delivery_failed, "error": error}
-        refreshed = get_job(job_id) or {}
+            from cron.executions import get_execution
+
+            execution = get_execution(str(execution_id))
         last_status = refreshed.get("last_status")
         # "delivery_failed": the run succeeded but output never reached the user — not a
         # success for the caller; surface last_delivery_error.
@@ -431,14 +400,14 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         # failed and surface the delivery error, which lives in last_delivery_error (last_error is None for
         # these runs, and a bare success=False with error=None reads as an unexplained failure). See #83993.
         ok = last_status in {"ok", "delivery_queued"}
+        if execution is not None and execution.get("status") != "completed":
+            ok = False
+            run_error = execution.get("error") or f"execution ended in {execution.get('status') or 'unknown'} state"
         return {"claimed": True, "success": bool(processed and ok), "error": run_error}
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
-        if job.get("execution_id"):
-            from cron.executions import finish_execution
-            finish_execution(str(job["execution_id"]), success=False, error=str(e))
         return {"claimed": True, "success": False, "error": str(e)}
     finally:
         # Setup failures and BaseException must release only our registration.
@@ -539,73 +508,52 @@ def _run_session_usage(job_id: str, execution_id: Optional[str]) -> dict[str, An
     compression chain), or ``{}`` when no run session exists (no_agent job, refused fire)."""
     if not execution_id:
         return {}
-    import sqlite3
-
     from hermes_constants import get_hermes_home
-    from hermes_state import SessionDB
+    from persistence.conversation.sessions import SessionWindow
+    from persistence.core.errors import PersistenceError
+    from persistence_assembly import open_persistence_reader
     # A missing or locked state.db costs the notice its usage line, never the completion.
     try:
-        db = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
-    except (sqlite3.Error, OSError):
-        return {}
-    try:
-        run = next((r for r in db.list_cron_job_runs(job_id, limit=50)
-                    if r.get("cron_execution_id") == execution_id), None)
-        if run is None:
-            return {}
-        rows = [db.get_session(sid) or {} for sid in db.get_compression_chain(run["id"])]
-    except sqlite3.Error as exc:
+        with open_persistence_reader(get_hermes_home()) as reader:
+            run = next((r for r in reader.sessions.list_cron_job_runs(job_id, SessionWindow(limit=50))
+                        if r.cron_execution_id == execution_id), None)
+            if run is None:
+                return {}
+            rows = [row for sid in reader.lineage.chain(run.entry.session.session_id)
+                    if (row := reader.sessions.get(sid)) is not None]
+    except (PersistenceError, OSError) as exc:
         logger.debug("cronjob run: run-session usage lookup failed for %s: %s", job_id, exc)
         return {}
-    finally:
-        db.close()
-    model = next((r["model"] for r in reversed(rows) if r.get("model")), None)
-    return {"api_calls": sum(int(r.get("api_call_count") or 0) for r in rows), **({"model": model} if model else {})}
+    model = next((r.model for r in reversed(rows) if r.model), None)
+    return {"api_calls": sum(int(r.api_call_count or 0) for r in rows), **({"model": model} if model else {})}
 
 
 def _manual_run_completion(
     res: dict[str, Any], job_id: str, job_name: str, deliver: str, started_at: float,
-    *, execution_id: Optional[str] = None,
-) -> dict[str, Any]:
-    """Report the exact durable execution, not the gateway waiter's result. Model and API
+    execution_id: Optional[str] = None) -> dict[str, Any]:
+    """Async-delegation completion block for a finished background manual run. Model and API
     calls come from the run's own session; without one they are omitted, never guessed."""
-    execution = None
-    if execution_id:
-        execution = _wait_for_manual_execution(str(execution_id))
-        state = (execution or {}).get("status") or "unknown"
-        error = (execution or {}).get("error")
-        if execution is None:
-            error = "Execution record is missing; outcome is unknown."
-        elif state == "completed" and _execution_delivery_status(execution) == "failed":
-            state, error = "failed", "Delivery failed for this execution."
-        res = {"success": state == "completed", "error": error}
-    else:
-        state = "completed" if res.get("success") else "failed"
     duration = round(time.time() - started_at, 2)
     refreshed = get_job(job_id) or {}
-    # Job-level delivery errors may belong to a different attempt, just like
-    # last_error and the newest output file. Never use them for an exact run.
-    delivery_status = _execution_delivery_status(execution or {})
-    delivery_note = _manual_run_delivery_note(deliver, refreshed) if not execution_id else (
-        " (output saved locally only)" if not deliver or deliver == "local" else
-        " (delivery FAILED for this execution)" if delivery_status == "failed" else
-        f" (delivery status: {delivery_status})")
-    label = "ok" if state == "completed" else "unknown" if state == "unknown" else "FAILED"
     lines = [
         f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-        f"Result: {label}"
+        f"Result: {'ok' if res.get('success') else 'FAILED'}"
         + (f" — {res.get('error')}" if res.get("error") else ""),
-        f"Delivery target: {deliver}" + delivery_note,
+        f"Delivery target: {deliver}" + _manual_run_delivery_note(deliver, refreshed),
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = (str((execution or {}).get("output") or "")[-4000:] if execution_id else
-               _latest_job_output_excerpt(job_id))
+    # This completion re-enters the session that invoked action='run', not the job's delivery
+    # target. Repeating an externally delivered payload here leaks it into a second, possibly
+    # unrelated chat/thread. Keep it only when nobody else got it: a local job, or a delivery that
+    # failed on EVERY target (a partial failure already posted the output somewhere).
+    reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
+    excerpt = _latest_job_output_excerpt(job_id) if reached_nobody else None
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
-        "status": "completed" if state == "completed" else "unknown" if state == "unknown" else "error",
-        "summary": "\n".join(lines), "error": res.get("error"), "duration_seconds": duration, **_run_session_usage(job_id, execution_id),
+        "status": "completed" if res.get("success") else "error", "summary": "\n".join(lines),
+        "error": res.get("error"), "duration_seconds": duration, **_run_session_usage(job_id, execution_id),
     }
 
 
@@ -657,10 +605,6 @@ def _try_dispatch_background_run(
         if err["claimed"]:
             err["dispatched"] = False
         return err
-    # Persist the attempt before registering the completion. A replacement
-    # process must know the exact worker to observe, not infer from job history.
-    from cron.executions import create_execution
-    claimed_job["execution_id"] = create_execution(job_id, source="manual")["id"]
 
     origin_ui_session_id = ""
     try:
@@ -680,7 +624,6 @@ def _try_dispatch_background_run(
         return result
 
     try:
-        from tools.delegate_tool import _get_max_async_children
         max_async = _get_max_async_children()
     except Exception:
         max_async = 3
@@ -693,9 +636,8 @@ def _try_dispatch_background_run(
     def _runner() -> dict[str, Any]:
         res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
         # run_one_job stamps the fire's ledger id onto this claimed snapshot.
-        return _manual_run_completion(
-            res, job_id, job_name, deliver, started_at,
-            execution_id=str((claimed_job or {}).get("execution_id") or "") or None,)
+        return _manual_run_completion(res, job_id, job_name, deliver, started_at,
+                                      (claimed_job or {}).get("execution_id"))
 
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
@@ -705,12 +647,7 @@ def _try_dispatch_background_run(
         toolsets=None, role="cron_run", model=None, session_key=session_key,
         parent_session_id=str(session_id) if session_id else None, runner=_runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async,
-        cron_execution={
-            "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
-            "cron_job_id": job_id, "cron_job_name": job_name,
-            "cron_deliver": deliver,
-        })
+        max_async_children=max_async)
     if dispatch.get("status") == "dispatched":
         return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
 
@@ -718,7 +655,7 @@ def _try_dispatch_background_run(
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -734,22 +671,6 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     if _notes:
         result["guidance"] = _notes
     return result
-
-
-def _review_value(raw: Optional[str], *, clear: bool = False) -> Optional[dict]:
-    if clear and raw is not None:
-        raise ValueError("review_json and clear_review are mutually exclusive")
-    if clear:
-        return None
-    if raw is None:
-        return None
-    try:
-        value = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"review_json must be valid JSON: {exc.msg}") from None
-    if not isinstance(value, dict):
-        raise ValueError("review_json must be a JSON object")
-    return value
 
 
 def _action_create(a: dict[str, Any]) -> str:
@@ -808,13 +729,19 @@ def _action_create(a: dict[str, Any]) -> str:
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
-            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
-           if a["paused"] is not False or a["paused_reason"] is not None else {}))
+            reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
+            timezone=_normalize_optional_job_value(a["timezone"]),
+            grace_minutes=a["grace_minutes"],
+            pinned=bool(a["pinned"]),
+            failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]),
+            **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+               if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
-        "Created PAUSED. Resume before scheduled or manual runs." if not job.get("enabled", True) else None,
+        "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
         _local_delivery_notice(job, deliver))))
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
@@ -840,23 +767,14 @@ def _action_list(a: dict[str, Any]) -> str:
 
 def _action_remove(job: dict[str, Any], a: dict[str, Any]) -> str:
     job_id = job["id"]
-    run_result = {}
-    if not remove_job(job_id, run_result=run_result):
+    if not remove_job(job_id):
         return tool_error(f"Failed to remove job '{job_id}'", success=False)
     _notify_provider_jobs_changed_safe()
     return _dumps({
         "success": True,
         "message": f"Cron job '{job['name']}' removed.",
         "removed_job": {"id": job_id, "name": job["name"], "schedule": job.get("schedule_display")},
-        **run_result,
     })
-
-
-def _action_pause(job: dict[str, Any], a: dict[str, Any]) -> str:
-    run_result = {}
-    updated = pause_job(job["id"], reason=a["reason"], run_result=run_result)
-    _notify_provider_jobs_changed_safe()
-    return _dumps({"success": updated is not None, "job": _format_job(updated or job), **run_result})
 
 
 def _job_state_result(updated: dict[str, Any]) -> str:
@@ -931,8 +849,30 @@ def _pick(updates: dict[str, Any], job: dict[str, Any], key: str) -> Any:
     return updates[key] if key in updates else job.get(key)
 
 
-def _update_delivery_fields(deliver: Any, a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
-    """Validate destination changes before applying their cron-context routing."""
+# Model-facing tri-state for ``wrap_response``: the tool cannot tell an omitted argument from an
+# explicit null, so "inherit" is the spelled-out reset. Real booleans and None (programmatic
+# callers, the CLI and dashboard lanes) pass through for update_job's strict normaliser to check.
+_WRAP_RESPONSE_MODES = {"on": True, "off": False, "inherit": None}
+
+
+def _wrap_response_override(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in _WRAP_RESPONSE_MODES:
+        return _WRAP_RESPONSE_MODES[value.strip().lower()]
+    return value
+
+
+def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """prompt / name / deliver / skills / model pins; returns an error string or None."""
+    prompt, deliver, skill, skills = a["prompt"], a["deliver"], a["skill"], a["skills"]
+    if prompt is not None:
+        scan_error = _scan_cron_prompt(prompt)
+        if scan_error:
+            return scan_error
+        updates["prompt"] = prompt
+    if a["name"] is not None and a["name"].strip():
+        # Blank name is a no-op, not a clear: a model re-sending the whole schema with
+        # type-default empties must not wipe untouched fields.
+        updates["name"] = a["name"]
     if deliver is not None:
         bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
         if bot_chat_error:
@@ -949,35 +889,10 @@ def _update_delivery_fields(deliver: Any, a: dict[str, Any], updates: dict[str, 
                 return bot_chat_error
             _norm_fd = _resolve_cron_context_deliver(_norm_fd)
         updates["failure_deliver"] = _norm_fd
-    return None
-
-
-def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
-    """prompt / name / deliver / skills / model pins; returns an error string or None."""
-    prompt, deliver, skill, skills = a["prompt"], a["deliver"], a["skill"], a["skills"]
-    if prompt is not None:
-        scan_error = _scan_cron_prompt(prompt)
-        if scan_error:
-            return scan_error
-        from cron.prompt_guard import prompt_update_error
-        guard_error = prompt_update_error(job.get("prompt"), prompt, allow_shrink=bool(a["allow_shrink"]))
-        if guard_error:
-            return guard_error
-        updates["prompt"] = prompt
-    if a["name"] is not None and a["name"].strip():
-        # Blank name is a no-op, not a clear: a model re-sending the whole schema with
-        # type-default empties must not wipe untouched fields.
-        updates["name"] = a["name"]
-    delivery_error = _update_delivery_fields(deliver, a, updates)
-    if delivery_error:
-        return delivery_error
-    if a["keep_pinned_lane"] is not None:
-        updates["keep_pinned_lane"] = bool(a["keep_pinned_lane"])
-    if a["priority"] is not None:
-        # '' clears (back to the production default); update_job validates the lane name.
-        updates["priority"] = a["priority"]
     if a["catch_up"] is not None:
         updates["catch_up"] = a["catch_up"]
+    if a["wrap_response"] is not None:
+        updates["wrap_response"] = _wrap_response_override(a["wrap_response"])
     if skills is not None or skill is not None:
         canonical_skills = _canonical_skills(skill, skills)
         updates["skills"] = canonical_skills
@@ -990,17 +905,12 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
-    # Preserve strict zero and explicit '' clears; None means unchanged. These values
-    # share the same forwarding contract, with field-specific validation in update_job.
-    for key in ("hard_wall_timeout_seconds", "max_catch_up_lateness_seconds",
-                "reasoning_effort", "interpreter"):
-        if a[key] is not None:
-            updates[key] = a[key]
-    if a["job_timezone"] is not None:
-        # CLI-only lane like reasoning_effort; update_job validates the IANA name, '' clears.
-        updates["timezone"] = a["job_timezone"] or None
-    if a["review_json"] is not None or a["clear_review"]:
-        updates["review"] = _review_value(a["review_json"], clear=bool(a["clear_review"]))
+    if a["reasoning_effort"] is not None:
+        # CLI-only lane; update_job validates, empty string clears the pin.
+        updates["reasoning_effort"] = a["reasoning_effort"]
+    if a["interpreter"] is not None:
+        # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
+        updates["interpreter"] = a["interpreter"]
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1123,7 +1033,7 @@ def _action_cancel(job: dict[str, Any], a: dict[str, Any]) -> str:
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": _action_pause,
+    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
     "cancel": _action_cancel,
 }
@@ -1174,30 +1084,18 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
-    job_timezone: Optional[str] = None,
     failure_deliver: Optional[str | list[str]] = None,
-    keep_pinned_lane: Optional[bool] = None,
-    priority: Optional[str] = None,
     catch_up: Optional[bool] = None,
-    task_id: str | None = None,
+    wrap_response: Optional[bool | str] = None,  # bool, or the tool's on / off / inherit
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
-    hard_wall_timeout_seconds: Optional[float] = None,
-    max_catch_up_lateness_seconds: Optional[float | str] = None,
-    review_json: Optional[str] = None,
-    clear_review: bool = False,
-    allow_shrink: bool = False,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int | str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
-    from agent.incognito import is_incognito
-    if is_incognito(session_id):
-        return tool_error("Durable cron operations are unavailable in incognito mode.", success=False)
-    del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()
         handler = _JOBLESS_ACTIONS.get(normalized)
@@ -1235,21 +1133,14 @@ def _cronjob_schema_overrides() -> dict:
 
 CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
-    "description": """Manage scheduled agent tasks: create, list, edit, run, cancel. action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires an enabled job (resume paused/disabled jobs first) immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only); 'cancel' stops a job's LIVE run without touching its schedule (a no-op when nothing is in flight).
+    "description": """Schedule recurring or one-off agent tasks (cron jobs): create, list, edit, run. action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only); 'cancel' stops a job's LIVE run without touching its schedule (a no-op when nothing is in flight).
 
-    Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
-            "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume before scheduled or manual runs. Default false."},
+            "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
-            "max_catch_up_lateness_seconds": {
-                "anyOf": [
-                    {"type": "number", "minimum": 0},
-                    {"type": "string", "enum": [""]},
-                ],
-                "description": "For create/update: finite nonnegative catch-up limit in seconds. Recurring: strict deadline; 0 allows no lateness and unset is unlimited. Intervals of 2 minutes or less require at least the interval plus 60 s. One-shot: widens the catch-up window to max(120, value); 0 keeps 120. Omit or null leaves an existing value unchanged; pass '' to clear it."
-            },
             "action": {
                 "type": "string",
                 "description": "One of: create, list, update, pause, resume, remove, run, cancel. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
@@ -1264,11 +1155,7 @@ CRONJOB_SCHEMA = {
             },
             "prompt": {
                 "type": "string",
-                "description": "For create/update: the full self-contained prompt (when it runs goes in 'schedule'; data windows like 'since yesterday' stay here; paired with any skills as the task instruction). For update: the COMPLETE replacement prompt text (never a file path or placeholder). For run: optional transient context for that single fire (never persisted)."
-            },
-            "allow_shrink": {
-                "type": "boolean",
-                "description": "Update only. Updates refuse a placeholder-looking prompt ('__FILE__', '<prompt>', 'TODO', '$(cat f)', '@file') and any prompt under 10% of an existing prompt of 500+ chars. Set true ONLY when that short or literal prompt is intended."
+                "description": "For create/update: the full self-contained prompt (when it runs goes in 'schedule'; data windows like 'since yesterday' stay here; paired with any skills as the task instruction). For run: optional transient context for that single fire (never persisted)."
             },
             "schedule": {
                 "type": "string",
@@ -1291,18 +1178,6 @@ CRONJOB_SCHEMA = {
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
-            "keep_pinned_lane": {
-                "type": "boolean",
-                "description": "For create/update: set true when the user asked for this job's output in a specific chat or topic, so the lane converter leaves that fixed delivery lane unchanged. Default false."
-            },
-            "review_json": {
-                "type": "string",
-                "description": "CLI/operator lane: JSON with contract, subject, optional deadline_minutes (default 10), rerun_deadline_minutes (default 20) and max_reruns (0 or 1, default 1). Requires deliver=local."
-            },
-            "clear_review": {
-                "type": "boolean",
-                "description": "CLI/operator lane: clear the job's review declaration."
-            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1312,10 +1187,10 @@ CRONJOB_SCHEMA = {
                 "type": "boolean",
                 "description": "Runs missed while the machine was off: true = run once on return, false = skip. Omit for the default (recurring run once, one-shots skip)."
             },
-            "priority": {
+            "wrap_response": {
                 "type": "string",
-                "enum": ["live", "production", "background", ""],
-                "description": "For create/update: business-impact admission lane when due jobs compete for workers. 'live' = a person or customer is waiting on it right now (starts first); 'production' = ordinary business work (default; unset means production); 'background' = housekeeping, personal or best-effort work that may wait behind the others. Affects start order only, never schedules, timeouts or worker counts. On update, '' clears back to production."
+                "enum": ["on", "off", "inherit"],
+                "description": "Per-job override for the 'Cronjob Response: <name>' header and 'To stop or manage this job...' footer around delivered output. 'on' wraps; 'off' delivers the raw output verbatim (useful for briefings meant to read clean); 'inherit' removes an override so the job follows the global cron.wrap_response again. Omit to leave it unchanged (a new job inherits)."
             },
             "script": {
                 "type": "string",
@@ -1382,10 +1257,9 @@ def check_cronjob_requirements() -> bool:
 # create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
-    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "priority", "skill", "skills", "reason",
+    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
-    "max_catch_up_lateness_seconds", "timezone", "grace_minutes", "catch_up")
+    "paused_reason", "pinned", "timezone", "grace_minutes", "catch_up", "wrap_response")
 
 
 def _cronjob_handler(args, **kw):
@@ -1397,7 +1271,6 @@ def _cronjob_handler(args, **kw):
         include_disabled=args.get("include_disabled", True),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
-        task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         paused=args.get("paused", False),
         **{key: args.get(key) for key in _HANDLER_FORWARDED_ARGS},
@@ -1412,4 +1285,5 @@ registry.register(
     check_fn=check_cronjob_requirements,
     emoji="⏰",
     dynamic_schema_overrides=_cronjob_schema_overrides,
+    compat_args=(*_HANDLER_FORWARDED_ARGS, "include_disabled", "monitor_script", "monitor_url"),
 )

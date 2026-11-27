@@ -328,6 +328,12 @@ async def _cdp_call(ws_url: str, method: str, params: dict[str, Any], target_id:
         return msg.get("result", {})
 
 
+def _redact_cdp_method_result(method: str, result: Any) -> Any:
+    """Redact a CDP result with ``method``'s binary-path exemptions; every success return goes through here."""
+    return _redact_cdp_output(result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                              flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))
+
+
 def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params: Optional[dict[str, Any]],
                                 timeout: float) -> str:
     """Route a CDP call through the live supervisor session for an OOPIF frame."""
@@ -456,8 +462,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
- flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
- field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
+        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+        field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
     if target_id:
         payload["target_id"] = target_id
     return json.dumps(payload, ensure_ascii=False)

@@ -14,6 +14,7 @@ import time
 from hermes_dir_acl import make_user_dir
 
 from hermes_constants import get_hermes_home
+from persistence import STORE_FAILURES
 from utils import atomic_json_write
 
 logger = logging.getLogger("tools.process_registry")
@@ -145,6 +146,8 @@ def save_completed_result(
     session, *, completion_reason: str | None = None, termination_source: str | None = None,
     prune: bool = True, only_if_owner_done: bool = False,
 ) -> None:
+    if session.sandbox_key:
+        return
     from agent.redact import redact_sensitive_text, redact_terminal_output
 
     # An in-flight owner reconciles the kill itself; do not make the kill wait for its IO.
@@ -213,6 +216,8 @@ def save_cut_pending_result(
     sweep passes its remaining budget so an unrelated writer holding the lock can
     never delay the stop signals; a skipped write returns False and stays retryable.
     """
+    if session.sandbox_key:
+        return False
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -221,7 +226,7 @@ def save_cut_pending_result(
     try:
         from hermes_constants import assert_named_profile_home_live
         assert_named_profile_home_live(directory)
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
         # Snapshot before taking the result lock: the two locks are never nested.
         from tools.process_registry_ssh import binding_record
         with session._lock:
@@ -270,15 +275,12 @@ def _owns_result(owner: str, parent: str | None) -> bool:
         return False
     if owner == parent:
         return True
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence_reader, profile_scope
 
     # Pure lineage read on the hot path of every retained-result load; a writable open here
     # was one more writer handle per call inside the gateway (#100896).
-    db = SessionDB(read_only=True)
-    try:
-        return db.get_compression_tip(parent) == owner
-    finally:
-        db.close()
+    with open_persistence_reader(profile_scope().profile_dir) as persistence:
+        return persistence.lineage.tip(parent) == owner
 
 
 def load_completed_results(prefix: str = "") -> dict:
@@ -286,9 +288,11 @@ def load_completed_results(prefix: str = "") -> dict:
     from tools.process_registry import ProcessSession
 
     from gateway.session_context import get_session_env
+    from tools.environments.sandbox_scope import hosted_scope
 
     owner = get_session_env("HERMES_SESSION_ID", "")
-    if not owner:
+    # A hosted agent's processes leave no receipt here and it sees no local one: never read or prune them.
+    if not owner or hosted_scope() is not None:
         return {}
     results = {}
     try:
@@ -311,11 +315,11 @@ def load_completed_results(prefix: str = "") -> dict:
             fields = {key: record[key] for key in _RESULT_FIELDS if key in record}
             fields["ssh_binding"] = restore_binding(record.get("ssh_binding"))
             session = ProcessSession(
-                **fields,
+                **fields, sandbox_key=record.get("sandbox_key", ""),
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
             results[session.id] = session
-        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        except (OSError, ValueError, KeyError, TypeError, *STORE_FAILURES):
             logger.debug("Skipping unreadable process result %s", path.name, exc_info=True)
     return results

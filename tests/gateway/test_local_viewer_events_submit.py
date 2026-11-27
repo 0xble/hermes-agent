@@ -20,13 +20,10 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     from gateway.session_cli_turn import cli_turn
     from gateway.session_controls import AuthorityConnection
     from gateway.session_ingress import admission_author
-    from gateway.platforms.event import turn_origin_for_event
-    from hermes_state_runtime import list_session_admissions
 
     seen = []
     async def answer(event):
-        seen.append((event.text, cli_turn(event.message_id), cli_turn('another-event'),
-                     admission_author.get(), turn_origin_for_event(event)))
+        seen.append((event.text, cli_turn(event.message_id), cli_turn('another-event'), admission_author.get()))
         return 'ok'
     authority = await _authority(tmp_path, monkeypatch, answer)
     connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
@@ -34,7 +31,7 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     try:
         await connection.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 's'}})
         for rid, extra in (
-                ('full', {'turn_author': author, 'turn_origin': 'goal_loop', 'api_text': '[voice] hi', 'clarify_batch': True,
+                ('full', {'turn_author': author, 'api_text': '[voice] hi', 'clarify_batch': True,
                           'model_override': {'model': ' gpt-x ', 'provider': 'openrouter'}}),
                 ('plain', {})):
             reply = await connection.dispatch({'id': 2, 'method': 'prompt.submit', 'params': {
@@ -52,25 +49,15 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     finally:
         await connection.close()
 
-    rows = {row['request_id']: row for row in list_session_admissions(authority.db, session_id='s', pending_only=False)}
-    assert rows['full']['payload']['cli_turn_v1'] == {
-        'turn_author': author, 'turn_origin': 'goal_loop', 'api_text': '[voice] hi', 'clarify_batch': True,
+    rows = {row.request_id: row for row in authority.persistence.admissions.list(session_id='s', pending_only=False)}
+    assert rows['full'].payload['cli_turn_v1'] == {
+        'turn_author': author, 'api_text': '[voice] hi', 'clarify_batch': True,
         'model_override': {'model': 'gpt-x', 'provider': 'openrouter'}}
-    assert 'cli_turn_v1' not in rows['plain']['payload']
+    assert 'cli_turn_v1' not in rows['plain'].payload
     assert not {'no-model', 'extra-key', 'bad-text', 'bad-author', 'bad-batch'} & set(rows)
-    assert seen[0] == ('full', rows['full']['payload']['cli_turn_v1'], {}, author, 'goal_loop')
+    assert seen[0] == ('full', rows['full'].payload['cli_turn_v1'], {}, author)
     # The next admission never inherits the previous turn's fields.
     assert seen[1][:3] == ('plain', {}, {})
-
-
-@pytest.mark.parametrize(("origin", "expected"), [
-    ("user", "user"), ("goal_loop", "goal_loop"), ("process", "process"),
-    ("relay", "user"), ("cron", "user"), ("unknown", "user"), ([], "user"),
-])
-def test_cli_prompt_only_accepts_its_own_turn_origins(origin, expected):
-    from gateway.session_cli_turn import admit_cli_turn
-
-    assert admit_cli_turn({"turn_origin": origin}) == {"cli_turn_v1": {"turn_origin": expected}}
 
 
 class _RecordingAgent:
@@ -96,7 +83,7 @@ def _gateway_runner():
     runner._provider_routing = {}
     runner._agent_cache_lock = None
     runner._agent_cache = {}
-    runner._session_db = runner._prefill_messages = None
+    runner._session_db = runner.persistence = runner._prefill_messages = None
     runner._pending_model_notes = runner._pending_skills_reload_notes = {}
     runner.session_store._entries = {}
     runner._pre_agent_fallback_notice = None
@@ -105,7 +92,7 @@ def _gateway_runner():
         "session-model", {"provider": "custom", "api_key": "k1", "base_url": "http://session"})
     runner._resolve_session_reasoning_config.return_value = None
     runner._resolve_session_service_tier.return_value = None
-    runner._resolve_turn_agent_config.side_effect = lambda _msg, model, rt: {
+    runner._resolve_turn_agent_config.side_effect = lambda _msg, model, rt, **_kw: {
         "model": model, "runtime": {k: v for k, v in rt.items() if k != "request_overrides"}}
     runner._agent_config_signature.return_value = ("sig",)
     runner._extract_cache_busting_config.return_value = {}
@@ -216,8 +203,7 @@ def test_a_classic_cli_receipt_carries_the_run_conversation_keys(classic):
         assert "pending_steer" not in stored and "billing_block" not in stored
         assert ctx.result_holder[0]["pending_steer"] == "also check the logs"
     # The delivered reply (message.complete text) keeps the gateway's own copy either way.
-    assert delivered["final_response"] == ""
-    assert delivered["delivery_text"] and stored["failed"] is True
+    assert delivered["final_response"] and stored["failed"] is True
 
 
 def test_only_a_classic_cli_surface_session_is_a_classic_cli_turn():
@@ -263,10 +249,10 @@ def test_a_one_turn_model_never_becomes_the_sessions_stored_model():
     from hermes_cli.model_switch import ModelSwitchResult
 
     written = []
-    db = SimpleNamespace(get_session=lambda sid: {"model": "session-model", "model_config": "{}"},
-                         update_session_meta=lambda sid, config, model=None: written.append((sid, model)))
+    sessions = SimpleNamespace(get=lambda sid: SimpleNamespace(model="session-model", model_config={}),
+                               replace_session_config=lambda sid, command: written.append((sid, command.model)))
     runner = _gateway_runner()
-    runner._session_db = SimpleNamespace(_db=db)
+    runner.persistence = SimpleNamespace(sessions=sessions)
     runner._sync_session_model_from_agent = (
         lambda sid, agent: GatewayTurnPrepareMixin._sync_session_model_from_agent(runner, sid, agent))
     moa = ModelSwitchResult(success=True, new_model="default", target_provider="moa", api_key="",

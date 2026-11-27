@@ -46,26 +46,26 @@ def _resolve_cli_reasoning(cli) -> None:
     from hermes_constants import resolve_reasoning_config
     # getattr: tests drive /new unbound on a SimpleNamespace without ``model`` (blank -> config default).
     cli.reasoning_config = resolve_reasoning_config(CLI_CONFIG, getattr(cli, "model", None) or "")
-    # Config-derived, so no explicit pick survives it (delegation must not treat an equal value as one).
-    cli._reasoning_override = None
+    cli._reasoning_user_set = False
 
 
 def stored_session_route(session_meta, *, current_model, current_provider):
     """The route a resumed session should run on, or ``None`` when the stored one is absent or
     already current. Returns ``(model, provider, base_url, api_mode, provider_changed)``; the
-    canonical row reader is ``SessionDB.session_gateway_runtime`` (``model_config.gateway_runtime``,
+    canonical row reader is ``gateway_runtime`` (``model_config.gateway_runtime``,
     else the TUI's top-level keys). Bare ``custom`` is healed because the CLI resolve path
     hard-fails on it (the TUI gateway keeps it when a base_url exists)."""
-    from agent.fallback_session_route import fallback_restored_row
-    session_meta = fallback_restored_row(session_meta)
-    stored_model = str((session_meta or {}).get("model") or "").strip()
+    from persistence.conversation.sessions import parse_model_config
+    from persistence.gateway.routing import resume_route
+    stored_model, runtime = resume_route(parse_model_config(session_meta.get("model_config")),
+                                         model=session_meta.get("model"),
+                                         billing_provider=str(session_meta.get("billing_provider") or ""),
+                                         billing_base_url=str(session_meta.get("billing_base_url") or ""))
     if not stored_model:
         return None
-    from hermes_state import SessionDB as _SessionDB
-    runtime = _SessionDB.session_gateway_runtime(session_meta)
-    base_url = runtime.get("base_url") or None
-    api_mode = runtime.get("api_mode") or None
-    stored_provider = runtime.get("provider") or None
+    base_url = runtime.base_url or None
+    api_mode = runtime.api_mode or None
+    stored_provider = runtime.provider or None
     provider = _heal_bare_custom_provider(stored_provider, base_url=base_url, model=stored_model)
     if provider != stored_provider:
         # A healed entry resolves its own current endpoint. A route that didn't heal is gone with its
@@ -74,9 +74,6 @@ def stored_session_route(session_meta, *, current_model, current_provider):
         if provider is None or not stored_provider:
             # An empty provider's saved wire came from turns that went to the wrong provider (#132648).
             api_mode = None
-    if provider is None:
-        base_url = None
-        api_mode = None
     provider_changed = bool(provider) and provider != current_provider
     if stored_model == current_model and not provider_changed:
         return None
@@ -179,7 +176,7 @@ def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_cont
         ctx = resolve_display_context_length(
             result.new_model, result.target_provider,
             base_url=result.base_url or cli.base_url or "",
-            api_key=result.api_key or cli.api_key or "", model_info=mi, api_mode=result.api_mode or "",
+            api_key=result.api_key or cli.api_key or "", model_info=mi,
             config_context_length=getattr(agent, "_config_context_length", None) if agent else None,
             custom_providers=getattr(agent, "_custom_providers", None) if agent else None)
     except Exception:
@@ -253,7 +250,7 @@ def _one_turn_selection_context(cli):
     except Exception:
         logger.debug("one-turn selection context unavailable", exc_info=True)
         return None
-    tokens = persisted_anchor_tokens(db, sid, messages)
+    tokens = persisted_anchor_tokens(db, sid, messages, persistence=getattr(db, "persistence", None))
     if not tokens:
         return None
     return SelectionContext(context_tokens=tokens, current_model=getattr(cli, "model", None) or None)
@@ -336,7 +333,6 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one
         _cprint(f"    {t('cli.model.reasoning_effort', effort=effort)}")
         return
     cli._reasoning_user_set = True
-    cli._reasoning_override = None if persist_global else parsed
     if cli.agent is not None:
         # The gateway session's agent commits an explicit level even when it equals the inherited one.
         pin = getattr(cli.agent, "pin_reasoning", None)
@@ -344,8 +340,6 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one
             pin(parsed)
         else:
             cli.agent.reasoning_config = parsed
-        cli.agent.reasoning_override = cli._reasoning_override
-        cli.agent._pre_fallback_reasoning_override = None
     saved = persist_global and save_config_value("agent.reasoning_effort", effort)
     if saved:
         CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort
@@ -569,7 +563,7 @@ class CLIModelSwitchMixin:
             "api_mode": result.api_mode or None}
         try:
             db.update_session_model(sid, result.new_model)
-            db.patch_session_model_config(sid, {"gateway_runtime": route, **route})
+            db.patch_session_model_config(sid, {"gateway_runtime": {**route, "model": result.new_model or None}, **route})
         except Exception:
             logger.debug("Failed to persist model switch to session DB", exc_info=True)
 
@@ -734,8 +728,6 @@ class CLIModelSwitchMixin:
         return {
             **_runtime_fields(self),
             "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
-            "reasoning_override": copy.deepcopy(getattr(agent, "reasoning_override", None)),
-            "cli_reasoning_override": copy.deepcopy(getattr(self, "_reasoning_override", None)),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None}
@@ -751,23 +743,14 @@ class CLIModelSwitchMixin:
                 setattr(self, key, snapshot.get(key))
 
         agent = getattr(self, "agent", None)
-        if "cli_reasoning_override" in snapshot:
-            self._reasoning_override = copy.deepcopy(snapshot["cli_reasoning_override"])
         if agent is None:
             return
-
-        def _restore_reasoning() -> None:
-            # The level and its explicit-pick marker leave together with the one-turn model.
-            if "reasoning_config" in snapshot:
-                from hermes_cli.gateway_agent import GatewayAgent
-                if isinstance(agent, GatewayAgent):
-                    agent.restore_reasoning(snapshot["reasoning_config"])
-                else:
-                    agent.reasoning_config = snapshot["reasoning_config"]
-                agent.reasoning_override = copy.deepcopy(snapshot.get("reasoning_override"))
-                agent._pre_fallback_reasoning_override = None
-
-        _restore_reasoning()
+        from hermes_cli.gateway_agent import GatewayAgent
+        # A gateway agent's one-turn level only rode the admission: put it back locally, write nothing.
+        restore_reasoning = (agent.restore_reasoning if isinstance(agent, GatewayAgent)
+                             else lambda config: setattr(agent, "reasoning_config", config))
+        if "reasoning_config" in snapshot:
+            restore_reasoning(snapshot["reasoning_config"])
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
@@ -775,7 +758,6 @@ class CLIModelSwitchMixin:
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
-                    _restore_reasoning()
                     return
             except Exception:
                 logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
@@ -788,7 +770,6 @@ class CLIModelSwitchMixin:
                     api_key=snapshot.get("api_key", ""), base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
                     capabilities=snapshot.get("capabilities"), once=True, restore=True)
-                _restore_reasoning()
             except Exception as exc:  # health: allow BLE001 -- runs in the turn's finally; reported below
                 logger.warning("CLI one-turn model restore failed: %s", exc)
                 restored = exc
@@ -801,6 +782,8 @@ class CLIModelSwitchMixin:
                     "cli.model.switch_failed", model=snapshot.get("model", ""), error=restored, old_model=agent.model)
                 _cprint(f"  {notice}")
                 return
+            if "reasoning_config" in snapshot:
+                restore_reasoning(snapshot["reasoning_config"])
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:
@@ -896,18 +879,6 @@ class CLIModelSwitchMixin:
                 return False
             finally:
                 self._confirmed_switch_warning = None  # this switch's confirmation only
-        if not getattr(self, "_model_switch_one_turn", False):
-            self._explicit_model_override = True
-            if self.agent is not None:
-                from agent.agent_init_fallback import _fallback_entries
-                from hermes_cli.fallback_config import same_model_fallbacks
-                self.agent._pinned_fallback_model = self.model
-                self.agent._fallback_chain = same_model_fallbacks(
-                    _fallback_entries(getattr(self, "_fallback_model", None)), self.model)
-                self.agent._fallback_model = self.agent._fallback_chain[0] if self.agent._fallback_chain else None
-                self.agent._fallback_index = 0
-                self.agent._preflight_fallback = None
-            self._preflight_fallback = None
         return True
 
     def _apply_model_switch_result(
@@ -1034,9 +1005,6 @@ class CLIModelSwitchMixin:
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
-            return
-        if request.is_all:
-            _cprint("  ✗ /model --all is only available in the gateway.")
             return
         target, explicit_provider = request.target, request.explicit_provider
         if request.is_reset:

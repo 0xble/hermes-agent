@@ -63,30 +63,56 @@ def test_live_agent_compaction_still_rebuilds():
     assert built == [""]
 
 
-@pytest.mark.parametrize("seed", [None, ""])
-def test_empty_hygiene_seed_rebuilds_on_the_next_real_turn(tmp_path, seed):
-    from agent.conversation_loop import _restore_or_build_system_prompt
-    from hermes_state import SessionDB
+@pytest.mark.parametrize("kind, platform", [("hygiene", None), ("manual", "telegram")])
+def test_compression_agent_refreshes_auto_ttl_after_context_engine_start(monkeypatch, kind, platform):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import hermes_cli.config
+    from agent.context_engine import ContextEngine
+    from gateway.run import GatewayRunner, _GATEWAY_HYGIENE_PLATFORM
 
-    db = SessionDB(tmp_path / "state.db")
-    sid = db.create_session("empty-seed", "telegram", system_prompt=seed)
-    hygiene, built = _agent(session_id=sid)
-    assert _seed_hygiene_system_prompt(hygiene, db.get_session(sid)) is False
-    boundary_prompt = _rebuild(hygiene)
-    assert boundary_prompt == "" and built == []
-    # This is the same persistence call used by in-place compaction. Empty is a
-    # stored string, not NULL, so exercise its actual SQLite readback and restore.
-    db.update_system_prompt(sid, boundary_prompt)
-    assert db.get_session(sid)["system_prompt"] == ""
-    live = SimpleNamespace(
-        session_id=sid, _session_db=db, _cached_system_prompt=None,
-        _build_system_prompt=lambda _message: STORED,
-        _persist_disabled=False, model="test", provider="test", platform="telegram",
-        tools=[], enabled_toolsets=None, disabled_toolsets=None, _use_prompt_caching=False,
-    )
+    starts = []
+
+    class Engine(ContextEngine):
+        name = "cache-ttl-test"
+
+        def update_from_response(self, usage):
+            pass
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(self, messages, current_tokens=None):
+            return messages
+
+        def on_session_start(self, session_id, **kwargs):
+            starts.append(kwargs["platform"])
+
+    cfg = {"context": {"engine": "cache-ttl-test"}}
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", lambda: cfg)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: cfg)
+    for key in ("HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT", "HERMES_SINGLE_QUERY_SESSION"):
+        monkeypatch.delenv(key, raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=None))
+
+    runtime = dict(api_key="fixture-key", provider="openrouter", base_url="https://openrouter.ai/api/v1")
+    if platform:
+        runtime["platform"] = platform
+    with (
+        patch("plugins.context_engine.load_context_engine", return_value=Engine()),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        if kind == "hygiene":
+            agent, _ = asyncio.run(runner._hmwa_hygiene_build_agent(
+                "fixture-model", runtime, SimpleNamespace(session_id="hygiene-cache")))
+        else:
+            agent = asyncio.run(runner._build_manual_compression_agent("manual-cache", "fixture-model", runtime))
     try:
-        _restore_or_build_system_prompt(live, None, [{"role": "user", "content": "continue"}])
-        assert live._cached_system_prompt == STORED
-        assert db.get_session(sid)["system_prompt"] == STORED
+        assert starts == [platform or "cli"]
+        assert agent.platform == _GATEWAY_HYGIENE_PLATFORM
+        assert agent._cache_ttl == "5m"
     finally:
-        db.close()
+        agent.close()

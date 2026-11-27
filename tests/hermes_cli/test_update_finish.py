@@ -44,13 +44,11 @@ def completion(tmp_path, monkeypatch):
     # in the working checkout is modified, even by import-time self-heals.
     for path in ROOT.glob("*.py"):
         shutil.copy2(path, source / path.name)
-    for name in ("hermes_cli", "hermes_platform", "pm", "agent", "gateway", "tools", "cron", "plugins"):
+    for name in ("hermes_cli", "hermes_platform", "hermes_agent", "pm", "agent", "gateway", "tools", "cron", "utils",
+                 "persistence", "session_rules"):
         shutil.copytree(ROOT / name, source / name,
                         ignore=shutil.ignore_patterns("__pycache__", "web_dist", "tui_dist"))
     shutil.copytree(ROOT / "scripts/build", source / "scripts/build",
-                    ignore=shutil.ignore_patterns("__pycache__"))
-    # The TUI product includes these runtime helpers even for the tiny graph.
-    shutil.copytree(ROOT / "ui-tui/scripts", source / "ui-tui/scripts",
                     ignore=shutil.ignore_patterns("__pycache__"))
     _put(source, "pyproject.toml", '[project]\nname="takeover-fixture"\nversion="2.0"\n')
     # Successful completion stamps the selected checkout's own git identity.
@@ -58,12 +56,12 @@ def completion(tmp_path, monkeypatch):
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
     for command in (["init", "-q"], ["add", "--all"], ["-c", "commit.gpgsign=false", "commit", "-qm", "selected"]):
         subprocess.run(["git", *command], cwd=source, env=git_env, check=True, capture_output=True)
-    # A real empty venv prevents a framework Python's global site packages from
-    # leaking into the stdlib-only completion parent. Its base executable still
-    # resolves its own stdlib, including relocatable standalone distributions.
+    # The selected interpreter is dependency-free, not the pytest environment. A symlink, not a
+    # copy: a relocatable build (python-build-standalone) locates its stdlib beside the resolved
+    # executable, so a lone copied binary cannot even import ``encodings``.
     python = tmp_path / "store/python/bin/python3"
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(python.parent.parent)],
-                   check=True, capture_output=True)
+    python.parent.mkdir(parents=True)
+    python.symlink_to(Path(sys._base_executable).resolve())
     _put(tmp_path / "store", "facts.json", json.dumps({"packages": {"python": {"entry": "python"}}}))
     # A real venv: isolated build children (icon generation, pnpm lifecycle scripts) run on the
     # selected generation's own interpreter, not on the store Python that hosts the completion.
@@ -454,8 +452,6 @@ def test_selected_child_builds_and_finalizes_under_parent_lock(completion):
     built = subprocess.run([node, str(source / "ui-tui/dist/entry.js")],
                            capture_output=True, text=True, check=True)
     assert built.stdout.strip() == "compiled local graph"
-    for name in ("gateway_bootstrap.py", "clipboard_image.py"):
-        assert (source / "ui-tui/dist/scripts" / name).read_bytes() == (source / "ui-tui/scripts" / name).read_bytes()
     assert (source / "hermes_cli/web_dist/index.html").is_file()
     assert any("compiled local graph" in p.read_text() for p in (source / "hermes_cli/web_dist/assets").glob("*.js"))
     assert (source / "node_modules/.hermes-node-deps").is_file()
@@ -511,7 +507,7 @@ def test_real_compiler_failure_is_owed_build_and_completion_continues(completion
     assert context.read_bytes() == context_before
     receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
     assert receipt["outcome"] == "success"
-    assert [row["step"] for row in receipt["followups"]] == ["build"], receipt["followups"]
+    assert [row["step"] for row in receipt["followups"]] == ["build"]
     # Only a build follow-up marks the build stage failed (an owed config/dependency step does not).
     assert {mark["name"]: mark["outcome"] for mark in receipt["stages"]}.get("build") == "failed"
     assert receipt["update_id"] == request["update_id"]

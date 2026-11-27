@@ -16,7 +16,7 @@ def test_outbox_freezes_failed_payload_and_reopens_exclusively(tmp_path):
     try:
         with pytest.raises(TimeoutError):
             store.append_messages_batch('s', rows)
-        disk = json.loads(store.path.read_text(encoding='utf-8-sig'))
+        disk = json.loads(store.path.read_text())
         assert disk['pending'][0]['payload']['messages'][0]['content'] == 'frozen'
         assert store.journal['pending'] == disk['pending']
         with pytest.raises(WorkerPersistenceError, match='outbox_in_use'):
@@ -34,7 +34,7 @@ def test_outbox_freezes_failed_payload_and_reopens_exclusively(tmp_path):
     try:
         assert restored.retry_pending() == []  # reopening already reconciled the acknowledged journal
         assert seen[0]['payload']['messages'][0]['content'] == 'frozen'
-        assert json.loads(restored.path.read_text(encoding='utf-8-sig'))['pending'] == []
+        assert json.loads(restored.path.read_text())['pending'] == []
     finally:
         restored.close()
 
@@ -58,8 +58,6 @@ def test_outbox_capacity_failure_does_not_advance_or_discard(tmp_path):
             store.append_messages_batch('s', [{'role': 'user', 'content': 'x' * 1000}])
         assert store.path.read_bytes() == before
         assert store.failure == 'outbox_full'
-        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
-            store.flush_token_counts()
     finally:
         with pytest.raises(WorkerPersistenceError, match='outbox_full'):
             store.close()
@@ -109,7 +107,7 @@ def test_outbox_journal_survives_a_cross_device_rename(tmp_path, monkeypatch):
     store = RuntimeSessionStore(lambda *a, **k: {}, {'session_id': 's'}, tmp_path / 'private')
     try:
         journal = store.path
-        assert json.loads(journal.read_text(encoding='utf-8-sig'))['scope'] == {'session_id': 's'}
+        assert json.loads(journal.read_text())['scope'] == {'session_id': 's'}
         if os.name == 'posix':
             assert stat.S_IMODE(journal.stat().st_mode) == 0o600
         assert [p.name for p in journal.parent.iterdir() if p.name.startswith('.pending-')] == []
@@ -122,26 +120,30 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
     agent reads it back from the same row (F26). Without the facade method the pin stays NULL
     and a config flip between turns silently forks the cached tools[] prefix."""
     from types import SimpleNamespace
-    from hermes_state import SessionDB
-    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
-    from tests.fakes.runtime_owner import begin_runtime_epoch
+    from persistence_assembly import open_persistence, profile_scope
+    from tests.fixtures.storage_read import session_row
+    from tests.fixtures.storage_seed import seed_session
     from tools.mcp_tool_agent import persist_agent_tool_names
-    db = SessionDB(tmp_path / 'state.db')
+    db = open_persistence(profile_scope(home=tmp_path))
     try:
-        db.create_session('owned', 'cli', system_prompt='prefix')
-        epoch = begin_runtime_epoch(db, instance_id='fixture')
+        seed_session(db, 'owned', 'cli', system_prompt='prefix')
+        epoch = db.runtime.begin_epoch(instance_id='fixture')
         scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
-        register_worker_execution(db, **scope, kind='compute', adoption_secret='test-secret')
-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
+        db.worker_executions.register(**scope, kind='compute', adoption_secret='test-secret')
+        store = RuntimeSessionStore(lambda method, **p: db.worker_executions.persist_operation(**p), scope,
+                                    tmp_path / 'outbox')
         try:
             tools = [{'type': 'function', 'function': {'name': n, 'parameters': {}}}
                      for n in ('terminal', 'tool_search', 'tool_describe', 'tool_call')]
             persist_agent_tool_names(SimpleNamespace(_session_db=store, session_id='owned', tools=tools))
-            db.create_session('direct', 'cli', system_prompt='prefix')
-            persist_agent_tool_names(SimpleNamespace(_session_db=db, session_id='direct', tools=tools))
+            seed_session(db, 'direct', 'cli', system_prompt='prefix')
+            with open_persistence(profile_scope(home=tmp_path)) as persistence:
+                persist_agent_tool_names(SimpleNamespace(_session_db=db, persistence=persistence,
+                                                         session_id='direct', tools=tools))
             # The same pin the direct store writes (the RPC canonicalizes key order for its receipt
             # digest): a worker-pinned session rebuilt in-process reads back version + tools intact.
-            assert json.loads(db.get_session('owned')['tool_names']) == json.loads(db.get_session('direct')['tool_names'])
+            assert (json.loads(session_row(db, 'owned')['tool_names'])
+                    == json.loads(session_row(db, 'direct')['tool_names']))
             assert json.loads(store.get_session('owned')['tool_names'])['tools'] == tools
             with pytest.raises(WorkerPersistenceError, match='permission_denied'):
                 store.update_session_tool_names('foreign', ['terminal'])

@@ -1,23 +1,15 @@
 """Primary rate-limit cooldown arming and per-session model rejection markers, shared by the
-fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers).
-
-Also owns the unattended transient-retry window policy: subagent, cron and side-agent sessions
-keep retrying the same route through transient provider errors for
-``delegation.fallback.transient_retry_window_seconds`` before the fallback chain runs."""
+fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers)."""
 import logging
 import math
 import time
 
 from agent.error_classifier import FailoverReason
-from agent.fallback_session_route import mark_fallback_route  # re-exported for the fallback walk
 
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
-# Reasons that arm the shared primary cooldown. An overloaded primary (529, or 503 with an
-# overload body) is as unusable for the next minutes as a rate-limited one, so it takes the same
-# shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
-_SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
+
 
 # Delegated, cron, and other unattended runs should give a temporarily unhealthy provider a
 # chance to recover before spending the next fallback route.  Three minutes is long enough to
@@ -144,8 +136,7 @@ def provider_declared_wait_seconds(api_error, error_context=None) -> float | Non
     wait = provider_retry_after_seconds(api_error)
     if wait is not None:
         return float(wait)
-    reset = _provider_reset_epoch(error_context.get("reset_at")) if isinstance(error_context, dict) else None
-    return None if reset is None else max(0.0, reset - time.time())
+    return _provider_reset_delay(error_context.get("reset_at")) if isinstance(error_context, dict) else None
 
 
 def _open_window_start(agent):
@@ -232,15 +223,10 @@ def _provider_reset_epoch(reset_at) -> float | None:
 
 
 def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired/implausible.
-
-    Shares the shared record's ceiling so the in-memory cooldown can never outlive what the
-    record would accept, even when the shared state write fails.
-    """
-    from agent.shared_primary_cooldown import _MAX_PROVIDER_RESET_SECONDS
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
     parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
-    if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_PROVIDER_RESET_SECONDS:
+    if delay is not None and math.isfinite(delay) and delay > 0:
         return delay
     return None
 
@@ -266,6 +252,22 @@ def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> 
     return True
 
 
+def _on_primary_route(agent) -> bool:
+    """True when the agent's live route IS the ``_primary_runtime`` snapshot: provider, model and
+    endpoint, the triple that keys a fallback entry (``_fallback_entry_key``). A provider name
+    alone is not an identity: two ``custom`` endpoints (or one provider's other model) share it."""
+    from hermes_cli.route_identity import normalize_route_base_url
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    if not str(rt.get("provider") or "").strip():
+        return False
+
+    def ident(provider, model, base_url):
+        return (str(provider or "").strip().lower(), str(model or "").strip(), normalize_route_base_url(base_url or ""))
+
+    live = ident(getattr(agent, "provider", ""), getattr(agent, "model", ""), getattr(agent, "base_url", ""))
+    return live == ident(rt.get("provider"), rt.get("model"), rt.get("base_url"))
+
+
 def _arm_rate_limit_cooldown(
     agent, reason: FailoverReason | None, reset_at=None,
 ) -> int | None:
@@ -277,47 +279,11 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
-    if reason not in _SHARED_COOLDOWN_REASONS:
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
         return None
-    if getattr(agent, "_shared_primary_probe_token", None):
-        from agent.shared_primary_cooldown import primary_probe_is_owned
-        if primary_probe_is_owned(agent):
-            return 0
-    request_id = str(getattr(agent, "_current_api_request_id", "") or "").strip()
-    if not request_id:
-        sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1
-        agent._cooldown_failure_sequence = sequence
-        request_id = f"fallback:{id(agent)}:{sequence}"
-    failed_outage_id = str(getattr(agent, "_shared_primary_probe_failed_outage_id", "") or "")
-    record = getattr(agent, "_shared_primary_cooldown_record", None)
-    if (failed_outage_id and isinstance(record, dict)
-            and str(record.get("outage_id") or "") == failed_outage_id
-            and not getattr(agent, "_fallback_activated", False)):
-        # A failed half-open probe already re-armed this outage.  Preserve the
-        # signal that permits a long fallback turn to retry the primary.
-        agent._fallback_episode_cooled = True
-        return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
+    if getattr(agent, "_fallback_activated", False) and not _on_primary_route(agent):
+        return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
-    if getattr(agent, "_fallback_activated", False):
-        # Compare the whole route: a same-provider fallback (another model or endpoint) failing
-        # says nothing about the primary and must not arm the primary's shared window.
-        from agent.shared_primary_cooldown import canonical_route, live_route_from_agent, route_from_agent
-        live_route = canonical_route(live_route_from_agent(agent))
-        primary_route = canonical_route(route_from_agent(agent))
-        if live_route != primary_route:
-            # Fallback routes have their own breaker. A fallback failure is never evidence that
-            # the primary recovered, and the reason is deliberately rate_limit-only.
-            from agent.shared_primary_cooldown import arm_cooldown
-            fallback_record = arm_cooldown(
-                live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
-                backoff_count=0, request_id=request_id,
-                request_started_at=getattr(agent, "_current_api_request_started_at", None),
-                short_window=(reset_at is None and reason != FailoverReason.overloaded
-                              and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
-            )
-            if fallback_record:
-                agent._shared_fallback_cooldown_record = fallback_record
-            return None
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
     if provider_delay is not None:
@@ -327,46 +293,9 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
     agent._rate_limited_until = time.monotonic() + backoff_seconds
-    agent._fallback_episode_cooled = True
-    # The in-memory fields remain the hot-path cache, while this record is the source of truth
-    # across gateway agent eviction, delegated children, cron workers and restarts.
-    agent._shared_primary_cooldown_record = None
-    try:
-        from agent.shared_primary_cooldown import arm_cooldown, read_cooldown, route_from_agent
-        primary_route = route_from_agent(agent)
-        existing = read_cooldown(primary_route)
-        if (getattr(agent, "_shared_primary_probe_failed_outage_id", None)
-                and (not isinstance(existing, dict)
-                     or str(existing.get("outage_id") or "") != str(agent._shared_primary_probe_failed_outage_id))):
-            agent._shared_primary_probe_failed_outage_id = None
-        owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
-        from agent.shared_primary_cooldown import _probe_token_value
-        token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))
-        if owner and owner != token:
-            logger.info("Ignoring stale primary failure while another probe owns the lease")
-            return None
-        record = arm_cooldown(
-            primary_route, reason=reason,
-            reset_at=_provider_reset_epoch(reset_at),
-            backoff_count=backoff_count,
-            request_id=request_id,
-            request_started_at=getattr(agent, "_current_api_request_started_at", None),
-            short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
-                          and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
-        )
-    except Exception:
-        record = None
-        logger.debug("Shared primary cooldown write failed", exc_info=True)
-    if record:
-        agent._shared_primary_cooldown_record = record
-        backoff_seconds = max(0, math.ceil(float(record["reset_at"]) - time.time()))
-        agent._rate_limited_until = time.monotonic() + backoff_seconds
-        agent._rate_limit_backoff_count = int(record.get("backoff_count", backoff_count + 1) or 0)
-        source = "provider reset" if record.get("source") == "provider_reset" else "exponential fallback"
     logging.info(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
-        max(0, agent._rate_limit_backoff_count - 1), backoff_seconds, backoff_seconds / 60,
-        agent._rate_limit_backoff_count, source,
+        backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
     )
     return backoff_seconds
 

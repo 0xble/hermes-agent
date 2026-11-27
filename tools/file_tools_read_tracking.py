@@ -18,10 +18,11 @@ of this task wrote without such a baseline, for the refusal wording) and
 container is hard-capped (``_cap_read_tracker_data``) so long sessions stay small.
 """
 
+import contextlib
+import contextvars
 import hashlib
 import logging
 import os
-from tools.node_execution import current_execution, tracking_key
 import stat
 import threading
 import time
@@ -31,13 +32,44 @@ from tools.file_tools_paths import _authoritative_workspace_root, _resolve_path_
 
 logger = logging.getLogger("tools.file_tools")
 
+
+class _PerAgentTracker(dict):
+    """``{task_id: ...}`` whose keys carry the bound hosted agent's sandbox key, so two hosted
+    agents that reuse a task id never share loop counters, read history or patch failures. With
+    no hosted scope bound a key is the task id itself, as before."""
+
+    @staticmethod
+    def _key(task_id):
+        from tools.environments.sandbox_scope import current_sandbox_key
+        sandbox = current_sandbox_key()
+        return f"{sandbox}:{task_id}" if sandbox else task_id
+
+    def __getitem__(self, task_id):
+        return super().__getitem__(self._key(task_id))
+
+    def __setitem__(self, task_id, value):
+        super().__setitem__(self._key(task_id), value)
+
+    def __contains__(self, task_id):
+        return super().__contains__(self._key(task_id))
+
+    def get(self, task_id, default=None):
+        return super().get(self._key(task_id), default)
+
+    def setdefault(self, task_id, default=None):
+        return super().setdefault(self._key(task_id), default)
+
+    def pop(self, task_id, *default):
+        return super().pop(self._key(task_id), *default)
+
+
 _read_tracker_lock = threading.Lock()
-_read_tracker: dict = {}
+_read_tracker: dict = _PerAgentTracker()
 
 # Consecutive patch failures per (task_id, resolved_path); escalates the hint
 # when the model keeps failing the same file. Reset on a successful patch.
 _patch_failure_lock = threading.Lock()
-_patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
+_patch_failure_tracker: dict = _PerAgentTracker()  # {task_id: {resolved_path: count}}
 _PATCH_FAILURE_PATHS_CAP = 64
 
 # Only the most recent reads matter for dedup, loop detection and external-edit
@@ -53,23 +85,19 @@ _NOT_FOUND_TTL_SECONDS = 60.0  # a path that didn't exist may be created soon
 def _task_data(task_id: str) -> dict:
     """Get-or-create the tracker entry for *task_id*, back-filling missing containers
     (search_tool / tests create partial entries). Lock must be held."""
-    task_data = _read_tracker.setdefault(tracking_key(task_id), {
+    task_data = _read_tracker.setdefault(task_id, {
         "last_key": None, "consecutive": 0, "read_history": set()})
     for key in ("dedup", "dedup_hits", "read_timestamps", "read_coverage", "full_write_baselines",
                 "blind_patches"):
         task_data.setdefault(key, {})
     task_data.setdefault("dedup_generation_reads", set())
-    execution = current_execution()
-    if execution:
-        from hermes_constants import get_hermes_home
-        task_data.update(node_owner=task_id, node_home=str(get_hermes_home()), node_scope=execution.key)
     return task_data
 
 
 def _record_patch_failure(task_id: str, resolved_path: str) -> int:
     """Increment and return the consecutive-failure count for this path."""
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.setdefault(tracking_key(task_id), {})
+        task_failures = _patch_failure_tracker.setdefault(task_id, {})
         # Evict the oldest entry once a task has failed on many distinct files.
         if resolved_path not in task_failures:
             _evict_oldest(task_failures, _PATCH_FAILURE_PATHS_CAP - 1)
@@ -82,7 +110,7 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
     if not resolved_paths:
         return
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(tracking_key(task_id))
+        task_failures = _patch_failure_tracker.get(task_id)
         for rp in resolved_paths if task_failures else ():
             task_failures.pop(rp, None)
 
@@ -114,7 +142,7 @@ def _resolved_or_none(filepath: str, task_id: str) -> str | None:
 
 def _pop_not_found(op: str, resolved_str: str, task_id: str) -> None:
     """Drop the negative-cache entry for *(op, resolved_str)*. Lock must be held."""
-    task_data = _read_tracker.get(tracking_key(task_id))
+    task_data = _read_tracker.get(task_id)
     nf = task_data.get("not_found") if task_data else None
     if nf:
         nf.pop((op, resolved_str), None)
@@ -127,7 +155,7 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     by write_file/patch on the path, or by any other tool call.
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(tracking_key(task_id))
+        task_data = _read_tracker.get(task_id)
         entry = (task_data.get("not_found") or {}).get((op, resolved_str)) if task_data else None
         if entry is None:
             return None
@@ -137,10 +165,9 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
             return None
     # "check → create → read" is common, so never serve a stale miss for a path
     # that now exists. The stat runs OUTSIDE the tracker lock: a hung stat on a
-    # dead network mount must not stall every task.
-    from tools.file_backend_state import remote_state
-    exists = remote_state(resolved_str)["exists"] if current_execution() else os.path.exists(resolved_str)
-    if exists:
+    # dead network mount must not stall every task. A sandbox path cannot be
+    # checked here, so its miss is never served from the cache.
+    if not _on_host(resolved_str) or os.path.exists(resolved_str):
         with _read_tracker_lock:
             _pop_not_found(op, resolved_str, task_id)
         return None
@@ -155,25 +182,53 @@ def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str)
         _cap_read_tracker_data(task_data)
 
 
+# Set while an ``execute_code`` cell dispatches a tool. The cell consumes the result in code, so
+# the "you already have this" stub only breaks it (``result["content"]`` raises), and the read
+# shows the model nothing, so it must not count as content the conversation has seen.
+_programmatic_read: contextvars.ContextVar[bool] = contextvars.ContextVar("programmatic_file_read", default=False)
+
+
+@contextlib.contextmanager
+def programmatic_file_read():
+    token = _programmatic_read.set(True)
+    try:
+        yield
+    finally:
+        _programmatic_read.reset(token)
+
+
+def _dedup_lookup(task_id: str, dedup_key: tuple) -> tuple[dict, object, bool]:
+    """``(task_data, cached_version, stub_eligible)`` for a read. Eligible means the model was
+    already served this region since the last compaction boundary (the summary may have dropped
+    exact bytes, so the first read after one serves content); never for a programmatic read."""
+    with _read_tracker_lock:
+        task_data = _task_data(task_id)
+        return (task_data, task_data["dedup"].get(dedup_key),
+                dedup_key in task_data["dedup_generation_reads"] and not _programmatic_read.get())
+
+
+def _note_read_served(task_data: dict, dedup_key: tuple, path: str, offset: int, limit: int) -> tuple[int, dict]:
+    """Record that a read's content was served; returns ``(consecutive count, dedup map)``. Lock
+    must be held. A programmatic read leaves the model-facing state alone: count 1 and a
+    throwaway map, so a later read by the model is never told it already has these bytes."""
+    if _programmatic_read.get():
+        return 1, {}  # the map is discarded: nothing is remembered as shown to the model
+    task_data["dedup_hits"].pop(dedup_key, None)
+    task_data["dedup_generation_reads"].add(dedup_key)
+    return _bump_consecutive(task_data, ("read", path, offset, limit)), task_data["dedup"]
+
+
 def _bump_consecutive(task_data: dict, key: tuple) -> int:
-    """Update last_key/consecutive for *key* and return the new count. Lock must be held."""
+    """Update last_key/consecutive for *key* and return the new count. Lock must be held.
+    A cell repeating a read or search in a loop is code, not a model stuck re-asking: count 1."""
+    if _programmatic_read.get():
+        return 1
     if task_data["last_key"] == key:
         task_data["consecutive"] += 1
     else:
         task_data["last_key"] = key
         task_data["consecutive"] = 1
     return task_data["consecutive"]
-
-
-def _owned_task_data(task_id: str) -> list[dict]:
-    """Lifecycle hooks run outside a node call, but still own its scoped trackers."""
-    if current_execution():
-        data = _read_tracker.get(tracking_key(task_id))
-        return [data] if data else []
-    from hermes_constants import get_hermes_home
-    home = str(get_hermes_home())
-    return [data for key, data in _read_tracker.items()
-            if key == task_id or (data.get("node_owner") == task_id and data.get("node_home") == home)]
 
 
 def reset_file_dedup(task_id: str | None = None):
@@ -189,20 +244,15 @@ def reset_file_dedup(task_id: str | None = None):
     (the stat runs outside the lock so a hung mount cannot stall other tasks)."""
     with _read_tracker_lock:
         if task_id:
-            targets = _owned_task_data(task_id)
+            targets = [_read_tracker[task_id]] if _read_tracker.get(task_id) else []
         else:
             targets = list(_read_tracker.values())
         for task_data in targets:
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
             task_data.setdefault("dedup_generation_reads", set()).clear()
-        # Unbound compaction cannot stat remote paths in controller coordinates.
-        # Keep those stamps: the next bound overwrite validates metadata + hash.
-        execution = current_execution()
-        scope = execution.key if execution else None
         candidates = [(task_data, dict(task_data.get("full_write_baselines", {})))
-                      for task_data in targets
-                      if not task_data.get("node_scope") or task_data["node_scope"] == scope]
+                      for task_data in targets]
     for task_data, baselines in candidates:
         changed = {p for p, version in baselines.items() if _file_metadata(p) != version[:-1]}
         if changed:
@@ -220,7 +270,8 @@ def notify_other_tool_call(task_id: str = "default"):
     have created a previously-missing path (or flipped its permissions).
     """
     with _read_tracker_lock:
-        for task_data in _owned_task_data(task_id):
+        task_data = _read_tracker.get(task_id)
+        if task_data:
             task_data["last_key"] = None
             task_data["consecutive"] = 0
             for key in ("dedup_hits", "not_found"):
@@ -228,14 +279,14 @@ def notify_other_tool_call(task_id: str = "default"):
                     task_data[key].clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str, *, resolved: str | None = None) -> None:
+def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     """Evict every dedup entry (all offset/limit ranges) and not-found entry for *filepath*
     after a write, so the next read returns fresh content. Acquires the lock itself."""
-    resolved = resolved if resolved is not None else _resolved_or_none(filepath, task_id)
+    resolved = _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(tracking_key(task_id))
+        task_data = _read_tracker.get(task_id)
         if task_data is None:
             return
         dedup = task_data.get("dedup")
@@ -246,39 +297,38 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str, *, resolved: str | N
         _pop_not_found("search", resolved, task_id)
 
 
-def _backend_mtime(path: str):
-    if current_execution():
-        from tools.file_backend_state import mtime
-        return mtime(path)
-    return os.path.getmtime(path)
-
-
-def _update_read_timestamp(filepath: str, task_id: str, *, resolved: str | None = None) -> None:
+def _update_read_timestamp(filepath: str, task_id: str) -> None:
     """After a successful write: invalidate dedup and refresh the stored mtime so
     consecutive edits by the same task don't trigger false staleness warnings.
 
     Also invalidates the dedup cache for the written path so that subsequent reads return fresh content
-    (fixes #13144). A committed edit supplies its already-resolved identity.
+    (fixes #13144).
     """
-    resolved = resolved if resolved is not None else _resolved_or_none(filepath, task_id)
-    if resolved is None:
+    _invalidate_dedup_for_path(filepath, task_id)
+    resolved = _resolved_or_none(filepath, task_id)
+    if resolved is None or not _on_host(resolved):
         return
-    _invalidate_dedup_for_path(filepath, task_id, resolved=resolved)
     try:
-        current_mtime = _backend_mtime(resolved)
-    except (OSError, RuntimeError):
+        current_mtime = os.path.getmtime(resolved)
+    except OSError:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(tracking_key(task_id))
+        task_data = _read_tracker.get(task_id)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
             _cap_read_tracker_data(task_data)
 
 
+def _on_host(resolved: str) -> bool:
+    """Whether *resolved* names a file on this host. A hosted agent's paths name its sandbox: the
+    bookkeeping below (dedup, staleness, baselines) never stats or opens them here."""
+    from tools.environments.sandbox_scope import hosted_scope
+    return hosted_scope() is None
+
+
 def _file_metadata(resolved: str) -> tuple | None:
-    if current_execution():
-        from tools.file_backend_state import metadata
-        return metadata(resolved)
+    if not _on_host(resolved):
+        return None
     try:
         st = os.stat(resolved)
         return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
@@ -288,9 +338,8 @@ def _file_metadata(resolved: str) -> tuple | None:
 
 def _file_version(resolved: str) -> tuple | None:
     """A byte snapshot, not just mtime (editors/copy tools can preserve that)."""
-    if current_execution():
-        from tools.file_backend_state import version
-        return version(resolved)
+    if not _on_host(resolved):
+        return None
     try:
         if not stat.S_ISREG(os.stat(resolved).st_mode):
             return None
@@ -326,7 +375,7 @@ def _mark_full_write_baseline(resolved: str, task_id: str, expected_sha256: str 
 
 def _has_full_write_baseline(resolved: str, task_id: str) -> bool:
     with _read_tracker_lock:
-        task_data = _read_tracker.get(tracking_key(task_id)) or {}
+        task_data = _read_tracker.get(task_id) or {}
         baseline = task_data.get("full_write_baselines", {}).get(str(resolved))
     return baseline is not None and _file_version(resolved) == baseline
 
@@ -335,7 +384,7 @@ def _known_full_content_sha256(resolved_paths, task_id: str) -> dict:
     """``{resolved: sha256 hex}`` for each path whose recorded full-write baseline still
     matches the bytes on disk. Call under the per-path locks, before a patch reads."""
     with _read_tracker_lock:
-        baselines = dict((_read_tracker.get(tracking_key(task_id)) or {}).get("full_write_baselines", {}))
+        baselines = dict((_read_tracker.get(task_id) or {}).get("full_write_baselines", {}))
     known = {}
     for resolved in {str(r) for r in resolved_paths if r}:
         baseline = baselines.get(resolved)
@@ -379,7 +428,7 @@ def _is_own_blind_patch(resolved: str, task_id: str) -> bool:
     """True when the bytes on disk are exactly what this task's own patch wrote without a
     full-content baseline (a blind patch, or one after a partial view)."""
     with _read_tracker_lock:
-        written_sha = ((_read_tracker.get(tracking_key(task_id)) or {}).get("blind_patches") or {}).get(str(resolved))
+        written_sha = ((_read_tracker.get(task_id) or {}).get("blind_patches") or {}).get(str(resolved))
     if written_sha is None:
         return False
     version = _file_version(resolved)
@@ -418,16 +467,16 @@ def _read_mtime_drifted(filepath: str, task_id: str) -> bool:
     """True when the file's mtime changed since this task last read it. False when
     never read, fresh, or unstattable (a deleted file is the write's problem)."""
     resolved = _resolved_or_none(filepath, task_id)
-    if resolved is None:
+    if resolved is None or not _on_host(resolved):
         return False
     with _read_tracker_lock:
-        task_data = _read_tracker.get(tracking_key(task_id))
+        task_data = _read_tracker.get(task_id)
         read_mtime = task_data.get("read_timestamps", {}).get(resolved) if task_data else None
     if read_mtime is None:
         return False
     try:
-        return _backend_mtime(resolved) != read_mtime
-    except (OSError, RuntimeError):
+        return os.path.getmtime(resolved) != read_mtime
+    except OSError:
         return False
 
 
@@ -447,10 +496,8 @@ def _mark_verification_stale(task_id: str, resolved_paths: list[str],
     first edited path's recognised project root, else the workspace root, else the first parent."""
     from pathlib import Path
 
-    if current_execution():
-        return  # Controller project/verification roots cannot describe this filesystem.
     paths = [p for p in resolved_paths if p]
-    if not paths:
+    if not paths or not _on_host(paths[0]):  # project detection reads the workspace's manifests
         return
     try:
         from agent.coding_context import project_facts_for
