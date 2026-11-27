@@ -525,28 +525,28 @@ async def probe(root, base, mode):
                             outgoing.extend(delayed_replies)
                             delayed_replies.clear()
 
-                        # Share the existing wait budget across the successor reply and drain checks.
+                        asyncio.get_running_loop().call_soon(expose_replies)
+                        await wait_for(lambda: replies(_FOLLOWER_ACK))
+                        await send('after-recovery', 'AFTER_RECOVERY')
+                        # A terminal row can precede delivery. Observe both within the later
+                        # turn's own allowance, separate from the follower reply.
                         async with asyncio.timeout(35):
-                            asyncio.get_running_loop().call_soon(expose_replies)
-                            await wait_for(lambda: replies(_FOLLOWER_ACK))
-                            await send('after-recovery', 'AFTER_RECOVERY')
                             await wait_for(lambda: any(r['request_id'] == 'after-recovery'
                                 and r['status'] == 'terminal' and r['outcome'] == 'completed'
                                 and r['seq'] > follower['seq'] for r in rows()))
-                            # A terminal row can precede delivery. Observe the later turn's reply,
-                            # then gracefully stop only the fixture successor. The idle handshake
-                            # and completion of the relay reader fence all remaining outbound frames.
                             await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
                                                        for action in replies(_AFTER_RECOVERY_ACK)))
-                            from gateway.status import write_planned_stop_marker
+                        from gateway.status import write_planned_stop_marker
 
-                            new_pid = proc.pid
-                            with patch.dict(os.environ, HERMES_HOME=str(home)):
-                                stop_requested = write_planned_stop_marker(new_pid)
-                            assert stop_requested, new_pid
-                            await successor_relay_drained.wait()
-                            assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
-                            returncode = await asyncio.wait_for(proc.wait(), 10)
+                        new_pid = proc.pid
+                        with patch.dict(os.environ, HERMES_HOME=str(home)):
+                            stop_requested = write_planned_stop_marker(new_pid)
+                        assert stop_requested, new_pid
+                        # Once idle is acknowledged, the relay reader only has to consume
+                        # already-buffered frames, so the shutdown drain needs no turn budget.
+                        await asyncio.wait_for(successor_relay_drained.wait(), 10)
+                        assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
+                        returncode = await asyncio.wait_for(proc.wait(), 10)
                         proc = None
                         assert returncode == 0, returncode
                         replayed_sends = replies(_AUTOMATION_ACK)
