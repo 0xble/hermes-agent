@@ -374,7 +374,8 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
         plan = schedule_retry(delegation_id)
         if plan is None:
             record = retry_status(delegation_id)
-            if record and record["retry_state"] in {"scheduled", "terminal"}:
+            if record and (record["retry_state"] == "terminal" or (
+                    record["retry_state"] == "scheduled" and not record["task"].get("execution_sealed_at"))):
                 plan = {"retry_state": record["retry_state"], "reason": record["retry_reason"],
                         "due_at": record["retry_due_at"], "attempt": record["retry_attempt"] + 1,
                         "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}

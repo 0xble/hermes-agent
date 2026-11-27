@@ -224,7 +224,8 @@ def test_execution_seal_prevents_retry_sweeper_claims_and_notices(route, phase):
 
     def row(did):
         with sqlite3.connect(ad._db_path()) as conn:
-            return conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone()
+            conn.row_factory = sqlite3.Row
+            return dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (did,)).fetchone())
 
     def prepare(did, *, sealed):
         _batch_row(did)
@@ -248,13 +249,27 @@ def test_execution_seal_prevents_retry_sweeper_claims_and_notices(route, phase):
     advance(control)
     assert row(control) != control_before, "the unsealed control must exercise real due retry work"
     prepare(sealed, sealed=True)
+    if phase == "dispatching":
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.executemany("INSERT INTO async_delegation_child_recovery "
+                             "(delegation_id, task_index, claim, claimed_at, replacement_delegation_id) "
+                             "VALUES (?, ?, 'stale-dispatch-claim', ?, ?)",
+                             [(sealed, 1, now, None), (sealed, 2, now, control)])
     before = row(sealed)
     actions = advance(sealed)
-    assert row(sealed) == before, "the retry sweeper must not classify, expire or claim sealed execution"
+    after = row(sealed)
+    if phase == "armed":
+        assert after == before, "a sealed armed row must not be classified"
+    else:
+        assert after == {**before, "retry_state": "cancelled", "retry_reason": dr.INELIGIBLE_SEALED,
+                         "retry_due_at": None, "retry_claim": None, "retry_claimed_at": None,
+                         "updated_at": now}
     assert not actions, "sealed execution must create neither recovery notices nor terminal reports"
     with sqlite3.connect(ad._db_path()) as conn:
-        assert conn.execute("SELECT * FROM async_delegation_child_recovery WHERE delegation_id=?",
-                            (sealed,)).fetchall() == []
+        child_claims = conn.execute("SELECT task_index, replacement_delegation_id "
+                                    "FROM async_delegation_child_recovery WHERE delegation_id=?",
+                                    (sealed,)).fetchall()
+        assert child_claims == ([(2, control)] if phase == "dispatching" else [])
 
 
 @pytest.mark.parametrize("shape", ["scalar", "batch"])

@@ -508,6 +508,74 @@ def test_rate_limited_failure_schedules_durable_retry_honoring_reset():
     assert row["retry_state"] == "scheduled" and row["retry_due_at"] == plan["due_at"]
 
 
+@pytest.mark.parametrize("seal_after_discovery", [False, True])
+def test_sealed_due_retries_settle_without_starving_unsealed_retries(monkeypatch, seal_after_discovery):
+    sealed = [_dispatch(f"deleg_sealed_{i}") for i in range(33)]
+    eligible = _dispatch("deleg_unsealed_due")
+    for i, did in enumerate([*sealed, eligible]):
+        at = T0 + 60 + i
+        _rate_limited(did, at=at)
+        plan = dr.schedule_retry(did, now=at)
+        assert plan and plan["retry_state"] == "scheduled"
+    before = None
+
+    def seal_rows():
+        nonlocal before
+        with sqlite3.connect(ad._db_path()) as conn:
+            conn.executemany("UPDATE async_delegations SET task_json=json_set(task_json, '$.execution_sealed_at', ?) "
+                             "WHERE delegation_id=?", [(T0 + 100, did) for did in sealed])
+        before = _row(sealed[0])
+
+    if seal_after_discovery:
+        discover = dr._read_retry_candidate_ids
+
+        def discover_then_seal(*args):
+            candidates = discover(*args)
+            if before is None:
+                seal_rows()
+            return candidates
+
+        monkeypatch.setattr(dr, "_read_retry_candidate_ids", discover_then_seal)
+    else:
+        seal_rows()
+
+    now = T0 + 3600
+    actions = dr.sweep_retries(now=now, limit=32)
+    assert [(a["delegation_id"], a["kind"]) for a in actions] == [(eligible, "notice")]
+    first = _row(sealed[0])
+    assert first and first["retry_state"] == "cancelled"
+    last = _row(sealed[-1])
+    assert last and last["retry_state"] == "scheduled", "settlements must also respect the limit"
+    assert dr.sweep_retries(now=now, limit=32) == []
+    for did in sealed:
+        row = _row(did)
+        assert row is not None
+        assert row["retry_state"] == "cancelled"
+        assert row["retry_reason"] == dr.INELIGIBLE_SEALED
+        assert row["retry_due_at"] is row["retry_claim"] is row["retry_claimed_at"] is None
+    after = _row(sealed[0])
+    assert after is not None and before is not None
+    for key in ("task_json", "result_json", "event_json", "state", "delivery_state"):
+        assert after[key] == before[key]
+
+
+def test_sealed_pending_completion_does_not_promise_an_automatic_retry():
+    did = _dispatch("deleg_sealed_pending_completion")
+    _rate_limited(did)
+    plan = dr.schedule_retry(did, now=T0 + 60)
+    assert plan and plan["retry_state"] == "scheduled"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET task_json=json_set(task_json, '$.execution_sealed_at', ?), "
+                     "delivery_state='pending' WHERE delegation_id=?", (T0 + 100, did))
+    before = _row(did)
+    assert before is not None
+    event = json.loads(before["event_json"])
+    ad._attach_retry_note(event)
+    assert "retry_note" not in event
+    assert dr.sweep_retries(now=T0 + 3600) == []
+    assert _row(did) == before
+
+
 def test_incident_replay_survives_restart_dispatches_once_and_ignores_no_reply():
     did = _dispatch("deleg_incident")
     _rate_limited(did)
