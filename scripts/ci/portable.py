@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.ci import affected
 from scripts.ci.temporary import temporary_parent
 
 STATE = ROOT / '.ci'
@@ -97,6 +98,16 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
         raise RuntimeError(f'Empty Python shard {index}/{count}')
     print(f'Python shard {index}/{count}: {len(files)} files', flush=True)
     python_files(env, files, workers)
+
+
+def ready_plan(sha: str, count: int) -> tuple[affected.Selection, list[list[str]]]:
+    buckets = shard_files(ROOT, count)
+    tracked = set(git('ls-files', '-z', '--cached').split('\0'))
+    inventory = [p for bucket in buckets for p in bucket
+                 if p in tracked and (ROOT / p).is_file() and not (ROOT / p).is_symlink()]
+    selection = affected.select(git, sha, inventory)
+    tests = set(selection.tests)
+    return selection, [[p for p in bucket if p in tests] for bucket in buckets]
 
 
 # Committed per-file bounds for known-slow files, keyed by repository-relative path.
@@ -1214,12 +1225,52 @@ def require_case_sensitive_tmpdir(parent: Path) -> None:
             )
 
 
+@contextmanager
+def ci_environment() -> Iterator[dict[str, str]]:
+    STATE.mkdir(exist_ok=True)
+    with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
+        if sys.platform == 'darwin':
+            require_case_sensitive_tmpdir(home)
+        yield resolve_local_toolchain(environment(home))
+
+
+def run_ready(args: argparse.Namespace, index: int, count: int) -> int:
+    sha = args.expected_sha
+    assert_exact_checkout(sha)
+    manifest = None
+    if (target := os.environ.get('CI_AFFECTED_MANIFEST')) is not None:
+        manifest = Path(target)
+        if count or not manifest.is_absolute() or not manifest.parent.is_dir() or os.path.lexists(manifest):
+            raise RuntimeError('CI_AFFECTED_MANIFEST requires unsharded ready and a nonexistent absolute path with an existing parent')
+    # Keep each argv below OS limits even when full fallback selects thousands of files.
+    selection, buckets = ready_plan(sha, count or 10)
+    batches = [buckets[index - 1]] if count else buckets
+    print(f'READY: {selection.selection}; {sum(map(len, batches))} Python/E2E files; {selection.reason}', flush=True)
+    if count and not batches[0]:
+        print('READY: no tests in this shard; not a qualification result')
+        return 0
+    with ci_environment() as env:
+        setup(env)
+        assert_exact_checkout(sha)
+        actions: list[tuple[str, Callable[[], None]]] = []
+        if not count:
+            actions.extend((('static', lambda: static(env)), ('node-gate', lambda: node_gate(env, args.node_workers))))
+        actions.append(('affected-python', lambda: run_all(
+            lambda files=files: python_files(env, files, args.workers) for files in batches if files)))
+        passed = aggregate(actions)
+        assert_exact_checkout(sha)
+    if passed and manifest is not None:
+        selection.write(manifest, sha)
+    print(f'READY (not qualification): {"PASS" if passed else "FAIL"}')
+    return 0 if passed else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
-    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly')
+    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'ready', 'gate', 'nightly', 'nightly-native'))
+    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by ready/gate/nightly')
     parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES, 'node-gate', 'nightly-only-e2e'), action='append', help='Select exact-SHA lanes or partial check lanes')
-    parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, gate/nightly only)')
+    parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, ready/gate/nightly only)')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
     parser.add_argument('--node-workers', type=int, default=2)
     args = parser.parse_args()
@@ -1229,30 +1280,29 @@ def main() -> int:
         parser.error('--lane is only valid for check/gate/nightly')
     shard_index = shard_count = 0
     if args.shard:
-        if args.command not in ('gate', 'nightly') or args.lane:
-            parser.error('--shard requires gate/nightly without --lane')
+        if args.command not in ('ready', 'gate', 'nightly') or args.lane:
+            parser.error('--shard requires ready/gate/nightly without --lane')
         match = re.fullmatch(r'([1-9][0-9]*)/([1-9][0-9]*)', args.shard)
         if not match or int(match[1]) > int(match[2]):
             parser.error('--shard must be I/N with 1 <= I <= N')
         shard_index, shard_count = map(int, match.groups())
     exact = args.command in ('gate', 'nightly', 'nightly-native')
-    if exact != bool(args.expected_sha):
-        parser.error('gate/nightly require a positional full SHA; other commands do not accept one')
+    if (exact or args.command == 'ready') != bool(args.expected_sha):
+        parser.error('ready/gate/nightly require a positional full SHA; other commands do not accept one')
+    if args.command == 'ready':
+        return run_ready(args, shard_index, shard_count)
     if args.command == 'preflight':
         preflight()
         return 0
     if exact:
         assert_exact_checkout(args.expected_sha)
+
     if args.command == 'list':
         for name, description in {**LANES, **OPTIONAL_LANES}.items():
             print(f'{name}: {description}')
         print('Residual platform/integration/release coverage: maintenance/portable-ci.md')
         return 0
-    STATE.mkdir(exist_ok=True)
-    with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
-        if sys.platform == 'darwin':
-            require_case_sensitive_tmpdir(home)
-        env = resolve_local_toolchain(environment(home))
+    with ci_environment() as env:
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)
             if args.command == 'setup':
