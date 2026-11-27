@@ -103,3 +103,15 @@ def test_a_newer_local_tag_outranks_an_older_recorded_baseline(tmp_path):
     info = _git_version_info(_fork_on_an_untagged_release(tmp_path, recorded="v0.19.0"))
 
     assert (info.base_version, info.distance) == ("0.20.0", 2)
+
+
+def test_a_branch_pin_is_recorded_as_the_expected_sha_and_no_pin_records_nothing():
+    pin = "c" * 40
+    pinned, unpinned = {}, {}
+    ref = update_cmd_check.select_apply_target(
+        SimpleNamespace(branch="chosen", expect_sha=pin), "chosen", pinned, git_cmd=["git"], stop=lambda: None)
+    update_cmd_check.select_apply_target(
+        SimpleNamespace(branch="chosen"), "chosen", unpinned, git_cmd=["git"], stop=lambda: None)
+    assert ref == ("origin/chosen", None, False, None)
+    assert pinned == {"expected_sha": pin}
+    assert unpinned == {}

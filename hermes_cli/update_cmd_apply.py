@@ -306,6 +306,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _fetch_source_update(
             git_cmd, branch, release_sha, target_is_head, target_ref, _windows_gateway_resume)
 
+        pinned = getattr(args, "expect_sha", None) if getattr(args, "branch", None) else None
+        if pinned:
+            _check.refuse_unpinned_branch_head(
+                git_cmd, branch, pinned,
+                stop=lambda: _m()._resume_windows_gateways_after_update(_windows_gateway_resume))
+
         _check.fetch_release_tag(git_cmd, _m().PROJECT_ROOT, completion_request)
         if not isinstance(release_sha, str):
             _guard_against_main_drop(
@@ -335,8 +341,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 held_message = f"✓ Holding at this build until a newer {channel} release ships."
         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
         _plan = _prepare_checkout_for_update(
-            git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
-            gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
+            git_cmd, branch, current_branch, is_fork=is_fork and not pinned, assume_yes=assume_yes,
+            gateway_mode=gateway_mode, gw_input_fn=gw_input_fn,
+            # A pinned update lands exactly on the pin: no in-place merge into a parked branch, and no
+            # fork upstream sync (``is_fork`` is False here and below), which would move HEAD past it.
+            switch_branch=opts.switch_branch or bool(pinned),
             target_ref=target_ref, _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
 
@@ -363,7 +372,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=is_fork and branch == "main" and not release_sha and not pinned,
+            assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
             expected_sha=completion_request.get("expected_sha"))
         _apply_pulled_update(

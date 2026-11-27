@@ -244,6 +244,10 @@ def select_apply_target(args, branch: str, request: dict, *, git_cmd, stop) -> t
     from hermes_cli.update_cmd_common import _record_stop
 
     if getattr(args, "branch", None):
+        if getattr(args, "expect_sha", None):
+            # An approved commit, not the branch tip: _pull_updates and _apply_pulled_update refuse a
+            # head_moved mismatch exactly as they do for a channel's release commit.
+            request["expected_sha"] = args.expect_sha
         return f"origin/{branch}", None, False, None
     root = _uc()._m().PROJECT_ROOT
     selected = _uc()._update_run_channel(args)
@@ -272,6 +276,24 @@ def select_apply_target(args, branch: str, request: dict, *, git_cmd, stop) -> t
     assert target.branch is not None  # a SourceTarget without a commit names its branch
     request["branch"] = target.branch
     return f"origin/{target.branch}", None, False, target.repository
+
+
+def refuse_unpinned_branch_head(git_cmd: list[str], branch: str, expected_sha: str, *, stop) -> None:
+    """Exit 1 unless the just-fetched ``origin/<branch>`` is exactly ``expected_sha``.
+
+    Runs right after the fetch and before the stash, the branch switch or the commit point, so a
+    force-push or branch advance that landed between approval and fetch changes nothing.
+    """
+    from hermes_cli.update_cmd_common import _record_stop
+
+    resolved = _uc()._resolved_commit(git_cmd, f"origin/{branch}")
+    if resolved == expected_sha:
+        return
+    print(f"✗ origin/{branch} resolves to {resolved[:10] or 'no commit'}, not the pinned commit "
+          f"{expected_sha[:10]} (--expect-sha). No update was applied.")
+    stop()
+    _record_stop("head_moved")
+    sys.exit(1)
 
 
 def fetch_release_tag(git_cmd: list[str], root: Path, request: dict) -> None:

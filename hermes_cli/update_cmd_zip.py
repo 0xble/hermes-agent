@@ -628,6 +628,13 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     A supplied commit keeps the archive on the target selected before Git failed.
     """
     from hermes_cli.update_cmd import _m, _complete_source_update
+    if getattr(args, "expect_sha", None):
+        # The archive is fetched by name with no resolve step to compare against the pin.
+        print("✗ --expect-sha is not supported on the Windows ZIP-fallback update path.")
+        print("  The archive cannot be verified against a pinned commit. Resolve the git-side breakage "
+              "and rerun, or update without --expect-sha.")
+        _record_stop("branch_unsupported")
+        _m().sys.exit(1)
     # The static archive would silently ignore --branch — the exact silent-divergence bug it exists to
     # prevent. Refuse rather than lie.
     branch = _m()._resolve_update_branch(args)

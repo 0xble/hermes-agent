@@ -518,3 +518,26 @@ def test_failed_ref_prune_still_finishes_activation(installed, monkeypatch, caps
     assert releases.read_pointer(installed.home / "current") == active
     assert not (installed.home / "release-txn.json").exists()
     assert "carry-forward refs" in capsys.readouterr().err
+
+
+def test_a_pinned_branch_applies_when_the_fetched_commit_is_the_pin(installed):
+    active = apply(installed, "--branch", "main", "--expect-sha", installed.target)
+    assert active.name == installed.target
+
+
+def test_a_pinned_branch_mismatch_refuses_before_staging(installed, monkeypatch):
+    staged = []
+    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: staged.append(a))
+    before = releases.read_pointer(installed.home / "current")
+    with pytest.raises(RuntimeError, match="pinned commit"):
+        apply(installed, "--branch", "main", "--expect-sha", installed.base)
+    assert staged == [] and installed.handed == []
+    assert releases.read_pointer(installed.home / "current") == before
+    assert not (installed.home / "release-txn.json").exists()
+    assert not releases.ReleasePaths.for_home(installed.home).release(installed.target).exists()
+    assert update_receipt._current.get().data["stop_class"] == "head_moved"
+
+
+def test_the_pin_crosses_the_post_swap_reexec(installed):
+    args = installed.parser.parse_args(["update", "--branch", "main", "--expect-sha", installed.target])
+    assert update_cmd._post_swap_argv_tail(args) == ["--branch", "main", "--expect-sha", installed.target]

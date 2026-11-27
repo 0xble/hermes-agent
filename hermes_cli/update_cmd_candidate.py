@@ -18,6 +18,13 @@ def candidate_sha(value: str) -> str:
     return value.lower()
 
 
+def expect_sha(value: str) -> str:
+    """``--expect-sha``: an exact full lowercase commit name, never a prefix or a ref."""
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise argparse.ArgumentTypeError("--expect-sha must be an exact lowercase 40-hex commit SHA")
+    return value
+
+
 def carried_candidate(source: Path, sha: str) -> str:
     """Unwrap our target-first, candidate-second merges, never arbitrary user merges."""
     from hermes_cli.update_cmd import _git_run

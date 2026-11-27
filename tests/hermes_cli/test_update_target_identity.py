@@ -485,3 +485,112 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
         assert git(t.clone, 'show', ':.gitignore') == staged.decode().strip()
         assert (t.clone / 'notes.txt').read_bytes() == b'untracked local work\n'
 
+
+
+def _pin_branch(t, pin):
+    """``hermes update --branch chosen --expect-sha <pin>`` from a clean checkout on main."""
+    git(t.clone, 'checkout', '-q', 'main')
+    git(t.origin, 'branch', 'chosen', t.wanted)
+    t.args.channel = 'main'
+    t.args.gateway = True
+    t.args.branch = 'chosen'
+    t.args.expect_sha = pin
+
+
+def _forbid_commit_point(monkeypatch):
+    """Nothing durable (tail, fleet marker, tree-move marker) may be armed on a refused pin."""
+    from hermes_cli import update_cmd_commit
+
+    def armed(*_a, **_k):
+        pytest.fail('the commit point was reached for a refused pin')
+
+    monkeypatch.setattr(update_cmd_commit, 'arm_commit_point', armed)
+    monkeypatch.setattr(update_cmd_commit, 'record_run_start', armed)
+
+
+def _spy_stop_reasons(monkeypatch):
+    reasons = []
+    real = update_receipt.record_stop_reason
+    monkeypatch.setattr(update_receipt, 'record_stop_reason', lambda reason: (reasons.append(reason), real(reason))[1])
+    return reasons
+
+
+def test_a_branch_pin_sets_expected_sha_and_lands_on_the_pin(update_tree, monkeypatch):
+    t = update_tree
+    _pin_branch(t, t.wanted)
+    cli_main.cmd_update(t.args)
+    request, = t.requests
+    assert request['expected_sha'] == t.wanted
+    assert git(t.clone, 'rev-parse', 'HEAD') == t.wanted
+
+
+def test_a_branch_pin_mismatch_exits_before_anything_changes(update_tree, monkeypatch, capsys):
+    t = update_tree
+    _pin_branch(t, t.newer)  # a real commit, but not what origin/chosen resolves to
+    local = t.clone / '.gitignore'
+    local_work = local.read_bytes() + b'# local work\n'
+    local.write_bytes(local_work)
+    (t.clone / 'notes.txt').write_bytes(b'untracked local work\n')
+    _forbid_commit_point(monkeypatch)
+    reasons = _spy_stop_reasons(monkeypatch)
+
+    with pytest.raises(SystemExit) as error:
+        cli_main.cmd_update(t.args)
+
+    assert error.value.code == 1
+    assert 'head_moved' in reasons
+    assert t.requests == []
+    assert t.resumed  # a paused Windows gateway is handed back
+    assert 'not the pinned commit' in capsys.readouterr().out
+    assert git(t.clone, 'rev-parse', 'HEAD') == t.base
+    assert git(t.clone, 'branch', '--show-current') == 'main'
+    assert not git(t.clone, 'stash', 'list')
+    assert local.read_bytes() == local_work
+    assert (t.clone / 'notes.txt').read_bytes() == b'untracked local work\n'
+    from hermes_cli._early_recovery import interrupted_pull_marker
+
+    assert not interrupted_pull_marker(t.clone).exists()
+
+
+def test_a_pinned_branch_that_advances_between_the_check_and_the_fetch_is_refused(
+        update_tree, monkeypatch, tmp_path, capsys):
+    """The approval read origin/chosen == approved; a push lands before the updater's fetch."""
+    from hermes_cli import update_custody
+
+    t = update_tree
+    git(t.clone, 'checkout', '-q', 'main')
+    bare = tmp_path / 'remote.git'
+    git(tmp_path, 'clone', '-q', '--bare', str(t.origin), str(bare))
+    git(bare, 'branch', 'chosen', t.wanted)
+    git(t.clone, 'remote', 'set-url', 'origin', str(bare))
+    approved = git(bare, 'rev-parse', 'refs/heads/chosen')  # the check
+    assert approved == t.wanted
+    pusher = tmp_path / 'pusher'
+    git(tmp_path, 'clone', '-q', '-b', 'chosen', str(bare), str(pusher))
+    git(pusher, 'config', 'user.name', 'Fixture')
+    git(pusher, 'config', 'user.email', 'fixture@example.invalid')
+    t.args.channel, t.args.gateway, t.args.branch, t.args.expect_sha = 'main', True, 'chosen', approved
+    _forbid_commit_point(monkeypatch)
+    reasons = _spy_stop_reasons(monkeypatch)
+    real_git, advanced = update_custody.run_git, []
+
+    def racing_git(git_cmd, git_args, **kwargs):
+        if 'fetch' in git_args and not advanced:
+            git(pusher, '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'advance after approval')
+            git(pusher, 'push', '-q', 'origin', 'chosen')
+            advanced.append(git(bare, 'rev-parse', 'refs/heads/chosen'))
+        return real_git(git_cmd, git_args, **kwargs)
+
+    monkeypatch.setattr(update_custody, 'run_git', racing_git)
+    with pytest.raises(SystemExit) as error:
+        cli_main.cmd_update(t.args)
+
+    assert error.value.code == 1
+    assert advanced and advanced[0] != approved
+    assert git(t.clone, 'rev-parse', 'origin/chosen') == advanced[0]  # the fetch really saw the new head
+    assert 'head_moved' in reasons
+    assert t.requests == []
+    assert git(t.clone, 'rev-parse', 'HEAD') == t.base
+    assert git(t.clone, 'branch', '--show-current') == 'main'
+    assert not git(t.clone, 'status', '--porcelain')
+    assert 'No update was applied' in capsys.readouterr().out

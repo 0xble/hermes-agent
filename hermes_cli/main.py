@@ -2196,6 +2196,14 @@ def _update_preflight_handled(args) -> bool:
     from hermes_cli.update_channel import handle_metadata_args
     from hermes_cli.update_cmd_common import _record_stop
 
+    if getattr(args, "expect_sha", None):
+        # A usage error: refused before any update state exists, so there is no receipt to record.
+        if not getattr(args, "branch", None):
+            print("✗ --expect-sha requires --branch: the pin names the commit that branch must resolve to.")
+            sys.exit(2)
+        if any(getattr(args, flag, False) for flag in ("rollback", "check", "plan", "list_venv_holders")):
+            print("✗ --expect-sha only applies to an update that fetches and installs the branch.")
+            sys.exit(2)
     if handle_metadata_args(args, PROJECT_ROOT):
         sys.exit(0)
     if is_managed():
