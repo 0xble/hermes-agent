@@ -107,4 +107,3 @@ def queue_entry(store, operation, payload, *, best_effort):
             store.failure = str(exc)
         raise
     store.journal = candidate
-

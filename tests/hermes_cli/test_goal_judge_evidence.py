@@ -320,4 +320,3 @@ def _judge_sequence(*verdicts):
 
 DISPUTED = ("continue", "no command output shown", False, {"disputed": True}, False)
 PLAIN_CONTINUE = ("continue", "tests still missing", False, None, False)
-

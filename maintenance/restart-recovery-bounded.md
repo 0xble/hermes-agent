@@ -38,7 +38,7 @@ keep read-only discovery out of the write transaction. If the in-flight statuses
 the `STEERING` outcome change, change the partial indexes with them: the planner test
 fails when a statement stops matching its index.
 
-Contract tests: `tests/hermes_state/test_restart_recovery_bounded.py`,
+Contract tests: `tests/persistence_sqlite/core/test_restart_recovery_bounded.py`,
   `tests/gateway/test_handoff_local_receipt.py`.
 
 Rollback is code-only. The partial indexes may stay: nothing else reads them.

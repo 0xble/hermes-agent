@@ -1788,7 +1788,8 @@ def _try_incremental_merge_fts(holder: StoreHolder) -> None:
         # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
         # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write
         # (#90734, #85079).
-        logger.warning("FTS incremental merge failed after commit: %s", exc)
+        log = logger.debug if is_sqlite_lock_error(exc) else logger.warning
+        log("FTS incremental merge failed after commit: %s", exc)
 
 
 def _fts_external_index_empty_with_messages(holder: StoreHolder, conn) -> bool:
@@ -1805,19 +1806,20 @@ def _fts_external_index_empty_with_messages(holder: StoreHolder, conn) -> bool:
 
 # ── FTS maintenance commands ───────────────────────────────────────────
 
-def _fts_table_exists(holder: StoreHolder, name: str) -> bool:
+def _fts_table_exists(holder: StoreHolder, name: str, *, conn=None) -> bool:
     """True if an FTS5 virtual table is queryable ("no such table" and "vtable
     constructor failed" — missing tokenizer / mid-teardown — both count as not)."""
     try:
-        holder._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
+        connection = holder._conn if conn is None else conn
+        connection.execute(f"SELECT 1 FROM {name} LIMIT 0")
         return True
     except sqlite3.DatabaseError:
         return False
 
 
-def _present_fts_tables(holder: StoreHolder) -> list[str]:
-    """Queryable FTS tables (caller holds ``self._lock``)."""
-    return [tbl for tbl in _FTS_TABLES if _fts_table_exists(holder, tbl)]
+def _present_fts_tables(holder: StoreHolder, *, conn=None) -> list[str]:
+    """Queryable FTS tables on the caller's locked writer or borrowed maintenance connection."""
+    return [tbl for tbl in _FTS_TABLES if _fts_table_exists(holder, tbl, conn=conn)]
 
 
 def _merge_fts_incrementally(holder: StoreHolder, *, max_pages: int, max_commands: Optional[int] = None) -> int:
@@ -1836,15 +1838,17 @@ def _merge_fts_incrementally(holder: StoreHolder, *, max_pages: int, max_command
         max_commands = holder._FTS_MERGE_COMMANDS_PER_PASS
     _positive_int("max_commands", max_commands)
     executed = 0
-    with holder._lock:
-        for tbl in _present_fts_tables(holder):
+    with holder._maintenance_conn() as conn:
+        if conn is None:
+            return 0
+        for tbl in _present_fts_tables(holder, conn=conn):
             if not holder._fts_usermerge_floor_applied:
-                holder._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
+                conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
             for _ in range(max_commands):
-                before = holder._conn.total_changes
-                holder._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
+                before = conn.total_changes
+                conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
                 executed += 1
-                if holder._conn.total_changes - before < 2:
+                if conn.total_changes - before < 2:
                     break
         holder._fts_usermerge_floor_applied = True
     return executed

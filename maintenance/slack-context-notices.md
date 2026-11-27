@@ -21,7 +21,7 @@ prose, notice-key prefixes, severity, or command names. `EphemeralReply` retains
 its command identity, lifetime and presentation marker through unwrapping.
 Both helpers live in `agent/notice_style.py`, outside `gateway/`, so storage and
 agent producers never load the gateway package
-(`tests/hermes_state/test_storage_import_boundary.py`).
+(`tests/persistence_sqlite/core/test_storage_import_boundary.py`).
 
 ## Classified Routes
 
@@ -128,5 +128,5 @@ Retire when upstream has equivalent producer-owned metadata classification and
 context rendering across sends and status edits. Never replace classification
 with text matching in the Slack adapter.
 
-Contract tests: `tests/hermes_state/test_storage_import_boundary.py`, `tests/gateway/test_slack_context_notices.py`, `tests/gateway/test_slack_notice_coverage.py`, `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/gateway/test_restart_resume_admission_identity.py`,
+Contract tests: `tests/persistence_sqlite/core/test_storage_import_boundary.py`, `tests/gateway/test_slack_context_notices.py`, `tests/gateway/test_slack_notice_coverage.py`, `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/gateway/test_restart_resume_admission_identity.py`,
   `tests/gateway/relay/test_abandoned_draft_reconciliation.py`, `tests/gateway/relay/test_draft_identity_metadata.py`, `tests/gateway/test_background_attribution_delivery.py`, `tests/gateway/test_slack_stream_fallback.py`.

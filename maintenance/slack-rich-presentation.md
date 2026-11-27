@@ -21,4 +21,4 @@ Run `scripts/run_tests.sh tests/plugins/platforms/slack tests/gateway/test_slack
 
 Retire only when the selected upstream release passes these behavior tests without the local patch. Roll back the owned renderer, delivery and hint changes together. Runtime promotion and restart remain separate decisions.
 
-Contract tests: `tests/gateway/test_slack_block_kit.py`, `tests/gateway/test_slack_block_kit_adapter.py`, `tests/tools/test_send_message_slack.py`.
+Contract tests: `tests/gateway/test_slack_block_kit.py`, `tests/gateway/test_slack_block_kit_adapter.py`, `tests/gateway/outbound/test_send_message_slack.py`.

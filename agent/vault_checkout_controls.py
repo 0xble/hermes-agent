@@ -104,4 +104,3 @@ FILL_HELPERS = r"""
     return role === 'listbox' ? option.getAttribute('aria-selected') === 'true' : comboboxMatches(el, f);
   };
 """
-

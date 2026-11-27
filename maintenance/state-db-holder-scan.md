@@ -37,4 +37,4 @@ when a selected released upstream version preserves bounded worker count and
 in-process detection during a blocked foreign scan. Revert the commit carrying
 `Fork-Patch: state-db-bounded-holder-scan` to restore per-open enumeration.
 
-Contract tests: `tests/hermes_state/test_darwin_scan_bounds.py`, `tests/hermes_state/test_state_db_darwin_fd_scan_hang.py`, `tests/hermes_state/test_deleted_wal_generation_guard.py`.
+Contract tests: `tests/persistence_sqlite/core/test_darwin_scan_bounds.py`, `tests/persistence_sqlite/core/test_state_db_darwin_fd_scan_hang.py`, `tests/persistence_sqlite/core/test_deleted_wal_generation_guard.py`.

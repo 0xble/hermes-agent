@@ -19,7 +19,7 @@ path, not cached in a fold plan.
 
 ## Evidence And Verification
 
-`tests/hermes_state/test_archive_compact_off_writer_lock.py` covers metadata-key
+`tests/persistence_sqlite/core/test_archive_compact_off_writer_lock.py` covers metadata-key
 invariance, visible metadata and membership, unchanged-row SQL traces, stale and
 unseen rows, planned/full-fold equivalence and the no-WAL fallback. The former
 metadata-recomputation test asserted an incorrect premise and is replaced with
@@ -125,7 +125,7 @@ Live, after #799 shipped (13:29-13:48), every slow compaction hold took `display
 
 [PR #853](https://github.com/0xble/hermes-agent/pull/853) applies the same handoff boundary to affected-group indexes, NULL backfill, stale-payload decode and repair UPDATEs. Keep both the row and byte budget: a row-only page caused the existing large-payload display-read memory regression to fail, so a bounded id/byte-count query chooses the payload prefix before payloads are fetched. An oversized row must still make progress alone, without JSON expansion. Do not replace the existing memory regression with a looser threshold.
 
-`tests/hermes_state/test_display_fold_writer_steps.py` checks page-level SQLite result stepping, batched repair writes, exact full-fold equivalence, both archive paths, and oversized/sparse/unordered selections. Retain `test_legacy_page_retains_only_bounded_payloads` in `test_get_messages_include_compacted.py` and the exact-type tests in `test_display_fold_one_step.py`.
+`tests/persistence_sqlite/core/test_display_fold_writer_steps.py` checks page-level SQLite result stepping, batched repair writes, exact full-fold equivalence, both archive paths, and oversized/sparse/unordered selections. Retain `test_legacy_page_retains_only_bounded_payloads` in `test_get_messages_include_compacted.py` and the exact-type tests in `test_display_fold_one_step.py`.
 
 `python scripts/bench_display_writer_hold.py --baseline 82cfb861e2b6487c7b92f0fef4b3d7780a599572 --rows 400 --rounds 100 --output "$TMPDIR/display-writer-hold.json"` measures real archive/FTS/commit hold time with 1 CPU-bound thread, alternating baseline/candidate pairs. Every sample is checked against the stored fold and a full-payload oracle. The output retains samples, source hash, environment, p50 and nearest-rank p99. This is a synthetic contention test, not live or cold-cache p99 for a large store. The PR records measured results and their runner provenance.
 
@@ -139,8 +139,8 @@ Each page reads the actual inserted ids and logical message ids through the exis
 
 `insert_incl_fts` includes preparation, SQL plus trigger work, checkpoint pruning, and stored-row snapshot hashing. Its nested phases now separate these costs as `insert_prepare`, `insert_sql_fts`, `insert_checkpoints`, and `insert_snapshots`. Snapshot hashing feeds the unchanged framed bytes to BLAKE2b in chunks of 2,047 bytes, matching the display-identity hash boundary. The digest is byte-identical, without a large-buffer hashlib GIL release at every long field. A low callback CPU time alone does not distinguish I/O wait from GIL reacquisition.
 
-`tests/hermes_state/test_compaction_insert_batches.py` drives both archive paths and checks a deterministic insert-step budget, 999-variable compatibility, row and byte budgets, AUTOINCREMENT gaps, caller snapshots, synchronous FTS integrity, and rollback. Upstream v0.23.1 retires the native CJK tokenizer and third index. The contract continues to exercise both retained search indexes, all insert budgets and atomic rollback. `tests/agent/test_transcript_snapshot_hash_steps.py` checks digest equivalence and hash-update sizes across the 2,048-byte boundary, Unicode, BLOBs, numeric values, and surrogate text.
+`tests/persistence_sqlite/core/test_compaction_insert_batches.py` drives both archive paths and checks a deterministic insert-step budget, 999-variable compatibility, row and byte budgets, AUTOINCREMENT gaps, caller snapshots, synchronous FTS integrity, and rollback. Upstream v0.23.1 retires the native CJK tokenizer and third index. The contract continues to exercise both retained search indexes, all insert budgets and atomic rollback. `tests/agent/test_transcript_snapshot_hash_steps.py` checks digest equivalence and hash-update sizes across the 2,048-byte boundary, Unicode, BLOBs, numeric values, and surrogate text.
 
 `scripts/bench_compaction_insert.py` compares the base inserter and snapshot hash with batch-only, hash-only, and combined variants. It alternates variants on the same synthetic 400-row scratch store, compacts 201 rows per sample, performs 1 warmup and 5 measured rounds, and measures both idle execution and contention from 1 CPU-bound thread. Every sample must have identical stored rows and correct MATCH results and integrity checks for all 3 FTS tables. This tests scheduling amplification, not cold-cache behavior or the absolute hold bound of the live 73 GB store. If the combined variant leaves the loaded insert phase and hold cost unchanged, the scheduling hypothesis is falsified for this workload.
 
-Contract tests: `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/hermes_state/test_display_fold_writer_steps.py`, `tests/hermes_state/test_compaction_insert_batches.py`, `tests/agent/test_transcript_snapshot_hash_steps.py`.
+Contract tests: `tests/persistence_sqlite/core/test_archive_compact_off_writer_lock.py`, `tests/persistence_sqlite/core/test_display_fold_writer_steps.py`, `tests/persistence_sqlite/core/test_compaction_insert_batches.py`, `tests/agent/test_transcript_snapshot_hash_steps.py`.

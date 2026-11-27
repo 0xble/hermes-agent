@@ -121,4 +121,3 @@ def test_poll_stays_off_for_a_pytest_home_and_an_explicit_disable(monkeypatch):
     assert filesystem_poll_seconds(5.0) == 0.0
     monkeypatch.delenv("HERMES_FS_POLL")
     assert filesystem_poll_seconds(5.0) == 5.0
-

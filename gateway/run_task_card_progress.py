@@ -258,4 +258,3 @@ class TaskCardProgressMixin:
                     raise
                 except Exception:
                     logger.debug("task-card stop failed during turn cleanup", exc_info=True)
-

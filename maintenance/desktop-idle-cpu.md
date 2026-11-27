@@ -51,9 +51,9 @@ and semantic regressions live in `tests/tui_gateway/test_change_watcher_sessions
 and `tests/hermes_cli/test_session_skill_previews.py`; existing lineage, paging,
 archive/pin and sidebar-cache tests cover the surrounding behavior.
 Trigger migration and publication accounting are covered by
-`tests/hermes_state/test_session_signature_triggers.py`,
-`tests/hermes_state/test_publication_rowcounts.py` and
-`tests/hermes_state/test_publication_wait_budget.py`.
+`tests/persistence_sqlite/core/test_session_signature_triggers.py`,
+`tests/persistence_sqlite/core/test_publication_rowcounts.py` and
+`tests/persistence_sqlite/core/test_publication_wait_budget.py`.
 
 Upstream disposition: no upstream PR or submission; this task stops at a draft
 PR in `0xble/hermes-agent`. Fork delivery: this branch only, not installed.
@@ -62,4 +62,4 @@ plan and signature implementation independently satisfy the regression tests.
 Retire the patch when the accepted baseline supplies equivalent bounded work.
 Rollback by reverting the commit carrying `Fork-Patch: desktop-idle-cpu`.
 
-Contract tests: `tests/tui_gateway/test_change_watcher_sessions.py`, `tests/hermes_cli/test_session_skill_previews.py`, `tests/hermes_state/test_session_signature_triggers.py`, `tests/hermes_state/test_publication_rowcounts.py`, `tests/hermes_state/test_publication_wait_budget.py`.
+Contract tests: `tests/tui_gateway/test_change_watcher_sessions.py`, `tests/hermes_cli/test_session_skill_previews.py`, `tests/persistence_sqlite/core/test_session_signature_triggers.py`, `tests/persistence_sqlite/core/test_publication_rowcounts.py`, `tests/persistence_sqlite/core/test_publication_wait_budget.py`.

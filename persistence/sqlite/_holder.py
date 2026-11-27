@@ -360,6 +360,8 @@ class StoreHolder:
         # The read connection each thread's open ``transcript_read_snapshot`` pinned.
         self._snapshot_pins = threading.local()
         self._conn = None
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_db: Optional[sqlite3.Connection] = None
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
         self._token_queue_cond = threading.Condition(threading.Lock())
@@ -539,6 +541,10 @@ class StoreHolder:
             # Existing WAL/SHM files may predate the main-file hardening;
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
+            if self._wal_active and sys.platform == "darwin":
+                # Periodic checkpoints own the full-device I/O barrier. An explicit
+                # database.wal_autocheckpoint setting may override this default.
+                conn.execute("PRAGMA wal_autocheckpoint=0")
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
         except BaseException:
@@ -1292,22 +1298,46 @@ class StoreHolder:
             return "a deleted WAL generation (split-brain)"
         return None
 
-    def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint; never raises. PASSIVE never blocks writers;
-        TRUNCATE corrupted B-trees on 65K+ page databases under exclusive-lock I/O pressure.
+    @contextmanager
+    def _maintenance_conn(self) -> Iterator[Optional[sqlite3.Connection]]:
+        """Borrow the holder's maintenance connection without holding the writer lock.
 
-        Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
-        exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
+        A concurrent periodic pass skips this run. Close takes the same maintenance
+        lock before the writer lock, so it cannot retire an in-use connection.
         """
-        if self._quarantine_reason() is not None:
+        if not self._maintenance_lock.acquire(blocking=False):
+            yield None
             return
         try:
             with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                conn = None
+                if self._conn is not None and not self.read_only and self._quarantine_reason() is None:
+                    self._raise_if_db_replaced()
+                    if self._maintenance_db is None:
+                        opened = self._open_writer_conn()
+                        try:
+                            if self._wal_lock_guard:
+                                _lockguard.hold(self.db_path, self._wal_lock_guard)
+                        except BaseException:
+                            self._close_connection_quietly(opened)
+                            raise
+                        self._maintenance_db = opened
+                    conn = self._maintenance_db
+            yield conn
+        finally:
+            self._maintenance_lock.release()
+
+    def _try_wal_checkpoint(self) -> None:
+        """Run a best-effort PASSIVE checkpoint outside the writer lock.
+
+        macOS fullfsync can wait for the entire device's dirty data. The separate
+        connection allows writes while that barrier runs.
+        """
+        try:
+            with self._maintenance_conn() as conn:
+                if conn is None:
+                    return
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:  # health: allow BLE001 -- a failed checkpoint is logged; the write has committed
@@ -1356,7 +1386,7 @@ class StoreHolder:
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
+        with self._maintenance_lock, self._lock:
             if self._conn:
                 generation_lost = not self.read_only and (
                     self._db_wal_generation_lost
@@ -1383,6 +1413,13 @@ class StoreHolder:
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:  # health: allow BLE001 -- a failed checkpoint at close is logged and the close goes on
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                maintenance_db, self._maintenance_db = self._maintenance_db, None
+                if maintenance_db is not None:
+                    if retire_without_close:
+                        self._retire_connection(maintenance_db)
+                    else:
+                        # Close under the existing live-generation lock guard.
+                        self._close_connection_quietly(maintenance_db)
                 _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)

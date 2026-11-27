@@ -2203,4 +2203,3 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
             except Exception:
                 logger.debug("status report: goodbye not started", exc_info=True)
         return await asyncio.to_thread(lever, *args)
-    

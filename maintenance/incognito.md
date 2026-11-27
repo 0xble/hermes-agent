@@ -149,7 +149,7 @@ Compare the complete suite's failures against the exact base before promotion.
 Off-mode differential proofs must compare the merged main revision, retaining
 exact SQL traces, SQLite pages and plugin callback assertions. A historical base
 with an older schema cannot establish current main compatibility.
-`tests/hermes_state/test_incognito_off_regression.py` runs only where git
+`tests/persistence_sqlite/core/test_incognito_off_regression.py` runs only where git
 history shows the unmerged feature on its pinned `BASE`, so shallow hosted CI
 skips it. Run it from a full checkout before promotion and re-pin `BASE` after
 any rebase.
@@ -172,5 +172,5 @@ same boundary proof. A source rollback removes the feature, it does not retract
 content already sent to messaging or model providers. Never turn an active
 private lane public merely by ignoring or deleting its routing sidecar.
 
-Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/hermes_state/test_incognito_off_regression.py`,
-  `tests/gateway/test_incognito_goal_suspend.py`, `tests/gateway/test_incognito_worker_boundary.py`, `tests/hermes_state/test_incognito_worker_write_contract.py`, `tests/hermes_state/test_runtime_privacy_journal.py`, `tests/hermes_state/test_runtime_privacy_ownership.py`.
+Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/persistence_sqlite/core/test_incognito_off_regression.py`,
+  `tests/gateway/test_incognito_goal_suspend.py`, `tests/gateway/test_incognito_worker_boundary.py`, `tests/persistence_sqlite/core/test_incognito_worker_write_contract.py`, `tests/persistence_sqlite/core/test_runtime_privacy_journal.py`, `tests/persistence_sqlite/core/test_runtime_privacy_ownership.py`.

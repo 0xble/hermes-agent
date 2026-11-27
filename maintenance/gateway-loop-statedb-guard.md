@@ -178,7 +178,7 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 ## Active replay access path
 
 Source: `hermes_state_messages.py::_fetch_conversation_rows`; proof:
-`tests/hermes_state/test_active_conversation_replay.py`. On fork base
+`tests/persistence_sqlite/core/test_active_conversation_replay.py`. On fork base
 `54f27baa0695c9b0f8bf57ba0184944130afb8ba`, the exact public replay projection chose
 `idx_messages_session_id`, filtering 332,311 archived rows to restore 173 live rows.
 Active-only `ORDER BY +id` lets SQLite use the existing `(session_id, active, timestamp)`
@@ -313,16 +313,16 @@ classic slot cannot hold the FIFO head until restart),
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
 `test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
-in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
-`tests/hermes_state/test_generation_checkpoint_durability.py` (real reader-blocked first checkpoint;
+in `tests/persistence_sqlite/core/test_wal_checkpoint_strategy.py`,
+`tests/persistence_sqlite/core/test_generation_checkpoint_durability.py` (real reader-blocked first checkpoint;
 main-file-only snapshot proves header and row durability after a warm open),
 `test_warm_writable_open_skips_generation_checkpoint` in `tests/hermes_state/test_hermes_state.py`,
-`tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`,
-`tests/hermes_state/test_archive_compact_off_writer_lock.py` (event-gated writer availability,
+`tests/persistence_sqlite/core/test_gateway_routing_replace_diff.py`, `tests/persistence_sqlite/core/test_db_identity_probe_off_lock.py`,
+`tests/persistence_sqlite/core/test_archive_compact_off_writer_lock.py` (event-gated writer availability,
 changed rows and user metadata, fold equivalence and non-WAL fallback), and
 `test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 
-Further proof surface: `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`,
+Further proof surface: `tests/persistence_sqlite/core/test_loop_guard.py`, `tests/persistence_sqlite/core/test_holder_scan_bounded.py`,
 `test_goal_family_commands_keep_loop_live` in `tests/gateway/test_turn_state_db_off_loop.py`, and the
 boot-delay case in `tests/hermes_cli/test_worktree_pushed_tier.py`, and
 `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`.
@@ -334,8 +334,8 @@ gate is installed, with no await in between, or fresh inbound can overtake a cla
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
 upstream bounds restart replay and cron catch-up itself.
 
-Contract tests: `tests/tools/test_completed_process_results.py`, `tests/hermes_state/test_active_conversation_replay.py`, `tests/gateway/test_lifecycle_state_db_check.py`, `tests/gateway/test_lifecycle_ledger.py`, `tests/gateway/test_admission_adapter_reconnect_wait.py`, `tests/gateway/test_startup_resume_admission.py`, `tests/gateway/test_reaped_eviction_interrupts_run.py`, `tests/gateway/test_classic_slot_holds_fifo_head.py`, `tests/cron/test_scheduler.py`, `tests/agent/test_turn_facade_lease.py`, `tests/hermes_state/test_wal_checkpoint_strategy.py`, `tests/hermes_state/test_generation_checkpoint_durability.py`, `tests/hermes_state/test_hermes_state.py`, `tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/agent/test_turn_liveness_watchdog.py`, `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/hermes_cli/test_worktree_pushed_tier.py`, `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`,
+Contract tests: `tests/tools/test_completed_process_results.py`, `tests/persistence_sqlite/core/test_active_conversation_replay.py`, `tests/gateway/test_lifecycle_state_db_check.py`, `tests/gateway/test_lifecycle_ledger.py`, `tests/gateway/test_admission_adapter_reconnect_wait.py`, `tests/gateway/test_startup_resume_admission.py`, `tests/gateway/test_reaped_eviction_interrupts_run.py`, `tests/gateway/test_classic_slot_holds_fifo_head.py`, `tests/cron/test_scheduler.py`, `tests/agent/test_turn_facade_lease.py`, `tests/persistence_sqlite/core/test_wal_checkpoint_strategy.py`, `tests/persistence_sqlite/core/test_generation_checkpoint_durability.py`, `tests/hermes_state/test_hermes_state.py`, `tests/persistence_sqlite/core/test_gateway_routing_replace_diff.py`, `tests/persistence_sqlite/core/test_db_identity_probe_off_lock.py`, `tests/persistence_sqlite/core/test_archive_compact_off_writer_lock.py`, `tests/agent/test_turn_liveness_watchdog.py`, `tests/persistence_sqlite/core/test_loop_guard.py`, `tests/persistence_sqlite/core/test_holder_scan_bounded.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/hermes_cli/test_worktree_pushed_tier.py`, `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`,
   `tests/gateway/test_routing_save_delta.py`, `tests/gateway/test_api_admission_off_loop.py`,
   `tests/gateway/test_adversarial_responses_eviction.py`, and
   `tests/gateway/test_responses_idem_replay_record.py`,
-  `tests/hermes_state/test_display_fold_writer_steps.py`.
+  `tests/persistence_sqlite/core/test_display_fold_writer_steps.py`.

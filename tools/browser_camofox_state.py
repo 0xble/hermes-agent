@@ -91,5 +91,3 @@ def get_camofox_account_identity(account: str, task_id: Optional[str] = None) ->
         uuid.NAMESPACE_URL, f"camofox-account-session:{scope_root}:{account}:{task_id or 'default'}"
     ).hex[:16]
     return {"user_id": matches[0], "session_key": f"{account}_{session_digest}"}
-
-

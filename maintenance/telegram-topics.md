@@ -192,7 +192,7 @@ its ledger rows in the same reviewed change.
 ## Verify and recover
 
 Run the focused title, icon, gateway, and state tests through `scripts/run_tests.sh`.
-`tests/hermes_state/test_telegram_icon_migration.py` injects failures at both
+`tests/persistence_sqlite/core/test_telegram_icon_migration.py` injects failures at both
 legacy icon-table drops, a later index, and the schema-version write, then checks
 exact rollback and successful retry.
 `tests/agent/test_title_preview_eligibility.py` exercises preview eligibility through
@@ -206,5 +206,5 @@ rolled-back code; never edit the operator's live config as part of source rollba
 `title-concurrent-endpoint` rolls back alone by reverting its commit: an unread
 `concurrent_requests` capability is ignored, so titles on that endpoint simply defer again.
 
-Contract tests: `tests/gateway/test_telegram_topic_owner_routing.py`, `tests/cron/test_cron_live_delivery_confirmation.py`, `tests/hermes_state/test_telegram_icon_migration.py`, `tests/agent/test_title_preview_eligibility.py`, `tests/agent/test_title_completion_retry.py`, `tests/hermes_state/test_auto_title_collisions.py`,
+Contract tests: `tests/gateway/test_telegram_topic_owner_routing.py`, `tests/cron/test_cron_live_delivery_confirmation.py`, `tests/persistence_sqlite/core/test_telegram_icon_migration.py`, `tests/agent/test_title_preview_eligibility.py`, `tests/agent/test_title_completion_retry.py`, `tests/persistence_sqlite/core/test_auto_title_collisions.py`,
   `tests/gateway/test_telegram_topic_initial_title.py`.

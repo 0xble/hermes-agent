@@ -25,4 +25,3 @@ def test_source_bounds_transient_fallback_without_refreshing_cache(monkeypatch, 
                                           'cache_max_stale_seconds': limit}, tmp_path)
     assert bool(result.secrets) is expected
     store.store.assert_not_called()
-

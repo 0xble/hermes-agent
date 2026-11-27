@@ -53,4 +53,4 @@ Evidence: the complete rejected-head inventory and receipt naming convention are
 
 Retire this patch when upstream persists provider-reported per-call cost with equivalent exactly-once display. To roll back, revert the `provider-reported-cost` commit.
 
-Contract tests: `tests/hermes_state/test_provider_reported_cost.py`, `tests/agent/test_usage_pricing.py`.
+Contract tests: `tests/persistence_sqlite/core/test_provider_reported_cost.py`, `tests/agent/test_usage_pricing.py`.

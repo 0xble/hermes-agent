@@ -51,8 +51,8 @@ Runtime session resolution and the shared compression/branch/reset child-row pub
 
 `tests/hermes_state/test_session_delete_batches.py` covers a 1,025-message single/chain/prune regression, another SQLite writer committing between pages, interruption immediately after retirement and after a committed page, restart/next-prune recovery, invisibility through FTS and LIKE, propagated database errors, pending-marker expiry, snapshot fences, and message-byte bounds. Existing guard, cascade, compression, retirement, media and prune tests remain authoritative.
 
-Contract tests: `tests/hermes_state/test_compaction_prepare_snapshot.py`, `tests/hermes_state/test_compaction_prepare_fallback.py`,
-  `tests/gateway/test_session_prune_budget.py`, `tests/hermes_cli/test_sessions_owner.py`, `tests/hermes_state/test_prune_cleanup_progress.py`, `tests/hermes_state/test_prune_pacing_regressions.py`, `tests/hermes_state/test_prune_sql_deadline.py`, `tests/hermes_state/test_prune_write_recovery.py`.
+Contract tests: `tests/persistence_sqlite/core/test_compaction_prepare_snapshot.py`, `tests/persistence_sqlite/core/test_compaction_prepare_fallback.py`,
+  `tests/gateway/test_session_prune_budget.py`, `tests/hermes_cli/test_sessions_owner.py`, `tests/persistence_sqlite/core/test_prune_cleanup_progress.py`, `tests/persistence_sqlite/core/test_prune_pacing_regressions.py`, `tests/persistence_sqlite/core/test_prune_sql_deadline.py`, `tests/persistence_sqlite/core/test_prune_write_recovery.py`.
 
 ## Compaction Attribution
 

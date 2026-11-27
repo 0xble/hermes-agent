@@ -15,7 +15,7 @@
   checks both live indexes in a fresh store. The existing bounded-merge test
   continues to require explicit `usermerge` and `merge` commands and forbids
   `optimize`.
-- **Contract tests:** `tests/hermes_state/test_fts_automerge.py`.
+- **Contract tests:** `tests/persistence_sqlite/core/test_fts_automerge.py`.
 - **Rollback:** Revert this source and test change. No schema migration or
   state rewrite is needed. Existing indexes keep their current data.
 - **Retirement:** Remove the private setting when an upstream release prevents

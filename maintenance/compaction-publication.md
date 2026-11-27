@@ -75,7 +75,7 @@ changes without relaxing the clean-close/sticky-loss invariant.
 
 ## Verification And Removal
 
-Regression coverage belongs in `tests/hermes_state/test_publication_wait_budget.py`
+Regression coverage belongs in `tests/persistence_sqlite/core/test_publication_wait_budget.py`
 and `tests/agent/test_compaction_events.py`, with the surrounding state,
 compaction, rollback, display, FTS, and lease suites. Run them with
 `scripts/run_tests.sh`, then the exact-head `bin/ci gate` through `semaphore`.
@@ -100,4 +100,4 @@ retry changes with slow-write diagnostics. Neither supplies the fork's bounded
 publication mutex attribution. Extend the existing wrapper and warning instead
 of changing admission, patience, or retries.
 
-Contract tests: `tests/hermes_state/test_publication_wait_budget.py`, `tests/agent/test_compaction_events.py`.
+Contract tests: `tests/persistence_sqlite/core/test_publication_wait_budget.py`, `tests/agent/test_compaction_events.py`.

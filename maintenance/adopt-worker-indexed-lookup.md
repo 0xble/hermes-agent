@@ -41,7 +41,7 @@ epoch, generation and retirement behavior, not only its SQL shape. Preserve the
 within-transaction checks during any port. An upstream query that scopes
 candidates only by target session loses active ancestor-lineage matches.
 
-Contract tests: `tests/hermes_state/test_adoption_indexed_lookup.py`,
+Contract tests: `tests/persistence_sqlite/core/test_adoption_indexed_lookup.py`,
   `tests/hermes_state/test_runtime_adoption.py`,
   `tests/hermes_state/test_runtime_worker.py`.
 

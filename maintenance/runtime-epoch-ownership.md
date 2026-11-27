@@ -35,7 +35,7 @@ the runtime epoch writer. Do not turn that staging step into an owner startup.
 
 ## Regression And Retirement
 
-The ownership regression is `tests/hermes_state/test_runtime_epoch_ownership.py`.
+The ownership regression is `tests/persistence_sqlite/core/test_runtime_epoch_ownership.py`.
 Its unreserved custom-home cases reproduce both absent and existing epoch rows
 with test markers cleared. The same file exercises gateway worker-thread
 ownership, thread-local maintenance, offline dashboard initialization, and the
@@ -56,4 +56,4 @@ conditions, not permission to skip this reservation. Keep new test fixtures on
 the same real temporary-home helper, and retain `HERMES_TEST_ISOLATION` across
 peer launch allowlists so asynchronous authority startup can reserve its home.
 
-Contract tests: `tests/hermes_state/test_runtime_epoch_ownership.py`.
+Contract tests: `tests/persistence_sqlite/core/test_runtime_epoch_ownership.py`.

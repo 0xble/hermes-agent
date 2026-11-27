@@ -97,7 +97,3 @@ def test_gpt61_sol_900k_is_opt_in_exact_and_billed_as_the_base():
     assert _CODEX_OAUTH_STALE_ADVERTISED_CTX < _verified_codex_ctx_for_slug("gpt-6.1-sol-900k") < 922_000  # 1.05M context - 128K max output
     assert _OFFICIAL_DOCS_PRICING[("openai", "gpt-6.1-sol-900k")] is _OFFICIAL_DOCS_PRICING[("openai", "gpt-6.1-sol")]
     assert _compression_threshold_for_model("gpt-6.1-sol-900k", provider="openai-codex") is None
-
-
-
-

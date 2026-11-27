@@ -220,7 +220,3 @@ def test_malformed_claim_is_refused(tmp_path: Path):
     proc = _run_admission(clone, "v0.1.2", "v0.1.2-rc1")
     assert proc.returncode != 0
     assert "is not a claim tag" in proc.stdout + proc.stderr
-
-
-
-

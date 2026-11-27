@@ -1554,5 +1554,3 @@ for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
                       dynamic_schema_overrides=(
                           _camofox_account_schema_override if _name == "browser_navigate" else None
                       ))
-
-

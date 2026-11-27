@@ -298,5 +298,3 @@ def test_failed_admission_log_retains_query_and_filters(db, monkeypatch, caplog)
     line = next(r.getMessage() for r in caplog.records if "slow session search:" in r.getMessage())
     assert "query='needle'" in line and "sort=oldest" in line
     assert "'role_filter': ['user']" in line and "path=admission" in line
-
-

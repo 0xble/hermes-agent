@@ -46,11 +46,11 @@ work removed. Live latency also depends on storage and process scheduling.
 `hermes_state_keys.py`, `hermes_state_common.py`, `hermes_state_local.py`,
 `gateway/session_ingress_media.py`, `hermes_state.py`, `hermes_state_sessions.py`,
 `hermes_state_worker_context.py`, `hermes_state_worker_lifecycle.py`, and
-`tests/hermes_state/test_lock_hold_indexes.py`.
+`tests/persistence_sqlite/core/test_lock_hold_indexes.py`.
 
 ## Verification
 
-**Contract tests:** `tests/hermes_state/test_lock_hold_indexes.py`.
+**Contract tests:** `tests/persistence_sqlite/core/test_lock_hold_indexes.py`.
 
 The tests record SQL and bound parameters at the production function boundary,
 assert the receipt plan with and without target ids and the held-media partial

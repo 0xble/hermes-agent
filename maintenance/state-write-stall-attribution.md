@@ -106,11 +106,11 @@ No checkpoint, synchronous, or fullfsync setting is changed by this patch.
 
 ## Verification and retirement
 
-Contract tests: `tests/hermes_state/test_commit_tail_attribution.py`,
-  `tests/hermes_state/test_write_stall_sampling.py`,
-  `tests/hermes_state/test_write_stall_native.py`,
-  `tests/hermes_state/test_write_stall_lifecycle.py`,
-  `tests/hermes_state/test_transcript_write_diagnostics.py`.
+Contract tests: `tests/persistence_sqlite/core/test_commit_tail_attribution.py`,
+  `tests/persistence_sqlite/core/test_write_stall_sampling.py`,
+  `tests/persistence_sqlite/core/test_write_stall_native.py`,
+  `tests/persistence_sqlite/core/test_write_stall_lifecycle.py`,
+  `tests/persistence_sqlite/core/test_transcript_write_diagnostics.py`.
 
 Regression files above cover warning fields, worker receipt identity, stalled
 callback/commit capture, quiet idle/finished writes, cross-write throttling,

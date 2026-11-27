@@ -136,4 +136,3 @@ def test_scan_failure_does_not_retain_callers(tmp_path, monkeypatch, scan_error)
         assert context_ref() is None
     finally:
         handle.close()
-
