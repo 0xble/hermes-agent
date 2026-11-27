@@ -40,12 +40,23 @@ class DeleteUnconfirmed(RuntimeError):
     """The delete was dispatched but the exact-topic readback has not shown it gone yet."""
 
 
-async def _confirm_deleted(bot, source, runner):
+async def _confirm_deleted(bot, source, runner, *, allow_send_probe=True):
+    if not _has_telegram_cli():
+        if not allow_send_probe:
+            return False
+        # The Bot API checks absence by posting. One attempt only; subsequent passes
+        # reconcile passively even if this send succeeded or its response was lost.
+        try:
+            return await _probe_deleted(bot, source, runner=runner)
+        except Exception as exc:
+            if _transient_delay(exc) is None:
+                raise
+            return False
     for delay in (0, *_DELETE_VERIFY_DELAYS):
         if delay:
             await asyncio.sleep(delay)
         try:
-            if await _probe_deleted(bot, source, runner=runner):
+            if await _probe_deleted(bot, source, runner=runner, read_only=True):
                 return True
         except Exception as exc:
             if _transient_delay(exc) is None:
@@ -83,6 +94,38 @@ def _schedule_retry(runner, source, delay: float) -> None:
     task = asyncio.get_running_loop().create_task(retry())
     tasks.add(task)
     task.add_done_callback(tasks.discard)
+
+
+async def _retry_preparation_refusal(runner, source, state, exc, delay):
+    """Spend a generation's retry budget before any subsequent advance can re-admit it."""
+    attempts = int(state.get("transient_retries") or 0)
+    if attempts < _TRANSIENT_RETRY_LIMIT:
+        state.update(transient_retries=attempts + 1, preparation_retry_at=time.time() + delay)
+        await save(runner, source, state)
+        _schedule_retry(runner, source, delay)
+        return
+    state.update(phase="failed", error=str(exc), failed_at=time.time(), preparation_retry_exhausted=True)
+    await save(runner, source, state)
+    logger.warning("Topic retirement preparation for %s exhausted its retries: %s", state["session_key"], exc)
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is not None and await _current(runner, source, state["generation"]):
+        await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc} Ask here to retry or cancel it.",
+                           metadata={"thread_id": str(source.thread_id)})
+
+
+async def record_preparation_refusal(runner, event, limit_message):
+    from gateway.telegram_retire_prepare import forget_refused_preparation
+    metadata = event.metadata
+    source = event.source
+    generation = metadata["retirement_generation"]
+    try:
+        state = await _current(runner, source, generation)
+        if (state and state["phase"] == "waiting" and state["session_id"] == metadata.get("gateway_session_id")):
+            await _retry_preparation_refusal(runner, source, state, limit_message, 30.0)
+    except RetirementSuperseded:
+        pass  # A newer decision owns the topic.
+    finally:
+        forget_refused_preparation(runner, event)
 
 
 def state_key(source):
@@ -264,10 +307,14 @@ async def _current(runner, source, generation):
     return state if state and state["generation"] == generation and state["phase"] not in {"cancelled", "done"} else None
 
 
+def _has_telegram_cli():
+    from hermes_platform.resolver import locate_command
+    return bool(locate_command("telegram").command)
+
+
 async def _probe_deleted(bot, source, *, runner=None, read_only=False):
     from gateway.telegram_retire_work import cli
-    from hermes_platform.resolver import locate_command
-    if runner is not None and locate_command("telegram").command:
+    if runner is not None and _has_telegram_cli():
         topics = await cli(runner, source, "telegram", "--agent", "topic", "list",
                            await _cli_peer(bot, source), "--id", str(source.thread_id))
         if not isinstance(topics, list):
@@ -390,6 +437,9 @@ async def _close_for_deletion(runner, source, state, adapter):
     state["closing_attempt"] = time.time()
     await save(runner, source, state)
     from gateway.telegram_retire_prepare import closing_note
+    state = await _current(runner, source, generation)
+    if not state:
+        return None
     try:
         # Thread-strict: a gone topic refuses rather than falling back to the chat root, so
         # a retry can never repeat the note outside the topic.
@@ -446,6 +496,8 @@ async def advance(runner, source):
         if not state:
             return
         generation = state["generation"]
+        if state["phase"] == "waiting" and time.time() < state.get("preparation_retry_at", 0):
+            return
         bot = getattr(adapter, "_bot", None)
         try:
             if await _recover_retirement(runner, source, state, bot):
@@ -460,15 +512,13 @@ async def advance(runner, source):
                         or receipt.get("chat_id") != str(source.chat_id)
                         or receipt.get("thread_id") != str(source.thread_id)):
                     raise RuntimeError("Missing exact-topic confirmed closing receipt")
-                passive = state["phase"] == "delete_unresolved"
-                if await _probe_deleted(bot, source, runner=runner, read_only=passive):
+                if await _probe_deleted(bot, source, runner=runner, read_only=True):
                     state = await _current(runner, source, generation)
                     if state:
                         await _unbind(runner, source, state)
-                    return
-                if passive:
-                    return
-                raise RuntimeError("The previous delete was not confirmed.")
+                elif state["phase"] == "deleting":
+                    raise DeleteUnconfirmed("The previous delete was not confirmed")
+                return
             from gateway.telegram_retire_work import prepare
             # Inventory happens here, after the turn, not when retirement was requested.
             if await asyncio.to_thread(runner.session_store.peek_session_id, key) != state["session_id"]:
@@ -485,18 +535,22 @@ async def advance(runner, source):
             # separates the final fence from initiating the destructive request.
             if not await _current(runner, source, generation):
                 return
+            allow_send_probe = True
             try:
                 if await bot.delete_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id)) is not True:
                     raise RuntimeError("Telegram did not acknowledge topic deletion")
             except Exception:
                 # A lost response can mean the topic is already gone. Reconcile
                 # the exact thread before invoking the user-CLI fallback once.
-                if not await _probe_deleted(bot, source, runner=runner):
-                    from gateway.telegram_retire_work import cli
-                    peer = await _cli_peer(bot, source)
-                    await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
-                              str(peer), str(source.thread_id))
-            if not await _confirm_deleted(bot, source, runner):
+                if await _probe_deleted(bot, source, runner=runner):
+                    await _unbind(runner, source, state)
+                    return
+                allow_send_probe = False  # Reconciliation may already have sent the single probe.
+                from gateway.telegram_retire_work import cli
+                peer = await _cli_peer(bot, source)
+                await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
+                          str(peer), str(source.thread_id))
+            if not await _confirm_deleted(bot, source, runner, allow_send_probe=allow_send_probe):
                 raise DeleteUnconfirmed("Telegram still accepts messages in the topic after deletion")
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
@@ -527,6 +581,12 @@ async def advance(runner, source):
                 return
             current = await _current(runner, source, generation)
             delay = _transient_delay(exc)
+            if current and current["phase"] == "waiting" and isinstance(exc, WakeNotAccepted) and delay is not None:
+                try:
+                    await _retry_preparation_refusal(runner, source, current, exc, delay)
+                except RetirementSuperseded:
+                    pass
+                return
             if (current and delay is not None and current["phase"] not in {"deleting", "delete_unresolved"}
                     and not current.get("closing_attempt")
                     and int(current.get("transient_retries") or 0) < _TRANSIENT_RETRY_LIMIT):
@@ -566,7 +626,8 @@ def _retryable(state):
     failed_at = float(state.get("failed_at") or 0.0)
     # Before closing_delivery_unconfirmed existed, a returned-but-unconfirmed send failed with this text.
     legacy_unconfirmed = str(state.get("error") or "").startswith("Closing reply was not fully acknowledged")
-    if (not failed_at or state.get("closing_receipt") or state.get("closing_delivery_unconfirmed")
+    if (not failed_at or state.get("preparation_retry_exhausted")
+            or state.get("closing_receipt") or state.get("closing_delivery_unconfirmed")
             or legacy_unconfirmed):
         return False
     # Only a closing attempt can lead to a delete on resume: an old one is not today's approval (374814).

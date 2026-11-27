@@ -245,8 +245,8 @@ async def test_pending_retirement_rechecks_same_receipt_on_resume(runtime, monke
         yield
 
     r.runner._async_profile_scope_for_source = scope
-    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(
-        side_effect=lambda *_args, read_only=False, **_kwargs: not read_only))
+    monkeypatch.setattr(retire, "_has_telegram_cli", lambda: False)
+    r.adapter._bot.send_message = AsyncMock(side_effect=RuntimeError("message thread not found"))
     monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
     dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Service Operations"}
     monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
@@ -1122,8 +1122,7 @@ async def test_cron_deleted_after_its_handoff_settles(runtime, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unreportable_task_is_relayed_and_no_longer_blocks_retirement(runtime, monkeypatch):
-    """298502: 'no reportable original assignment' blocked deletion on every retry."""
+async def test_delivered_fyi_does_not_clear_the_unreportable_task_from_inventory(runtime, monkeypatch):
     r = runtime
     record = {"id": "t1", "assignment_id": "a1", "assigned_by": "hermes:default/parent", "report_to": "hermes:default/other"}
     item = {"id": "task:t1", "kind": "task", "title": "Pay", "record": record}
@@ -1139,14 +1138,24 @@ async def test_unreportable_task_is_relayed_and_no_longer_blocks_retirement(runt
         return {"id": "r1", "target": "hermes:default/next", "status": "delivered"}
 
     monkeypatch.setattr(work, "cli", command)
-    sent = await work.receipt(r.runner, r.source, r.state, item, dest)
-    assert sent["receipt_id"] == "r1" and "--fyi" in sends[0]
-    assert r.state["handoffs"][item["id"]]["unassigned_task"] == "t1"
-    # The relayed task no longer appears as open work that points at the retiring topic.
+    await work.settle_handoffs(r.runner, r.source, r.state)
+    handoff = r.state["handoffs"][item["id"]]
+    assert handoff["receipt_id"] == "r1" and "--fyi" in sends[0]
+    assert handoff["unassigned_task"] == "t1" and not handoff["moved"]
+    # The relay receipt proves delivery, not that the destination accepted ownership.
     monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("tasks",)))
 
+    source_inbox = [record | {"title": "Pay"}]
+
     async def inventory_cli(_runner, _source, *args, **_):
-        return [] if "claims" in args else [record | {"title": "Pay"}]
+        assert args[2] in {"claims", "inbox"}
+        return [] if "claims" in args else source_inbox
 
     monkeypatch.setattr(work, "cli", inventory_cli)
-    assert await work.inventory(r.runner, r.source, r.state) == []
+    remaining = await work.inventory(r.runner, r.source, r.state)
+    assert [entry["id"] for entry in remaining] == ["task:t1"]
+    with pytest.raises(RuntimeError, match="accepted assignment or a user decision"):
+        await work.prepare(r.runner, r.source, r.state)
+    source_inbox.clear()  # The ledger no longer routes the task to this session.
+    assert await work.prepare(r.runner, r.source, r.state)
+    assert len(sends) == 1

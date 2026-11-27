@@ -123,3 +123,42 @@ def test_status_command_bypasses_active_session_limit(monkeypatch):
     runner._handle_status_command.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_capped_plugin_injection_requeues_its_claim(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from gateway import session_automation_retry as retry
+    from gateway.session_contract import SessionRef
+    from hermes_state_runtime import list_session_admissions
+    from tests.gateway.test_automation_notification_category import _native_owner
+
+    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    try:
+        with patch.object(runner, '_handle_message', AsyncMock(return_value=None)):
+            await authority._drain(ref)  # Settle the fixture's human seed without a provider.
+        runner.config.max_concurrent_sessions = 1
+        _occupy_session(runner)
+        monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: 1000.0))
+        run_agent = AsyncMock(side_effect=AssertionError('the refused turn must not reach the agent'))
+        monkeypatch.setattr(runner, '_handle_message_with_agent', run_agent)
+        send = AsyncMock(side_effect=AssertionError('a machine turn must not post the limit notice'))
+        monkeypatch.setattr(adapter, 'send', send)
+
+        assert await runner._admit_plugin_injection(
+            adapter, source, session_key=metadata['gateway_session_key'], session_id=ref.session_id,
+            content='continue this handoff', plugin_id='relay',
+        ) is True
+        row, _ = await authority._claim_next(ref, authority.sessions[ref.session_id])
+        outcome = await authority._execute_claimed(ref, authority.sessions[ref.session_id], row)
+        assert outcome == (None, 'deferred')
+        queued, = list_session_admissions(authority.db, session_id=ref.session_id)
+        assert (queued['admission_id'], queued['status']) == (row['admission_id'], 'queued')
+        assert retry.retry_state(authority.db, row['admission_id']) == {'attempt': 1, 'due_at': 1010.0}
+        assert (await authority._claim_next(ref, authority.sessions[ref.session_id]))[0] == 'automation_wait'
+        run_agent.assert_not_awaited()
+        send.assert_not_awaited()
+    finally:
+        authority.db.close()
+
+

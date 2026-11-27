@@ -173,13 +173,19 @@ async def test_delete_failure_keeps_binding_and_posts_failure(setup_retire, monk
 
 
 @pytest.mark.asyncio
-async def test_restart_reconciles_delete_without_repeating_it(setup_retire):
+async def test_restart_reconciles_delete_without_repeating_it(setup_retire, monkeypatch):
     runner, source, adapter, _ = setup_retire
+    monkeypatch.setattr(retire, "_has_telegram_cli", lambda: True)
+    adapter._bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot"))
+    lookup = AsyncMock(return_value=[])
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     await retire.request(runner, source)
     state = await retire.load(runner, source)
     state.update(phase="deleting", closing_receipt={"message_id": "10", "generation": state["generation"], "chat_id": "100", "thread_id": "42"})
     await retire.save(runner, source, state)
     await retire.advance(runner, source)
+    lookup.assert_awaited_once()
+    adapter._bot.send_message.assert_not_awaited()
     adapter._bot.delete_forum_topic.assert_not_awaited()
     assert (await retire.load(runner, source))["phase"] == "done"
 
@@ -752,13 +758,35 @@ async def test_delete_readback_lag_is_retried_not_failed(setup_retire, monkeypat
     runner, source, adapter, _ = setup_retire
     sleeps = []
     monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock(side_effect=lambda s: sleeps.append(s)))
-    probes = iter([False, False, False, True, True])  # recovery probe, then two lagging readbacks
-    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(side_effect=lambda *a, **k: next(probes)))
+    monkeypatch.setattr(retire, "_has_telegram_cli", lambda: True)
+    adapter._bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot"))
+    topic = [{"id": 42}]
+    lookup = AsyncMock(side_effect=[topic, topic, topic, []])  # recovery, two lagging readbacks, absence
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     await retire.request(runner, source)
     await retire.advance(runner, source)
     assert (await retire.load(runner, source))["phase"] == "done"
     assert sleeps == list(retire._DELETE_VERIFY_DELAYS[:2])
+    assert lookup.await_count == 4
+    adapter._bot.send_message.assert_not_awaited()
     adapter._bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_readback_without_cli_sends_at_most_one_notice(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    bot = adapter._bot
+    bot.send_message.side_effect = None  # Telegram still accepts sends briefly after deletion.
+    monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock())
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    state = await retire.load(runner, source)
+    assert state is not None and state["phase"] == "delete_unresolved"
+    await retire.advance(runner, source)
+    await retire.advance(runner, source)
+    bot.send_message.assert_awaited_once_with(chat_id=100, message_thread_id=42, text=retire.NOTICE)
+    bot.delete_forum_topic.assert_awaited_once()
+    assert adapter.send.await_count == 1  # Only the closing note; no failure post.
 
 
 @pytest.mark.asyncio
@@ -896,6 +924,8 @@ async def test_cancel_during_resend_never_deletes(setup_retire, monkeypatch, bou
                 await real_save(r, s, {**current, "generation": "other", "phase": "cancelled"}, force=True)
     monkeypatch.setattr(retire, "save", save)
     await retire.advance(runner, source)
+    if boundary == "before_send":
+        adapter.send.assert_not_awaited()
     adapter._bot.delete_forum_topic.assert_not_awaited()
     final = await retire.load(runner, source)
     assert final is not None and final["phase"] == "cancelled"

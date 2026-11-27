@@ -239,20 +239,28 @@ async def test_cap_refused_preparation_leaves_no_dedupe_and_sends_nothing(runtim
         event._gateway_accepted = True
         replies.append(await gw._handle_message(event))
     r.adapter.handle_message.side_effect = handle
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(retire, 'time', SimpleNamespace(time=lambda: clock.now))
+    scheduled = []
+    monkeypatch.setattr(retire, '_schedule_retry', lambda _runner, _source, delay: scheduled.append(delay))
     items = [{"id": "loop", "kind": "loop", "title": "Watch Service"}]
-    with pytest.raises(WakeNotAccepted):
-        await queue_preparation(r.runner, r.source, r.state, items)
+    # The adapter ACK survives; a later execution refusal owns its own retry clock.
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
     assert replies == [None]  # no limit text returned for the adapter to send
     r.adapter.send.assert_not_awaited()
     key = (r.state["session_id"], r.state["generation"])
     assert key not in r.runner._telegram_retire_preparations
-    assert (await load(r.runner, r.source))["phase"] == "waiting"
-    # Slot free again: the same decision is admitted once, then deduplicated.
+    saved = await load(r.runner, r.source)
+    assert saved is not None and saved["phase"] == "waiting"
+    assert saved["transient_retries"] == 1 and saved["preparation_retry_at"] == 1030.0
+    assert scheduled == [30.0]
+    # Slot free again at the deadline: the same decision is admitted once, then deduplicated.
     async def accept(event):
         event._gateway_accepted = True
     r.adapter.handle_message.side_effect = accept
-    assert not await queue_preparation(r.runner, r.source, r.state, items)
-    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    clock.now = saved["preparation_retry_at"]
+    assert not await queue_preparation(r.runner, r.source, saved, items)
+    assert not await queue_preparation(r.runner, r.source, saved, items)
     assert r.adapter.handle_message.await_count == 2
     r.adapter.send.assert_not_awaited()
 
@@ -273,3 +281,63 @@ async def test_cap_refusal_racing_admission_still_clears_the_dedupe(runtime):
     forget_refused_preparation(r.runner, admitted[0])  # the background turn hit the cap
     assert not await queue_preparation(r.runner, r.source, r.state, items)
     assert r.adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_spawned_cap_refusal_backs_off_before_adapter_finalizer_reenters(runtime, monkeypatch, tmp_path):
+    from tests.gateway.test_busy_wake_admission import WakeAdapter
+    from tests.gateway.test_duplicate_user_message import _bootstrap
+    from tests.gateway.test_max_concurrent_sessions import _occupy_session
+
+    r = runtime
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._session_db = r.runner._session_db
+    runner.config.max_concurrent_sessions = 1
+    _occupy_session(runner)
+    class RetirementAdapter(WakeAdapter):
+        _bot = SimpleNamespace(delete_forum_topic=AsyncMock())
+
+    adapter = RetirementAdapter()
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._wire_adapter_handlers(adapter)
+    monkeypatch.setattr(runner, '_delivery_adapter_for', lambda _: adapter)
+    monkeypatch.setattr(runner.session_store, 'peek_session_id', lambda _: 'old')
+    monkeypatch.setattr(runner.session_store, 'lookup_by_session_key', lambda _: SimpleNamespace(session_id='old'))
+    key = runner._session_key_for_source(r.source)
+    monkeypatch.setattr('hermes_platform.resolver.locate_command', lambda _: SimpleNamespace(command=()))
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(retire, 'time', SimpleNamespace(time=lambda: clock.now))
+    delays = []
+    monkeypatch.setattr(retire, '_schedule_retry', lambda runner, source, delay: delays.append(delay))
+    await retire.request(runner, r.source)
+
+    try:
+        for attempt in range(retire._TRANSIENT_RETRY_LIMIT + 1):
+            await retire.advance(runner, r.source)
+            spawned = adapter._session_tasks[key]
+            await spawned  # Includes the real adapter finalizer and its call to advance().
+            state = await retire.load(runner, r.source)
+            assert key not in adapter._session_tasks
+            assert state is not None
+            if attempt == retire._TRANSIENT_RETRY_LIMIT:
+                assert state['phase'] == 'failed'
+                break
+            assert state['phase'] == 'waiting'
+            assert state['transient_retries'] == attempt + 1
+            assert not adapter.sent
+            clock.now += 29
+            await retire.advance(runner, r.source)
+            assert key not in adapter._session_tasks
+            clock.now += 1
+        assert delays == [30] * retire._TRANSIENT_RETRY_LIMIT
+        clock.now += 3600  # Exhaustion must not rearm the wake through the general failure retry.
+        await retire.advance(runner, r.source)
+        await retire.advance(runner, r.source)
+        assert key not in adapter._session_tasks
+        assert len(adapter.sent) == 1 and 'Topic retirement failed' in adapter.sent[0]
+        final = await retire.load(runner, r.source)
+        assert final is not None and final['phase'] == 'failed'
+        adapter._bot.delete_forum_topic.assert_not_awaited()
+    finally:
+        await adapter.cancel_session_processing(key)

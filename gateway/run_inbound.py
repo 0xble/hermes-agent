@@ -410,16 +410,16 @@ class GatewayInboundMixin(
         # Authorization above still checks the live conversation cooldown on every attempt.
         if not getattr(event, "_bot_loop_admitted", False):
             charge = object() if getattr(source, "is_bot", False) else None
-            admit_for_source = getattr(self, "_admit_bot_message_for_source")
-            admit_chain = getattr(self, "_admit_bot_chain")
+            admit_for_source = self._admit_bot_message_for_source
+            admit_chain = self._admit_bot_chain
             admitted = (admit_for_source(source) if charge is None
                         else admit_for_source(source, charge=charge))
             if not admitted or not admit_chain(event):
                 return None
             if charge is not None:
-                guard = getattr(self, "_bot_loop_guard_instance")()
-                conversation = getattr(self, "_bot_loop_guard_conversation")(source)
-                setattr(event, "_busy_bot_loop_charge", (guard, conversation, charge))
+                guard = self._bot_loop_guard_instance()
+                conversation = self._bot_loop_guard_conversation(source)
+                event._busy_bot_loop_charge = guard, conversation, charge
             event._bot_loop_admitted = True
         record_received(event)
         await _admit_outbox_event(self, event, source)
@@ -1190,7 +1190,7 @@ class GatewayInboundMixin(
                     # cooperatively; admission never awaits publication or the interrupt.
                     from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
                     if not getattr(event, "_gateway_machine_preemption_scheduled", False):
-                        setattr(event, "_gateway_machine_preemption_scheduled", True)
+                        event._gateway_machine_preemption_scheduled = True
                         schedule_authority_machine_preemption(
                             self, event, source, _quick_key, state, state.turn,
                             self._current_session_run_generation(_quick_key), running_agent,
@@ -2216,14 +2216,18 @@ class GatewayInboundMixin(
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             await self._release_unsettled_loop_tick(event, ran=False)
-            from gateway.session_synthetic import is_synthetic
-            if is_internal or is_synthetic(event):
-                # A machine wake never ran. The limit text is for a person; posting it would make a
-                # wake visible. A refused retire preparation must also not stay deduplicated.
-                from gateway.telegram_retire_prepare import forget_refused_preparation
-                forget_refused_preparation(self, event)
-                event._gateway_accepted = False
+            if is_internal and (event.metadata or {}).get("retirement_generation"):
+                from gateway.telegram_retire import record_preparation_refusal
+                # The adapter ACK meant "scheduled", not "ran". Persist the retry before
+                # the adapter releases its guard and advances the retirement again.
+                await record_preparation_refusal(self, event, _limit_message)
                 return None
+            from gateway.session_automation_retry import held_runtime_refusal
+            if held_runtime_refusal(event, {
+                "final_response": "", "failed": True, "completed": False,
+                "error": _limit_message, "pre_execution_runtime_refusal": True,
+            }):
+                return None  # The authority puts the unexecuted automation input back in its FIFO.
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)

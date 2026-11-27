@@ -70,7 +70,7 @@ class WorkInProgress(RuntimeError):
 
 
 class UnreportableAssignment(RuntimeError):
-    """A task whose original reporting route cannot be reassigned; it is relayed to an owner instead."""
+    """A task whose original reporting route cannot be reassigned by retirement."""
 
 
 def open_control(raw):
@@ -125,8 +125,6 @@ async def inventory(runner, source, state) -> list[dict]:
         if not isinstance(tasks, list):
             raise RuntimeError("Task inventory returned an incomplete response")
         for task in tasks:
-            if state.get("handoffs", {}).get("task:" + str(task["id"]), {}).get("unassigned_task"):
-                continue  # Recorded and relayed; the ledger cannot reassign it, so it must not block.
             items.append({"id": "task:" + str(task["id"]), "kind": "task", "title": task["title"], "record": task})
     return items
 
@@ -328,8 +326,8 @@ async def receipt(runner, source, state, item, dest):
         await assign_task(runner, source, state, task_id, target,
                           item["record"] if item["kind"] == "task" else None)
     except UnreportableAssignment:
-        # The ledger cannot re-point this task's reporting route, and a precondition that cannot be
-        # met must not block deletion forever. Record the obligation and relay it as plain context.
+        # The ledger cannot re-point this task's reporting route. Send context once, but
+        # leave the obligation in the source inventory until the task ledger clears it.
         body = (f"📦 Topic handoff (unassigned)\nTask {task_id} was open in the retiring topic but its "
                 "reporting assignment cannot be transferred. It stays in the task ledger; take ownership "
                 "of it from there. This note requests no reply.")
@@ -582,16 +580,23 @@ async def settle_handoffs(runner, source, state):
     # Reconcile receipts independently of source inventory. A crash after moving
     # an item must not forget a still-unconfirmed handoff just because it moved.
     for item_id, handoff in state["handoffs"].items():
-        if (handoff.get("receipt_id") or handoff.get("accepted_task_id")) and handoff.get("moved"):
+        if handoff.get("fyi_confirmed") or (
+                (handoff.get("receipt_id") or handoff.get("accepted_task_id")) and handoff.get("moved")):
             continue
-        item, dest = handoff["item"], handoff["destination"]
-        sent = await receipt(runner, source, state, item, dest)
-        handoff.update(sent)
+        await settle_handoff(runner, source, state, handoff)
+
+
+async def settle_handoff(runner, source, state, handoff):
+    item, dest = handoff["item"], handoff["destination"]
+    handoff.update(await receipt(runner, source, state, item, dest))
+    if handoff.get("unassigned_task"):
+        handoff["fyi_confirmed"] = True
         await save(runner, source, state)
-        if not handoff.get("moved"):
-            await transfer(runner, source, state, item, dest)
-            handoff["moved"] = True
-            await save(runner, source, state)
+        return  # A delivered FYI is not an accepted assignment.
+    await save(runner, source, state)
+    await transfer(runner, source, state, item, dest)
+    handoff["moved"] = True
+    await save(runner, source, state)
 
 
 async def reconcile_controls(runner, source, state, items, *, confirmed_absent=False):
@@ -691,6 +696,8 @@ async def prepare(runner, source, state):
             selected.append((context, dest, False))
     for item in items:
         if item["id"] in state["handoffs"]:
+            if state["handoffs"][item["id"]].get("unassigned_task"):
+                raise RuntimeError(f"Task {item['record']['id']} still needs an accepted assignment or a user decision in the task ledger")
             raise RuntimeError(f"Previously handed-off work still targets this topic: {item['id']}")
         selector = owners.get(item["id"]) or state.get("target")
         if not selector:
@@ -718,11 +725,7 @@ async def prepare(runner, source, state):
             handoff["task_only"] = True
         state["handoffs"][item["id"]] = handoff
         await save(runner, source, state)
-        handoff.update(await receipt(runner, source, state, item, dest))
-        await save(runner, source, state)
-        await transfer(runner, source, state, item, dest)
-        handoff["moved"] = True
-        await save(runner, source, state)
+        await settle_handoff(runner, source, state, handoff)
     if unresolved:
         return await queue_preparation(runner, source, state, unresolved)
     # Repeating discovery catches work created by a final tool call and stale
