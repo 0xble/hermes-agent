@@ -66,9 +66,9 @@ def _standalone_runtime_home(runner) -> Optional[Path]:
     """Parent of this runner's session DB, else the process home.
 
     A partial runner (identity-restore fixtures) may not have opened a DB. The resolved parent is
-    memoized per DB path: the check-in poll restores every routed session's origin on the event
-    loop every few seconds, and one realpath per session (36,898 on the live gateway, each a
-    handful of GIL-releasing lstat calls) held the loop for seconds per pass under thread load.
+    memoized per DB path: origin restores can run once per routed session on the event loop, and
+    one realpath per session (36,898 on the live gateway, each a handful of GIL-releasing lstat
+    calls) held the loop for seconds per pass under thread load.
     """
     db = None
     with contextlib.suppress(Exception):

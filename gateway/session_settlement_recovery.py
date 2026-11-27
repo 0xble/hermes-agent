@@ -257,8 +257,6 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
     read back by ``finish_result``, and a failure after the commit (``settled`` set) never retries.
     A fence refusal (``RuntimeStoreError``) is not transient and is raised at once."""
     from gateway.session_runtime_workers import track_mutation
-    from gateway.checkin_delivery import fence_local_settlement
-    response = await fence_local_settlement(authority, live, row, response, captured)
     for delay in (*_SETTLE_RETRY_DELAYS_S, None):
         try:
             return await asyncio.shield(track_mutation(authority, asyncio.to_thread(
@@ -366,9 +364,6 @@ async def settle_and_deliver(authority, live, ref, row, response, outcome):
             waiter_replies(authority).pop(admission_id, None)
             # Taken on every exit, so a turn that never settled leaves no reset for a later one.
             reset = authority.deferred_resets.pop(live.route, None)
-        if settled is not None:
-            from gateway.run_checkins import record_local_settlement
-            await record_local_settlement(authority.runner, live.source, settled, response, captured)
         await authority._run_deferred_reset(live.route, reset)
         from gateway.session_ingress import deliver_settled, fire_post_delivery
         await deliver_settled(authority, admission_id)

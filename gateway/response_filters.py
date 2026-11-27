@@ -233,8 +233,7 @@ _BRACKETED_SILENCE_MARKERS = tuple(
 # Persisted kinds of self-injected MessageEvent(internal=True) turns.
 INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
 # A producer's internal event naming a card (with display_text) retains this row kind.
-PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete",
-                                         "supervisor_checkin"})
+PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete"})
 MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
 # Loop exit the agent stamps when a machinery turn ends with the model adding nothing
 # (agent/turn_empty_response.py NOTIFICATION_NO_REPLY_EXIT mirrors this; agent/ cannot import gateway/).
@@ -634,9 +633,7 @@ def display_metadata_for_event(event: Any) -> dict:
     ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    from gateway.checkin_delivery import transcript_metadata
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {}),
-            **transcript_metadata(event)}
+    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
 
 
 def persisted_user_metadata_for_event(event: Any) -> dict:

@@ -254,8 +254,7 @@ async def test_folded_human_gets_one_gateway_retry(harness, marker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["supervisor_checkin", "internal_notification",
-                                 "process_complete", "async_delegation_complete"])
+@pytest.mark.parametrize("kind", ["internal_notification", "process_complete", "async_delegation_complete"])
 @pytest.mark.parametrize("mode", ["steer", "redirect"])
 @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
 @pytest.mark.parametrize("second_marker", [False, True])
@@ -401,7 +400,7 @@ async def test_second_marker_is_terminal_and_human_fallback_remains(harness):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [None, "internal_notification", "supervisor_checkin"])
+@pytest.mark.parametrize("kind", [None, "internal_notification"])
 @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
 @pytest.mark.parametrize("folded", [None, "relay", "unaddressed"])
 async def test_relay_only_or_machinery_has_no_retry_or_delivery(harness, kind, marker, folded):

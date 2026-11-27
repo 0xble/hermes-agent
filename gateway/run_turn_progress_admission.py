@@ -3,9 +3,6 @@
 async def editable_progress_adapter(self):
     from gateway.run_turn_progress import BasePlatformAdapter
     ctx = self._ctx
-    if ctx.persist_user_display_kind == "supervisor_checkin":
-        self._drain_progress_queue()
-        return
     adapter = self._runner._delivery_adapter_for(ctx.source) if ctx.progress_queue else None
     if not adapter:
         return

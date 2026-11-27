@@ -443,19 +443,6 @@ def _owner(runner, event, authority):
     return entry
 
 
-def automation_checkin_metadata(metadata):
-    tick = metadata.get('checkin')
-    if tick is None:
-        return {}
-    import math
-    if (not isinstance(tick, list) or len(tick) != 2 or not isinstance(tick[0], str)
-            or not tick[0] or isinstance(tick[1], bool) or not isinstance(tick[1], (int, float))
-            or not math.isfinite(tick[1]) or tick[1] <= 0
-            or metadata.get('display_kind') != 'supervisor_checkin'):
-        raise RuntimeStoreError('invalid_params')
-    return {'checkin': list(tick)}
-
-
 def automation_notification_metadata(metadata):
     """Validate trusted producer category; omit the default from old fingerprints."""
     category = metadata.get('notification_category', 'result')
@@ -503,7 +490,7 @@ def automation_retry_metadata(descriptor):
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
     'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
-    'delegation_retry_notice', 'checkin', 'completion_wakes_parent', 'completion_resumes_parent', 'requester_user_id'})
+    'delegation_retry_notice', 'completion_wakes_parent', 'completion_resumes_parent', 'requester_user_id'})
 
 
 def admission_display(payload):
@@ -646,7 +633,6 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     if synthetic is None and set(event.metadata) - _AUTOMATION_METADATA:
         raise RuntimeStoreError('invalid_params', field='automation_metadata')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | automation_checkin_metadata(event.metadata)
                     | _tick_metadata(event.metadata) | automation_retry_metadata(event.metadata))
     entry = captured[0] if captured is not None else _owner(runner, event, authority)
     from gateway.session_detached import detached_route_of
@@ -772,7 +758,6 @@ def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref
                   'route': entry.session_key, 'target': entry.session_id}
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
-    descriptor.update(automation_checkin_metadata(event.metadata))
     descriptor.update(automation_retry_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
     if 'completion_wakes_parent' in event.metadata:
@@ -832,7 +817,6 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
-    event.metadata.update(automation_checkin_metadata(descriptor))
     event.metadata.update(automation_retry_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])

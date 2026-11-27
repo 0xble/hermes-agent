@@ -32,9 +32,7 @@ _INLINE_THINK_RE = re.compile(r'<think>|<thinking>|<reasoning>', re.IGNORECASE)
 # internal_notification turn plus the producer-notice cards (background-process completions,
 # async delegation results). Mirrors gateway.response_filters.MACHINERY_DISPLAY_KINDS;
 # agent/ cannot import gateway/.
-_MACHINERY_DISPLAY_KINDS = frozenset({
-    "internal_notification", "process_complete", "async_delegation_complete", "supervisor_checkin",
-})
+_MACHINERY_DISPLAY_KINDS = frozenset({"internal_notification", "process_complete", "async_delegation_complete"})
 
 # Loop exit stamped when a machinery turn ends with the model adding nothing.
 NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
@@ -260,8 +258,7 @@ def _machinery_quiet_exit(agent: Any, assistant_message: Any, finish_reason: str
     did not announce a tool call: ``finish_reason="tool_calls"`` with no payload is a dropped
     action, so it keeps the ladder below, whose re-prompt recovers it.
     """
-    if (finish_reason == "tool_calls" or _latest_user_display_kind(messages) == "supervisor_checkin"
-            or not _notification_turn_without_tool_round(messages)):
+    if finish_reason == "tool_calls" or not _notification_turn_without_tool_round(messages):
         return False
     logger.info(
         "Empty response on a machinery turn (%s): ending the turn without a reply",

@@ -739,12 +739,6 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
             if not await self._prepare_loop_wake_execution(event, source):
                 self._log_loop_wake_suppressed(event, "superseded during turn preparation")
                 return
-            from gateway.run_checkins import prepare_checkin
-            if not await prepare_checkin(self, event, session_entry):
-                return
-            if not await self._prepare_loop_wake_execution(event, source):
-                self._log_loop_wake_suppressed(event, "superseded during turn preparation")
-                return
             # The setup guard already emitted agent:start and checked heartbeat ownership.
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
@@ -776,10 +770,6 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
                 if message_text is None:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
-            if not await prepare_checkin(self, event, session_entry, start=True):
-                return
-            if (event.metadata or {}).get("checkin"):
-                message_text = event.text
             event._loop_completion_identity = await self._run_in_executor_with_context(
                 loop_completion.capture_loop_identity, _run_start_session_id)
             started, agent_result = await self._invoke_loop_wake_effect(
@@ -857,9 +847,7 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
             from gateway.runtime_footer import FooteredReply  # streamed: the footer goes out as a trailing send instead
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = FooteredReply(response, _footer_line)  # its send may put it on a photo caption (#74547)
-            _terminal_display_kind = agent_result.get("queued_terminal_display_kind", prepared.persist_user_display_kind)
-            if _terminal_display_kind != "supervisor_checkin":
-                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
+            await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -874,16 +862,6 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source, event=event,
             )
-            # Normalize supervisor output after generic error/empty-reply shaping, so a provider
-            # explainer cannot replace it in either delivery or the captured completion.
-            from gateway.run_checkins import silence_fallback
-            checkin_result = await silence_fallback(self, event, session_entry, agent_result)
-            if checkin_result is not agent_result:
-                agent_result = checkin_result
-                response = agent_result["final_response"]
-                _intentional_silence = agent_result["intentional_silence"]
-            if _terminal_display_kind == "supervisor_checkin":
-                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
@@ -917,11 +895,6 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
-            try:
-                from gateway.run_checkins import reconcile_turn
-                await reconcile_turn(self, source, session_key)
-            except Exception:
-                logger.warning("Could not reconcile supervisor check-in", exc_info=True)
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 

@@ -165,23 +165,17 @@ async def automation(connection, ref, params):
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
             from gateway.session_context import scoped_current_session_id
             with scoped_current_session_id(target):
-                before = authority.db.get_meta(f"goal:{target}") if kind == "goal" else None
-                result = invoke(runner, kind, target, call, args, kwargs)
-                changed = kind == "goal" and authority.db.get_meta(f"goal:{target}") != before
-                return result, changed
+                return invoke(runner, kind, target, call, args, kwargs)
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
     # Publish read-side writes if any, but pure barrier checks leave the wait for wake admission.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
-    result, goal_changed = await asyncio.to_thread(run)
+    result = await asyncio.to_thread(run)
     if kind == "heartbeat" and call in _WATCHDOG_CALLS and (call == "due_prompt" or result.get("value") is not None):
         # The CLI's watchdog runs from these on: from then on the gateway poller leaves the ticks to it.
         if not hasattr(authority, "viewer_heartbeat"):
             authority.viewer_heartbeat = {}
         authority.viewer_heartbeat[ref.session_id] = connection
-    if goal_changed:
-        from gateway.run_checkins import reconcile_turn
-        await reconcile_turn(runner, live.source, live.route)
     if before is None or rows() != before:
         # The classic CLI drives this session's automation: other viewers (Ink, Desktop) repaint from the event.
         from gateway.session_control_actions import publish

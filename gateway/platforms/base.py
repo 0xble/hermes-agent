@@ -166,8 +166,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    from gateway.checkin_delivery import delivery_metadata
-    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
+    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
 
 def _schedule_outbound_platform_stamp(store, session_key: str, platform_message_id: str, message_uid: str | None) -> None:
@@ -4234,8 +4233,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
         fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
         volume budget shed on purpose)."""
-        from gateway.checkin_delivery import DISARMED
-        return getattr(result, "error", None) in {SEND_SHED_BY_BUDGET, DISARMED}
+        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
 
     @staticmethod
     def _is_partial_delivery(result: SendResult) -> bool:
@@ -4831,7 +4829,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
             if _copy_index is not None:
                 _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
-            from gateway.checkin_delivery import is_supervisor_checkin
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_message_ref or ""), text_content)
             from gateway.copy_blocks import wrap_copy_block
@@ -4845,8 +4842,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
-                resume_turn_id=getattr(event, "_gateway_active_turn_token", None),
-                supervisor_checkin=is_supervisor_checkin(event, metadata))
+                resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4878,11 +4874,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
-            from gateway.checkin_delivery import DISARMED
-            if getattr(result, "error", None) == DISARMED:
-                from gateway.delivery_ledger import abandon_obligation
-                await asyncio.to_thread(abandon_obligation, obligation_id, DISARMED)
-                return
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id, result)
                 return

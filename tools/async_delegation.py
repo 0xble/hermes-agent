@@ -1867,7 +1867,7 @@ from tools.async_delegation_recovery import (
     is_interim_delegation_event, claim_event_delivery, release_completion_delivery,
     defer_completion_delivery, drop_completion_delivery, complete_completion_delivery,
     requeue_admitted_completion, complete_event_delivery, release_event_delivery,
-    return_completion_offer, _event_delivery, supervisor_inventory, retirement_inventory,
+    return_completion_offer, _event_delivery, retirement_inventory,
     transfer_retirement_owner, refresh_retirement_route, get_durable_delegation, _json_object,
     failed_delegations_for_session,
 )

@@ -381,42 +381,19 @@ class GatewayTurnPersistenceMixin:
             return PARTIAL_FAILED_TURN_NOTICE
         return FAILED_TURN_NOTICE
 
-    async def _hmwa_close_failed_turn(self, session_id, notice, own_boundary_row_id=None):
+    async def _hmwa_close_failed_turn(self, session_id, notice):
         """Append the gateway-owned assistant boundary iff the durable tail is open (a user row, or the
         tool row of a call that ran before the failure).
 
         The tail, not "did the gateway write the user row", is the key: on the primary path the
         agent's turn-start flush already persisted the row (so the platform-id dedupe skips the
         gateway write), and a platform redelivery of an already-closed turn must not stack a
-        second assistant row.
-
-        ``own_boundary_row_id``: the row the agent's core closer flushed for THIS turn. When the
-        gateway owns better copy (the supervisor's normalized status), that boundary is rewritten in
-        place while it is still the live tail, so the transcript keeps one boundary saying what was
-        delivered; an earlier turn's boundary or any later row is never touched."""
+        second assistant row."""
         if await self.async_session_store.transcript_tail_role(session_id) not in OPEN_TURN_TAIL_ROLES:
-            if own_boundary_row_id is not None:
-                await self.async_session_store.replace_failed_turn_boundary(
-                    session_id, own_boundary_row_id, notice)
             return
         await self.async_session_store.append_to_transcript(session_id, {
             "role": "assistant", "content": notice, "timestamp": time.time(), "display_kind": FAILED_TURN_DISPLAY_KIND,
         })
-
-
-    def _hmwa_own_failed_boundary_row_id(self, agent_result):
-        """Row id of the failed-turn boundary the agent's core closer flushed for THIS turn (the last
-        message, typed ``failed_turn``, after the turn's start), or ``None`` when it wrote none."""
-        messages = agent_result.get("messages") or []
-        start = agent_result.get("current_turn_user_idx", agent_result.get("history_offset"))
-        if not messages or not isinstance(start, int) or not 0 <= start < len(messages) - 1:
-            return None
-        tail = messages[-1]
-        if not isinstance(tail, dict) or tail.get("role") != "assistant" or tail.get(
-                "display_kind") != FAILED_TURN_DISPLAY_KIND:
-            return None
-        row_id = tail.get("_row_id")
-        return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
 
     def _hmwa_classify_turn_failure(self, agent_result, history, session_entry):
         """Classify a finished turn for transcript persistence. Returns
@@ -707,19 +684,12 @@ class GatewayTurnPersistenceMixin:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                supervisor_status = bool(response) and agent_result.get(
-                    "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
                 from gateway.run_turn import _failed_turn_copy_is_user_facing
-                notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
-                if not supervisor_status and not _failed_turn_copy_is_user_facing(
-                    event, prepared.persist_user_display_kind,
-                ):
-                    # Only the generic resend boundary is human-facing copy. A supervisor's
-                    # normalized status is explicit durable work content and must survive even on
-                    # a synthetic origin; synthetic failures without status content stay empty.
+                notice = self._hmwa_failed_turn_notice(agent_result)
+                if not _failed_turn_copy_is_user_facing(event, prepared.persist_user_display_kind):
+                    # Only the generic resend boundary is human-facing copy. Synthetic failures stay empty.
                     notice = ""
-                await self._hmwa_close_failed_turn(
-                    sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
+                await self._hmwa_close_failed_turn(sid, notice)
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -830,8 +800,7 @@ class GatewayTurnPersistenceMixin:
 
     def _event_thread_metadata(self, event, source):
         """Public thread metadata for a send that replies to ``event``."""
-        from gateway.checkin_delivery import delivery_metadata
-        return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
+        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
     async def _deliver_turn_response_then_limit_offer(
         self, event, source, session_entry, session_key, run_generation,
@@ -839,10 +808,6 @@ class GatewayTurnPersistenceMixin:
     ):
         """``_hmwa_deliver_turn_response``, then, for a usage-window refusal, the limit offer: the limit
         sentence is the reply, and the button follows it once it lands."""
-        from gateway.checkin_delivery import delivery_metadata, permits_metadata, suppress_result
-        if not await permits_metadata(self, delivery_metadata(event, {})):
-            suppress_result(agent_result)
-            return ""
         delivered = await self._hmwa_deliver_turn_response(
             event, source, session_entry, session_key, run_generation,
             agent_result, agent_messages, response, footer_line, intentional_silence,
