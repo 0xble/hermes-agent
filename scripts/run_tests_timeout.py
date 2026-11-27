@@ -115,7 +115,7 @@ _STACK_DUMP_MAX_BYTES = 256 * 1024
 
 def read_stack_dump(attempt_dir: str) -> str:
     try:
-        with open(Path(attempt_dir) / _STACK_FILE, "rb") as fh:
+        with open(Path(attempt_dir) / _STACK_FILE, "rb") as fh:  # windows-footgun: ok (binary mode, decoded below)
             size = fh.seek(0, os.SEEK_END)
             fh.seek(max(0, size - _STACK_DUMP_MAX_BYTES))
             raw = fh.read(_STACK_DUMP_MAX_BYTES)
