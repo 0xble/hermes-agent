@@ -16,11 +16,14 @@ import time
 from unittest.mock import patch
 
 import websockets
+from websockets.exceptions import ConnectionClosedOK
+
 from tests.gateway.test_normal_runtime_boot import control
 from tests.waiting import async_wait_until
 from tests.gateway.fixtures.local_recovery_probe import child_env, websocket, rpc
 
 
+_AUTOMATION_ACK = 'AUTOMATION_ACK'
 _FOLLOWER_ACK = 'FIFO_FOLLOWER_ACK'
 _AFTER_RECOVERY_ACK = 'AFTER_RECOVERY_ACK'
 
@@ -59,7 +62,7 @@ class Model(BaseHTTPRequestHandler):
                 and 'REAL_TERMINAL_COMPLETION' in str(last)):
             server.completion_blocked.set()
             server.completion_release.wait(120)
-        message: dict[str, Any] = {'role': 'assistant', 'content': 'AUTOMATION_ACK'}
+        message: dict[str, Any] = {'role': 'assistant', 'content': _AUTOMATION_ACK}
         if getattr(server, 'recovery_replies', False):
             if 'HUMAN_FIFO_FOLLOWER' in str(last):
                 message['content'] = _FOLLOWER_ACK
@@ -253,6 +256,7 @@ async def probe(root, base, mode):
             'supports_threads': model.checkin, 'markdown_dialect': 'plain', 'len_unit': 'chars'}
         await ws.send(json.dumps({'type': 'descriptor', 'descriptor': descriptor}) + '\n')
         await ready.put(ws)
+        can_ack = True
         async for line in ws:
             frame = json.loads(line)
             action = frame.get('action', {})
@@ -267,18 +271,29 @@ async def probe(root, base, mode):
                     outgoing.append(frame)
             else:
                 outgoing.append(frame)
+            ack = None
             if frame['type'] == 'outbound':
-                if 'AUTOMATION_ACK' in json.dumps(frame):
+                serialized = json.dumps(frame)
+                if _AUTOMATION_ACK in serialized:
                     outbound_at['initial'] = time.time()
-                if status_marker in json.dumps(frame):
+                if status_marker in serialized:
                     outbound_at['supervisor'] = time.time()
-                    await status_ack.wait()
-                await ws.send(json.dumps({'type': 'outbound_result', 'requestId': frame['requestId'],
-                    'result': {'success': True, 'message_id': 'fixture-final'}}) + '\n')
+                    if can_ack:
+                        await status_ack.wait()
+                ack = {'type': 'outbound_result', 'requestId': frame['requestId'],
+                       'result': {'success': True, 'message_id': 'fixture-final'}}
             elif frame['type'] == 'going_idle':
-                await ws.send(json.dumps({'type': 'going_idle_ack'}) + '\n')
-                if ws is successor_ws:
-                    successor_idle_ack.set()
+                ack = {'type': 'going_idle_ack'}
+            if can_ack and ack is not None:
+                try:
+                    await ws.send(json.dumps(ack) + '\n')
+                except ConnectionClosedOK:
+                    # The peer can finish closing before we ACK already buffered frames.
+                    # Keep observing them; only the write side is finished.
+                    can_ack = False
+                else:
+                    if frame['type'] == 'going_idle' and ws is successor_ws:
+                        successor_idle_ack.set()
         if ws is successor_ws:
             successor_relay_drained.set()
 
@@ -510,28 +525,32 @@ async def probe(root, base, mode):
                             outgoing.extend(delayed_replies)
                             delayed_replies.clear()
 
-                        asyncio.get_running_loop().call_soon(expose_replies)
-                        await wait_for(lambda: replies(_FOLLOWER_ACK))
-                        await send('after-recovery', 'AFTER_RECOVERY')
-                        await wait_for(lambda: any(r['request_id'] == 'after-recovery'
-                            and r['status'] == 'terminal' and r['outcome'] == 'completed'
-                            and r['seq'] > follower['seq'] for r in rows()))
-                        # A terminal row can precede delivery. Observe the later turn's reply,
-                        # then gracefully stop only the fixture successor. The idle handshake
-                        # and completion of the relay reader fence all remaining outbound frames.
-                        await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
-                                                   for action in replies(_AFTER_RECOVERY_ACK)))
-                        from gateway.status import write_planned_stop_marker
+                        # Share the existing wait budget across the successor reply and drain checks.
+                        async with asyncio.timeout(35):
+                            asyncio.get_running_loop().call_soon(expose_replies)
+                            await wait_for(lambda: replies(_FOLLOWER_ACK))
+                            await send('after-recovery', 'AFTER_RECOVERY')
+                            await wait_for(lambda: any(r['request_id'] == 'after-recovery'
+                                and r['status'] == 'terminal' and r['outcome'] == 'completed'
+                                and r['seq'] > follower['seq'] for r in rows()))
+                            # A terminal row can precede delivery. Observe the later turn's reply,
+                            # then gracefully stop only the fixture successor. The idle handshake
+                            # and completion of the relay reader fence all remaining outbound frames.
+                            await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
+                                                       for action in replies(_AFTER_RECOVERY_ACK)))
+                            from gateway.status import write_planned_stop_marker
 
-                        new_pid = proc.pid
-                        with patch.dict(os.environ, HERMES_HOME=str(home)):
-                            stop_requested = write_planned_stop_marker(new_pid)
-                        assert stop_requested, new_pid
-                        await wait_for(successor_relay_drained.is_set)
-                        assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
-                        returncode = await asyncio.wait_for(proc.wait(), 10)
+                            new_pid = proc.pid
+                            with patch.dict(os.environ, HERMES_HOME=str(home)):
+                                stop_requested = write_planned_stop_marker(new_pid)
+                            assert stop_requested, new_pid
+                            await successor_relay_drained.wait()
+                            assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
+                            returncode = await asyncio.wait_for(proc.wait(), 10)
                         proc = None
                         assert returncode == 0, returncode
+                        replayed_sends = replies(_AUTOMATION_ACK)
+                        assert not replayed_sends, f'unexpected post-restart AUTOMATION_ACK sends: {replayed_sends!r}'
                         revived_sends = replies(_FOLLOWER_ACK)
                         assert len(revived_sends) == 1, outgoing[sent_before_restart:]
                         assert reply_sources[id(revived_sends[0])] is successor_ws, revived_sends
