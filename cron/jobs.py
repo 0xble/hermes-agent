@@ -1741,7 +1741,9 @@ def _stage_jobs_payload(
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            # Keep the on-disk format, but avoid a Python stream write for
+            # every fragment of the pretty-printed multi-megabyte store.
+            f.write(json.dumps(payload, indent=2, ensure_ascii=False))
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
