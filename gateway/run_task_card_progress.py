@@ -231,6 +231,11 @@ class TaskCardProgressMixin:
         See #29483.
         """
         ctx = self._ctx
+        # Native cards are a tool-progress surface. Preserve Slack's implicit tier-off behavior
+        # (native cards can be enabled independently), but never bypass an explicit operator off.
+        if getattr(ctx, "tool_progress_explicit", False) and not getattr(ctx, "tool_progress_enabled", False):
+            logger.info("native task-card progress suppressed by explicit tool_progress=off")
+            return
         st = self._TaskCardState(adapter)
         try:
             while ctx._run_still_current():

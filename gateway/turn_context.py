@@ -86,6 +86,9 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    # True when the operator explicitly configured tool_progress for this turn's platform/global scope.
+    # Slack-native cards may use the platform tier's implicit off, but must honor explicit off.
+    tool_progress_explicit: bool = False
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)
