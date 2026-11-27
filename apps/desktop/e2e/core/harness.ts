@@ -206,7 +206,8 @@ export function webappLaunchLink(sandbox: CoreSandbox, profile?: string): string
 /** One Webapp journey: a sandbox gateway serving the built renderer to a fresh Chromium, the model scripted. */
 export async function withWebapp(
   label: string,
-  body: (sandbox: CoreSandbox, provider: ScriptedProvider, browser: Browser) => Promise<void>
+  body: (sandbox: CoreSandbox, provider: ScriptedProvider, browser: Browser) => Promise<void>,
+  extraConfig = ''
 ) {
   test.skip(process.platform !== 'linux', 'runs with the other Webapp journeys (Linux CI)')
   expect(
@@ -220,13 +221,15 @@ export async function withWebapp(
   // todo_list is deferred behind tool_search by default; the scripted model calls it directly.
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
+    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n` + extraConfig
   )
   let browser: Browser | null = null
+  let failed = true
 
   try {
     browser = await chromium.launch({ executablePath: process.env.HERMES_E2E_CHROMIUM || undefined })
     await body(sandbox, provider, browser)
+    failed = false
   } finally {
     await browser?.close().catch(() => undefined)
 
@@ -238,8 +241,20 @@ export async function withWebapp(
       }
     }
 
-    await provider.close()
-    sandbox.cleanup()
+    try {
+      await provider.close()
+    } finally {
+      try {
+        const logs = path.join(sandbox.hermesHome, 'logs')
+        if (failed && fs.existsSync(logs)) {
+          fs.cpSync(logs, test.info().outputPath('gateway-logs'), { recursive: true })
+        }
+      } catch (error) {
+        console.warn('could not keep the gateway logs', error)
+      } finally {
+        sandbox.cleanup()
+      }
+    }
   }
 }
 

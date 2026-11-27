@@ -97,6 +97,32 @@ def test_exact_silence_tokens_are_intentional_silence():
         assert is_intentional_silence_response(token)
 
 
+@pytest.mark.parametrize(
+    "response",
+    ["[ S I L E N T ]", " \t[  s i l e n t\t]\n"],
+    ids=["spaced", "outer-whitespace-and-mixed-case"],
+)
+def test_spaced_silence_marker_is_intentional_silence(response):
+    assert is_intentional_silence_response(response)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "[ S I L E N T ] nothing new",
+        "Use [ S I L E N T ] when no answer is needed.",
+        "S I L E N T",
+        "[ S I L E N T",
+        "[ D O N E ]",
+        "done",
+        "[S" + " " * 64 + "ILENT]",
+    ],
+    ids=["prefix-in-prose", "embedded-in-prose", "unbracketed", "unclosed", "unknown", "done", "over-cap"],
+)
+def test_whitespace_normalization_does_not_hide_non_markers(response):
+    assert not is_intentional_silence_response(response)
+
+
 def test_blank_and_prose_mentions_are_not_silence():
     assert not is_intentional_silence_response("")
     assert not is_intentional_silence_response("Use NO_REPLY when no answer is needed.")

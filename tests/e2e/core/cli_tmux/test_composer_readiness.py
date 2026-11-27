@@ -5,13 +5,14 @@ import pytest
 
 from tests.e2e.core.cli_tmux._classic import ClassicHome, Pane, require_tmux
 
-require_tmux()
-
 pytestmark = pytest.mark.platforms("linux", "macos")
 
 
 @pytest.mark.parametrize("prefix", ["As", "──", "界"])
 def test_composer_acknowledges_input_at_the_cursor_not_its_chrome(tmp_path, monkeypatch, prefix):
+    # Inside the test, like every other tmux suite: a module-level pytest.skip is a collection
+    # error, and the CI e2e lane's HERMES_E2E_REQUIRE_TUI=1 failure is raised per test too.
+    require_tmux()
     home = ClassicHome(tmp_path / "cursor").write("http://127.0.0.1:9")
     script = (
         "from prompt_toolkit import PromptSession; "

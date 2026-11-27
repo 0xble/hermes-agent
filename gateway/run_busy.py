@@ -715,6 +715,19 @@ class GatewayBusySessionMixin:
             )
         return False
 
+    def _human_preempts_autonomous_turn(self, event: MessageEvent, state: Any) -> bool:
+        """Allow typed input to preempt only untouched automation, never another user's turn."""
+        from gateway.platforms.event import turn_origin_for_event
+        from gateway.response_filters import is_agent_origin_text
+
+        turn = getattr(state, "turn", None)
+        opener = getattr(turn, "event", None)
+        if opener is None or turn_origin_for_event(event) != "user" or is_agent_origin_text(event.text):
+            return False
+        if getattr(turn.agent, "_turn_user_intervened", False) is True:
+            return False
+        return turn_origin_for_event(opener) != "user" or is_agent_origin_text(getattr(opener, "text", ""))
+
     async def _resolve_busy_steer_or_redirect(
         self, event: MessageEvent, session_key: str, effective_mode: str, running_agent: Any
     ) -> GatewayRunner._BusySteerOutcome:
@@ -1021,6 +1034,7 @@ class GatewayBusySessionMixin:
         is_redirect_mode = effective_mode == "interrupt" and redirected
         if (
             effective_mode == "interrupt" and not redirected
+            and not getattr(_steer, "machine_preempted", False)
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)

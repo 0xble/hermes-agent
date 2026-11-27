@@ -605,6 +605,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent.interim_assistant_callback = None
             agent.clarify_context_callback = None
             agent.thinking_progress = False
+        from gateway.run_turn_pending_preemption import settle_stale_preemption
+
+        settle_stale_preemption(agent, ctx)
         ctx.agent_holder[0] = agent  # interrupt support
         if self._approval_owner is not None:
             authority, owner_id, generation = self._approval_owner

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from gateway.config import Platform
 from gateway.delivery import prime_revived_egress
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType, turn_origin_for_event
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -101,20 +101,50 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(
+        source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
+        goal_continuation: bool = False, goal_session_id: str = "",
+        goal_state: Any = None, goal_fingerprint: Optional[str] = None, goal_instance: Optional[float] = None,
+    ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
         prompt is not a reply to it, so it is dropped or every progress bubble and final reply
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
+
+        ``reply_expected=False`` marks a gateway-authored wake that may end silently (a goal
+        continuation on a no-change tick). A typed message absorbed into the same turn still
+        restores the human contract through ``MessageEvent.absorb_reply_expected``.
         ``replace_source`` keeps the receiving-adapter provenance native admission reads.
         """
-        from gateway.session_identity import replace_source
-        source = replace_source(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(
+        metadata = {}
+        if goal_continuation:
+            from hermes_cli.session_controls import _definition_fingerprint
+            # Instance fences replacement; definition edits refresh when the queue is consumed.
+            fingerprint = goal_fingerprint if goal_fingerprint is not None else _definition_fingerprint(
+                "goal", goal_state.to_json() if goal_state is not None else None,
+            )
+            metadata = {
+                GOAL_CONTINUATION_METADATA_KEY: True,
+                "goal_continuation_session_id": goal_session_id,
+                "goal_continuation_fingerprint": fingerprint,
+                "goal_continuation_instance": (
+                    goal_instance if goal_instance is not None else getattr(goal_state, "created_at", None)
+                ),
+                "goal_continuation_created_at": time.time(),
+            }
+        if getattr(source, "message_id", None):
+            from gateway.session_identity import replace_source
+            source = replace_source(source, message_id=None)
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+            reply_expected=reply_expected,
+            metadata=metadata,
             inherit_channel_pin=True,
         )
+        from gateway.session_synthetic import mark_synthetic
+        mark_synthetic(event)
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -311,17 +341,38 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
-        run_generation: int | None = None,
+        run_generation: int | None = None, goal_instance: Optional[float] = None,
+        user_initiated: bool = True, external_event: bool = False,
+        invalidation_epoch: Optional[int] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        from gateway.wake import automatic_route_available
+
+        def current():
+            return invalidation_epoch is None or (
+                self._session_invalidation_epoch(self._session_key_for_source(source)) == invalidation_epoch
+            )
+
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
-        if mgr is None or not mgr.is_active():
+        if mgr is None:
+            return
+        if not mgr.is_active():
+            return
+        # A continuation turn answers the goal instance it was stamped for. If that goal was
+        # replaced or cleared and re-set while the turn ran, its response is not evidence for the
+        # new goal: judging it would spend the new goal's turns and verdicts on old work.
+        if goal_instance is not None and getattr(mgr.state, "created_at", None) != goal_instance:
+            logger.info("goal continuation: turn answered a superseded goal instance; not judged")
+            return
+
+        # Probe only eligible goals, but before judging can spend a retired topic's turns.
+        if source is not None and not await automatic_route_available(self, source, idle_backoff=True):
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -337,10 +388,12 @@ class GatewayGoalsMixin:
         # without which aux credential resolution fails under multiplexing.
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
-            ),
+                final_response or "", user_initiated=user_initiated, external_event=external_event,
+                background_processes=_bg_procs, active_delegations=_active_deleg,
+            ) if current() else {},
         )
+        if not current():
+            return
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
@@ -349,12 +402,19 @@ class GatewayGoalsMixin:
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
+        continuation = self._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+            goal_session_id=mgr.session_id, goal_state=mgr.state,
+        )
         if getattr(source, "platform", None) == Platform.LOCAL:
             # A local session's adapter FIFO has no reader: its turns are authority admissions.
             # Commit the continuation there, as main's TUI chained it after the turn.
             from gateway.session_automation import admit_route_wake
             try:
-                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")
+                await admit_route_wake(
+                    self, self._delivery_adapter_for(source), source, prompt, "goal-continuation",
+                    metadata=continuation.metadata,
+                )
             except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
                 logger.debug("goal continuation: local admission failed", exc_info=True)
             return
@@ -363,7 +423,7 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                self._enqueue_fifo(_quick_key, continuation, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -389,16 +449,22 @@ class GatewayGoalsMixin:
         # folder is gone) is no evidence either (the TUI's hook skips it the same way): the tick is
         # released with no text, so a --until judge never grades it.
         failed = self._turn_failed()
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip() and not failed:
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            metadata = (getattr(event, "metadata", None) or {})
+            origin = turn_origin_for_event(event) if event is not None else ""
+            key = self._session_key_for_source(source)
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, {
+                "goal_instance": metadata.get("goal_continuation_instance"),
+                "user_initiated": origin == "user" if event is not None else not is_internal,
+                "external_event": origin in {"process", "relay"},
+                "invalidation_epoch": self._session_invalidation_epoch(key),
+            }))
+        for label, hook, options in hooks:
             try:
-                # Both hooks may defer a notice into this turn's post-delivery slot: each needs
-                # the turn's generation or the chained bubble cleanup loses it.
                 await hook(session_entry=session_entry, source=source,
                            final_response="" if failed else final_text,
-                           run_generation=turn_run_generation(event))
+                           run_generation=turn_run_generation(event), **options)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
         await self._publish_local_control(source, only_if_present=True)

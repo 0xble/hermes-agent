@@ -113,6 +113,12 @@ jobs:
         working-directory: apps/desktop
         run: pnpm run builder --dir --publish never --linux
 
+      - name: Prepare Chromium sandbox helper for native Electron tests
+        working-directory: apps/desktop
+        run: |
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
+
       - name: Run the core suite under xvfb
         working-directory: apps/desktop
         run: |

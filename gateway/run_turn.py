@@ -1164,7 +1164,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             )
             return
         turn_state = self._session_state(session_key).turn
-        turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
+        turn_state.publish_agent(agent_holder[0], turn_ctx, self._current_session_run_generation(session_key) if run_generation is None else run_generation)  # never None: waiters match it
         if self._draining:
             self._update_runtime_status("draining")
 

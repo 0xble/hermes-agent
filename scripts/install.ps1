@@ -620,10 +620,19 @@ function Get-PinnedGit {
     }
     Log "installing git $($script:GitPinVersion) ($target)"
     $tmpDir = Join-Path ([IO.Path]::GetTempPath()) "hermes-git-bootstrap-$PID"
-    # Extract beside the entry, not in %TEMP%: the final step must be a
-    # rename on one volume. Created only after the download verifies, so
+    # The final step must be a rename on one volume, and the extractor must stay
+    # under MAX_PATH: PortableGit carries members ~85 characters deep, and a store
+    # below a long HERMES_RUNTIME_DIR (CI temp homes, deep profile paths) pushes
+    # the extractor past 260 (it then exits 1 and reports nothing). So extract in
+    # the short %TEMP% scratch when it shares the entry's volume, and beside the
+    # entry only when it does not. Created only after the download verifies, so
     # rejected bytes never touch the store.
-    $extractDir = Join-Path (Split-Path -Parent $entry) ".staging-git-bootstrap-$PID"
+    $storeParent = Split-Path -Parent $entry
+    $extractDir = Join-Path $storeParent ".staging-git-bootstrap-$PID"
+    $tempRoot = [IO.Path]::GetPathRoot($tmpDir)
+    if ($tempRoot -and ($tempRoot -ieq [IO.Path]::GetPathRoot($storeParent))) {
+        $extractDir = Join-Path $tmpDir "unpacked"
+    }
     try {
         New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
         $sfxPath = Join-Path $tmpDir "portable-git.7z.exe"
@@ -647,6 +656,9 @@ function Get-PinnedGit {
         }
         if (-not (Test-Path (Join-Path $extractDir "cmd\git.exe"))) { Fail "git.exe not found in the downloaded archive" git_extract_failed }
         if (Test-Path -LiteralPath $entry) { Remove-PinnedGitTree $entry }
+        # Extracting in %TEMP% no longer creates the store directory as a side
+        # effect, and Directory.Move needs the destination's parent to exist.
+        New-Item -ItemType Directory -Force -Path $storeParent | Out-Null
         Invoke-WhileHeld { [IO.Directory]::Move($extractDir, $entry) }
         if (-not (Test-PinnedGitHttpsReady $gitExe)) {
             Remove-PinnedGitTree $entry

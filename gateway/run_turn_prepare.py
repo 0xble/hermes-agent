@@ -25,7 +25,7 @@ from gateway.session import (
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
-from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
+from gateway.turn_lease import DEFAULT_LEASE_WAIT
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -646,7 +646,7 @@ class GatewayTurnPrepareMixin:
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens):
+    async def _hmwa_acquire_turn_lease(self, _quick_key, run_generation, session_entry, _session_env_tokens, event=None):
         """Serialize [load history → run → flush] per resolved SESSION_ID so another routing key on
         the same session waits for the prior flush. Fail-closed on timeout (outer dispatch returns
         a resend notice). Released in _handle_message's finally, granted per (routing key, run
@@ -655,13 +655,28 @@ class GatewayTurnPrepareMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
+        _lease_wait_timeout = _float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT)
+        if _lease_wait_timeout <= 0:
+            _lease_wait_timeout = DEFAULT_LEASE_WAIT
+
+        from gateway.run_turn_lease_wait import lease_wait_max_seconds, lease_wait_notice, preserve_lease_wait_async
+        from gateway.run_turn_pending_preemption import preempt_machine_holder
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
-                timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                timeout=_lease_wait_timeout,
+                max_wait=lease_wait_max_seconds(),
+                on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_contended=(lambda holder: preempt_machine_holder(
+                    self, event, _quick_key, holder, lease_wait_max_seconds()
+                )) if event is not None else None,
+                event=event,
+                on_timeout=(lambda: preserve_lease_wait_async(
+                    self, _quick_key, session_entry.session_id, event,
+                )) if event is not None else None,
             )
-        except TurnLeaseTimeoutError:
-            # The cleanup finally starts later; restore the tokens here or this exit leaks identity.
+        except BaseException:
+            # Lease cancellation and spool failures occur before the caller enters its cleanup.
             self._clear_session_env(_session_env_tokens)
             raise
         if _lease_token is not None:
@@ -825,7 +840,7 @@ class GatewayTurnPrepareMixin:
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
-        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens, event)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.

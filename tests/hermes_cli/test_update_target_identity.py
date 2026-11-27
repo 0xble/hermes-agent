@@ -331,10 +331,13 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
 
     def guard(command, args, kwargs, call):
         nonlocal fetched, failed
-        command = list(map(str, command))
+        # The updater reaches this seam two ways: run_git(git_cmd, args) hands the git prefix and
+        # its arguments separately, update_custody.run(argv) hands one assembled argv. Judge the
+        # assembled argv either way, or the 'fetch'/'--abbrev-ref' fault triggers never fire.
+        command = [*map(str, command), *map(str, args[0] if args and isinstance(args[0], (list, tuple)) else ())]
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
         cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
-        assert cwd in {t.clone, t.origin}, (command, cwd)
+        assert cwd in {t.clone.resolve(), t.origin.resolve()}, (command, cwd)
         assert 'push' not in command and 'pull' not in command, command
         git_calls.append(command)
         if transport == 'no-git':
@@ -342,7 +345,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         if fetched and not failed and '--abbrev-ref' in command and kwargs.get('check'):
             failed = True
             raise subprocess.CalledProcessError(128, command, '', 'fixture: Git file I/O failed')
-        result = call(command, *args, **kwargs)
+        result = call(command, **kwargs)
         if 'fetch' in command:
             fetched = True
         return result
@@ -352,10 +355,11 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             return real_run(command, *args, **kwargs)
         return guard(command, args, kwargs, real_run)
 
-    def custody_call(command, *args, **kwargs):
+    def custody_call(command, **kwargs):
+        # guard hands the callback the fully assembled argv.
         seam.custody = True
         try:
-            return real_custody_run(command, *args, **kwargs)
+            return real_custody_run(command, **kwargs)
         finally:
             seam.custody = False
 

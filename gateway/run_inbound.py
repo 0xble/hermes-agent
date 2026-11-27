@@ -219,10 +219,23 @@ class GatewayInboundMixin(
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
-        self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
-        if event is None:
-            return None
+        if not getattr(event, "_gateway_compression_deferred", False):
+            self._scale_to_zero_note_real_inbound()
+            from gateway.wake import note_topic_present
+            note_topic_present(self, source)
+            original_event = event
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+            if event is None:
+                return None
+            if event is not original_event:
+                # The native adapter retains this exact object for compression retries.
+                # Keep the rewrite and callback proof on that owner, not a throwaway copy.
+                from gateway.session_ingress_context import carry_callback
+                original_event.text = event.text
+                carry_callback(event, original_event)
+                event = original_event
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        event = apply_agent_origin_reply_expectation(event)
         source = event.source
 
         if not self._is_user_authorized_for_source(source):
@@ -246,11 +259,135 @@ class GatewayInboundMixin(
             else:
                 logger.warning("Unauthorized user: %s on %s", source.user_id, source.platform.value)
             return None
-        # The busy path charged this event on arrival; a drained follow-up must not pay twice.
-        if not getattr(event, "_bot_loop_admitted", False) and not (
-                self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
-            return None
+        # Charge each admitted event once, including retries and drained busy follow-ups.
+        if not getattr(event, "_bot_loop_admitted", False):
+            if not (self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
+                return None
+            event._bot_loop_admitted = True
+        from gateway.reply_latency import record_received
+        record_received(event)
         return event, source, False
+
+    def _relay_fyi_passive_enabled(self, source: Optional[SessionSource] = None) -> bool:
+        """Read the rollback flag from the routed profile's effective config; absent means enabled."""
+        try:
+            from gateway.run import _load_gateway_config
+            config = None
+            if source is not None and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_name = str(getattr(source, "profile", "") or "").strip()
+                if not profile_name:
+                    with suppress(Exception):
+                        profile_name = str(self._profile_name_for_source(source) or "").strip()
+                primary = getattr(self, "_primary_profile_name", None) or "default"
+                if profile_name and profile_name != primary:
+                    config = (getattr(self, "_relay_fyi_passive_by_profile", None) or {}).get(profile_name)
+                    if config is None:
+                        home = self._resolve_profile_home_for_source(source)
+                        config = _load_gateway_config(home / "config.yaml")
+            if config is None:
+                config = _load_gateway_config()
+            raw = ((config.get("relay") or {}).get("fyi_passive", True))
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                # Only an explicit on value keeps passive delivery; a malformed rollback value
+                # turns it off so the normal turn path stays the safe default.
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+            return False
+        except Exception:
+            return False
+
+    async def _hm_try_passive_fyi_relay(
+        self, event: MessageEvent, source: SessionSource, session_key: str,
+    ) -> bool:
+        """Persist one unaddressed Telegram FYI relay without creating an agent turn."""
+        from gateway.response_filters import is_passive_fyi_relay_event
+        if not is_passive_fyi_relay_event(
+            event, source, enabled=self._relay_fyi_passive_enabled(source),
+        ):
+            return False
+        session_store = self.async_session_store
+        try:
+            session_entry = await session_store.lookup_by_session_key(session_key)
+        except Exception:
+            logger.debug("FYI relay session lookup failed; falling back to a turn", exc_info=True)
+            return False
+        if session_entry is None or not getattr(session_entry, "session_id", None):
+            return False
+        # Claim the same running-session sentinel/lease used by real turns before any further await.
+        # The dedupe check and append must be one exclusive interval: otherwise a turn can start between
+        # the last idle check and the append and interleave its transcript rows with this FYI.
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        passive_lease, _limit_message = self._claim_active_session_slot(session_key, source)
+        if _limit_message is not None:
+            return False
+        if self._is_session_running(session_key):
+            return False
+        state = self._session_state(session_key)
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.agent_published_event = asyncio.Event()
+        state.turn.turn_ended_event = asyncio.Event()
+        state.turn.event = event
+        state.turn.lease = passive_lease
+        state.turn.started_ts = time.time()
+        self._persist_active_agents()
+
+        def _active_wakes():
+            from hermes_cli.goals import _get_session_db, load_goal
+            from hermes_cli.loops import load_loop
+            if _get_session_db() is None:
+                raise RuntimeError("session control database unavailable")
+            return load_goal(session_entry.session_id), load_loop(session_entry.session_id)
+
+        try:
+            try:
+                goal_state, loop_state = await self._run_in_executor_with_context(_active_wakes)
+            except Exception:
+                logger.debug("FYI relay goal/loop lookup failed; falling back to a turn", exc_info=True)
+                return False
+            if (
+                getattr(goal_state, "status", None) == "active"
+                or getattr(loop_state, "status", None) == "active"
+            ):
+                return False
+
+            if getattr(event, "message_id", None):
+                try:
+                    if await session_store.has_platform_message_id(
+                        session_entry.session_id, str(event.message_id),
+                    ):
+                        logger.info(
+                            "Skipping duplicate passive FYI relay (message_id=%s) in session %s",
+                            event.message_id, session_entry.session_id,
+                        )
+                        event._agent_turn_succeeded = True
+                        return True
+                except Exception:
+                    logger.debug("FYI relay duplicate lookup failed; falling back to a turn", exc_info=True)
+                    return False
+
+            timestamp = getattr(event, "timestamp", None)
+            try:
+                timestamp = timestamp.timestamp()
+            except (AttributeError, TypeError, ValueError):
+                timestamp = time.time()
+            row = {"role": "user", "content": event.text, "timestamp": timestamp}
+            if getattr(event, "message_id", None):
+                row["message_id"] = str(event.message_id)
+            try:
+                await session_store.append_to_transcript(session_entry.session_id, row)
+            except Exception:
+                logger.warning("FYI relay transcript append failed; falling back to a turn", exc_info=True)
+                return False
+            try:
+                await self._refresh_agent_cache_message_count(session_key, session_entry.session_id)
+            except Exception:
+                logger.debug("FYI relay agent-cache rebaseline failed", exc_info=True)
+            event._agent_turn_succeeded = True
+            return True
+        finally:
+            if state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is event:
+                self._release_running_agent_state(session_key)
 
     def _hm_estop_turn_allowed(self, event: MessageEvent, source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
@@ -840,6 +977,23 @@ class GatewayInboundMixin(
         if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
+            if self._human_preempts_autonomous_turn(event, state):
+                if mode == "queue" and event.message_type == MessageType.TEXT:
+                    # Keep the user message as a durable FIFO row and cut the machine turn
+                    # cooperatively; admission never awaits publication or the interrupt.
+                    from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
+                    if not getattr(event, "_gateway_machine_preemption_scheduled", False):
+                        setattr(event, "_gateway_machine_preemption_scheduled", True)
+                        schedule_authority_machine_preemption(
+                            self, event, source, _quick_key, state, state.turn,
+                            self._current_session_run_generation(_quick_key), running_agent,
+                        )
+                else:
+                    # Steer mode and media keep queue semantics: saved as a queued row, say so.
+                    queued = self._BusySteerOutcome(
+                        effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
+                        steered=False, redirected=False)
+                    await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, queued)
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
         note_busy_outcome(event, outcome)
@@ -1401,6 +1555,10 @@ class GatewayInboundMixin(
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
+            if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
+                return None
+            if self._is_session_running(_quick_key):
+                return await self._hm_handle_running_session_message(event, source, _quick_key)
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.
@@ -1422,6 +1580,8 @@ class GatewayInboundMixin(
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+        _claim_state.turn.agent_published_event = asyncio.Event()
+        _claim_state.turn.turn_ended_event = asyncio.Event()
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock

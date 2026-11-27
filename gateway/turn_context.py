@@ -111,6 +111,10 @@ class TurnContext:
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
 
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Keep a temporary progress card in this turn's cleanup list."""
+        self._cleanup_msg_ids.append(message_id)
+
     @property
     def _status_adapter(self) -> Any:
         """The adapter that answers the turn NOW. A reconnect replaces the platform's adapter while a

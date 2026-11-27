@@ -336,6 +336,74 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     return retry_after is not None and retry_after > cap
 
 
+# Gateway/capacity statuses a pending fallback may take over from after one short retry. Other
+# 4xx never qualify (a 400/401/403 body may echo user or tool text), 429 is judged on its Retry-After.
+# A generic 500/502/504 remains on the established retry path; only explicit capacity statuses
+# (503/529), or the classifier's overloaded verdict, enter this provider-outage shortcut.
+_FAST_FAILOVER_5XX = frozenset({503, 529})
+_FAST_FAILOVER_5XX_REASONS = frozenset({
+    FailoverReason.overloaded, FailoverReason.server_error, FailoverReason.timeout, FailoverReason.rate_limit,
+})
+_FAST_FAILOVER_TRANSPORT_NAMES = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "PoolTimeout", "ReadError", "WriteError",
+    "RemoteProtocolError", "ServerDisconnectedError", "APIConnectionError", "APITimeoutError",
+    "SSLEOFError", "SSLZeroReturnError", "SSLSyscallError", "IncompleteRead", "RemoteDisconnected",
+})
+
+
+def _has_transport_exception(api_error: Any) -> bool:
+    """Whether the error, or one in its cause chain, is a connection/timeout/EOF exception type.
+
+    Decided by exception class only: a message that merely says "connection reset" proves nothing.
+    """
+    seen: set[int] = set()
+    node = api_error
+    for _ in range(5):
+        if node is None or id(node) in seen:
+            break
+        seen.add(id(node))
+        if isinstance(node, (ConnectionError, TimeoutError, EOFError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+            return True
+        if any(base.__name__ in _FAST_FAILOVER_TRANSPORT_NAMES for base in type(node).__mro__):
+            return True
+        node = getattr(node, "__cause__", None) or getattr(node, "__context__", None)
+    return False
+
+
+def fast_failover_on_provider_outage(agent: Any, classified: Any, api_error: Any) -> bool:
+    """Whether a pending fallback should get one short retry before activation.
+
+    Provider-capacity and transport failures are unlikely to recover during a provider-declared
+    multi-minute cooldown.  A configured fallback can make progress, so keep one bounded probe of
+    the primary and then move on.  With no pending fallback this is false, preserving the existing
+    Retry-After and recovery-ladder behavior.
+
+    This layer decides from the HTTP status, the exception type and the error classifier's reason,
+    and does not read error text itself.  The upstream classifier may read the message for
+    status-less errors and for 429 (and for a structured proxy ``auth_unavailable``), so its reason
+    can depend on text there.  A 4xx other than 429 is never an outage here: a real 401/403 keeps
+    its refresh/terminal path, and a 400 keeps its request-validation path.
+    """
+    if not agent._has_pending_fallback() or getattr(agent, "_turn_independent_attempt_active", False):
+        return False
+    status = getattr(classified, "status_code", None)
+    status = status if isinstance(status, int) and not isinstance(status, bool) else None
+    if status is not None and 400 <= status < 500 and status != 429:
+        return False
+    reason = getattr(classified, "reason", None)
+    if reason is FailoverReason.overloaded:
+        return True
+    if status == 429:
+        from agent.retry_utils import provider_retry_after_seconds
+        retry_after = provider_retry_after_seconds(api_error)
+        return reason is FailoverReason.rate_limit and retry_after is not None and retry_after > 5.0
+    if status in _FAST_FAILOVER_5XX:
+        return reason in _FAST_FAILOVER_5XX_REASONS
+    if status is None:
+        return reason is FailoverReason.timeout and _has_transport_exception(api_error)
+    return False
+
+
 def _is_local_validation_error(api_error: Any) -> bool:
     """ValueError/TypeError are local bugs, except: UnicodeEncodeError (surrogate recovery
     path), json.JSONDecodeError / provider stream-parse ValueErrors (transient provider/network failure, must retry),
@@ -367,7 +435,7 @@ class UnrecoveredErrorVerdict:
     max_retries: Any = None
 
 
-def settle_unrecovered_error(
+def settle_unrecovered_error(  # health: allow CC -- preserves the ordered recovery gates and fallback handoff in one transaction.
     agent: Any, *, api_error: Any, classified: Any, _retry: Any, status_code: Any, error_msg: Any,
     is_context_length_error: Any, is_rate_limited: Any, _is_zai_coding_overload: Any,
     _provider: Any, _base: Any, _model: Any, messages: Any, api_messages: Any, api_kwargs: Any,
@@ -504,6 +572,30 @@ def settle_unrecovered_error(
         max_retries = retry_count
         hold_noninteractive_transient = False
 
+    # Capacity/transport outages should not spend the provider's long Retry-After when another
+    # configured route can serve the turn. Keep one short same-provider retry for a transient blip,
+    # then let the normal exhaustion path activate the fallback. No pending fallback means the
+    # existing provider cooldown and auto-recovery behavior remain unchanged. An unattended
+    # same-provider window in progress owns the retry cadence: it already bounds the wait before the
+    # fallback runs, and a 5s cap on every retry inside it would only multiply the attempts on an
+    # overloaded primary. A Retry-After that outlasts the window never opens it (no hold), so that
+    # case keeps the fast path.
+    fast_failover = (
+        not over_wait_cap
+        and not hold_noninteractive_transient
+        and fast_failover_on_provider_outage(agent, classified, api_error)
+    )
+    if fast_failover:
+        # Keep ``max_retries`` intact: the fallback restart budget also governs the rebuilt
+        # message handoff, including its independent-endpoint allowance. Only the provider's
+        # same-route retry budget is shortened here.
+        # The retry is spent per route visit: a fallback activation starts a new visit, so a
+        # fallback that also fails with a capacity error gets its own short retry.
+        if _retry.fast_failover_retry_visit == route_visit(agent):
+            retry_count = max_retries
+        else:
+            _retry.fast_failover_retry_visit = route_visit(agent)
+
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
     attempts_made = min(retry_count, max_retries)
@@ -523,7 +615,7 @@ def settle_unrecovered_error(
         # transient transport errors (stale pool, TCP reset). Not after a spent unattended
         # window with a fallback pending: the route already had its recovery time.
         if (
-            not over_wait_cap and not skip_to_fallback and not _retry.primary_recovery_attempted
+            not over_wait_cap and not skip_to_fallback and not fast_failover and not _retry.primary_recovery_attempted
             and agent._try_recover_primary_transport(api_error, retry_count=retry_count, max_retries=max_retries)
         ):
             _retry.primary_recovery_attempted = True
@@ -575,7 +667,7 @@ def settle_unrecovered_error(
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
-        base_url=_base, model=_model,
+        base_url=_base, model=_model, retry_wait_cap=5.0 if fast_failover else None,
     )
     if hold_noninteractive_transient:
         # Never back off past the window: the attempt after it ends must be the one that falls back.

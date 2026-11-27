@@ -111,6 +111,9 @@ found = []
 class NewTreeFinder:
     def find_spec(self, name, path=None, target=None):
         spec = importlib.machinery.PathFinder.find_spec(name, path)
+        # Windows may load a standard-library codec lazily after the install moves.
+        if name.startswith("encodings."):
+            return None
         where = [spec.origin or "", *(spec.submodule_search_locations or [])] if spec else []
         if any(w.startswith(REPO + os.sep) and "site-packages" not in w for w in map(str, where)):
             found.append(name)
