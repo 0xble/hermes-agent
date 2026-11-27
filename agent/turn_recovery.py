@@ -1386,13 +1386,15 @@ def reset_hint(api_error: Exception) -> str:
 
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
-    is_zai_coding_overload: bool, base_url: Any, model: Any,
+    is_zai_coding_overload: bool, base_url: Any, model: Any, retry_wait_cap: Optional[float] = None,
 ) -> float:
     """Pick the wait before the next API retry and announce it. Retry-After wins for
     rate limits and any other retryable error (capped at ``RETRY_AFTER_CAP_S``); otherwise
     jittered backoff, replaced by the adaptive policy for 429s / Z.AI overloads. Retries are
     buffered (replayed only if every retry fails); a long Z.AI Coding wait or a non-rate-limit
-    ``Retry-After`` over ``LIVE_RETRY_WAIT_CAP_S`` is announced when it starts."""
+    ``Retry-After`` over ``LIVE_RETRY_WAIT_CAP_S`` is announced when it starts. ``retry_wait_cap``
+    is reserved for a route that is about to fail over; it bounds only that one short same-provider
+    retry and leaves the normal no-fallback policy unchanged."""
     # Imported lazily so tests that patch ``agent.retry_utils.jittered_backoff`` /
     # ``adaptive_rate_limit_backoff`` (incl. the run_agent conftest fast-backoff fixture) intercept.
     from agent.retry_utils import (
@@ -1409,12 +1411,18 @@ def compute_error_backoff(
     if _retry_after is not None:
         _retry_after = min(_retry_after, RETRY_AFTER_CAP_S)
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    if retry_wait_cap is not None:
+        wait_time = min(wait_time, max(0.0, float(retry_wait_cap)))
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
     if _adaptive and _retry_after is None:
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
+    if retry_wait_cap is not None:
+        # Adaptive provider policies can replace the default wait after the first cap; the
+        # fast-failover route still owns this retry's hard upper bound.
+        wait_time = min(wait_time, max(0.0, float(retry_wait_cap)))
     _reset = reset_hint(api_error) if _adaptive else ""
     _free_busy = is_rate_limited and on_free_model(agent, base_url)
     _wait_reason = ("The free model is busy" if _free_busy
