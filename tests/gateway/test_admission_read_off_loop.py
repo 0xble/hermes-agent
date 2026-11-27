@@ -6,7 +6,7 @@ load. Done on the loop thread it froze every adapter: on 2026-11-27 a typed Tele
 waited about 2 minutes behind other sessions' writes before its turn started.
 """
 import asyncio
-import time
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,6 +15,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, SessionSource
 from gateway.session_ingress import admit_message
+from tests.waiting import async_wait_until
 
 
 def _event(text='typed'):
@@ -27,35 +28,21 @@ def _authority():
     return SimpleNamespace(admit_native=admit, native_waiters=set(), waiters={}, db=None)
 
 
-async def _heartbeat(gaps, stop, tick=0.01):
-    """Record gaps between ticks until *stop* is set: a frozen loop stops ticking."""
-    last = time.monotonic()
-    while not stop.is_set():
-        await asyncio.sleep(tick)
-        now = time.monotonic()
-        gaps.append(now - last)
-        last = now
-
-
 @pytest.mark.asyncio
-async def test_admission_read_waiting_on_the_writer_lock_keeps_the_loop_running(monkeypatch):
+async def test_admission_read_waiting_on_the_writer_lock_runs_off_the_loop(monkeypatch):
+    """The read can queue behind other sessions' writes for seconds: it must not hold the loop."""
     authority = _authority()
-    stall = 0.6  # the read queues behind another session's write
+    loop_thread, read_threads = threading.get_ident(), []
 
-    def slow_read(db, admission_id):
-        time.sleep(stall)
+    def read(db, admission_id):
+        read_threads.append(threading.get_ident())
         return {'status': 'queued'}
 
-    monkeypatch.setattr('hermes_state_runtime.get_session_admission', slow_read)
+    monkeypatch.setattr('hermes_state_runtime.get_session_admission', read)
     monkeypatch.setattr('gateway.session_ingress._claim_post_delivery', lambda *args: None)
-    gaps, stop = [], asyncio.Event()
-    beat = asyncio.create_task(_heartbeat(gaps, stop))
-    await asyncio.sleep(0.05)  # the heartbeat is ticking before the message arrives
     reply = asyncio.create_task(admit_message(authority, _event()))
-    await asyncio.sleep(stall + 0.3)
-    stop.set()
-    await beat
-    assert max(gaps) < stall / 2, f'the event loop froze for {max(gaps):.2f}s during the admission read'
+    await async_wait_until(lambda: read_threads and 'a1' in authority.waiters, timeout=5)
+    assert loop_thread not in read_threads, 'the admission read ran on the event-loop thread'
     authority.waiters['a1'].set_result('answer')
     assert await asyncio.wait_for(reply, 5) == 'answer'
 
