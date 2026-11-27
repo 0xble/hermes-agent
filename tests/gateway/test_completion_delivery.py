@@ -57,6 +57,8 @@ def _runner(adapter, *, origins=None):
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
+    # Routing/claim tests do not wait for the idle settle timer; batching tests opt in.
+    runner._completion_notification_batch_window = 0.0
     return runner
 
 
@@ -578,11 +580,6 @@ def test_duplicate_primary_does_not_discard_fresh_batch_sibling(primary):
         "fresh": _completion_event(started_at=2.0, session_id="proc_fresh"),
     }
     runner._completion_deliveries_delivered[runner._completion_delivery_identity(events["duplicate"])] = None
-
-    async def _hold(_evt, *, session_busy=False):
-        return 0.0
-
-    runner._completion_hold_seconds = _hold
     order = [primary, "fresh" if primary == "duplicate" else "duplicate"]
 
     async def _exercise():

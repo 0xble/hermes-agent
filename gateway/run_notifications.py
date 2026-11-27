@@ -268,16 +268,16 @@ class GatewayNotificationsMixin(
         "session_key", "parent_session_id", "platform", "chat_type", "chat_id", "thread_id", "user_id")
     _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[2:])
 
-    # Fan-in for routine completion wakes (#70300). While a session is mid-turn or started a turn
-    # within ``gateway.completion_notification_batch_window_seconds`` (default 300), a successful
-    # process or delegation result is held so every result that lands in the window reaches the
-    # agent as ONE synthetic turn. Failures and results a parked goal explicitly waits on are never
-    # held. A prompt result joins its own route's held batch, and releases the conversation's other
+    # Fan-in for routine completion wakes (#70300). Hold successes until the running turn ends or
+    # the configured cap expires. For idle sessions, settle briefly from arrival instead. Failures
+    # and results a parked goal explicitly waits on are never held. A prompt result joins its own
+    # route's held batch and releases the conversation's other
     # held batches (the other kind, or the diagnostic task-failure notice lane, which keeps its own
     # turn and mute policy) so nothing waits behind a wake that is happening anyway. 0 keeps only
     # the same-tick fan-in floor. Held results are never dropped: delivery failure retries, and
     # shutdown releases them into the durable drain spool.
     _COMPLETION_FAN_IN_FLOOR_S = 0.1
+    _COMPLETION_IDLE_SETTLE_S = 10.0
     _COMPLETION_BATCH_WINDOW_DEFAULT_S = 300.0
     _COMPLETION_BATCH_WINDOW_MAX_S = 3600.0
     _COMPLETION_SHUTDOWN_FLUSH_S = 5.0
@@ -341,8 +341,8 @@ class GatewayNotificationsMixin(
             return session is not None and getattr(session, "pid", None) == state.waiting_on_pid
         return False
 
-    async def _completion_hold_seconds(self, evt: dict, *, session_busy: bool = False) -> float:
-        """How long to hold this result before waking its session; 0 means deliver promptly.
+    async def _completion_batch_window(self, evt: dict) -> float:
+        """Return the configured cap for this result; 0 means deliver promptly.
 
         Window and goal state are read in the owning profile's scope (multiplexed gateways)."""
         session_key = str(evt.get("session_key") or "").strip()
@@ -355,18 +355,27 @@ class GatewayNotificationsMixin(
         try:
             async with self._completion_event_scope(evt):
                 window = self._completion_notification_window_seconds()
-                state = self._peek_session_state(session_key)
-                started = state.conversation.last_turn_started_at if state is not None else 0.0
-                running = session_busy or self._is_session_running(session_key)
-                remaining = (started + window - time.time()) if started else 0.0
-                if window <= 0 or (not running and remaining <= 0):
+                if window <= 0:
                     return 0.0
                 if await asyncio.to_thread(self._completion_awaited_by_goal, evt):
                     return 0.0
         except Exception:
             logger.debug("Completion hold check failed; delivering promptly", exc_info=True)
             return 0.0
-        return window if running else min(window, remaining)
+        return window
+
+    def _completion_hold_seconds(self, evt: dict, window: float) -> float:
+        # Sample the live slot after asynchronous policy checks, with no await between
+        # this decision and registering the batch. A turn that already ended cannot release it.
+        if window <= 0:
+            return 0.0
+        session_key = str(evt.get("session_key") or "").strip()
+        running = self._is_session_running(session_key)
+        hold = window if running else min(window, self._COMPLETION_IDLE_SETTLE_S)
+        logger.info("Completion hold reason=%s hold_s=%g window_s=%g session_key=%s event=%s id=%s",
+                    "running" if running else "idle_settle", hold, window, session_key,
+                    evt.get("type"), evt.get("delegation_id") or evt.get("session_id"))
+        return hold
 
     def _ensure_completion_batch_state(self) -> None:
         """Lazy defaults: lifecycle tests build GatewayRunner via ``object.__new__``."""
@@ -395,8 +404,11 @@ class GatewayNotificationsMixin(
         self._track_task_in(flush_tasks, task)
 
     def _release_held_completions(self, session_key: str) -> None:
-        """A prompt wake is happening anyway: let this conversation's held results join it now."""
-        for releases in (self._completion_notification_batch_releases, self._async_delegation_batch_releases):
+        """Release this conversation's held results on a prompt wake or running-turn exit."""
+        for attr in ("_completion_notification_batch_releases", "_async_delegation_batch_releases"):
+            releases = getattr(self, attr, None)
+            if not releases:
+                continue
             for key, release in list(releases.items()):
                 if key and key[0] == session_key:
                     release.set()
@@ -2165,7 +2177,7 @@ class GatewayNotificationsMixin(
                     # turn itself installs the guard).
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
                     delivery = asyncio.ensure_future(self._enqueue_process_completion_notification(
-                        synth_text, completion_evt, session_busy=turn_busy,
+                        synth_text, completion_evt,
                     ))
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the agent hears of it only later (a

@@ -419,7 +419,7 @@ class AdmittingHandler(AsyncMock):
         return result
 
 
-def _fan_in_runner(*, window=300.0, last_turn_age=10.0):
+def _fan_in_runner(*, window=300.0, last_turn_age: float | None = 10.0):
     adapter = SimpleNamespace(handle_message=AdmittingHandler(), _active_sessions={})
     runner = object.__new__(GatewayRunner)
     runner._running = True
@@ -476,20 +476,116 @@ async def _settle(predicate, timeout=2.0):
 
 
 @pytest.mark.asyncio
-async def test_idle_session_completion_is_prompt(hermes_home):
+async def test_idle_session_completion_is_prompt(hermes_home, monkeypatch):
     runner, adapter = _fan_in_runner(last_turn_age=10_000)
-    assert await runner._enqueue_process_completion_notification("done", _completion("proc_a")) is True
+    monkeypatch.setattr(runner, "_COMPLETION_IDLE_SETTLE_S", 0.2)
+    assert await asyncio.wait_for(
+        runner._enqueue_process_completion_notification("done", _completion("proc_a")), timeout=2,
+    ) is True
     adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_recent_session_holds_successes_then_one_turn_lists_all(hermes_home):
+@pytest.mark.parametrize("kind", ["process", "delegation"])
+async def test_idle_recent_turn_completion_uses_arrival_settle_not_old_turn_start(hermes_home, caplog, kind):
+    from tests.waiting import async_wait_until
+
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    # Exercise the real timer and delivery rail with a shortened idle settle constant.
+    runner._COMPLETION_IDLE_SETTLE_S = 0.2
+    caplog.set_level("INFO", logger="gateway.run")
+    if kind == "process":
+        awaitable = runner._enqueue_process_completion_notification("done", _completion("proc_idle"))
+    else:
+        awaitable = runner._enqueue_async_delegation_group([_delegation("deleg_idle")])
+    assert await asyncio.wait_for(awaitable, timeout=2) is True
+    await async_wait_until(lambda: adapter.handle_message.await_count, timeout=2,
+                           what=f"{kind} admission after a short idle settle")
+    adapter.handle_message.assert_awaited_once()
+    holds = [msg for msg in caplog.messages if msg.startswith("Completion hold reason=")]
+    assert len(holds) == 1
+    assert "reason=idle_settle hold_s=0.2 window_s=3600" in holds[0]
+
+
+@pytest.mark.asyncio
+async def test_current_turn_end_releases_both_completion_kinds_without_releasing_other_routes(hermes_home):
+    from gateway.turn_context import TurnContext
+    from tests.waiting import async_wait_until
+
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=None)
+    session_key = ROUTE["session_key"]
+    other_key = "agent:main:telegram:dm:999"
+    runner._draining = False
+    generation = runner._begin_session_run_generation(session_key)
+    runner._session_state(session_key).turn.agent = object()
+    runner._session_state(other_key).turn.agent = object()
+    other = {**_delegation("deleg_other"), "session_key": other_key}
+    assert await runner._enqueue_async_delegation_group([other]) is True
+    assert await runner._enqueue_async_delegation_group([_delegation("deleg_held")]) is True
+    held = asyncio.create_task(runner._enqueue_process_completion_notification("done", _completion("proc_end")))
+    try:
+        await async_wait_until(lambda: runner._completion_notification_batches, timeout=2,
+                               what="process completion held during the turn")
+        adapter.handle_message.assert_not_awaited()
+        # A displaced turn cannot clear the replacement slot or release the replacement's hold.
+        assert runner._release_running_agent_state(session_key, run_generation=generation - 1) is False
+        assert runner._is_session_running(session_key)
+        assert not any(release.is_set() for release in runner._completion_notification_batch_releases.values())
+        assert not any(release.is_set() for release in runner._async_delegation_batch_releases.values())
+
+        await runner._run_agent_cleanup_turn_tasks(
+            TurnContext(session_key=session_key, run_generation=generation),
+            progress_task=None, log_task=None, stream_task=None,
+            interrupt_monitor=asyncio.create_task(asyncio.sleep(0)),
+            _notify_task=asyncio.create_task(asyncio.sleep(0)),
+            tracking_task=asyncio.create_task(asyncio.sleep(0)),
+        )
+        assert not runner._is_session_running(session_key)
+        assert await asyncio.wait_for(held, timeout=2) is True
+        await async_wait_until(lambda: adapter.handle_message.await_count == 2, timeout=2,
+                               what="both completion kinds admitted after the parent turn ends")
+        assert all(call.args[0].source.chat_id == ROUTE["chat_id"]
+                   for call in adapter.handle_message.await_args_list)
+        assert not next(iter(runner._async_delegation_batch_releases.values())).is_set()
+    finally:
+        await runner._cancel_process_completion_batch_tasks()
+
+
+@pytest.mark.asyncio
+async def test_turn_end_during_completion_policy_check_does_not_leave_busy_hold(hermes_home, monkeypatch):
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner._COMPLETION_IDLE_SETTLE_S = 0.2
+    session_key = ROUTE["session_key"]
+    runner._session_state(session_key).turn.agent = object()
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def goal_check(evt):
+        started.set()
+        assert proceed.wait(timeout=5)
+        return False
+
+    monkeypatch.setattr(runner, "_completion_awaited_by_goal", goal_check)
+    delivery = asyncio.create_task(runner._enqueue_process_completion_notification("done", _completion("proc_race")))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert runner._release_running_agent_state(session_key)
+    finally:
+        proceed.set()
+    assert await asyncio.wait_for(delivery, timeout=2) is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_cap_still_flushes_without_turn_end_and_lists_all(hermes_home):
     runner, adapter = _fan_in_runner(window=0.4, last_turn_age=0.0)
+    runner._session_state(ROUTE["session_key"]).turn.agent = object()
     results = await asyncio.gather(*(
         runner._enqueue_process_completion_notification(f"text {i}", _completion(f"proc_{i}", started_at=float(i)))
         for i in range(3)
     ))
     assert results == [True, True, True]
+    assert runner._is_session_running(ROUTE["session_key"])
     adapter.handle_message.assert_awaited_once()
     text = adapter.handle_message.await_args.args[0].text
     assert "3 background processes completed" in text
@@ -711,6 +807,7 @@ async def test_busy_turn_receipt_is_sent_while_the_wake_is_held(hermes_home, mon
 
     runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     adapter._active_sessions[ROUTE["session_key"]] = asyncio.Event()  # launching turn still running
+    runner._session_state(ROUTE["session_key"]).turn.agent = object()
     sends: list[str] = []
 
     async def _send(chat_id, text, **_kwargs):
@@ -729,7 +826,7 @@ async def test_busy_turn_receipt_is_sent_while_the_wake_is_held(hermes_home, mon
     await asyncio.sleep(0.2)
     adapter.handle_message.assert_not_awaited()  # the wake itself is still held
     assert not task.done()
-    await runner._cancel_process_completion_batch_tasks()
+    runner._release_running_agent_state(ROUTE["session_key"])
     await asyncio.wait_for(task, timeout=2.0)
     adapter.handle_message.assert_awaited_once()
     assert len(sends) == 1
@@ -863,7 +960,8 @@ async def test_raw_api_server_completion_is_never_held(hermes_home):
     runner, _adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     evt = {**_completion("proc_api"), "platform": "", "chat_id": "", "chat_type": ""}
     runner._build_process_event_source = lambda e: None
-    assert await runner._completion_hold_seconds(evt, session_busy=True) == 0.0
+    runner._session_state(ROUTE["session_key"]).turn.agent = object()
+    assert await runner._completion_batch_window(evt) == 0.0
 
 
 @pytest.mark.asyncio

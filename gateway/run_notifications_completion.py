@@ -609,7 +609,7 @@ class GatewayNotificationsMixin:
 
 
     async def _enqueue_process_completion_notification(
-        self, synth_text: str, evt: dict, *, session_busy: bool = False,
+        self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Fan in one conversation's completions; hold routine successes per the batch window."""
         from gateway.run_notifications import asyncio
@@ -622,9 +622,10 @@ class GatewayNotificationsMixin:
         self._ensure_completion_batch_state()
         if self._completion_notification_batches_stopping:
             return await self._deliver_completion_while_stopping(synth_text, evt)
-        hold = await self._completion_hold_seconds(evt, session_busy=session_busy)
+        window = await self._completion_batch_window(evt)
         if self._completion_notification_batches_stopping:
             return await self._deliver_completion_while_stopping(synth_text, evt)
+        hold = self._completion_hold_seconds(evt, window)
         if hold <= 0:
             self._release_held_completions(str(evt.get("session_key") or ""))
         # A route key alone is not ownership: /new can leave old and new pins
