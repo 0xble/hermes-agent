@@ -389,10 +389,14 @@ async def probe(root, base, mode):
                         recovered = [r for r in rows() if r['principal_id'].startswith('automation:')]
                         assert len(recovered) == 1 and recovered[0]['outcome'] == 'interrupted', rows()
                         assert recovered[0]['admission_id'] == automatic[0]['admission_id']
-                        await wait_for(lambda: len(outgoing) > sent_before_restart)
-                        revived_sends = [f['action'] for f in outgoing[sent_before_restart:]
-                            if f.get('type') == 'outbound' and f.get('action', {}).get('op') == 'send'
-                            and f['action'].get('content') == 'AUTOMATION_ACK']
+                        def recovered_replies():
+                            return [f['action'] for f in outgoing[sent_before_restart:]
+                                if f.get('type') == 'outbound' and f.get('action', {}).get('op') == 'send'
+                                and f['action'].get('content') == 'AUTOMATION_ACK']
+
+                        # The ledger can settle and a busy notice can arrive before the reply.
+                        await wait_for(recovered_replies)
+                        revived_sends = recovered_replies()
                         assert len(revived_sends) == 1, outgoing[sent_before_restart:]
                         assert revived_sends[0].get('metadata', {}).get('user_id') == 'fixture-user', revived_sends
                         await send('after-recovery', 'AFTER_RECOVERY')
