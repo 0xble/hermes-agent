@@ -63,3 +63,14 @@ def test_per_file_timeout_dumps_stacks(tmp_path):
 @pytest.mark.platforms("linux")
 def test_forkserver_per_file_timeout_dumps_stacks(tmp_path):
     _assert_timeout_stacks(tmp_path, forkserver=True)
+
+
+def test_stack_dump_read_is_bounded(tmp_path):
+    from scripts import run_tests_timeout as rt
+
+    big = "x" * (rt._STACK_DUMP_MAX_BYTES + 1000) + "TAIL"
+    (tmp_path / rt._STACK_FILE).write_text(big, encoding="utf-8")
+    out = rt.read_stack_dump(str(tmp_path))
+    assert out.endswith("TAIL")
+    assert "truncated to last" in out
+    assert len(out) < rt._STACK_DUMP_MAX_BYTES + 200

@@ -110,11 +110,20 @@ def _request_stack_dump(pid: int, attempt_dir: str) -> None:
             pass  # The child may have exited; normal tree cleanup still runs.
 
 
+_STACK_DUMP_MAX_BYTES = 256 * 1024
+
+
 def read_stack_dump(attempt_dir: str) -> str:
     try:
-        stacks = (Path(attempt_dir) / _STACK_FILE).read_text(encoding="utf-8-sig", errors="replace")
+        with open(Path(attempt_dir) / _STACK_FILE, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - _STACK_DUMP_MAX_BYTES))
+            raw = fh.read(_STACK_DUMP_MAX_BYTES)
     except OSError:
         return ""
+    stacks = raw.decode("utf-8-sig", errors="replace")
+    if size > _STACK_DUMP_MAX_BYTES:
+        stacks = f"[stack dump truncated to last {_STACK_DUMP_MAX_BYTES} bytes of {size}]\n" + stacks
     if stacks:
         return "\n=== Python thread stacks before file timeout ===\n" + stacks
     return ""

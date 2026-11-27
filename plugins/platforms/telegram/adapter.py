@@ -497,12 +497,17 @@ _RICH_CODE_RE = re.compile(
 # Preserve closed math, but not dollar-prefixed tickers or prose such as "$6 per US$ unit". A numeric
 # amount followed by an ordinary word is currency here; single-letter variables and backslash math
 # commands survive.
+# An amount followed by prose is currency: a word of 2+ ASCII letters, or any word in a non-Latin
+# script (TeX variables are ASCII, so "$5 и 10$" is prose while "$5 a 10$" may be math). Math never
+# spans a backtick, so "$5 (`$`" cannot swallow the opener of a following code span.
+_RICH_AMOUNT_BEFORE_WORD = (
+    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z])[^\W\d_])+)\b)")
 _RICH_CURRENCY_PROTECTED_RE = re.compile(
     _RICH_CODE_RE.pattern
     + r"|(?<![\\$])\$\$.*?\$\$"
     + r"|(?<![\\$])\$(?![\s$])"
-    + r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+[A-Za-z]{2,}\b)"
-    + r"[^$\n]*?(?<![\s([{,:;])\$(?![\w$])",
+    + _RICH_AMOUNT_BEFORE_WORD
+    + r"[^$\n`]*?(?<![\s([{,:;])\$(?![\w$])",
     re.DOTALL)
 _RICH_DOLLAR_ENTITY_RE = re.compile(
     _RICH_CODE_RE.pattern + r"|&#(?:0*36|x0*24);", re.DOTALL | re.IGNORECASE)
@@ -1758,16 +1763,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
         """Return the shared raw-Markdown Rich Message payload."""
         payload = rich_message_payload(content, skip_entity_detection=skip_entity_detection)
-        markdown = payload.get("markdown", "")
-        # Keep the legacy currency contract for prose amounts that the shared rich
-        # shaper cannot distinguish from an inline-math span.
-        if content.startswith("Price $") and " (`$` or `$6`)." in content:
-            markdown = markdown.replace("Price $5", "Price \\$5").replace("`\\$6`", "`$6`")
-        elif content == "$5 и 10$":
-            markdown = "\\$5 и 10$"
-        elif content == "$2+2$ costs $5 vs $6":
-            markdown = markdown.replace("\\$5", "`$5`").replace("\\$6", "`$6`")
-        payload["markdown"] = markdown
         if RICH_EMAIL_TOKEN_RE.search(content):
             payload["skip_entity_detection"] = True
         return payload
