@@ -214,8 +214,11 @@ _REPLY_QUOTE_SHORTEST_RE = re.compile(r'^\[Replying to(?: your previous message)
 # discussed), not an instruction, so a message containing any of them grants no quote authority.
 # An ASCII single quote at a word edge ('...') is a quotation; inside a word it is an apostrophe
 # (don't, user's), which stays allowed. Conservative: a trailing plural possessive also refuses.
+# A typographic apostrophe (U+2019, what phones type for "week's") is quoted data only when it
+# is not inside a word, exactly like the straight one: a possessive or contraction is not a quote.
 _QUOTED_DATA_RE = re.compile(
-    r'["\u201c\u201d\u2018\u2019\u201a\u201e`]|^\s*>|(?<![A-Za-z0-9])\'|\'(?![A-Za-z0-9])', re.MULTILINE)
+    r'["\u201c\u201d\u2018\u201a\u201e`]|^\s*>|(?<![A-Za-z0-9])[\'\u2019]|[\'\u2019](?![A-Za-z0-9])',
+    re.MULTILINE)
 
 
 def _message_grants_authority(source: str) -> bool:
@@ -1038,6 +1041,25 @@ def _lifecycle_autonomy(kind: str) -> bool:
     return kind in {"goal", "loop"} and autonomy_enabled(f"{kind}s")
 
 
+_QUOTE_REFUSAL_HINTS = {
+    "user_quote_too_short": "the quote is too short to identify an instruction",
+    "user_quote_not_found": "the quote is not in the user's latest typed message",
+    "user_quote_ambiguous": "the user's latest message has an ambiguous reply pointer",
+    "user_message_too_long": "the user's latest message is too long to match a quote against",
+    "user_quote_negated": "the user's message refuses or negates the instruction",
+    "user_quote_qualified": "the user's message has a condition, question, hedge or quoted text",
+    "user_quote_multi_sentence": "the user's latest message holds more than one sentence or request",
+    "user_quote_mismatch": "the quote does not state this control for this target",
+}
+
+
+def _quote_refusal_error(refused: str) -> str:
+    hint = _QUOTE_REFUSAL_HINTS.get(refused, "the quote did not match the user's latest typed message")
+    return (f"user_quote refused ({refused}): {hint}. Approval cards are hidden, so only the user's own "
+            "latest typed message authorizes this. Ask the user to send just that one instruction in "
+            "its own message, then pass it verbatim as user_quote.")
+
+
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Create a pending request, or apply an autonomous goal or loop control immediately."""
@@ -1205,6 +1227,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         except ValueError as exc:
             return {"ok": False, "error_code": str(exc), "error": str(exc)}
         if not record.get("id"):
+            if user_quote and record.get("error_code") == "approval_cards_hidden":
+                # The hidden-card text says "pass their exact words", which the caller just did.
+                return {**record, "quote_refused": refused, "error": _quote_refusal_error(refused)}
             return record
         outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record,
                    "non_blocking": True}
