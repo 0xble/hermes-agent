@@ -429,8 +429,8 @@ Run `git fetch origin main` and `./bin/ci ready "$(git rev-parse HEAD)"` from a
 clean PR checkout. `ready` compares the exact head with its merge base against
 `origin/main`. It keeps the existing static and Node gate (including lint and
 type checks) and runs selected Python/E2E files through `scripts/run_tests.sh`.
-Only edits confined to existing test bodies in the explicit leaf-test allowlist
-can narrow the suite. The pilot admits `tests/gateway/test_response_filters.py`:
+Test-only narrowing is confined to existing test bodies in the explicit
+leaf-test allowlist. The pilot admits `tests/gateway/test_response_filters.py`:
 its assertions run in isolation, it does not provide fixtures or pytest plugins,
 and no other tracked code imports it. Re-audit the allowlist before adding paths
 or sharing an existing entry. A `test_*.py` name or presence in the test inventory
@@ -439,13 +439,38 @@ module structure outside existing test bodies. Changes to imports, test
 signatures, decorators or other module-level code run the full inventory,
 including when those changes have already landed on the base branch.
 
-All production changes run the full PR Python/E2E inventory. For example,
-`gateway/response_filters.py` has indirect ACP consumers outside the former
-pilot directories. Imported test modules, pytest plugins, fixture providers, CI
-and config, additions, deletions, mode changes, renames, and uncertainty reading
-Git or parsing audited modules also select the full inventory. If the canonical
-inventory itself cannot be built, CI fails rather than reporting a partial pass.
-Native, integration, upgrade and other nightly-only coverage are unchanged.
+The production pilot recognizes edits to local string/tuple normalization in
+`gateway/response_filters.py::_canonical_silence_candidates`, optionally with
+declarative regression tests in the existing `test_gateway_silence_tokens.py`.
+Both sides must match the audited structure outside that scope. It subtracts
+eight exact tooling probes from the canonical inventory, keeping every other
+file in its original shard. It does not map production modules to test
+directories: indirect consumers such as ACP's `test_gateway_event_mapping.py`
+and every PR E2E file stay selected.
+
+The omitted tests exercise cache-log parsing, marker and shebang lint, case
+collisions, instruction-size rules, lockfile reporting, release job groups,
+and the pytest runner with miniature suites. Reading the real tree in the
+case-collision and lockfile probes checks path names and dependency locks, not
+response behavior. The audit pins the probe files, their tools and fixtures,
+and shared test entry points in Git; new or changed inputs (including changes
+already on `main`) disable the omission until re-audited. Do not extend the
+list by path prefix or treat the scope check as a general dependency analyzer.
+
+All other production diffs, shared test code outside the audited scope, pytest
+plugins, fixtures, CI/config, additions, deletions, mode changes, renames, and
+unreadable Git or Python inputs select the full inventory. CI fails if the
+canonical inventory cannot be built. Nightly-only coverage is unchanged.
+
+Replay of the same three first-parent PR commits against their pre-merge
+parents with the pilot's ten-shard canonical inventory (Python/E2E **files**,
+not test cases or a runtime estimate):
+
+| PR | Base → head | Selected / full | Reason |
+| --- | --- | ---: | --- |
+| #1408 | `fbd104cd903` → `06b13de1c77` | 8,418 / 8,418 | Shared automation fixture |
+| #1363 | `5d5341e88b3` → `fbd104cd903` | 8,410 / 8,418 | Local marker normalization; only the eight tooling probes omitted |
+| #1399 | `ea6a1c6b44c` → `5d5341e88b3` | 8,418 / 8,418 | Production edits and a new test file |
 
 Draft PRs against `main` use `ready --shard` for Python/E2E feedback only. A
 draft cannot pass `qualification`, even on full fallback. Marking a PR ready

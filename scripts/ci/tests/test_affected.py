@@ -1,6 +1,7 @@
 """Exercise the PR shard planner against real Git history and inventory."""
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,10 @@ from scripts.ci import affected, portable
 
 LEAF = 'tests/gateway/test_response_filters.py'
 SOURCE = 'gateway/response_filters.py'
+SOURCE_BODY = 'def _canonical_silence_candidates(text):\n    return (text,)\n'
+COMPANION = 'tests/gateway/test_gateway_silence_tokens.py'
+TOOL_TEST = 'tests/scripts/test_run_tests_parallel.py'
+TOOL = 'scripts/run_tests_parallel.py'
 SHARED = 'tests/acp_adapter/test_acp_image_staging_boundary.py'
 PLUGIN = 'tests/gateway/test_session_bot_retry.py'
 FIXTURE = 'tests/gateway/test_normal_runtime_boot.py'
@@ -34,13 +39,17 @@ class SelectionTests(unittest.TestCase):
         self.write(FIXTURE, 'def control():\n    return 1\n')
         self.write(INFRA, 'def test_runner():\n    assert True\n')
         self.write(CONSUMER, 'from gateway.run_turn_runner import TurnRunner\n')
+        self.write(SOURCE, SOURCE_BODY)
+        self.write(COMPANION, 'def helper():\n    pass\n')
+        self.write(TOOL_TEST, 'def test_runner():\n    assert True\n')
+        self.write(TOOL, '# runner\n')
         self.write(E2E, 'def test_smoke():\n    assert True\n')
         self.write('tests/conftest.py', 'from tests.gateway.test_normal_runtime_boot import control\n')
         self.write('tests/acp_adapter/test_acp_discard_review.py',
                    'from tests.acp_adapter.test_acp_image_staging_boundary import PNG\n')
         self.write('tests/gateway/test_bot_mailbox_async.py',
                    'pytest_plugins = ("tests.gateway.test_session_bot_retry",)\n')
-        for path in (SOURCE, 'uv.lock', 'scripts/ci/python_shard_timings.json'):
+        for path in ('uv.lock', 'scripts/ci/python_shard_timings.json'):
             self.write(path, '{}\n')
         self.base = self.commit()
         self.git('update-ref', 'refs/remotes/origin/main', self.base)
@@ -102,6 +111,64 @@ class SelectionTests(unittest.TestCase):
                 self.write(LEAF, LEAF_SOURCE.replace('1 == 1', '2 == 2'))
                 self.write(path, '# mixed\n')
                 self.assert_full(self.commit())
+
+    def production_scope(self):
+        dependencies = (TOOL_TEST, TOOL, 'tests/conftest.py', 'tests/scripts/conftest.py')
+        tree = self.git('ls-tree', '-z', '--full-tree', self.base, '--', *dependencies)
+        self.enterContext(patch.multiple(
+            affected,
+            SILENCE_SOURCE_BLOB=self.git('rev-parse', f'{self.base}:{SOURCE}').strip(),
+            SILENCE_TEST_BLOB=self.git('rev-parse', f'{self.base}:{COMPANION}').strip(),
+            SILENCE_INDEPENDENT_TESTS=(TOOL_TEST,),
+            SILENCE_AUDIT_PATHS=dependencies,
+            SILENCE_AUDIT_TREE=hashlib.sha256(tree.encode()).hexdigest(),
+        ))
+
+    def test_silence_fix_excludes_only_audited_tooling_and_retains_indirect_consumers(self):
+        self.production_scope()
+        self.write(SOURCE, SOURCE_BODY.replace('(text,)', '(text.strip(),)'))
+        self.write(COMPANION, 'def helper():\n    pass\n\ndef test_silence():\n    assert True\n')
+        selection, buckets = portable.ready_plan(self.commit(), 3)
+        self.assertEqual(selection.selection, 'affected')
+        full = portable.shard_files(self.root, 3)
+        self.assertEqual(buckets, [[path for path in bucket if path != TOOL_TEST] for bucket in full])
+        self.assertTrue({LEAF, COMPANION, CONSUMER, E2E} <= set(selection.tests))
+
+    def test_silence_scope_falls_back_on_mixed_changes_or_audit_drift(self):
+        self.production_scope()
+        for path, source, on_main in (
+            (TOOL_TEST, '# new gateway consumer\n', True),
+            (TOOL, '# changed runner\n', True),
+            ('tests/scripts/conftest.py', '# new nested fixture\n', True),
+            (SOURCE, 'import re\n' + SOURCE_BODY, False),
+            (SOURCE, SOURCE_BODY.replace('(text,)', '(new_consumer(text),)'), False),
+            (SOURCE, SOURCE_BODY.replace('    return', '    text[0] = "a"\n    return'), False),
+            (COMPANION, 'def helper():\n    return 42\n', False),
+            (COMPANION, 'def helper():\n    pass\n\n@pytest.fixture\ndef test_fixture():\n    pass\n', False),
+            (LEAF, LEAF_SOURCE.replace('1 == 1', '2 == 2'), False),
+            ('uv.lock', '# mixed config\n', False),
+            ('tests/gateway/test_new.py', 'def test_new():\n    pass\n', False),
+        ):
+            with self.subTest(path=path):
+                self.git('switch', '--detach', self.base)
+                self.git('update-ref', 'refs/remotes/origin/main', self.base)
+                self.write(SOURCE, SOURCE_BODY.replace('(text,)', '(text.strip(),)'))
+                self.write(path, source)
+                if on_main:
+                    self.git('update-ref', 'refs/remotes/origin/main', self.commit())
+                    self.write(SOURCE, SOURCE_BODY.replace('(text,)', '(text.lower(),)'))
+                self.assert_full(self.commit())
+
+    def test_silence_scope_requires_the_canonical_companion_and_tool_probe(self):
+        self.production_scope()
+        self.write(SOURCE, SOURCE_BODY.replace('(text,)', '(text.strip(),)'))
+        head = self.commit()
+        for missing in (COMPANION, TOOL_TEST):
+            with self.subTest(missing=missing):
+                inventory = [LEAF, COMPANION, CONSUMER, TOOL_TEST, E2E]
+                inventory.remove(missing)
+                selection = affected.select(self.git, head, inventory)
+                self.assertEqual((selection.selection, selection.tests), ('full', tuple(sorted(inventory))))
 
     def test_audited_file_cannot_change_module_scope_or_test_definition(self):
         for content in (
