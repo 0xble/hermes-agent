@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from utils import base_url_host_matches
 
@@ -99,15 +99,29 @@ def resolve_route_identity(entry: dict[str, Any]):
     return BackendIdentity.build(provider=provider, model=model, base_url=base_url)
 
 
+class RouteBind(NamedTuple):
+    """``bound`` is ``bind_route_entry``'s result; ``reason`` says why it is None."""
+
+    bound: Optional[tuple[str, str]]
+    reason: Optional[str] = None  # "pinned": session pin refused the model; "no_client": provider unusable
+
+
 def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, explicit_switch: bool = False) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
-    old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
-    so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
+    old_provider)``, or None when the route was not bound (see ``try_bind_route_entry`` for why).
+    Sets ``_fallback_activated`` so the next turn's ``restore_primary_runtime`` reverts it; raises
+    on a failed swap."""
+    return try_bind_route_entry(agent, entry, provider, model, explicit_switch=explicit_switch).bound
+
+
+def try_bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, explicit_switch: bool = False) -> RouteBind:
+    """``bind_route_entry`` with the reason a route was not bound: a pinned session refusing a
+    different model is policy (``"pinned"``), not a broken provider (``"no_client"``)."""
     pinned = getattr(agent, "_pinned_fallback_model", None)
     if not explicit_switch and isinstance(pinned, str) and pinned:
         from hermes_cli.fallback_config import same_fallback_model
         if not same_fallback_model(pinned, model) and not getattr(agent, "_billing_fallback_attempt", False):
-            return None
+            return RouteBind(None, "pinned")
 
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
@@ -130,7 +144,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
         api_mode=api_mode)
     if client is None:
-        return None
+        return RouteBind(None, "no_client")
     if provider == "moa":
         # A MoA entry means the preset itself, exactly like ``provider: moa`` in config. The client
         # is the preset's aggregator and only proves the preset resolves; bind the facade with the
@@ -158,7 +172,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     ):
         if client is not getattr(agent, "client", None):
             _close_failed_route_client(agent, client)
-        return None
+        return RouteBind(None, "pinned")
 
     from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
     save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them
@@ -215,7 +229,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     from time import monotonic
     agent._active_fallback_entry = entry
     agent._fallback_stay_started_at = monotonic()
-    return old_model, old_provider
+    return RouteBind((old_model, old_provider))
 
 
 def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
