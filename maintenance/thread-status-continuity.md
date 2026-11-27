@@ -55,3 +55,5 @@ refresh and Discord transport loop and asserts the POST method, path and channel
 Remove the fork delta when released upstream provides equivalent per-thread
 ownership and intermediate-post continuity. Roll back by reverting this focused
 commit, without changing the separate Telegram cadence or Slack API patches.
+
+Contract tests: `tests/gateway/test_slack_thread_status.py`, `tests/gateway/test_typing_stale_cleanup.py`, `tests/gateway/test_typing_surface_ownership.py`, `tests/gateway/test_typing_prompt_lifecycle.py`, `tests/gateway/test_typing_adapter_boundaries.py`, `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`.

@@ -31,6 +31,26 @@ def _run(home: Path, code: str) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def test_primary_cooldown_does_not_cool_different_fallback_routes(tmp_path):
+    """A primary's 503/429 record is keyed by provider, endpoint, and model, not endpoint alone."""
+    result = _run(
+        tmp_path,
+        """
+import json, time
+from agent.shared_primary_cooldown import arm_cooldown
+from agent.shared_primary_probe_runtime import fallback_route_is_active
+primary = ("custom:openai-proxy", "http://127.0.0.1:8317/v1", "gpt-6.2-sol")
+arm_cooldown(primary, reason="server_error", reset_at=time.time() + 600)
+backups = [
+    ("custom:claude-proxy", "http://127.0.0.1:8317/v1", "claude-sonnet-5-5"),
+    ("custom:openai-proxy", "http://127.0.0.1:8317/v1", "muse-wonder-full-1.0"),
+]
+print(json.dumps({"primary": fallback_route_is_active(*primary), "backups": [fallback_route_is_active(*route) for route in backups]}))
+""",
+    )
+    assert result == {"primary": True, "backups": [False, False]}
+
+
 def test_two_processes_share_one_cooldown_and_notice_claim(tmp_path):
     route = ("custom:fixture", "http://127.0.0.1:8317/v1", "primary")
     arm_code = f"""
@@ -585,7 +605,7 @@ def _overload_turns(home, stub, mode="stream"):
     return first, second, first_primary, len(stub.primary_requests()) - len(first_primary)
 
 
-@pytest.mark.parametrize(("status", "retry_after"), [(529, "7200"), (503, None)])
+@pytest.mark.parametrize(("status", "retry_after"), [(529, "7200"), (503, None), (503, "342")])
 def test_overload_arms_the_shared_cooldown_across_processes(tmp_path, status, retry_after):
     home = tmp_path / ".hermes"
     write_home_config(home)
@@ -603,7 +623,8 @@ def test_overload_arms_the_shared_cooldown_across_processes(tmp_path, status, re
     assert entry["reason"] == "overloaded"
     window = entry["reset_at"] - entry["recorded_at"]
     if retry_after:
-        assert window > 7000, entry  # Retry-After on a 529 goes through the provider-reset path
+        expected = float(retry_after)
+        assert expected - 1 <= window <= expected + 1, entry
     else:
         assert 59 <= window <= 61, entry
     notices = first["notices"] + second["notices"]

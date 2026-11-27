@@ -144,7 +144,10 @@ def _adapter_event(event, **changes):
         if projected is event:
             projected = copy(event)
         projected._native_absorbed_synthetic = _absorbed_synthetic(event)
-    return _drop_remote_media(projected)
+    projected = _drop_remote_media(projected)
+    if recovery_id := getattr(event, '_hermes_recovery_id', None):
+        projected._hermes_recovery_id = recovery_id
+    return projected
 
 
 def _drop_remote_media(event):
@@ -340,6 +343,8 @@ def _native_payload(runner, event, provenance, fresh_roles=False, encoded_source
         }
     if event.message_id is None and (receipt_id := getattr(event, '_reply_latency_receipt_id', None)):
         envelope['reply_receipt_id'] = receipt_id
+    if event.message_id is None and (recovery_id := getattr(event, '_hermes_recovery_id', None)):
+        envelope['recovery_id'] = recovery_id
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -433,7 +438,21 @@ def restore_native_source(payload, runner=None):
         from gateway.session_ingress_context import callback_runner, restore_provenance
         runner = runner or callback_runner()
         if runner is not None:
-            restore_provenance(runner, source, envelope['provenance'])
+            provenance = dict(envelope['provenance'])
+            # Native envelopes written before multiplex transport ownership was
+            # persisted have a null transport profile.  The legacy agent:main
+            # namespace is the default profile, so repair only that unambiguous
+            # case.  Named namespaces may be shared-bot satellites and remain
+            # fail-closed until their receiving profile is known.
+            # Relay receipts seal the exact provenance, including the primary
+            # transport's null profile. Preserve that value for verification.
+            if (getattr(getattr(runner, 'config', None), 'multiplex_profiles', False)
+                    and 'relay' not in provenance
+                    and provenance.get('transport_profile') is None):
+                from hermes_state_keys import profile_from_session_key
+                if profile_from_session_key(envelope.get('route')) == 'default':
+                    provenance['transport_profile'] = 'default'
+            restore_provenance(runner, source, provenance)
     return source
 
 
@@ -453,6 +472,8 @@ def restore_native(payload, runner=None):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']
     event._reply_latency_receipt_id = envelope.get('reply_receipt_id')
+    if recovery_id := envelope.get('recovery_id'):
+        event._hermes_recovery_id = recovery_id
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

@@ -70,6 +70,8 @@ def cold_review_parent(runner, source, session_key, session_id):
         model, runtime = runner._resolve_session_agent_runtime(
             source=source, session_key=session_key, user_config=user_config)
         route = runner._resolve_turn_agent_config("", model, runtime, tier=tier)  # /fast request options
+        route["runtime"].pop("_preflight_fallback", None)
+        route["runtime"].pop("_fallback_notice", None)
         agent = AIAgent(
             model=route["model"], **route["runtime"], quiet_mode=True, verbose_logging=False,
             enabled_toolsets=enabled, disabled_toolsets=disabled,

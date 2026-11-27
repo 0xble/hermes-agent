@@ -344,8 +344,6 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     elif visible:
         checkpoint_parts += ["Visible response before the interruption:", visible]
     checkpoint = "\n\n".join(checkpoint_parts)
-    correction = f"[Context from the interrupted assistant response]\n{checkpoint}\n\n{text}"
-
     # The live tail is normally user or tool, so an assistant placeholder + correction
     # keeps strict alternation; if the tail is already assistant, the checkpoint is folded
     # into the user correction instead of creating assistant→assistant. The placeholder
@@ -355,8 +353,8 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         # Hidden row with a neutral api_content (#88955). Never _INTERRUPT_SCAFFOLD_MARKER:
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
-    # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    from agent.plugin_live_notes import append_redirect_correction
+    append_redirect_correction(agent, messages, text, checkpoint)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
@@ -863,8 +861,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             return
         refresh_epoch = stored_prompt_refresh_epoch(agent, session_row)
         if refresh_epoch:
-            # `hermes sessions refresh-prompts` ran after this prompt was built. Pin tools[] first
-            # (the refresh is about instructions; the frozen tool array stays), then rebuild once.
+            # `hermes sessions refresh-prompts` ran after this prompt was built. Restore tools[] first,
+            # then rebuild once. Explicit gateway delegation mode is the cache-break exception.
             _restore_pinned_tools(agent, session_row)
             rebuild_for_refresh(agent, system_message, conversation_history, refresh_epoch)
             return
@@ -1782,6 +1780,10 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    # The unattended same-provider window is per outage within a turn: a failed turn's expired
+    # outage start must not cancel the next turn's window.
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
@@ -1898,6 +1900,7 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
+    from agent.proxy_request_class import bind_aux_request_turn
     from agent.turn_context import export_current_turn_boundary
     from agent.turn_finalizer import settle_held_final
     from agent.voice_turn_route import end_voice_turn_route
@@ -1912,11 +1915,17 @@ def run_conversation(
     if turn_origin not in {"user", "relay", "process", "goal_loop", "cron", "unknown"}:
         turn_origin = "unknown"
 
-    # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
-    agent._turn_user_intervened = False
+    # A gateway steer can arrive after this turn was admitted but before its agent enters
+    # run_conversation.  ``steer()`` latches the intervention flag before queuing the text;
+    # preserve that fact across this reset so the first request cannot be paced as background.
+    # Do not carry the prior turn's flag: only an actually buffered steer belongs to this turn.
+    pending_human_steer = bool(getattr(agent, "_pending_steer", None))
+    # Reset both on reused agents; steering alters scheduling without changing the turn origin.
+    agent._turn_provenance = turn_origin
+    agent._turn_user_intervened = pending_human_steer
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
+    with bind_aux_request_turn(agent), native_turn_images(user_message):
         try:
             result = _run_conversation_turn(
                 agent,

@@ -7,6 +7,7 @@ import logging
 import os
 import json
 import threading
+from itertools import count
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
@@ -27,6 +28,7 @@ from gateway.session_transcript import SessionTranscriptMixin
 from hermes_state_keys import profile_from_session_key_namespace
 
 logger = logging.getLogger(__name__)
+_route_versions = count()
 
 
 # -- PII redaction helpers --------------------------------------------------------------------
@@ -607,6 +609,14 @@ class SessionEntry:
     attended_pin_until: Optional[float] = None
     incognito: bool = False
     _incognito_persisted: Optional[dict[str, Any]] = field(default=None, repr=False)
+    # Temporary progress cards still on the platform: ``{"chat_id", "message_id", "pid"}``, plus
+    # ``attempts`` once a boot delete has failed. Their
+    # deletion is an in-memory post-delivery callback a restart drops, so boot deletes the cards a
+    # dead process recorded. Omitted from JSON when empty.
+    progress_cards: list[dict[str, Any]] = field(default_factory=list)
+    # Metadata copies and compression advances keep this in-memory identity.
+    # A conversation switch replaces the entry with a new identity.
+    _route_version: int = field(default_factory=_route_versions.__next__, compare=False, repr=False)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -661,6 +671,8 @@ class SessionEntry:
             result["attended_pinned"] = True
             if self.attended_pin_until is not None:
                 result["attended_pin_until"] = self.attended_pin_until
+        if self.progress_cards:
+            result["progress_cards"] = [dict(card) for card in self.progress_cards]
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -767,6 +779,12 @@ class SessionEntry:
             if data.get("reasoning_override_scope") in ("session", "temporary") else "session",
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            progress_cards=[
+                {"chat_id": str(card["chat_id"]), "message_id": str(card["message_id"]), "pid": card.get("pid"),
+                 **({"attempts": card["attempts"]} if isinstance(card.get("attempts"), int) else {})}
+                for card in data.get("progress_cards") or []
+                if isinstance(card, dict) and card.get("chat_id") and card.get("message_id")
+            ],
             **plain,
         )
 
@@ -956,6 +974,9 @@ class SessionStore(
         self._routing_generation = 0
         self._persisted_routing_generation = 0
         self._fast_persisted_entries: dict[str, tuple[int, str]] = {}
+        # Routing rows this process last persisted (key -> entry_json, None if unknown); full saves
+        # write their diff against it. Guarded by _save_lock.
+        self._routing_baseline: Optional[dict[str, Optional[str]]] = None
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: dict[str, _SessionFlight] = {}
         # Ids a route names before their state.db row is live: a route transition publishes under

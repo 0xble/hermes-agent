@@ -41,3 +41,5 @@ proof of a model's output language or historical provider routing.
 Retire when an adopted upstream release provides this gateway behavior without
 changing explicit vision requests or the surrounding enrichment contract.
 Rollback is a source revert. Runtime deployment remains separately authorized.
+
+Contract tests: `tests/gateway/test_vision_preprocess.py`.

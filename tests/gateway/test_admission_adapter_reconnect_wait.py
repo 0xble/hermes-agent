@@ -115,3 +115,52 @@ async def test_turn_still_fails_when_the_adapter_never_returns(tmp_path, monkeyp
                    and 'not_found' in str(record.exc_info[1]) for record in caplog.records)
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_admission_waits_out_an_adapter_reconnect(tmp_path, monkeypatch):
+    """A slot reaped after capture must not turn a fresh user message into ``not_found``."""
+    from gateway import session_envelope
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.fakes.runtime_owner import initialize_session_authority
+
+    monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
+    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+    runner = GatewayRunner(GatewayConfig())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+    runner.adapters = {Platform.DISCORD: adapter}
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    event = MessageEvent(text='fresh-during-reconnect', source=source, message_id='fresh-during-reconnect')
+    captured = asyncio.Event()
+    original_prepare = session_envelope.prepare_native
+
+    async def prepare_then_lose_slot(*args, **kwargs):
+        payload = await original_prepare(*args, **kwargs)
+        runner.adapters.pop(Platform.DISCORD, None)
+        captured.set()
+        return payload
+
+    monkeypatch.setattr(session_envelope, 'prepare_native', prepare_then_lose_slot)
+
+    async def reinstall():
+        await asyncio.wait_for(captured.wait(), timeout=2)
+        runner.adapters[Platform.DISCORD] = adapter
+
+    reconnect = asyncio.create_task(reinstall())
+    try:
+        with native_callback(runner, event, get_hermes_home()):
+            receipt = await asyncio.wait_for(authority.admit_native(event), timeout=5)
+        await reconnect
+        assert receipt.status == 'queued'
+    finally:
+        if not reconnect.done():
+            reconnect.cancel()
+        authority.db.close()

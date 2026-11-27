@@ -7,6 +7,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
+from hermes_state import SessionDB
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -86,3 +87,42 @@ async def test_partial_final_recovers_without_repeating_text_and_interim_stays_i
     assert interim.success is False
     assert all(call.kwargs.get("metadata", {}).get("thread_id") == "150565"
                for call in adapter.send.await_args_list[2:])
+
+
+@pytest.mark.asyncio
+async def test_deleted_private_topic_final_prunes_only_its_stale_binding(tmp_path):
+    """Stops a recovered final from leaving the deleted topic's binding in state.db, where inbound
+    recovery keeps steering the chat's next messages back to the dead thread."""
+    from telegram.error import BadRequest
+
+    chat_id, deleted_topic, live_topic = "2027045491", "150565", "150999"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for thread_id in (deleted_topic, live_topic):
+            db.create_session(session_id=f"session-{thread_id}", source="telegram", user_id=chat_id)
+            db.bind_telegram_topic(
+                chat_id=chat_id, thread_id=thread_id, user_id=chat_id,
+                session_key=f"agent:main:telegram:dm:{chat_id}:{thread_id}", session_id=f"session-{thread_id}",
+            )
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        adapter.set_session_store(SimpleNamespace(_db=db))
+        adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
+            BadRequest("Message thread not found"),
+            BadRequest("Message thread not found"),
+            SimpleNamespace(message_id=120),
+        ]))
+
+        result = await adapter._send_with_retry(
+            chat_id=chat_id, content="Completed response", reply_to=deleted_topic,
+            metadata={
+                "notify": True, "thread_id": deleted_topic,
+                "telegram_reply_to_message_id": deleted_topic,
+                "telegram_dm_topic_reply_fallback": True,
+            },
+        )
+
+        assert result.success is True
+        assert db.get_telegram_topic_binding(chat_id=chat_id, thread_id=deleted_topic) is None
+        assert db.get_telegram_topic_binding(chat_id=chat_id, thread_id=live_topic) is not None
+    finally:
+        db.close()

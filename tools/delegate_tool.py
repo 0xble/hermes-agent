@@ -225,6 +225,7 @@ def _build_child_agent(
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
+    prevent_parent_api_key: bool = False,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[dict[str, Any]] = None,
 
@@ -243,6 +244,7 @@ def _build_child_agent(
     override_reasoning_effort: Any = None,
     profile_home: Optional[Path] = None,
     override_service_tier: Optional[str] = None,  # a route's checked speed tier (tools/delegate_tool_tuning.py)
+    model_map_option: Optional[str] = None,  # the model-map option that chose this route, if one did
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
@@ -287,7 +289,8 @@ def _build_child_agent(
         rt = _resolve_child_runtime(
             parent_agent, delegation_cfg if reasoning_cfg is None else reasoning_cfg, parent_api_key,
             model=model, override_provider=override_provider,
-            override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
+            override_base_url=override_base_url, override_api_key=override_api_key,
+            prevent_parent_api_key=prevent_parent_api_key, override_api_mode=override_api_mode,
             override_acp_command=override_acp_command,
             override_acp_args=override_acp_args,
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
@@ -358,6 +361,9 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+    # The model-map option that routed this child, for failure copy. ``_delegate_role`` is the
+    # depth/permission role (leaf/orchestrator), never a config entry the user can edit.
+    child._delegate_model_map_option = model_map_option
     # Plugins see one conversation per delegation tree.
     from agent.prompt_cache_scope import conversation_id
     child._inherited_conversation_id = conversation_id(parent_agent)
@@ -465,6 +471,12 @@ def _run_single_child(
             preview=str(exc), summary=str(exc), status="failed",
         )
     finally:
+        if not _child_close_deferred:
+            try:
+                from agent.spare_guards import release_fallback_route
+                release_fallback_route(child)
+            except Exception:
+                logger.debug("Failed to release spare fallback lease", exc_info=True)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
         # This is the driver's final boundary, including any synchronous schema-retry turn.
         # An abandoned conversation can publish only after its genuine done callback.
@@ -475,7 +487,8 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
     """``_build_child_agent`` override kwargs for a resolved credential bundle (delegate_task and the lifecycle API)."""
     return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+        "override_api_key": creds["api_key"], "prevent_parent_api_key": creds.get("no_parent_api_key", False),
+        "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
@@ -490,6 +503,9 @@ def _route_overrides(route: Any) -> dict[str, Any]:
         **_credential_overrides(route.creds, route.routing_cfg),
         "override_reasoning_effort": route.reasoning_effort, "profile_home": route.profile_home,
         "reasoning_cfg": route.reasoning_cfg,
+        # The route label is the option name only under the model-map backend; a profile
+        # route's label is a profile, and the cached routing_cfg can carry a sibling's label.
+        "model_map_option": route.label if route.backend == "model_map" else None,
     }
 
 
@@ -819,11 +835,12 @@ def _build_dynamic_schema_overrides() -> dict:
 
     # The active delegation provider's per-task parameters and guidance (delegation.backend; none for the
     # built-in default). Built from config with the rest of the definition, never per turn.
-    from tools.delegate_tool_routes import schema_extension
+    from tools.delegate_tool_routes import core_task_parameters, schema_extension
     extra_params, addendum = schema_extension(_load_config())
-    if extra_params:
-        tasks = overrides_params["properties"]["tasks"]
-        tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
+    # Core's explicit per-task model alias and reasoning effort come first, then the backend's (e.g. a role `option`).
+    extra_params = {**core_task_parameters(), **extra_params}
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
     description = _build_top_level_description(independent_completions=independent_completions)
     return {
         "description": f"{description}\n{addendum}" if addendum else description,

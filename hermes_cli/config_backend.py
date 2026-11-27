@@ -230,8 +230,20 @@ class FileBackend:
 
     def probe_readable(self, home: Path) -> None:
         path = self.config_path(home)
-        with open(path, "rb") as f:
-            f.read(1)
+        # Keep the module-level ``open`` seam used by integrity tests and callers
+        # that inject a transient EMFILE/EIO, but use a non-blocking descriptor for
+        # the normal path.  A FIFO or other file-like config path must not stall a
+        # gateway cache hit while an ordinary unreadable file must still raise.
+        injected_open = globals().get("open")
+        if injected_open is not None:
+            with injected_open(path, "rb") as stream:
+                stream.read(1)
+            return
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            os.read(fd, 1)
+        finally:
+            os.close(fd)
 
     def write_changes(self, home: Path, changes: Changes) -> None:
         self.write_path(self.config_path(home), changes)

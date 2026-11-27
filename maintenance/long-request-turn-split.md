@@ -21,3 +21,5 @@ Own upstream contribution: [#132487](https://github.com/NousResearch/hermes-agen
 ## Retirement and rollback
 
 Retire after a released upstream version splits an oversized turn whose token-bounded text request exceeds 1,400 characters and restates it verbatim after the handoff. Roll back the patch commit and its regression. No persistent-data migration is required.
+
+Contract tests: `tests/agent/test_split_turn_compaction.py`.

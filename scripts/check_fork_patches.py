@@ -48,10 +48,10 @@ def _resolve_repo() -> Path:
 
 REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
-# key -> (expected, or None meaning "must be set")
+# key -> (expected, or None meaning "must be set"). Delegation is checked separately because
+# legacy ``delegation.model`` and Advanced Delegation's model-map route are both supported.
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",
-    "delegation.model": None,
     "auxiliary.review.model": None,
 }
 # Fallback only: the accepted baseline is read from MAINTENANCE.md (scripts/ci/release_baseline.py),
@@ -91,7 +91,10 @@ _IDENTITY_LINE = re.compile(r"identit", re.IGNORECASE)
 # A unit pins the behavioural tests that prove its fork behaviour as backticked pytest targets on a
 # ``Contract tests:`` line (or its indented continuation): ``tests/x.py`` or ``tests/x.py::test_name``.
 _CONTRACT_LINE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:", re.IGNORECASE)
-_CONTRACT_TARGET = re.compile(r"^(?P<path>tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
+_CONTRACT_TARGET = re.compile(r"^(?P<path>(?:scripts/ci/)?tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
+# ``Contract tests: none`` plus a reason: the unit has no pytest proof by nature (retired, a
+# documentation or dependency pin, proof in another language). Stated, so it is not an oversight.
+_CONTRACT_NONE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:(?:\*\*)?\s*none\b\W*\w", re.IGNORECASE)
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
 
@@ -155,7 +158,8 @@ def contract_tests(revision: str = "HEAD") -> dict[str, list[str]]:
     """Pinned behavioural tests by unit path, in declaration order."""
     pinned: dict[str, list[str]] = {}
     for name, text in _unit_files(revision):
-        lines = _line_blocks(text, lambda head: _CONTRACT_LINE.match(head) is not None)
+        lines = _line_blocks(text, lambda head: _CONTRACT_LINE.match(head) is not None
+                             and _CONTRACT_NONE.match(head) is None)
         targets = [t.strip() for line in lines for t in _OWNED_TOKEN.findall(line)]
         if targets:
             pinned[name] = list(dict.fromkeys(targets))
@@ -195,11 +199,46 @@ def check_contract_tests(revision: str = "HEAD", contract: str = "HEAD") -> list
 
 
 def uncovered_units(contract: str = "HEAD") -> list[str]:
-    """Units that own a patch identity but pin no contract test: behaviour a sync can drop unseen."""
+    """Units that own a patch identity but neither pin a contract test nor state why none applies:
+    behaviour a sync can drop unseen."""
     pinned = contract_tests(contract)
     return [name for name, text in _unit_files(contract)
-            if name not in pinned and any(_OWNED_TOKEN.findall(line) for line in
-                                          _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
+            if name not in pinned
+            and not any(_CONTRACT_NONE.match(line) for line in text.splitlines())
+            and any(_OWNED_TOKEN.findall(line) for line in
+                    _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
+
+
+_DROPPED_TARGET = re.compile(r"^`(?:scripts/ci/)?tests/[\w./-]+\.py")
+
+
+def check_contract_continuations(contract: str = "HEAD") -> list[str]:
+    """A test target written on an unindented line after a ``Contract tests:`` line is not part of
+    the block (an unindented line ends it), so the deletion guard silently omits that test."""
+    failures: list[str] = []
+    for name, text in _unit_files(contract):
+        in_block = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                in_block = False
+                continue
+            indented = line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
+            if indented and in_block:
+                continue
+            if in_block and _DROPPED_TARGET.match(stripped):
+                failures.append(f"{name}: contract test line {stripped.split('`')[1]!r} continues a "
+                                "`Contract tests:` block without indentation, so it is not pinned; indent it")
+                continue
+            in_block = (_CONTRACT_LINE.match(stripped.split("`", 1)[0]) is not None
+                        and _CONTRACT_NONE.match(stripped) is None)
+    return failures
+
+
+def check_units_are_covered(contract: str = "HEAD") -> list[str]:
+    return [f"{unit} owns a fork patch identity but pins no contract test; add a `Contract tests:` "
+            "line naming its pytest proof, or `Contract tests: none` with the reason"
+            for unit in uncovered_units(contract)]
 
 
 def _owned_identities(revision: str = "HEAD") -> set[str] | None:
@@ -362,6 +401,55 @@ def check_extensions(home: Path) -> list[str]:
     return failures
 
 
+def _config_get(python: Path, code_root: Path, env: dict[str, str], key: str, *, as_json: bool = False
+                ) -> tuple[subprocess.CompletedProcess[str], object]:
+    """Read one value through the release CLI, keeping config resolution in one place."""
+    command = [str(python), "-m", "hermes_cli.main", "config", "get", key]
+    if as_json:
+        command.append("--json")
+    run = subprocess.run(command, cwd=str(code_root), env=env,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
+    stdout = run.stdout.strip()
+    if as_json:
+        try:
+            return run, json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return run, stdout
+    return run, (stdout.splitlines() or [""])[-1].strip()
+
+
+def _is_set(run: subprocess.CompletedProcess[str], value: object) -> bool:
+    """Whether a CLI value is present, including list/mapping values parsed from all stdout."""
+    if run.returncode != 0 or value is None:
+        return False
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    if not isinstance(value, str):
+        return bool(value)
+    return bool(value.strip()) and value.strip().lower() not in ("none", "null")
+
+
+def _model_map_route(default: object, options: object) -> tuple[bool, str]:
+    """Resolve the model-map default against the declared route options.
+
+    This mirrors ``tools.delegate_tool_routes.resolve_task_routes``'s runtime guard. The
+    advanced-delegation provider accepts a model route or a profile route, so either non-empty
+    field makes the selected option runnable.
+    """
+    if not isinstance(default, str) or not default.strip():
+        return False, f"default {default!r} is empty"
+    if not isinstance(options, list):
+        return False, f"default {default!r} has no declared options"
+    option = next((entry for entry in options
+                   if isinstance(entry, dict) and entry.get("name") == default), None)
+    if option is None:
+        return False, f"default {default!r} is not declared in delegation.backends.model_map.options"
+    if not (isinstance(option.get("model"), str) and option["model"].strip()) and not (
+            isinstance(option.get("profile"), str) and option["profile"].strip()):
+        return False, f"default {default!r} names an option without a non-empty model or profile"
+    return True, ""
+
+
 def check_config(home: Path) -> list[str]:
     failures: list[str] = []
     context = _runtime_context(home)
@@ -370,14 +458,33 @@ def check_config(home: Path) -> list[str]:
     python, code_root = context
     env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
-        run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
-        value = (run.stdout.strip().splitlines() or [""])[-1].strip()
+        run, value = _config_get(python, code_root, env, key)
         if expected is None:
-            if run.returncode != 0 or not value or value.lower() in ("none", "null", ""):
+            if not _is_set(run, value):
                 failures.append(f"config {key} is not set")
         elif value.lower() != expected.lower():
             failures.append(f"config {key} = {value!r}, expected {expected!r}")
+
+    # ``delegation.model`` is the legacy route. Advanced Delegation stores the selected
+    # provider and its effective default route separately; ask the same config resolver that
+    # the CLI uses instead of reading YAML or deleting the route requirement altogether.
+    legacy_run, legacy_model = _config_get(python, code_root, env, "delegation.model")
+    if not _is_set(legacy_run, legacy_model):
+        backend_run, backend = _config_get(python, code_root, env, "delegation.backend")
+        default_run, default_route = _config_get(python, code_root, env, "delegation.backends.model_map.default")
+        options_run, options = _config_get(
+            python, code_root, env, "delegation.backends.model_map.options", as_json=True)
+        if (_is_set(backend_run, backend) and isinstance(backend, str)
+                and backend.strip().lower() == "model_map" and _is_set(default_run, default_route)
+                and _is_set(options_run, options)):
+            resolved, reason = _model_map_route(default_route, options)
+            if not resolved:
+                failures.append(f"config delegation route is not resolvable: {reason}")
+        else:
+            failures.append(
+                "config delegation route is not resolvable: set delegation.model or "
+                "delegation.backend='model_map' with a non-empty default and declared options"
+            )
     return failures
 
 
@@ -582,6 +689,11 @@ def main(argv: list[str] | None = None) -> int:
         args.baseline, args.trailer_floor, floor_subject, revision=revision, contract=contract)
     if not pointer_failure:
         failures += check_contract_tests(revision, contract)
+        if args.source_only:
+            # An authoring rule for the tree being changed. A release that shipped before the
+            # rule existed (a rollback target) is not judged by it after the fact.
+            failures += check_units_are_covered(contract)
+            failures += check_contract_continuations(contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:

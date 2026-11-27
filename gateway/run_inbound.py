@@ -330,6 +330,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # counting internal/system events would keep a genuinely idle gateway awake.
         if not getattr(event, "_gateway_compression_deferred", False):
             self._scale_to_zero_note_real_inbound()
+            from gateway.wake import note_topic_present
+            note_topic_present(self, source)
             original_event = event
             event = await self._hm_pre_gateway_dispatch_hook(event, source)
             if event is None:
@@ -433,6 +435,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
         state = self._session_state(session_key)
         state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.agent_published_event = asyncio.Event()
+        state.turn.turn_ended_event = asyncio.Event()
         state.turn.event = event
         state.turn.lease = passive_lease
         state.turn.started_ts = time.time()
@@ -926,7 +930,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = self._hm_mounted_owner(authority, _quick_key) if authority else None
+        # SessionStore's routing map is guarded by a blocking lock. Keep the probe and any
+        # recovery mount off the gateway event-loop thread while a busy command stops a turn.
+        sid = await asyncio.to_thread(self._hm_mounted_owner, authority, _quick_key) if authority else None
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
@@ -1049,9 +1055,28 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         state = self._peek_session_state(_quick_key)
         running_agent = state.turn.agent if state else None
         adapter = self._delivery_adapter_for(source)
-        if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
+        if self._draining or adapter is None or running_agent is None:
+            return False
+        if (running_agent is _AGENT_PENDING_SENTINEL
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
+            if self._human_preempts_autonomous_turn(event, state):
+                if mode == "queue" and event.message_type == MessageType.TEXT:
+                    # Keep the user message as a durable FIFO row and cut the machine turn
+                    # cooperatively; admission never awaits publication or the interrupt.
+                    from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
+                    if not getattr(event, "_gateway_machine_preemption_scheduled", False):
+                        setattr(event, "_gateway_machine_preemption_scheduled", True)
+                        schedule_authority_machine_preemption(
+                            self, event, source, _quick_key, state, state.turn,
+                            self._current_session_run_generation(_quick_key), running_agent,
+                        )
+                else:
+                    # Steer mode and media keep queue semantics: saved as a queued row, say so.
+                    queued = self._BusySteerOutcome(
+                        effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
+                        steered=False, redirected=False)
+                    await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, queued)
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
         note_busy_outcome(event, outcome)
@@ -2106,6 +2131,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+        _claim_state.turn.agent_published_event = asyncio.Event()
+        _claim_state.turn.turn_ended_event = asyncio.Event()
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
@@ -2253,11 +2280,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         return image_paths, audio_paths, audio_file_paths, video_paths
 
     async def _enrich_inbound_images(
-        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
+        self, event: MessageEvent, source: SessionSource, session_key: str,
+        message_text: str, image_paths: list[str],
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
+        # models.dev and Ollama probes can block, so resolve the mode off the event loop.
         _img_mode = await asyncio.to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
@@ -2272,8 +2299,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
-        # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
-        # runtime explicitly rather than consulting process-global compatibility mirrors.
+        # Bind this event and runtime before the agent turn; a queued event may have a different origin.
         vision_runtime = None
         try:
             turn_model, runtime_kwargs = await self._resolve_session_agent_runtime_async(
@@ -2284,8 +2310,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("vision enrichment: session runtime resolution failed", exc_info=True)
 
         from agent.auxiliary_client import scoped_runtime_main
-
-        with scoped_runtime_main(vision_runtime):
+        from agent.proxy_request_class import bind_aux_request_origin
+        with scoped_runtime_main(vision_runtime), bind_aux_request_origin(turn_origin_for_event(event)):
             return await self._enrich_message_with_vision(message_text, image_paths)
 
     async def _enrich_inbound_voice(
@@ -2510,7 +2536,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
-            message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            message_text = await self._enrich_inbound_images(event, source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         # Keep current media after the recall boundary, not among discarded backfill.

@@ -9,6 +9,7 @@ registry first, then the legacy built-in path. Plugin side: ``platform_registry
 
 import contextlib
 import contextvars
+import inspect
 import logging
 import sys
 import threading
@@ -53,6 +54,10 @@ class PlatformEntry:
     # PASSIVE dependency probe (deps importable RIGHT NOW); must be side-effect free since it
     # runs from status displays and the config enablement pass, which may never pip-install.
     check_fn: Callable[[], bool]
+    # Optional adapter class for capability inspection when the factory is a wrapper (for example,
+    # a factory that applies post-construction configuration). This is metadata only: callers must
+    # never instantiate the adapter to inspect capabilities.
+    adapter_class: Optional[type] = None
 
     # Optional: given a PlatformConfig, is it properly configured?
     # If None, the registry skips config validation and lets the adapter
@@ -487,6 +492,38 @@ class PlatformRegistry:
             entries, _deferred = self._scope_maps(self.current_scope_key())
             return {n for e in (*self._entries.values(), *entries.values())
                     for n in e.required_env if isinstance(n, str)}
+
+    def adapter_class(self, name: str) -> Optional[type]:
+        """Return a loaded adapter class for *name* without resolving deferred plugins.
+
+        Tool selection must not discover manifests (notably in safe mode), so an unresolved
+        entry intentionally returns ``None`` and callers should fail open.
+        """
+        with self._lock:
+            scope = self.current_scope_key()
+            entries, _deferred = self._scope_maps(scope)
+            entry = entries.get(name) or self._entries.get(name)
+            if entry is None:
+                return None
+            adapter_class = entry.adapter_class
+            if adapter_class is None and inspect.isclass(entry.adapter_factory):
+                adapter_class = entry.adapter_factory
+            return adapter_class if inspect.isclass(adapter_class) else None
+
+    def reactions_supported(self, name: str) -> Optional[bool]:
+        """Return whether a loaded adapter supports reactions, or ``None`` when unknown.
+
+        This is deliberately a passive registry read: constructing an adapter can import SDKs or
+        perform setup work, and resolving deferred manifests from tool selection is forbidden.
+        """
+        adapter_class = self.adapter_class(name)
+        if adapter_class is None:
+            return None
+        declared = getattr(adapter_class, "SUPPORTS_REACTIONS", None)
+        if declared is not None:
+            return bool(declared)
+        from gateway.platforms.base import BasePlatformAdapter
+        return getattr(adapter_class, "add_reaction", None) is not BasePlatformAdapter.add_reaction
 
     def is_registered(self, name: str) -> bool:
         # A deferred (not-yet-imported) platform still counts as registered so cheap membership

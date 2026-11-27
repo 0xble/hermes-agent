@@ -40,3 +40,5 @@ through one shared helper and preserves emoji tag sequences.
 ## Rollback
 
 Revert the commit carrying `Fork-Patch: unicode-tag-strip`.
+
+Contract tests: `tests/agent/test_tool_dispatch_helpers.py`, `tests/tools/test_unicode_tag_strip.py`.

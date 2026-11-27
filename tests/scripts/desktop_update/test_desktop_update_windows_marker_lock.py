@@ -82,7 +82,13 @@ def test_a7_concurrent_claimants_over_a_dead_marker_yield_one_owner(tmp_path: Pa
         refused = [c for c in claimants if c.poll() == 2]
         running = [c for c in claimants if c.poll() is None]
         assert len(running) == 1 and len(refused) == 3, [c.returncode for c in claimants]
-        assert marker.read_bytes().decode().split('\n')[0] == _custodian(home, running[0].pid)
+        assert marker.exists()
+        owner = running[0]
+        deadline = time.monotonic() + 30
+        while not _custodian(home, owner.pid):
+            assert time.monotonic() < deadline, 'winner custodian was not published'
+            time.sleep(0.1)
+        assert marker.read_bytes().decode().splitlines()[0] == _custodian(home, owner.pid)
     finally:
         hold.touch()
         for c in claimants:

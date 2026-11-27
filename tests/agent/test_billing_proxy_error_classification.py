@@ -145,6 +145,13 @@ def test_proxy_provider_overload_signal_is_provider_wide():
     assert classified.error_context["provider_wide"] is True
 
 
+def test_generic_503_with_provider_overload_wording_is_provider_wide():
+    error = _ProxyError("server_is_overloaded: please try again later", 503)
+    classified = classify_api_error(error, provider="custom:openai-proxy")
+    assert classified.reason is FailoverReason.overloaded
+    assert classified.error_context["provider_wide"] is True
+
+
 class _Agent:
     log_prefix = ""
     verbose_logging = False

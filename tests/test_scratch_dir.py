@@ -1,6 +1,8 @@
 """Scratch dir contract: TMPDIR/TMP/TEMP follow HERMES_HOME/cache/scratch unless the user set them."""
 
 import contextlib
+import errno
+import json
 import os
 import shlex
 import shutil
@@ -425,23 +427,24 @@ def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -
     import subprocess
 
     scratch = get_scratch_dir(tmp_path, prune=False)
-    gone, stuck = scratch / "idle-lane", scratch / "stuck-lane"
+    gone, stuck_entry = scratch / "idle-lane", scratch / "stuck-lane"
     ancient = time.time() - 30 * 3600
-    for entry in (gone, stuck):
+    for entry in (gone, stuck_entry):
         entry.mkdir()
         (entry / "out.md").write_text("deliverable", encoding="utf-8")
         for path in (entry / "out.md", entry):
             os.utime(path, (ancient, ancient))
     worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(gone),
                               stdin=subprocess.DEVNULL)
-    real_rmtree = shutil.rmtree
+    real_rename = os.rename
 
-    def rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
-        if os.path.realpath(path) != os.path.realpath(stuck):
-            real_rmtree(path, *args, **kwargs)
+    def rename(src, dst, *args, **kwargs):
+        if os.path.basename(os.fspath(src)) == stuck_entry.name:
+            return None
+        return real_rename(src, dst, *args, **kwargs)
 
     try:
-        with patch("hermes_constants_scratch.shutil.rmtree", rmtree):
+        with patch("hermes_constants_scratch.os.rename", rename):
             assert prune_scratch_dir(scratch) == 1
         assert worker.wait(timeout=10) is not None
     finally:
@@ -451,7 +454,7 @@ def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -
     log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
     assert f"removed {str(gone)!r} (" in log
     assert f"sent TERM pid={worker.pid} " in log
-    assert f"could not fully remove {str(stuck)!r}" in log and f"removed {str(stuck)!r}" not in log
+    assert f"could not fully remove {str(stuck_entry)!r}" in log and f"removed {str(stuck_entry)!r}" not in log
 
 
 @pytest.mark.platforms("linux")  # macOS and Windows filesystems reject non-UTF-8 names
@@ -551,7 +554,15 @@ def test_prune_releases_git_worktree_registration_of_idle_entry(tmp_path):
     assert prune_scratch_dir(scratch) == 1
     listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True,
                              text=True, stdin=subprocess.DEVNULL, check=True).stdout
-    assert str(tree) not in listing and not tree.exists()
+    # The tree is held, not deleted: its registration is kept so a restore stays valid.
+    assert not tree.exists() and str(tree) in listing
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/lane"))
+    assert held.exists()
+    import hermes_constants_scratch as retention
+    assert retention.purge_expired_holds(scratch, time.time() + 8 * 24 * 3600, retention.logger) == 1
+    listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True,
+                             text=True, stdin=subprocess.DEVNULL, check=True).stdout
+    assert str(tree) not in listing and not held.exists()
 
 
 
@@ -676,14 +687,8 @@ def test_midprune_vanished_entry_is_recorded_not_counted(tmp_path: Path) -> None
     assert "re-scan failed" not in log, log
 
 
-def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) -> None:
-    """R2/P2 on #134173: after rmtree, the removal-confirmation gate uses
-    os.path.lexists(), which swallows OSError from lstat and returns False — so an
-    entry that stayed (rmtree left residue) but became unreadable is counted and
-    recorded as removed. Only an explicit lstat proves absence: FileNotFoundError
-    confirms gone, a successful stat is residue, any other OSError means the
-    removal state is unknown, so the entry is neither counted nor recorded removed.
-    Red on the previous head: removed == 1 and a false 'removed' record."""
+def test_postremoval_residue_is_not_counted_as_removed(tmp_path: Path) -> None:
+    """A rename that leaves the source behind must not count or log a removal."""
     scratch = get_scratch_dir(tmp_path, prune=False)
     entry = scratch / "residue-lane"
     entry.mkdir()
@@ -694,29 +699,55 @@ def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) 
         os.utime(path, (ancient, ancient))
     log_file = tmp_path / "logs" / "scratch-prune.log"
 
-    deny = {"lstat": False}
-
-    def rmtree_leaves_residue(path, *args, **kwargs):
-        # rmtree(ignore_errors=True) is allowed to leave the directory in place.
-        deny["lstat"] = True
-
-    real_lstat = os.lstat
-
-    def lstat(path, *args, **kwargs):
-        # Only the post-removal visibility check fails; everything else stat()s.
-        if deny["lstat"] and os.path.abspath(os.fspath(path)) == os.path.abspath(entry):
-            raise PermissionError("post-rmtree visibility denied")
-        return real_lstat(path, *args, **kwargs)
+    def rename(src, dst, *args, **kwargs):
+        return None
 
     with patch("hermes_constants_scratch.reap_processes_rooted_in", lambda *a, **k: 0), \
-         patch("hermes_constants_scratch.shutil.rmtree", rmtree_leaves_residue), \
-         patch("hermes_constants_scratch.os.lstat", lstat):
-        assert prune_scratch_dir(scratch) == 0  # unknown, not removed
+         patch("hermes_constants_scratch.os.rename", rename):
+        assert prune_scratch_dir(scratch) == 0  # rename did not move it
     assert entry.exists() and payload.read_text(encoding="utf-8-sig") == "still here"
     log = log_file.read_text(encoding="utf-8-sig")
     assert f"removed {str(entry)!r} (" not in log, log
-    assert "could not confirm removal" in log, log
-    assert "could not fully remove" not in log, log
+    assert "could not fully remove" in log, log
+    assert "could not confirm removal" not in log, log
+
+
+@pytest.mark.parametrize("move", [False, True], ids=["residue", "moved"])
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
+def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path, move, error):
+    """Only ENOENT confirms removal; another lstat error leaves the result unknown."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "unknown-removal")
+    real_rename, real_lstat = os.rename, os.lstat
+    attempted = False
+    post_move_checks = 0
+
+    def rename(src, dst, *args, **kwargs):
+        nonlocal attempted
+        if move:
+            real_rename(src, dst, *args, **kwargs)
+        attempted = True
+
+    def lstat(path, *args, **kwargs):
+        nonlocal post_move_checks
+        if attempted and os.fspath(path) == os.fspath(entry):
+            post_move_checks += 1
+            # Let hold_expired_entry observe its result, then fail the caller's
+            # independent removal-confirmation check (never lexists()).
+            if post_move_checks > 1:
+                raise OSError(error, "post-move stat failed")
+        return real_lstat(path, *args, **kwargs)
+
+    with patch("hermes_constants_scratch.os.rename", rename), \
+         patch("hermes_constants_scratch.os.lstat", lstat):
+        assert prune_scratch_dir(scratch) == 0
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8")
+    assert f"could not confirm removal of {str(entry)!r}" in log
+    assert f"removed {str(entry)!r} (" not in log
+    assert entry.exists() is not move
+    if move:
+        held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/unknown-removal"))
+        assert (held / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
 
 
 @pytest.mark.platforms("posix")
@@ -1059,3 +1090,403 @@ def test_prune_keeps_the_entry_a_linked_declaration_file_points_into(tmp_path):
     assert prune_scratch_dir(scratch) == 1
     assert (owner / "input-pins.json").exists() and (data / "f").exists()
     assert not control.exists()
+
+
+def test_prune_moves_expired_entry_to_restorable_holding_dir(tmp_path):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "restore-me"
+    entry.mkdir()
+    payload = entry / "result.txt"
+    payload.write_text("restore this", encoding="utf-8")
+    _age_tree(entry)
+    size = payload.stat().st_size + entry.stat().st_size
+
+    assert prune_scratch_dir(scratch) == 1
+    assert not entry.exists()
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/restore-me"))
+    assert held.is_dir() and (held / "result.txt").read_text(encoding="utf-8") == "restore this"
+    manifest = held.parent.parent / "manifest.jsonl"
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert record["original"] == str(entry)
+    assert record["size"] == size
+    assert record["mtime"] is not None and record["pruned_at"].endswith("Z")
+    held.rename(entry)
+    assert (entry / "result.txt").read_text(encoding="utf-8") == "restore this"
+
+
+@pytest.mark.platforms("posix")
+def test_holding_dir_resolves_beside_symlink_target_outside_scratch(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = tmp_path / "home" / "cache" / "scratch"
+    target = tmp_path / "other-volume" / "scratch"
+    scratch.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    scratch.symlink_to(target, target_is_directory=True)
+    trash = retention.holding_dir(scratch)
+    assert trash == target.resolve().parent / ".scratch-trash"
+    assert trash.parent.stat().st_dev == scratch.stat().st_dev
+    assert not trash.is_relative_to(scratch.resolve())
+    entry = _idle_entry(scratch, "held-on-target")
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    _age_tree(trash)
+    # An old holding root is never selected by the ordinary 24-hour entry scan.
+    monkeypatch.setattr(retention.time, "time", lambda: now + 48 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    assert (held / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
+
+
+@pytest.mark.platforms("posix")
+def test_prune_symlinked_scratch_avoids_cross_device_rename(tmp_path, monkeypatch):
+    """Emulate a separate volume: rename across the target-volume boundary raises EXDEV."""
+    import hermes_constants_scratch as retention
+
+    scratch = tmp_path / "home" / "cache" / "scratch"
+    target_volume = tmp_path / "other-volume"
+    target = target_volume / "scratch"
+    scratch.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    scratch.symlink_to(target, target_is_directory=True)
+    entry = _idle_entry(scratch, "restorable")
+    real_rename = os.rename
+    renamed = []
+
+    def rename(src, dst, *args, **kwargs):
+        if Path(src).resolve().is_relative_to(target_volume.resolve()) != Path(dst).resolve().is_relative_to(target_volume.resolve()):
+            raise OSError(errno.EXDEV, "cross-volume rename")
+        renamed.append((Path(src), Path(dst)))
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(retention.os, "rename", rename)
+    assert prune_scratch_dir(scratch) == 1
+    assert len(renamed) == 1 and not entry.exists()
+    held = renamed[0][1]
+    record = json.loads((held.parent.parent / "manifest.jsonl").read_text(encoding="utf-8"))
+    assert record["original"] == str(entry) and record["held"] == str(held)
+    held.rename(entry)
+    assert (entry / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mode", [None, "2770"])
+def test_holding_directories_are_always_private_regardless_of_home_mode(tmp_path, monkeypatch, mode):
+    """The hold is a safety boundary: a shared HERMES_HOME_MODE never widens it."""
+    import hermes_constants_scratch as retention
+
+    TestScratchDirPermissionPolicy()._isolate_env(monkeypatch, tmp_path)
+    if mode is not None:
+        monkeypatch.setenv("HERMES_HOME_MODE", mode)
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "private")
+    trash = retention.holding_dir(scratch)
+    assert prune_scratch_dir(scratch) == 1
+    assert not entry.exists()
+    held = next(trash.glob("*/entries/private"))
+    for directory in (trash, held.parent.parent, held.parent):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert directory.stat().st_uid == os.getuid()
+
+
+@pytest.mark.platforms("posix")
+def test_hold_refuses_bad_mode_dir_and_keeps_entry(tmp_path):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "keep-me")
+    trash = tmp_path / "cache" / ".scratch-trash"
+    trash.mkdir(mode=0o755)
+    os.chmod(trash, 0o755)
+    assert prune_scratch_dir(scratch) == 0
+    assert (entry / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
+    assert stat.S_IMODE(trash.stat().st_mode) == 0o755  # refused, not repaired
+
+
+@pytest.mark.platforms("posix")
+def test_hold_refuses_dir_owned_by_another_uid_and_keeps_entry(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "keep-me")
+    trash = retention.holding_dir(scratch)
+    trash.mkdir(mode=0o700)
+    monkeypatch.setattr(retention.os, "getuid", lambda: os.stat(trash).st_uid + 1)
+    assert prune_scratch_dir(scratch) == 0
+    assert (entry / "sub" / "out.log").exists()
+    assert not list(trash.iterdir())
+
+
+def test_test_temp_sweeps_delete_directly_without_a_hold(tmp_path):
+    """prune_idle_entries without restorable_hold (conftest, run_tests_parallel) deletes."""
+    import hermes_constants_scratch as retention
+
+    root = tmp_path / "var-tmp" / "hermes-pytest"
+    root.mkdir(parents=True)
+    entry = _idle_entry(root, "old-fixture")
+    assert retention.prune_idle_entries(root, 24, frozenset()) == 1
+    assert not entry.exists()
+    assert not (root.parent / ".scratch-trash").exists()
+    assert not list(root.parent.rglob("old-fixture"))
+
+
+def test_hermes_scratch_prune_opts_into_the_hold(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    seen = {}
+    real = retention.prune_idle_entries
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(retention, "prune_idle_entries", spy)
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    prune_scratch_dir(scratch)
+    assert seen.get("restorable_hold") is True
+
+
+def test_lstat_failure_after_rename_still_records_manifest_and_mtime(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "lstat-fails")
+    real_lstat = os.lstat
+    renamed = []
+    real_rename = os.rename
+
+    def rename(src, dst, *a, **k):
+        real_rename(src, dst, *a, **k)
+        renamed.append(dst)
+
+    def lstat(path, *a, **k):
+        if renamed and os.fspath(path) == os.fspath(entry):
+            raise PermissionError(errno.EACCES, "denied")
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(retention.os, "rename", rename)
+    monkeypatch.setattr(retention.os, "lstat", lstat)
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 7, now)
+    monkeypatch.undo()
+    assert held is not None and held.exists()
+    manifest = held.parent.parent / "manifest.jsonl"
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert record["held"] == str(held) and record["original"] == str(entry)
+    assert abs(os.lstat(held).st_mtime - now) < 5
+
+
+def test_purge_uses_hold_time_not_original_mtime(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "ancient")  # source mtime is far older than seven days
+    os.utime(entry, (1, 1))
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    assert held is not None
+    os.utime(held, (1, 1))  # even a stale mtime on the held entry must not trigger a purge
+    assert retention.purge_expired_holds(scratch, now + 3600, retention.logger) == 0
+    assert held.exists()
+
+
+def test_stuck_entries_include_held_day_dirs(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+    import hermes_constants_scratch_stuck as stuck
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "locked-hold")
+    held = retention.hold_expired_entry(entry, scratch, 0, time.time())
+    assert held is not None
+    day = held.parent.parent
+    monkeypatch.setattr(stuck, "_accessible", lambda _path: False)
+    stuck.record(held.parent, held, [os.fspath(held)], retention.logger, state_dir=day)
+    assert held in stuck.stuck_entries(scratch)
+
+
+def test_day_dir_without_manifest_is_purged_by_its_date(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "no-manifest")
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    assert held is not None
+    (held.parent.parent / "manifest.jsonl").unlink()
+    assert retention.purge_expired_holds(scratch, now + 3600, retention.logger) == 0
+    assert held.exists()
+    assert retention.purge_expired_holds(scratch, now + 9 * 24 * 3600, retention.logger) == 1
+    assert not held.exists()
+    assert not (held.parent.parent / "manifest.jsonl").exists()
+
+
+def test_prune_purges_holding_entries_after_seven_days(tmp_path, monkeypatch):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "old-hold"
+    entry.mkdir()
+    (entry / "x").write_text("x", encoding="utf-8")
+    _age_tree(entry)
+    now = time.time()
+    assert prune_scratch_dir(scratch) == 1
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/old-hold"))
+    manifest = held.parent.parent / "manifest.jsonl"
+    original_manifest = manifest.read_text(encoding="utf-8")
+    monkeypatch.setattr("hermes_constants_scratch.time.time", lambda: now + 8 * 24 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    assert not held.exists()
+    manifest_lines = manifest.read_text(encoding="utf-8").splitlines()
+    assert manifest_lines[0] == original_manifest.rstrip("\n")
+    assert json.loads(manifest_lines[-1])["purged"]
+
+
+def test_prune_keeps_enabled_job_references_but_not_disabled_jobs(tmp_path):
+    import json
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    referenced, disabled, free = (scratch / name for name in ("referenced", "disabled", "free"))
+    for entry in (referenced, disabled, free):
+        entry.mkdir()
+        (entry / "x").write_text("x", encoding="utf-8")
+        _age_tree(entry)
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.parent.mkdir()
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "on", "enabled": True, "prompt": f"read {referenced / 'x'}"},
+        {"id": "off", "enabled": False, "prompt": f"read {disabled / 'x'}"},
+    ]}), encoding="utf-8")
+
+    assert prune_scratch_dir(scratch) == 2
+    assert referenced.exists()
+    assert not disabled.exists() and not free.exists()
+
+
+@pytest.mark.parametrize("field", ["prompt", "script", "script_args", "args", "command"])
+@pytest.mark.parametrize("container", [str, list, dict], ids=["string", "argv", "mapping"])
+def test_job_references_match_raw_windows_paths(tmp_path, monkeypatch, field, container):
+    """Windows path text is data, even on POSIX; JSON escaping must not change the matcher input."""
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    referenced = _idle_entry(scratch, "referenced")
+    free = _idle_entry(scratch, "free")
+    prefix = r"C:\Users\tester\.hermes\cache\scratch"
+    text = prefix + r"\referenced\sub\out.log"
+    value = {str: text, list: ["--input", text], dict: {"input": text}}[container]
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.parent.mkdir()
+    jobs.write_text(json.dumps({"jobs": [{"enabled": True, field: value}]}), encoding="utf-8")
+    monkeypatch.setattr(retention, "_job_spellings", lambda root: [prefix])
+    assert prune_scratch_dir(scratch) == 1
+    assert referenced.exists() and not free.exists()
+
+
+def test_prune_moves_symlink_without_following_target(tmp_path):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.txt"
+    target.write_text("do not touch", encoding="utf-8")
+    link = scratch / "link"
+    link.symlink_to(target)
+    os.utime(link, (time.time() - 30 * 3600, time.time() - 30 * 3600), follow_symlinks=False)
+
+    assert prune_scratch_dir(scratch) == 1
+    assert target.read_text(encoding="utf-8") == "do not touch"
+    assert not link.exists() and list((tmp_path / "cache" / ".scratch-trash").glob("*/entries/link"))
+
+
+def test_entry_named_manifest_is_held_intact_and_restorable(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "manifest.jsonl"
+    entry.write_text("original entry\n", encoding="utf-8")
+    os.utime(entry, (time.time() - 30 * 3600, time.time() - 30 * 3600))
+
+    assert prune_scratch_dir(scratch) == 1
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/manifest.jsonl"))
+    manifest = held.parent.parent / "manifest.jsonl"
+    assert held.read_text(encoding="utf-8") == "original entry\n"
+    assert manifest.is_file() and manifest != held
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert record["original"] == str(entry) and record["held"] == str(held)
+    held.rename(entry)
+    assert entry.read_text(encoding="utf-8") == "original entry\n"
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, entry.stat().st_size, now)
+    assert held is not None
+    assert retention.purge_expired_holds(scratch, now + 8 * 24 * 3600, retention.logger) == 1
+    assert not held.exists()
+    assert manifest.is_file()
+
+
+@pytest.mark.platforms("posix")
+def test_purge_held_tree_does_not_follow_directory_links(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "keep").write_text("not held", encoding="utf-8")
+    entry = scratch / "links"
+    entry.mkdir()
+    (entry / "outside").symlink_to(target, target_is_directory=True)
+    (entry / "broken").symlink_to(tmp_path / "absent", target_is_directory=True)
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    assert held is not None
+
+    assert retention.purge_expired_holds(scratch, now + 8 * 24 * 3600, retention.logger) == 1
+    assert not held.exists()
+    assert (target / "keep").read_text(encoding="utf-8") == "not held"
+
+
+def test_failed_manifest_read_does_not_delete_manifest(tmp_path, monkeypatch):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "kept-record"
+    entry.write_text("x", encoding="utf-8")
+    os.utime(entry, (time.time() - 30 * 3600, time.time() - 30 * 3600))
+    now = time.time()
+    assert prune_scratch_dir(scratch) == 1
+    manifest = next((tmp_path / "cache" / ".scratch-trash").glob("*/manifest.jsonl"))
+    held = manifest.parent / "entries" / "kept-record"
+    original = manifest.read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def fail_manifest(self, *args, **kwargs):
+        if self == manifest:
+            raise OSError("manifest unreadable")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_manifest)
+    monkeypatch.setattr("hermes_constants_scratch.time.time", lambda: now + 8 * 24 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    monkeypatch.undo()
+    assert manifest.read_text(encoding="utf-8") == original
+    assert held.read_text(encoding="utf-8") == "x"
+
+
+def test_purge_preserves_a_hold_appended_after_manifest_read(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    old = scratch / "old"
+    old.write_text("old", encoding="utf-8")
+    now = 20_000 * 24 * 3600 + 12 * 3600  # fixed UTC noon, so the second hold stays in this day
+    held = retention.hold_expired_entry(old, scratch, 3, now)
+    manifest = held.parent.parent / "manifest.jsonl"
+    original = manifest.read_bytes()
+    real_remove = retention._remove_nofollow
+    fresh_held = []
+
+    def append_during_purge(path):
+        fresh = scratch / "fresh"
+        fresh.write_text("fresh", encoding="utf-8")
+        # Same day namespace, but this hold is less than seven days old at the purge timestamp.
+        fresh_held.append(retention.hold_expired_entry(fresh, scratch, 5, now + 3600))
+        return real_remove(path)
+
+    monkeypatch.setattr(retention, "_remove_nofollow", append_during_purge)
+    assert retention.purge_expired_holds(scratch, now + 7 * 24 * 3600 + 1, retention.logger) == 1
+    assert fresh_held[0].read_text(encoding="utf-8") == "fresh"
+    assert manifest.read_bytes().startswith(original)
+    records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert any(record.get("held") == str(fresh_held[0]) for record in records)
+    assert records[-1]["held"] == str(held) and records[-1]["purged"]

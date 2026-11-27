@@ -13,6 +13,7 @@ scan's ``on_saved`` hooks so an unwritable store cannot book the same miss every
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Any, Optional
 
@@ -90,19 +91,40 @@ def fast_forward_missed_recurring(d: Any, grace: int) -> bool:
     new_next = d.recompute_next()
     if not new_next:
         return False
-    d.scan.persist(d.job["id"], next_run_at=new_next)
     missed = count_missed_slots(d.schedule, d.next_run, d.scan.now, timezone=d.job)
     capped = missed >= _MAX_COUNTED_SLOTS
     if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
             and not job_catches_up(d.job)):
-        logger.info(
-            "Job '%s' missed its scheduled time (%s, grace=%ds). "
-            "Skipping %d missed occurrence(s) because catch-up is off for this job; next run: %s",
-            d.label, d.next_run, grace, missed, new_next)
+        from cron.occurrences import scheduled_instant
+        from cron.owner_alerts import queue_owner_failure
+
+        job_id = d.job["id"]
+        first = scheduled_instant(d.next_run_dt.isoformat())
+        count = f"at least {missed}" if capped else str(missed)
+        message = (f"{d.label} ({job_id}) skipped {count} scheduled occurrence(s) starting at "
+                   f"{first}: past the {grace}s grace window and catch-up is off. "
+                   f"No job code ran for these occurrences. Next run: {new_next}.")
+        # If jobs.json fails after enqueue, the occurrence key suppresses duplicate delivery.
+        # An outbox storage failure still leaves the skipped occurrence in the schedule and ledger
+        # records below. Blocking the advance would keep the job from reaching its next valid slot.
+        try:
+            queue_owner_failure(d.job, f"missed-recurring:{job_id}:{first}", message)
+        except (OSError, sqlite3.Error):
+            logger.warning("Job '%s' (%s): could not queue owner alert for skipped occurrence %s",
+                           d.label, job_id, first, exc_info=True)
+        d.scan.persist(job_id, next_run_at=new_next, last_status="skipped", last_error=message)
+        record = d.scan.find(job_id)
+        pending = record.get("pending_slot") if record is not None else None
+        if record is not None and isinstance(pending, dict) and pending.get("scheduled_at") == d.next_run:
+            record.pop("pending_slot")
+        d.scan.on_saved.append(lambda: logger.warning(
+            "cron.occurrence_dropped job_id=%s scheduled_at=%s reason=catch_up_off "
+            "missed_count=%d capped=%s next_run_at=%s", job_id, first, missed, capped, new_next))
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
         d.scan.on_saved.append(lambda job=d.job, first=d.next_run: _book_missed(
             job, missed, first, f"skipped, catch-up off; next run {new_next}", capped=capped))
         return True
+    d.scan.persist(d.job["id"], next_run_at=new_next)
     logger.info(
         "Job '%s' missed its scheduled time (%s, grace=%ds). "
         "Running now; next run provisionally set to: %s (re-anchored on completion)",

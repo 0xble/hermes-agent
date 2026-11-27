@@ -661,17 +661,16 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=bindings,
-        transport_resolver=lambda binding, _task: (
-            waiting if binding.room_id == "room-waiting" else healthy
-        ),
+        transport_resolver=lambda binding, _task: waiting if binding.room_id == "room-waiting" else healthy,
         turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=0.4,
+        clock=lambda now=time.time(): now,  # frozen: lease expiry is not the fault under test
+        lease_ttl_seconds=30,  # lease expiry is not under test; a short lease fences slow starts
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
 
     runtime.start()
-    assert waiting.submitted.wait(1.0)
+    assert waiting.submitted.wait(5.0)
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     assert state.get_task(db, identities[0])["status"] == "running"
     assert runtime.stop(timeout=5.0)

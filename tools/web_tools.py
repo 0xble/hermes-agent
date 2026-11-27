@@ -451,6 +451,17 @@ def _search_with_cache(
 ) -> tuple[dict, Optional[str]]:
     """Read or populate the shared search cache, coalescing concurrent misses."""
     from tools.web_result_cache import cache_enabled, search_memo
+    from tools.web_search_attribution import record_search_call
+
+    search_type = cache_identity.get("search_type", "default")
+    search_type_reason = getattr(provider, "SEARCH_TYPE_REASON", "") or ""
+
+    def record(response: dict, outcome: str) -> None:
+        record_search_call(
+            session_id=session_id, provider=cache_provider, search_type=search_type,
+            search_type_reason=search_type_reason, query=query, cache_outcome=outcome,
+            success=bool(isinstance(response, dict) and response.get("success")),
+        )
 
     def lookup() -> Optional[dict]:
         return search_memo.lookup(cache_provider, query, limit, **cache_identity)
@@ -464,23 +475,38 @@ def _search_with_cache(
     def process_lock():
         return search_memo.process_lock(cache_provider, query, limit, **cache_identity)
 
+    def paid_search(outcome: str) -> tuple[dict, bool, Optional[str]]:
+        try:
+            response, rescued, warning = _paid_search(provider, query, limit, session_id)
+        except Exception:
+            record({"success": False}, outcome)
+            raise
+        return response, rescued, warning
+
     response_data = lookup()
     if response_data is not None:
+        record(response_data, "hit")
         return response_data, None
-    with flight_lock():
+    flight = flight_lock()
+    was_coalesced = flight.locked()
+    with flight:
         response_data = lookup()
         if response_data is not None:
+            record(response_data, "coalesced" if was_coalesced else "hit")
             return response_data, None
         if not cache_enabled():
-            response_data, _, budget_warning = _paid_search(provider, query, limit, session_id)
+            response_data, _, budget_warning = paid_search("coalesced" if was_coalesced else "miss")
+            record(response_data, "coalesced" if was_coalesced else "miss")
             return response_data, budget_warning
         with process_lock():
             response_data = lookup()
             if response_data is not None:
+                record(response_data, "coalesced" if was_coalesced else "hit")
                 return response_data, None
-            response_data, was_rescued, budget_warning = _paid_search(provider, query, limit, session_id)
+            response_data, was_rescued, budget_warning = paid_search("coalesced" if was_coalesced else "miss")
             if not was_rescued:
                 store(response_data)
+            record(response_data, "coalesced" if was_coalesced else "miss")
             return response_data, budget_warning
 
 
@@ -640,7 +666,7 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web: returns titles, URLs and snippets (5 by default). Read pages with web_extract. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": "Search the web: returns titles, URLs and snippets (5 by default). Search in rounds of about 5 queries and read results before widening; reuse earlier results rather than looping templated searches. If you already know the URL, or would use site: to reach a specific page, call web_extract instead. Read pages with web_extract. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
     "parameters": {
         "type": "object",
         "properties": {

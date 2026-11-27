@@ -29,7 +29,8 @@ def _user(db, sid, text, *, display_kind=""):
 
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("entry", ["apply", "request"])
-def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
+@pytest.mark.parametrize("target", ["target", "hermes:default/target"])
+def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry, target):
     from hermes_constants import get_hermes_home
     from hermes_cli import session_controls
     from hermes_cli.goals import GoalManager, load_goal
@@ -40,24 +41,139 @@ def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
     _user(state, "requester", quote)
     control = session_controls.apply_control if entry == "apply" else session_controls.request_control
     kwargs = {"user_quote": quote} if quoted and entry == "apply" else {}
-    result = control("goal", "pause", "target", requester_sid="requester", **kwargs)
+    result = control("goal", "pause", target, requester_sid="requester", **kwargs)
     assert result["ok"] and result["status"] == "applied"
     record = session_controls._load_record(result["record"]["id"])
     durable = load_goal("target")
-    if quoted and entry == "apply":
-        assert durable.status == "paused" and not durable.waiting_until
-        assert record["authority"]["via"] == "quote"
-        assert "outcome" not in record and "notice" not in result
+    assert durable.status == "paused" and not durable.waiting_until
+    assert record["authority"]["via"] == ("quote" if quoted and entry == "apply" else "autonomy")
+    assert record["outcome"] == result["outcome"] == "paused"
+    assert "paused" in result["notice"].lower()
+    assert "wait_seconds" not in record
+    assert "waiting_until" not in record
+
+
+@pytest.mark.parametrize("target", ["requester", "target"])
+@pytest.mark.parametrize("entry", ["apply", "request"])
+def test_autonomous_clear_records_reason_actor_and_notice(state, target, entry):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalContract, GoalManager, load_goal
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    manager = GoalManager(target)
+    manager.set("duplicate repair", contract=GoalContract(verification="test passes", constraints="no restart"))
+    manager.add_subgoal("readback")
+    before = load_goal(target)
+    reason = "Duplicate of the verified takeover in hermes:default/other"
+    control = session_controls.apply_control if entry == "apply" else session_controls.request_control
+    result = control("goal", "clear", target, requester_sid="requester", reason=f"  {reason}  ")
+    assert result["ok"] and result["status"] == "applied", result
+    durable = load_goal(target)
+    assert durable is not None and before is not None
+    assert reason in result["notice"]
+    assert durable.status == "cleared"
+    assert durable.contract == before.contract and durable.subgoals == before.subgoals
+    assert durable.created_at == before.created_at
+    revision = durable.revisions[-1]
+    assert revision["kind"] == "clear" and revision["reason"] == reason
+    assert revision["actor"] == "agent" and revision["authority"] == "autonomy"
+    record = session_controls._load_record(result["record"]["id"])
+    assert record is not None and record["notice"] == result["notice"]
+    assert record["reason"] == reason and record["authority"]["via"] == "autonomy"
+    assert record["authority"]["session_id"] == "requester"
+    assert reason in GatewaySessionControlsMixin._control_notice(record)
+    assert any(row["id"] == record["id"] for row in session_controls.pending_outbox())
+    again = control("goal", "clear", target, requester_sid="requester", reason=reason)
+    assert not again["ok"] and again["error_code"] == "nothing_to_clear"
+    assert load_goal(target).revisions == durable.revisions
+    GoalManager(target).set("next task")
+    assert revision in load_goal(target).revisions
+    assert load_goal(target).revisions[-1]["reason"] == "Previous goal cleared"
+
+
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_goal_pause_is_agent_owned_and_agent_resumable(state, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager(target).set("watch the build")
+    paused = session_controls.apply_control("goal", "pause", target, requester_sid="requester",
+                                            reason="waiting on a deploy")
+    assert paused["ok"] and paused["record"]["authority"]["via"] == "autonomy", paused
+    assert load_goal(target).status == "paused" and load_goal(target).paused_by == "agent"
+    resumed = session_controls.apply_control("goal", "resume", target, requester_sid="requester",
+                                             reason="deploy finished")
+    assert resumed["ok"] and resumed["status"] == "applied", resumed
+    assert load_goal(target).status == "active" and load_goal(target).paused_by == ""
+
+
+def _legacy_unowned_pause(manager, target):
+    from hermes_cli.goals import save_goal
+
+    legacy = manager.pause(reason="session-control: paused")
+    legacy.paused_by = ""
+    save_goal(target, legacy)
+
+
+def _autonomous_pause(manager, target):
+    from hermes_cli import session_controls
+
+    assert session_controls.apply_control("goal", "pause", target, requester_sid="requester",
+                                          reason="waiting on a deploy")["ok"]
+
+
+_GOAL_PAUSES = {
+    "slash": lambda manager, target: manager.pause(),
+    "stop": lambda manager, target: manager.pause(reason="user-interrupted (/stop)"),
+    "system": lambda manager, target: manager.pause(reason="session-control: budget", by="system"),
+    "legacy": _legacy_unowned_pause,
+    "agent": _autonomous_pause,
+}
+
+
+@pytest.mark.parametrize("pause", sorted(_GOAL_PAUSES))
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_clear_ends_only_agent_owned_pauses(state, pause, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    manager = GoalManager(target)
+    manager.set("watch the build")
+    _GOAL_PAUSES[pause](manager, target)
+    before = load_goal(target).to_json()
+    reason = "Superseded by the verified takeover in hermes:default/other"
+    result = session_controls.apply_control("goal", "clear", target, requester_sid="requester",
+                                            reason=reason)
+    if pause == "agent":
+        assert result["ok"] and result["status"] == "applied", result
+        cleared = load_goal(target)
+        assert cleared.status == "cleared" and cleared.revisions[-1]["reason"] == reason
     else:
-        assert durable.status == "active" and durable.paused_reason is None
-        assert record["authority"]["via"] == "autonomy"
-        assert record["outcome"] == result["outcome"] == "timed_wait"
-        assert record["wait_seconds"] == result["wait_seconds"] == durable.waiting_seconds == 900
-        assert record["waiting_until"] == result["waiting_until"] == durable.waiting_until
-        assert record["notice"] == result["notice"] == (
-            "Goal waiting 15 min (autonomous timed wait, no approval); still active"
-        )
-        assert "paused" not in result["notice"] and "Telegram" not in result["notice"]
+        assert not result["ok"] and result["error_code"] == "user_paused", result
+        assert result["record"]["status"] == "failed"
+        assert load_goal(target).to_json() == before
+
+
+@pytest.mark.parametrize("reason", ["", "  \n\t", None, 42])
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_clear_requires_nonempty_reason_without_mutating(state, reason, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager(target).set("still required")
+    before = load_goal(target).to_json()
+    result = session_controls.apply_control("goal", "clear", target, requester_sid="requester", reason=reason)
+    assert not result["ok"] and result["error_code"] == "reason_required"
+    assert load_goal(target).to_json() == before
+    assert session_controls.pending_outbox() == []
 
 
 def test_quote_applies_cross_session_clear_and_audits(state):
@@ -156,6 +272,28 @@ def test_cross_session_goal_replace_without_an_active_goal_fails_before_any_requ
     )
     assert self_result["error_code"] == "no_goal"
     assert self_result["status"] == "failed"
+
+
+def test_self_replace_exposes_missing_requirement_details(state):
+    from hermes_constants import get_hermes_home
+    from hermes_cli.goals import GoalContract, GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    limits = "Never restart the gateway\nNever weaken the canary"
+    GoalManager("target").set("Ship the repair", contract=GoalContract(
+        verification="The repair is live", constraints=limits))
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="target", reason="trim the contract",
+        payload={"goal": "Ship the repair", "contract": {"constraints": "Never restart the gateway"}},
+    )
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["error_code"] == "constraint_quote_required"
+    assert result["error"] == "Retain each requirement or quote the user's exact removal instruction: Never weaken the canary"
+    assert result["missing_requirements"] == ["Never weaken the canary"]
+    saved = load_goal("target")
+    assert saved is not None and saved.contract.constraints == limits
 
 
 def test_cross_session_replace_rechecks_goal_before_recording_failure(state, monkeypatch):
@@ -584,7 +722,7 @@ def test_reply_prefix_does_not_block_users_own_quote(state):
 
 
 @pytest.mark.parametrize("status", ["done", "cleared", "active"])
-def test_resume_refuses_goals_that_are_not_paused(state, status):
+def test_resume_only_active_goals_are_idempotent(state, status):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
 
@@ -597,10 +735,18 @@ def test_resume_refuses_goals_that_are_not_paused(state, status):
     _user(state, "requester", "Please resume the target goal now please")
     quoted = apply_control("goal", "resume", "target", requester_sid="requester",
                            user_quote="resume the target goal now please")
-    assert quoted["error_code"] == "nothing_to_resume"
+    if status == "active":
+        assert quoted["status"] == "applied"
+        assert quoted.get("error") is None
+    else:
+        assert quoted["error_code"] == "nothing_to_resume"
     pending = request_control("goal", "resume", "target", requester_sid="requester")
     resolved = resolve_request(pending["id"], "approve", "admin")
-    assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
+    if status == "active":
+        assert (resolved["status"], resolved["error"]) == ("applied", None)
+    else:
+        assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
+        assert resolved["error_reason"] == "goal was not paused (already running or cleared)"
     assert load_goal("target").status == status
 
 

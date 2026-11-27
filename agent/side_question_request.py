@@ -116,6 +116,8 @@ def _build_fork(parent: Any, capture: SideQuestionCapture) -> Any:
     # The static tier decides where the system-prompt cache breakpoint splits; rebuilding it on
     # the fork re-reads prompt files and can land the marker elsewhere.
     fork._cached_system_prompt_static = capture.system_prompt_static
+    # The auxiliary post hook owns the single request-ledger row for this physical request.
+    fork._request_usage_ledger_owned_by_auxiliary = True
     fork.tools = capture.tools
     fork.valid_tool_names = {tool["function"]["name"] for tool in capture.tools}
     fork.session_id = capture.session_id

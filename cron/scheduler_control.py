@@ -1,10 +1,15 @@
 """Reach the existing cancellation path from schedule mutations in this process."""
 from __future__ import annotations
 
+import logging
+import os
 import threading
 from datetime import UTC, datetime
+from typing import Any
 
 from agent.interrupt_scope import InterruptScope
+
+logger = logging.getLogger(__name__)
 
 
 class RunControl(threading.Event):
@@ -209,9 +214,13 @@ def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
     return jobs._under_fire_fence(job_id, lambda: jobs._with_job(job_id, apply, False))
 
 
-def running_job_state(job: dict) -> dict:
+_UNSET = object()
+
+
+def running_job_state(job: dict, *, detached_execution: Any = _UNSET) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
+    from cron.executions import cancellable_execution
 
     key = sched._inflight_key(str(job.get("id") or "unknown"))
     with sched._running_lock:
@@ -220,11 +229,32 @@ def running_job_state(job: dict) -> dict:
         started = control.started_at if control is not None else None
     claim = job.get("fire_claim") or {}
     live_claim = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+    # Not the latest row: a refused Run-now books a newer ``failed`` row that would hide the live run.
+    if detached_execution is _UNSET:
+        try:
+            detached = cancellable_execution(str(job.get("id") or ""))
+        except Exception:
+            # An unreadable ledger must not abort a mutation that already saved: removal still has
+            # to clean up output and notes. Fall back to the process-local and claim evidence.
+            logger.warning("Cron execution ledger lookup failed for job %s", job.get("id"), exc_info=True)
+            detached = None
+    else:
+        detached = detached_execution
+    if detached is not None and detached.get("owner_kind") == "detached":
+        return {
+            "was_running": True,
+            "run_started_at": detached.get("started_at") or detached.get("claimed_at"),
+            "run_id": detached.get("id"),
+            "interrupted": False,
+            "delivery_completed": False,
+            "_detached_execution": detached,
+        }
     queued = local and control is not None and control.local and started is None
     return {
         "was_running": not queued and (bool(started) or live_claim),
         "run_started_at": (
             None if queued else started or (claim.get("started_at", claim.get("at")) if live_claim else None)),
+        "run_id": None,
         "interrupted": False,
         "delivery_completed": bool(control and control.delivery_completed),
     }
@@ -234,8 +264,25 @@ def interrupt_job_run(job: dict) -> dict:
     """Report a live remote claim honestly; an Event cannot stop another process."""
     from cron import scheduler as sched
     from cron.jobs import self_removal_delivery_allowed
+    from cron.detached_authority import cancel_detached
 
     result = running_job_state(job)
+    detached = result.pop("_detached_execution", None)
+    # A run that removes or disables its own job (agent tool call, or a script it spawned) must
+    # not cancel itself: its result and delivery still belong to it.
+    own_run = (detached is not None
+               and os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == str(detached.get("id") or ""))
+    if own_run or self_removal_delivery_allowed(job["id"]):
+        if result["was_running"]:
+            result["warning"] = "The current run changed its own job; it was not interrupted."
+        return result
+    if detached is not None and detached.get("owner_kind") == "detached":
+        cancel_detached(detached)
+        result["interrupted"] = True
+        result["warning"] = (
+            "A detached run was in progress and cancellation was recorded. "
+            "Side effects already performed cannot be undone; read back the target before retrying.")
+        return result
     with sched._running_lock:
         control = sched._running_cancel_events.get(sched._inflight_key(job["id"]))
     if control is not None and control.local and not self_removal_delivery_allowed(job["id"]):

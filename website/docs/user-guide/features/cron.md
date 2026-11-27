@@ -211,6 +211,22 @@ When `workdir` is set:
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. `cron.max_parallel_jobs` limits how many due jobs run at once (default `4`, `0` for unbounded), which also keeps the catch-up after a restart from firing every missed job at the same moment.
 :::
 
+## Business-impact admission lanes
+
+When due jobs compete for workers, mark the job's business impact with `priority`:
+
+- `live`: a person or customer is waiting, such as a reply watcher during a live event.
+- `production`: ordinary business work. This is the default when unset.
+- `background`: housekeeping and best-effort work.
+
+Due jobs are submitted in that order. The single reserved worker for intervals of 2 minutes or less goes to the highest-ranked such job, with ties in job-store order. The four-worker script lane starts the best queued rank first, then FIFO. Worker counts are unchanged. Detached workers and script jobs see the effective lane in `HERMES_WORK_PRIORITY`.
+
+```bash
+hermes cron create "every 2m" --priority live "Review customer queue"
+hermes cron edit <job_id> --priority background
+hermes cron edit <job_id> --priority ""  # clear to unset/production
+```
+
 ## Per-job timezone
 
 By default a job's cron expression is read in your profile's timezone (`timezone:` in `config.yaml`). A job can pin its own zone instead, so one profile can serve several markets:
@@ -647,7 +663,19 @@ Checks per active job:
   gateway down, or a wedged fire-claim),
 - script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
 - `no_agent` job with no script,
-- configured `workdir` that no longer exists.
+- configured `workdir` that no longer exists,
+- a non-empty `enabled_toolsets` allowlist that cannot perform explicit shell or
+  relay-routing steps in the prompt or an attached on-disk skill. This includes
+  Daily Brief `finding add` commands, shell code blocks, and relay's
+  `Pick the Destination` route. Shell steps need terminal access (including
+  composite toolsets that provide it); relay routing can use terminal CLI
+  access or a relay toolset.
+
+The prompt/tool check is an advisory static scan, not proof that every command
+will work. It leaves unrestricted and script-only jobs alone, never widens a
+job's allowlist, and reads attached skills without executing their templates or
+installing dependencies. After changing operational steps, run doctor and
+reconcile the allowlist or remove the incompatible step.
 
 Doctor never mutates jobs or state — it only reports. Pair it with
 `hermes cron incidents` (durable failure records) and `hermes cron runs`
@@ -715,9 +743,18 @@ output_local_only: true
 
 Set or replace the declaration with `hermes cron create/edit --review-json '{"contract":"reports/stripe-brief.yaml","subject":"139328"}'`. Clear it with `hermes cron edit <job_id> --clear-review`. Unrelated edits preserve the declaration. Setting review also sets `output_local_only: true`, and clearing it sets that flag to false. The cron tool exposes the same `review_json` and `clear_review` arguments.
 
-The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
+The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output against the original, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
 
-The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries. A gateway restart requeues reports still under review without changing their admission deadline, and the agent is never asked about the same report twice. A decision it already gave is reused even after the deadline, so a saved correction that passed the contract is still sent. A restart after the review prompt went out but before its decision was saved sends the original. A report whose review had not started goes out as the original once its deadline has passed. A report never gets a second rerun: a restart during the rerun sends the original. A review turn cut off by a restart is never resumed, so it cannot post a reply. Only a crash after final delivery begins produces an unknown send outcome, which is recorded and never retried. Gateway shutdown terminates tracked rerun process groups.
+Contracts can opt into source fidelity with `preserve_line_patterns`, a non-empty list of Python regular expressions. The checker selects the complete visible lines matching any pattern and requires the same text, count, and order in each FIX or RERUN, including replayed decisions. Fenced and indented code cannot stand in for visible source lines. Invalid rules or rules matching no original lines reject the rewrite and select the original. Contracts without this key keep their existing behavior. Use broad enough selectors for every immutable field and numbered task, including headings when section identity matters, while leaving supporting detail editable:
+
+```yaml
+preserve_line_patterns:
+  - '^\*\*(?:Status|Move|Running):\*\*'
+  - '^\d+\. '
+```
+
+
+The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries. A gateway restart requeues reports still under review without changing their admission deadline, and the agent is never asked about the same report twice. A decision it already gave is reused even after the deadline, but a saved correction is rechecked against the current contract and original report before sending. A restart after the review prompt went out but before its decision was saved sends the original. A report whose review had not started goes out as the original once its deadline has passed. A report never gets a second rerun: a restart during the rerun sends the original. A review turn cut off by a restart is never resumed, so it cannot post a reply. Only a crash after final delivery begins produces an unknown send outcome, which is recorded and never retried. Gateway shutdown terminates tracked rerun process groups.
 
 Final delivery uses the normal bot lane and mirrors a labelled cron delivery as a user turn into the resolved session. The invisible review's assistant decision remains separate from the final report when the transcript is replayed. The visible report omits the optional generic cron wrapper so the contract's envelope survives. Review decisions, candidate checks, selected text, message ID, delivery errors, and elapsed time are recorded in `<HERMES_HOME>/cron/review-receipts.jsonl`. The file rotates at 2 MiB and retains 1 backup, `review-receipts.jsonl.1`.
 
@@ -780,7 +817,7 @@ Cronjob Response: Morning feeds
 Note: The agent cannot see this message, and therefore cannot respond to it.
 ```
 
-To deliver the raw agent output without the wrapper, set `cron.wrap_response` to `false`:
+To deliver the raw agent output without the wrapper or a pre-agent provider fallback notice, set `cron.wrap_response` to `false`. Provider fallback still runs as configured and remains recorded in scheduler logs:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -1301,6 +1338,11 @@ lateness. For a one-shot, the field widens the catch-up window to
 `max(120, value)`; unset, invalid, and `0` keep 120 seconds. A start exactly
 at the resulting limit is still eligible. To clear the field through the update
 tool, pass an empty string.
+
+An interval of 2 minutes or less needs a limit of at least its interval plus
+60 seconds, such as `120` for `every 1m`. Under ordinary load such jobs start up
+to about one scheduler tick late, so a tighter deadline would skip routine
+occurrences. Create and update refuse a smaller value and name the minimum.
 
 Hermes checks the original scheduled instant both before admission and again
 when the worker starts, including after a wait for capacity or detached-worker

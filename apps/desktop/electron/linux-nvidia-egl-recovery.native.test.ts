@@ -51,6 +51,9 @@ function buildArtifact(name: string, commit: string): string {
 function start(artifact: string, userData: string, quitBeforeReveal = false) {
   const env = { ...process.env }
   delete env.ELECTRON_RUN_AS_NODE
+  if (process.platform === 'linux') {
+    env.ELECTRON_DISABLE_SANDBOX = '1'
+  }
   const nonce = `${Date.now()}-${children.length}`
   const eventsFile = path.join(userData, `events-${nonce}.jsonl`)
   const commandFile = path.join(userData, `command-${nonce}`)

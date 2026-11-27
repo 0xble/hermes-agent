@@ -158,7 +158,7 @@ function Complete-HandoffLog([int]$Seconds = 10) {
     while (-not (Sync-HandoffLog) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
 }
 
-function Write-HandoffLog([string]$Message) {
+function Write-HandoffLog([string]$Message, [bool]$ReplayToHost = $true) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
     # Add-Content is unsafe once a second writer is live: PowerShell caches a
     # content writer per path, so the second writer (an overlapping hand-off
@@ -174,7 +174,7 @@ function Write-HandoffLog([string]$Message) {
     [void](Sync-HandoffLog)
     if ($MarkerOp) { return }   # a helper op's stdout is its one verdict line
     if ($script:ConsoleInput -and [HermesHandoff.ConsoleInput]::Selecting()) { return }
-    Write-Host $line
+    if ($ReplayToHost) { Write-Host $line }
 }
 
 # Update marker (contract C1 v2 + amendments A1-A4) lives in marker.ps1 next
@@ -270,13 +270,6 @@ try {
 $script:Ui = $null
 $script:UiStage = "Hermes will open once done."   # until the first gate; matches ui.html
 $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-function Write-HandoffLog([string]$Message, [bool]$ReplayToHost = $true) {
-    $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
-    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
-    if ($script:ConsoleInput -and [HermesHandoff.ConsoleInput]::Selecting()) { return }
-    if ($ReplayToHost) { Write-Host $line }
-}
 
 # ── The shim: repo-owned HTML in a chromeless default-browser app window ───
 # The window is a veneer, not a participant: the update runs identically with
@@ -1114,6 +1107,9 @@ function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink, [ref]$Moved) {
 }
 
 function Sync-ChildStage {
+    # A prior writer may have queued lines while another process held the log. Every stage poll
+    # is also a publication opportunity, so release the queue before checking for new child data.
+    [void](Sync-HandoffLog)
     # Best-effort: an unreadable or half-replaced file leaves the current stage on screen.
     try {
         $stream = [IO.File]::Open($script:ChildStageFile, 'Open', 'Read', 'ReadWrite, Delete')
@@ -1659,13 +1655,16 @@ if ($SelfTestLogConcurrency) {
     # would leave the runspace without a callable definition.
     $fnAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null).FindAll({
         param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @("Write-HandoffLog", "Sync-HandoffLog", "Complete-HandoffLog")
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and @("Write-HandoffLog", "Sync-HandoffLog", "Complete-HandoffLog") -contains [string]$node.Name
     }, $true)
     if (-not $fnAst -or $fnAst.Count -ne 3) {
-        Write-Host "LOG-CONCURRENCY SELF-TEST: FAIL -- the hand-off log writer definitions were not found in this script"
-        exit 1
+        # Windows PowerShell 5.1 can expose no FunctionDefinitionAst when invoked through a detached -File wrapper. Reconstruct the loaded definitions.
+        $fnText = @("Sync-HandoffLog", "Write-HandoffLog", "Complete-HandoffLog" | ForEach-Object {
+            "function $_ {`r`n$((Get-Item Function:\$_).Definition)`r`n}"
+        }) -join "`r`n`r`n"
+    } else {
+        $fnText = (@($fnAst) | ForEach-Object { $_.Extent.Text }) -join "`r`n`r`n"
     }
-    $fnText = (@($fnAst) | ForEach-Object { $_.Extent.Text }) -join "`r`n`r`n"
     $body = @'
 param([string]$TargetLog, [string]$MutexName, [int]$Count, [int]$WriterId)
 $LogPath = $TargetLog

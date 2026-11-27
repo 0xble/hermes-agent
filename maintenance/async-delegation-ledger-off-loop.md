@@ -109,3 +109,5 @@ The completion pre-flight marks a claim settled before awaiting a terminal `drop
 `release`. The delivery `finally` block skips that primary claim, so cancellation while the
 worker-thread settle is blocked cannot issue a competing `release` and strand the completion.
 The regression `test_cancelled_preflight_settle_is_not_released_again` covers both dispositions.
+
+Contract tests: `tests/gateway/test_completion_delivery.py`, `tests/gateway/test_claim_refund_context.py`, `tests/gateway/test_completion_owner_retry.py`, `tests/tools/test_async_delegation_requeue.py`.

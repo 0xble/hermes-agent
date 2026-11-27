@@ -106,7 +106,12 @@ jobs:
 
       - name: Upload review status artifact
         if: always() && steps.emit-status.outcome != 'skipped'
+        # The artifact is a convenience copy of review_status, which the job already emits as an output.
+        # A stalled upload (actions/upload-artifact v7 hang, run 43094363909) must not consume the job
+        # deadline and fail qualification, so bound it below the job timeout; continue-on-error keeps
+        # the summary and status steps blocking.
         continue-on-error: true
+        timeout-minutes: 1
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: review-status-prompt-surface

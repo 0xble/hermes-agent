@@ -145,8 +145,13 @@ class PluginHost:
                 return self._channel  # type: ignore[return-value]
             self._stopping = False
             argv = self._argv()
+            # Windows holds a process's current directory open, so a host started in the profile
+            # directory makes an otherwise safe profile rename fail with WinError 32 while it is
+            # alive. Start it outside the profile there. POSIX renames a cwd freely, so it keeps
+            # the profile home.
+            cwd = Path(__file__).resolve().parents[1] if sys.platform == "win32" else self._home
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, env=self._env(), cwd=str(self._home),
+                                    stderr=subprocess.PIPE, env=self._env(), cwd=str(cwd),
                                     bufsize=0)
             threading.Thread(target=_pump_stderr, args=(proc, self._home.name), daemon=True,
                              name=f"plugin-host-{proc.pid}-stderr").start()

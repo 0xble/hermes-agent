@@ -38,9 +38,11 @@ def _clean_queue_and_context(monkeypatch):
 
 def _built(inline: bool):
     from agent.agent_init import _load_tools
+    from gateway.session_context import set_session_vars
     from tools.delegate_tool_config import gateway_delegation_inline_scope
 
-    agent = SimpleNamespace(platform="whatsapp", quiet_mode=True)
+    set_session_vars(platform="whatsapp", chat_id="c1", session_key="agent:main:whatsapp:dm:c1")
+    agent = SimpleNamespace(platform="whatsapp", quiet_mode=True, _gateway_session_key="agent:main:whatsapp:dm:c1")
     with gateway_delegation_inline_scope(inline):
         _load_tools(agent, ["hermes-cli"], None)
     return agent
@@ -113,6 +115,94 @@ def test_a_restored_mode_survives_a_later_tools_refresh(refresh, pinned_inline):
     refresh_agent_mcp_tools(fresh, quiet_mode=True, **refresh)
     assert session_joins_delegation(fresh) is pinned_inline
     assert _delegate(fresh) == _delegate(first)
+
+
+@pytest.mark.parametrize(
+    ("initial_inline", "current_mode"),
+    [(True, "background"), (False, "inline")],
+    ids=["inline-to-background", "background-to-inline"],
+)
+def test_cache_break_rederives_gateway_mode_from_current_config(initial_inline, current_mode, monkeypatch):
+    """Prompt refresh and compaction boundaries adopt a changed gateway_mode in both directions."""
+    from agent.conversation_compression import _refresh_agent_tool_definitions
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+    from tools.delegate_tool import session_joins_delegation
+    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+
+    agent = _built(inline=initial_inline)
+    agent._notification_config = {"delegation": {"gateway_mode": current_mode}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is True
+    refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)
+    assert session_joins_delegation(agent) is (current_mode == "inline")
+
+    # The compaction-owned helper performs the same convergence before its rebuild.
+    agent._notification_config = {"delegation": {
+        "gateway_mode": "inline" if current_mode == "background" else "background",
+    }}
+    _refresh_agent_tool_definitions(agent)
+    assert session_joins_delegation(agent) is (current_mode == "background")
+
+
+@pytest.mark.parametrize("platform", ["cli", "tui", "desktop", "cron", "subagent", ""])
+def test_cache_break_does_not_flip_non_gateway_agents(platform, monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent.platform = platform
+    agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert not hasattr(agent, "_delegation_inline") or agent._delegation_inline is False
+
+
+def test_cache_break_uses_session_interim_setting_for_heartbeat(monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent.platform = "telegram"
+    agent._gateway_interim_messages_enabled = False
+    agent._session_interim_assistant_messages_enabled = True
+    agent._notification_config = {"delegation": {"gateway_mode": "auto"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert agent._delegation_inline is False
+
+
+def test_prompt_refresh_converges_backend_pin_with_schema(monkeypatch):
+    from tools.mcp_tool_agent import refresh_agent_delegation_tool
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": {"gateway_mode": "inline", "backend": "default"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    monkeypatch.setattr("agent.delegation_backends.saved_backend", lambda: "default")
+    assert refresh_agent_delegation_tool(agent) is True
+    assert agent._delegation_inline is True
+    assert agent._delegation_backend == "default"
+
+
+@pytest.mark.parametrize("malformed", ["broken", {"gateway_mode": []}])
+def test_malformed_gateway_config_keeps_existing_mode(monkeypatch, malformed):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": malformed}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: {"delegation": malformed})
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert getattr(agent, "_delegation_inline", False) is False
+
+
+def test_unreadable_gateway_config_keeps_existing_mode(monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
+    monkeypatch.setattr(
+        "hermes_cli.config.read_user_config_raw",
+        lambda _path: (_ for _ in ()).throw(ValueError("bad yaml")),
+    )
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert getattr(agent, "_delegation_inline", False) is False
 
 
 def _parent(tools, depth=0):

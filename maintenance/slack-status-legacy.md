@@ -25,3 +25,5 @@ Run `scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_a
 With live-message authorization, mention the bot in a channel thread and verify its root is processing with native Stop during work and active after completion or Stop. Unit coverage does not establish live Slack rollout or UI behavior.
 
 Retire the fork adaptation only when released upstream preserves both protocols, bounded native transitions and successor fencing, or a deliberately accepted migration replaces the phrase path before Slack's legacy API removal. Reverting native supplementation must retain the phrase-only repair. Runtime promotion remains separate from source publication.
+
+Contract tests: `tests/gateway/test_slack.py`, `tests/gateway/test_slack_agent_sessions_api.py`, `tests/gateway/test_slack_native_stop.py`, `tests/gateway/test_slack_thread_status.py`, `tests/plugins/platforms/slack/test_session_status.py`, `tests/plugins/platforms/slack/test_outbound_budget.py`, `tests/gateway/test_typing_stale_cleanup.py`, `tests/gateway/test_typing_surface_ownership.py`.

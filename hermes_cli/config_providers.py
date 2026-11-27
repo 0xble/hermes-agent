@@ -119,7 +119,7 @@ _KNOWN_PROVIDER_KEYS = {
     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
-    "catalog_provider", "session_affinity_header"}
+    "catalog_provider", "session_affinity_header", "hermes_request_class"}
 
 
 def _pick_provider_base_url(entry: dict[str, Any], provider_key: str) -> str:
@@ -270,6 +270,8 @@ def _normalize_custom_provider_entry(
 
     # Per-provider extra HTTP headers may carry credentials — never log them downstream.
     _put("extra_headers", normalize_extra_headers(entry.get("extra_headers")))
+    if entry.get("hermes_request_class") is True:
+        normalized["hermes_request_class"] = True
     _put("session_affinity_header", _stripped("session_affinity_header"))
     _put("ssl_ca_cert", _stripped("ssl_ca_cert"))
 
@@ -293,7 +295,7 @@ def _custom_provider_entry_to_provider_config(
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
         "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
-        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider"):
+        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider", "hermes_request_class"):
         if field in normalized:
             provider_entry[field] = normalized[field]
     if "model" in normalized:

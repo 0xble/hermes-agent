@@ -128,6 +128,7 @@ class GatewayAgentCacheMixin:
                 hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else "",
                 runtime.get("base_url", ""), runtime.get("provider", ""),
                 runtime.get("requested_provider", ""), runtime.get("api_mode", ""),
+                runtime.get("model_pinned") is True,
                 sorted((runtime.get("capabilities") or {}).items()),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — set per-message on the cached agent; no prompt/tool effect.
@@ -275,12 +276,16 @@ class GatewayAgentCacheMixin:
 
     async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
         """Serialize restart hydration with route edits, publishing only on the loop."""
-        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
-            if self._session_model_override(session_key) is None:
-                epoch = self._session_model_override_epoch(session_key)
-                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
-                self._commit_session_model_override(session_key, loaded, epoch)
+            await self._rehydrate_session_model_override_locked_async(session_key)
+
+    async def _rehydrate_session_model_override_locked_async(self, session_key: str) -> None:
+        """Hydrate an override while the caller already owns its route lock."""
+        if self._session_model_override(session_key) is None:
+            from gateway.session_store_async import run_store_lookup
+            epoch = self._session_model_override_epoch(session_key)
+            loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
+            self._commit_session_model_override(session_key, loaded, epoch)
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Synchronous callers retain lazy restoration, using the same fenced commit.
@@ -325,7 +330,7 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
             return None, "session"
-        if not persisted:
+        if not isinstance(persisted, dict) or not persisted:
             return None, scope
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         if "expires_at" in persisted:

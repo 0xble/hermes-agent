@@ -617,6 +617,16 @@ def _run_once_locked(home: Path, plist: Path, label: str, *, grace: float | None
 
 def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str,
                    explicit: bool | None = None) -> bytes:
+    """launchd definition that keeps spawning across interpreter changes in ``current``.
+
+    launchd records a launch constraint (LWCR) for the job's program binary. With the release venv's
+    Python as the program, a release whose venv points at a different interpreter build leaves that
+    record stale: every spawn then fails with "Unable to get updated LWCR ... error 0x3" and exit 78,
+    and a kickstart does not refresh it. Release switches, ``hermes update --rollback`` and this
+    guardian's own rollback all change that binary. The gateway's ``/usr/bin/osascript`` wrapper keeps
+    the program fixed and runs the release interpreter as its child, so the guardian uses it too.
+    """
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
     mode = domain.split("/", 1)[0]
     if mode not in {"gui", "user"}:
         raise ValueError("guardian launchd domain must be gui or user")
@@ -626,14 +636,16 @@ def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str,
                         if gateway_plist.is_file() else None)
         explicit = mode == "user" or session_type in ("Aqua", "Background")
     session = {"LimitLoadToSessionType": "Background" if mode == "user" else "Aqua"} if explicit else {}
+    logs = home / "logs/guardian"
+    command = [str(python), "-m", "hermes_cli.gateway_guardian", "run",
+               "--gateway-plist", str(gateway_plist), "--gateway-label", label, "--domain", domain]
     return plistlib.dumps({**session, "Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
-                           "ProgramArguments": [str(python), "-m", "hermes_cli.gateway_guardian", "run",
-                                                "--gateway-plist", str(gateway_plist), "--gateway-label", label,
-                                                "--domain", domain],
+                           "ProgramArguments": launchd_program_arguments(
+                               command, logs / "stdout.log", logs / "stderr.log"),
                            "WorkingDirectory": str(home / "current"),
                            "EnvironmentVariables": {"HERMES_HOME": str(home)},
-                           "StandardOutPath": str(home / "logs/guardian/stdout.log"),
-                           "StandardErrorPath": str(home / "logs/guardian/stderr.log")})
+                           "StandardOutPath": str(logs / "stdout.log"),
+                           "StandardErrorPath": str(logs / "stderr.log")})
 
 
 def cli(argv: list[str] | None = None) -> int:

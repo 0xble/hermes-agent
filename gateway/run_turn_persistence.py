@@ -99,11 +99,20 @@ class GatewayTurnPersistenceMixin:
             # the human-turn notice. Live delivery must stay silent rather than become an error.
             logger.warning("Could not record the room silence decision for %s", session_key, exc_info=True)
 
+    async def _loop_completion_reply(self, session_entry, loop_identity, response) -> str:
+        if loop_identity is None or session_entry is None:
+            return ""
+        from gateway.loop_completion import complete_loop_response
+        return await self._run_in_executor_with_context(
+            complete_loop_response, session_entry.session_id, loop_identity, response)
+
     async def _hmwa_shape_agent_response(
         self, agent_result, source, history, session_entry, session_key,
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        loop_identity: Optional[tuple] = None,
+        internal: bool = False,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -119,6 +128,17 @@ class GatewayTurnPersistenceMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
+        _internal_preemption_silence = (
+            internal
+            and agent_result.get("interrupted")
+            and agent_result.get("interrupt_source") == "gateway_user_turn_preemption"
+        )
+        # A cold-path user admission stops an internal machine turn cooperatively. Its partial model
+        # output is transcript evidence, never a chat reply, and must not become the generic
+        # "send it again" response used for an unstarted human turn.
+        if _internal_preemption_silence:
+            response = ""
+            _intentional_silence = True
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
@@ -131,15 +151,22 @@ class GatewayTurnPersistenceMixin:
         # the exchange in silence, and the visible fallback would be runtime text it answers (#137027).
         if not automatic_notices_allowed(_silence_source):
             _silence_reply_expected = False
-        if _intentional_silence and not self._silence_allowed_for_source(
-            _silence_source, _silence_kind, _silence_reply_expected, agent_result,
+        if (
+            _intentional_silence
+            and not _internal_preemption_silence
+            and not self._silence_allowed_for_source(
+                _silence_source, _silence_kind, _silence_reply_expected, agent_result,
+            )
         ):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
-            response = _unexpected_silence_reply()
+            # ``[SILENT]`` plus LOOP_COMPLETE finishes the loop this turn observed. That notice is
+            # the turn's one reply; the post-turn hook then finds the loop already stopped.
+            response = await self._loop_completion_reply(session_entry, loop_identity, response) \
+                or _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
                 "silence marker suppressed on an unaddressed or opted-in turn: platform=%s chat=%s",
@@ -529,6 +556,7 @@ class GatewayTurnPersistenceMixin:
             _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
+    # health: allow CC -- fallback boundary copy must classify synthetic origin before writing; keep this persistence seam intact.
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -616,7 +644,15 @@ class GatewayTurnPersistenceMixin:
                 # into an unrelated future message and replay stale side effects (#107070).
                 supervisor_status = bool(response) and agent_result.get(
                     "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
+                from gateway.run_turn import _failed_turn_copy_is_user_facing
                 notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
+                if not supervisor_status and not _failed_turn_copy_is_user_facing(
+                    event, prepared.persist_user_display_kind,
+                ):
+                    # Only the generic resend boundary is human-facing copy. A supervisor's
+                    # normalized status is explicit durable work content and must survive even on
+                    # a synthetic origin; synthetic failures without status content stay empty.
+                    notice = ""
                 await self._hmwa_close_failed_turn(
                     sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
             else:

@@ -1,5 +1,13 @@
 # Fork CI reliability
 
+## Prompt-prefix journey isolation
+
+Fork patch identity: `release-qualification`.
+
+The cross-surface prompt-prefix journey runs in its own file so the default 300-second watchdog applies independently of the CLI-only and TUI-only restart journeys. Both files use the same fixture and assertion helper to verify the cached prefix and durable history. Retire the split when the selected upstream suite gives these journeys independent execution bounds.
+
+Contract tests: `tests/e2e/core/history/test_prefix_stability.py`, `tests/e2e/core/history/test_prefix_stability_surface_switch.py`.
+
 ## Reset cleanup fixture scope
 
 The reset resource-cleanup probe has a cached agent but no persisted old
@@ -266,6 +274,16 @@ time and each surviving group member's independent proof. Foreign, mixed,
 recycled and unverifiable identities remain refused. Deterministic regressions
 force sibling reparenting between delivery calls, and the real POSIX grace-kill
 regression must pass without guard bypasses or longer timeouts.
+The reset-cleanup liveness regression rendezvous with the actual worker via
+`call_soon_threadsafe` and an asyncio event, then holds cleanup until the loop
+releases it. Reset setup and executor admission have no separate one-second
+speed requirement; the test still rejects inline cleanup and a reset that
+omits cleanup. Every assertion path releases the worker, drains the reset task,
+and stops the fixture's executor. Loaded-runner scheduling must not be confused
+with an event-loop deadlock or repaired by widening a timeout.
+The post-commit restart oracle follows the pause-record recovery warning rather
+than the older fleet-restart wording, while still proving that the warning
+clears only after a gateway serves the new commit.
 
 Local native Electron case-spelling security tests require a case-sensitive
 temporary filesystem. On a default case-insensitive macOS volume, provide a
@@ -419,6 +437,14 @@ endpoint or existing explicit overrides are unsupported. Related SDK-wiring,
 accounting and plugin-only resolution tests stub the DeepInfra inventory,
 OpenRouter pricing catalog and models.dev provider catalog respectively, without
 replacing the behavior each test actually asserts.
+
+ACP attachment uses cache-only registry, label, aggregator and recommendation
+metadata plus shared endpoint caches. The background picker warmer also enumerates
+named proxies whose slugs collide with canonical providers. Ordinary inventory
+readers keep their live discovery behavior. Nous policy, tier, free-tier and
+Portal recommendation behavior is unchanged from base: unknown policy remains
+unfiltered, and expired governed catalogs synchronously refresh with the existing
+8-second request timeout. This change does not invent a second entitlement cache.
 
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
@@ -598,6 +624,17 @@ completion with `PROCESS_NOTIFICATION_END`; the older test still required the
 payload's closing bracket to be the final character. Assert the exact bounded
 output and framing terminator together. The nightly Linux failure was a stale
 test expectation, not a truncated-notice product defect.
+
+## Hosted room independence test lease
+
+The `fork-ci-reliability` identity also covers
+`tests/tui_gateway/test_hosted_room_driver_runtime.py::test_waiting_room_does_not_block_an_independent_room`.
+It ran the threaded runtime on a 0.4s wall-clock room lease and waited 1.0s for the waiting room's
+submit. If starting the task stalls for longer than the lease, the pre-submit renewal finds the
+lease expired and fences the attempt, which goes `indeterminate` and is never submitted, so the wait
+fails at any length. The test now uses a 30s lease, as `test_authority_loss_stops_terminal_commit`
+does, and a 5s submit bound. Product code is unchanged. Other tests in the file still run on the
+0.4s lease. Retire when upstream stops this test depending on lease expiry.
 
 ## Git fixture isolation
 
@@ -784,6 +821,16 @@ cached identity. Shared foreign sessions, unverifiable processes and genuinely
 unowned groups remain blocked. Previously verified identities continue to cover
 leaderless groups without trusting a bare PID or PGID.
 
+On macOS a gateway start bootstraps a transient launchd plist, and launchd, not
+the test, then runs the gateway under an osascript wrapper with ppid 1. The
+bootstrap argv names only the plist, so the guard reads the plist's
+`ProgramArguments`. It applies the same gateway-spawn check to the wrapped shell
+command and refuses the bootstrap unless the test is marked
+`spawns_gateway_lookalike`. Without this, a cron unit test that reached
+`run_canonical_job` leaked a real detached gateway that kept its pytest
+`HERMES_HOME` for hours. Retire this when upstream starts gateways without a
+launchd job or its own guard inspects launchd payloads.
+
 Run the live-system guard canary, process registry and PTY suites, plus the real
 handoff publication fixture. The canary creates an inert orphan before the first
 signal and covers stale identities, vanished leaders and changing membership.
@@ -870,9 +917,14 @@ baseline reached `/quit after resume` with 294.3 seconds of successful steps
 and then hit the unchanged 300-second file cap before its one-shot/cleanup.
 Deadline failures now include the step, pane and gateway log, and stop further
 input instead of accumulating later timeouts. A missing composer acknowledgement
-never sends Enter. A slash-command completion redraw that leaves the typed
-text on its own line still counts; a suggestion row that only names the
-command does not. With that checked readiness condition, idle steps use a
+never sends Enter. Composer acknowledgement requires a fresh occurrence ending
+at the terminal insertion cursor, not adjacency to `❯` or a bare exact line.
+After interruption the completion redraw can retain rule/answer chrome before
+the typed text (`──/compress` or `As/compress` in hosted failures); neither
+changes the input buffer. Cursor coordinates distinguish that buffer from a
+suggestion row or auto-suggest suffix, even when either shows the full command.
+The existing 10-second deadline and fresh-output requirement remain unchanged.
+With that checked readiness condition, idle steps use a
 0.5-second quiet period instead of a 2-second timing cushion. All output,
 traceback, process and witness assertions remain. Non-TTY output is captured to
 temporary files so inherited
@@ -1091,7 +1143,8 @@ without receiving a signal whose ownership cannot be proved. The discovery scan
 still skips inaccessible environments. The containment assertion and final
 case-owned survivor verification remain mandatory.
 
-Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`.
+Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`,
+  `tests/acp_adapter/test_cold_catalog_socket.py`, `tests/acp_adapter/test_cold_catalog_warming.py`, `tests/acp_adapter/test_gateway_catalog_offline.py`, `tests/e2e/core/cli_tmux/test_composer_readiness.py`, `tests/hermes_cli/test_picker_registry_read_scope.py`.
 
 This extends the fork-local `routing-test-process-cleanup` harness, with no product
 runtime change. Retire when the accepted upstream case teardown handles the same

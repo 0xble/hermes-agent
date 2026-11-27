@@ -254,6 +254,29 @@ def test_switch_only_compaction_path_was_removed():
     assert not hasattr(TurnRunner, "_compact_before_attended_switch")
 
 
+def test_attended_switch_back_notifies_usage_ledger():
+    previous = AttendedResolution(
+        "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
+    )
+    decision = AttendedResolution(
+        "gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True,
+    )
+    turn, runner, _state = _runner(
+        decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses"}),
+    )
+    agent = SimpleNamespace(
+        session_id="session-1", model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision=previous, _gateway_attended_decision_key=previous.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"}, context_compressor=None,
+    )
+    with patch("agent.agent_runtime_helpers.switch_model"), patch(
+        "hermes_cli.observability.request_usage_ledger.note_attended_switch",
+    ) as note:
+        turn._apply_attended_before_api_call(agent)
+    note.assert_called_once_with(runner, turn._ctx, agent, previous, "gpt-6.1-sol")
+
+
 def test_new_session_first_attended_turn_has_no_switch_in_notice():
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True, new_session=True)
     turn, runner, _state = _runner(decision)

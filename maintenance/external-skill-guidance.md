@@ -32,3 +32,5 @@ Remove this patch when released upstream distinguishes external-dir skill mainte
 ## Rollback
 
 Revert the commit carrying `Fork-Patch: external-skill-guidance`.
+
+Contract tests: `tests/agent/test_prompt_builder.py`, `tests/agent/test_refine_focus.py`, `tests/tools/test_skill_manager_tool.py`, `tests/agent/test_background_review.py`, `tests/agent/test_background_review_cache_parity.py`, `tests/agent/test_background_review_memory_scope.py`, `tests/agent/test_background_review_toolset_restriction.py`.

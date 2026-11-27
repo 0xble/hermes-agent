@@ -15,4 +15,4 @@ def test_llm_oneshot_passes_any_task_key_through(monkeypatch):
     replies = [server._methods["llm.oneshot"]("r", {"input": "x", **({"task": task} if task else {})})
                for task in ("my_digest", "  ", None)]
     assert [reply.get("result") for reply in replies] == [{"text": "t"}] * 3, replies
-    assert seen == ["my_digest", "title_generation", "title_generation"]
+    assert seen == ["my_digest", "oneshot", "oneshot"]

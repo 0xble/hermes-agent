@@ -19,3 +19,5 @@ Adapted from archived HERMES-065 (`session-context.md`) and Brian's open upstrea
 ## Retirement and rollback
 
 Retire after a released upstream version supplies equivalent platform-aware session-search results and the Telegram delivery guard, with tests passing without this fork patch. Roll back by reverting the fork patch commit; no persisted data or schema migration.
+
+Contract tests: `tests/tools/test_session_search.py`, `tests/tools/test_registry.py`, `tests/agent/test_token_persistence_non_cli.py`, `tests/gateway/test_telegram_unsupported_link_targets.py`, `tests/gateway/test_telegram_format.py`, `tests/gateway/test_telegram_rich_messages.py`.

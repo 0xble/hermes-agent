@@ -8,6 +8,7 @@ guard regression cannot kill anything.
 """
 
 import os
+import plistlib
 import subprocess
 import sys
 
@@ -66,6 +67,23 @@ def test_gateway_start_inside_a_container_exec_is_not_blocked():
 def test_gateway_start_on_the_host_is_still_blocked():
     with pytest.raises(RuntimeError, match="REAL.*gateway runtime"):
         subprocess.run(["python", "-m", "hermes_cli.main", "gateway", "start"], check=False)
+
+
+def test_launchd_gateway_bootstrap_is_blocked_before_detach(tmp_path):
+    """Inspect transient macOS launchd plists before osascript can orphan a gateway."""
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
+
+    plist = tmp_path / "gateway.plist"
+    plistlib.dump({
+        "ProgramArguments": launchd_program_arguments(
+            [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--quiet", "--idle-exit"],
+            tmp_path / "stdout.log",
+            tmp_path / "stderr.log",
+        ),
+    }, plist.open("wb"))
+
+    with pytest.raises(RuntimeError, match="REAL Hermes gateway"):
+        subprocess.run(["launchctl", "bootstrap", "gui/123", str(plist)], check=False)
 
 
 def test_custom_home_tmpdir_is_relocated_before_pytest_uses_it(tmp_path):

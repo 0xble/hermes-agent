@@ -446,8 +446,9 @@ auxiliary:
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config_cache
         monkeypatch.setattr(config_mod, "_LOAD_CONFIG_CACHE", {})
-        monkeypatch.setattr(config_mod, "_RAW_CONFIG_CACHE", {})
+        monkeypatch.setattr(config_cache, "_RAW_CONFIG_CACHE", {})
 
         manager = self._make_manager()
         ctx = self._register(manager, name="my-plugin", key="my-plugin", task_key="classifier")
@@ -530,8 +531,9 @@ auxiliary:
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config_cache
         monkeypatch.setattr(config_mod, "_LOAD_CONFIG_CACHE", {})
-        monkeypatch.setattr(config_mod, "_RAW_CONFIG_CACHE", {})
+        monkeypatch.setattr(config_cache, "_RAW_CONFIG_CACHE", {})
         _set_registry(monkeypatch, [{"key": "classifier", "plugin": "my-plugin"}])
         _set_builtins(monkeypatch, [])
 
@@ -578,8 +580,9 @@ auxiliary:
             encoding="utf-8",
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli import config_cache
         monkeypatch.setattr(config_mod, "_LOAD_CONFIG_CACHE", {})
-        monkeypatch.setattr(config_mod, "_RAW_CONFIG_CACHE", {})
+        monkeypatch.setattr(config_cache, "_RAW_CONFIG_CACHE", {})
         _set_registry(monkeypatch, [{"key": "classifier", "plugin": "my-plugin"}])
         _set_builtins(monkeypatch, [])
 

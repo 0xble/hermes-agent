@@ -124,7 +124,7 @@ class TestStartupPlatformIsolation:
             ]
         )
 
-        def fake_create_task(coro):
+        def fake_create_task(coro, *, name=None, context=None):
             coro.close()
             return MagicMock()
 
@@ -913,7 +913,7 @@ class TestVoiceInputCallbackWiring:
         adapter = self._make_discord_voice_adapter()
         runner.config.sessions_dir = tmp_path
 
-        def fake_create_task(coro):
+        def fake_create_task(coro, *, name=None, context=None):
             coro.close()
             return MagicMock()
 

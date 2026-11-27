@@ -431,3 +431,5 @@ To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,
 set it to `true` for adaptive rich rendering or `false` for MarkdownV2. Rolling
 back while leaving `always` would reproduce the silent-disable regression.
+
+Contract tests: `tests/gateway/test_telegram_rich_copy_quotes.py`, `tests/tools/test_send_message_tool.py`, `tests/gateway/test_telegram_chat_outbound_budget.py`, `tests/gateway/test_telegram_progress_literals.py`, `tests/agent/test_display.py`, `tests/gateway/test_telegram_rich_messages.py`, `tests/gateway/test_telegram_chunk_indicator_budget.py`.

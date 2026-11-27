@@ -5,6 +5,13 @@ measured to answer with ``terminal.integrated.enableImages`` on (sixel reply + D
 (DA1 only), optionally late, then types ``hi``. After the probe the child reads its tty and feeds
 it to prompt_toolkit's parser with the CLI's input tables, as the prompt would: ``typed`` is what
 would land in the user's prompt.
+
+The scenarios are positioned relative to the probe's own deadline and drain, and the child runs
+those windows (and the parent's reply delays) ``_SCALE`` times wider than production. Production is
+a 50 ms deadline + 50 ms drain, so the "late but inside the drain" case (reply at 80 ms) had about
+20 ms of slack against one scheduler stall; the failing macOS run was a 4-worker lane where this
+file took 15 s instead of ~4 s. Same ordering of reply vs deadline vs drain, five times the slack.
+The production constants are unchanged.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import pytest
 
 pytestmark = pytest.mark.platforms("posix")
 
+_SCALE = 5
 _REPO = str(Path(__file__).resolve().parents[2])
 _CHILD = textwrap.dedent("""
     import os, select, sys, termios, tty
@@ -28,12 +36,15 @@ _CHILD = textwrap.dedent("""
     from hermes_cli.pt_input_extras import install_ignored_terminal_sequences
     from prompt_toolkit.input.vt100_parser import Vt100Parser
     from prompt_toolkit.keys import Keys
+    scale = float(os.environ["PROBE_TEST_SCALE"])
+    terminal_image._VSCODE_PROBE_TIMEOUT_S *= scale
+    terminal_image._VSCODE_DRAIN_S *= scale
     result = terminal_image.probe_vscode_images()
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     leaked = b""
-    while select.select([fd], [], [], 0.3)[0]:
+    while select.select([fd], [], [], 0.3 * scale)[0]:
         leaked += os.read(fd, 256)
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
     install_ignored_terminal_sequences()
@@ -56,7 +67,8 @@ def _run(reply: bytes, delay: float) -> str:
     master, slave = pty.openpty()
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SSH_", "KITTY_", "ITERM_", "WEZTERM_", "KONSOLE_", "TMUX"))}
-    env.update(TERM_PROGRAM="vscode", TERM="xterm-256color", PYTHONPATH=_REPO)
+    env.update(TERM_PROGRAM="vscode", TERM="xterm-256color", PYTHONPATH=_REPO,
+               PROBE_TEST_SCALE=str(_SCALE))
     proc = subprocess.Popen([sys.executable, "-c", _CHILD], stdin=slave, stdout=slave,
                             stderr=subprocess.PIPE, env=env, cwd=_REPO)
     os.close(slave)
@@ -72,7 +84,7 @@ def _run(reply: bytes, delay: float) -> str:
                 break
             out += data
             if not answered and b"\x1b[c" in out:
-                time.sleep(delay)  # health: allow HX013 -- the late reply IS the scenario under test
+                time.sleep(delay * _SCALE)  # health: allow HX013 -- the late reply IS the scenario under test
                 os.write(master, reply)
                 time.sleep(0.02)  # health: allow HX013 -- the user's keys arrive after the reply
                 os.write(master, b"hi")

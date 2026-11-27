@@ -8,6 +8,8 @@ import hmac
 import os
 
 from gateway.session_admission import admission_fingerprint
+from gateway.session_authorities import require_serving
+from gateway.session_store_async import run_store_call
 from hermes_state_runtime import (
     RuntimeStoreError, _secret_digest, adopt_worker_execution,
     mutate_worker_execution, register_worker_execution,
@@ -16,13 +18,15 @@ from hermes_state_runtime import (
 _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
 
 
-def _claim(connection, ref, params):
+async def _claim(connection, params):
     authority = connection.authority
     if params.get('profile_id') != authority.profile_id or connection.actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     if not connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
-    return worker_identity_claim(authority, params, connection.actor.subject)
+    claim = await run_store_call(worker_identity_claim, authority, params, connection.actor.subject)
+    require_serving(authority)
+    return claim
 
 
 def worker_identity_claim(authority, params, subject):
@@ -50,8 +54,10 @@ def worker_identity_claim(authority, params, subject):
         key: params[key] for key in _SCOPE} | {'session_id': origin, 'principal': subject})
 
 
-def _verify(connection, ref, params, claim):
-    return verify_worker_identity_claim(connection.authority, params, claim)
+async def _verify(connection, params, claim):
+    authority = connection.authority
+    await run_store_call(verify_worker_identity_claim, authority, params, claim)
+    require_serving(authority)
 
 
 def verify_worker_identity_claim(authority, params, claim, *, live_only=False):
@@ -73,7 +79,6 @@ def verify_worker_identity_claim(authority, params, claim, *, live_only=False):
 
 
 async def worker_request(connection, ref, params, *, operation):
-    from gateway.session_authorities import require_serving
     require_serving(connection.authority)  # adopt/persist would write with the released epoch
     if operation == "persist" and isinstance(params.get("operation"), str) and params["operation"].startswith("delegation."):
         from gateway.session_worker_delegation import worker_delegation_request
@@ -84,7 +89,7 @@ async def worker_request(connection, ref, params, *, operation):
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise RuntimeStoreError('invalid_params')
-    claim = _claim(connection, ref, params)
+    claim = await _claim(connection, params)
     authority = connection.authority
     if operation == 'register':
         authority._require_admission_open()
@@ -106,7 +111,7 @@ async def worker_request(connection, ref, params, *, operation):
             **scope, kind='compute', adoption_secret=claim, require_idle=True)
     if 'worker:adopt' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
-    _verify(connection, ref, params, claim)
+    await _verify(connection, params, claim)
     if operation == 'adopt':
         return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
                                        **scope, adoption_secret=claim)

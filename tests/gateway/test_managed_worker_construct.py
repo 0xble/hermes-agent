@@ -74,7 +74,7 @@ def _serve(cls):
     return server
 
 
-def run_pair(tmp_path, extra_config, turn, *, before_create=None, **create_params):
+def run_pair(tmp_path, extra_config, turn, *, before_create=None, explicit_model=True, **create_params):
     """Boot one ordinary daemon; create an in-process and a managed session from the same config;
     run ``turn(ws, sid, name, settle, servers)`` for each and return its results by session.
     ``before_create(home)`` edits the profile after the daemon started, before each create."""
@@ -120,8 +120,8 @@ def run_pair(tmp_path, extra_config, turn, *, before_create=None, **create_param
                     edited['gateway']['managed_workers'] = True
                     (home / 'config.yaml').write_text(json.dumps(edited))
                 created = await rpc(ws, 'session.create', request_id=name, source='cli', cwd=str(home),
-                                    model='primary-model', provider='custom', base_url=purl,
-                                    api_key='loopback-only', toolsets=[], **create_params)
+                                    provider='custom', base_url=purl, api_key='loopback-only', toolsets=[],
+                                    **({'model': 'primary-model'} if explicit_model else {}), **create_params)
                 assert 'result' in created, created
                 sid = created['result']['session_id']
                 results[name] = await turn(ws, sid, name, settle, SimpleNamespace(primary=primary, backup=backup, query=query))
@@ -137,18 +137,26 @@ def run_pair(tmp_path, extra_config, turn, *, before_create=None, **create_param
 
 
 @pytest.mark.platforms("linux")
-def test_managed_turn_falls_back_like_the_in_process_turn(tmp_path):
+@pytest.mark.parametrize('explicit_model', [False, True])
+def test_managed_turn_falls_back_like_the_in_process_turn(tmp_path, explicit_model):
     async def turn(ws, sid, name, settle, servers):
         servers.primary.refuse = True
-        start = len(servers.backup.requests)
+        first_primary, first_backup = len(servers.primary.requests), len(servers.backup.requests)
         result = await settle(ws, sid, name + '-refused', 'NEED_FALLBACK')
         return {'result': {k: result.get(k) for k in ('final_response', 'failed', 'completed', 'model')},
-                'backup_models': {r.get('model') for r in servers.backup.requests[start:]}}
-    results = run_pair(tmp_path, lambda home: {}, turn)
-    expected = {'final_response': 'BACKUP_OK', 'failed': False, 'completed': True, 'model': 'backup-model'}
+                'primary_models': {r.get('model') for r in servers.primary.requests[first_primary:]},
+                'backup_models': {r.get('model') for r in servers.backup.requests[first_backup:]}}
+    results = run_pair(tmp_path, lambda home: {}, turn, explicit_model=explicit_model)
     for name in ('inproc', 'managed'):
-        assert results[name]['result'] == expected, (name, results)
-        assert results[name]['backup_models'] == {'backup-model'}, results
+        result = results[name]['result']
+        if explicit_model:
+            assert result['failed'] and not result['completed'], (name, results)
+            assert results[name]['primary_models'] == {'primary-model'}, (name, results)
+            assert not results[name]['backup_models'], (name, results)
+        else:
+            expected = {'final_response': 'BACKUP_OK', 'failed': False, 'completed': True, 'model': 'backup-model'}
+            assert result == expected, (name, results)
+            assert results[name]['backup_models'] == {'backup-model'}, (name, results)
     assert (results['inproc']['workers'], results['managed']['workers']) == (0, 1), results
 
 

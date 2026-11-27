@@ -446,6 +446,22 @@ def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> None:
     finish_delegation_unit(unit.task_list, results, background=True)
 
 
+def batch_route_chain(child_agents: list) -> list[tuple[str, str, str]]:
+    """Each child's primary route, then the first child's fallbacks, each distinct route once.
+
+    Children of one batch usually share a route. Keeping each route once, in order, means a retry
+    reads each route's cooldown once instead of once per child.
+    """
+    from agent.shared_primary_cooldown import route_from_agent
+    routes = [route_from_agent(child) for child in child_agents]
+    if child_agents:
+        for entry in list(getattr(child_agents[0], "_fallback_chain", []) or []):
+            if isinstance(entry, dict):
+                routes.append((str(entry.get("provider") or "").strip().lower(),
+                               str(entry.get("base_url") or ""), str(entry.get("model") or "").strip()))
+    return list(dict.fromkeys(routes))
+
+
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
@@ -478,6 +494,14 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     def _cancel_queued(reason: str = "Queued delegation cancelled"):
         _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
 
+    from agent.shared_primary_cooldown import route_from_agent, route_from_record
+    # Children can run on different routes (model-map options), so every child's primary and
+    # fallbacks belong in the chain; otherwise the retry misses a sibling's recovering route.
+    routes = [route_from_agent(child) for child in child_agents]
+    routes += [route_from_record(entry) for child in child_agents
+               for entry in (getattr(child, "_fallback_chain", None) or []) if isinstance(entry, dict)]
+    route_chain = list(dict.fromkeys(routes))
+
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
         goals=[t["goal"] for t in unit.task_list], context=effective_context,
@@ -493,6 +517,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
                           and unit.live_writers[i].path is not None},
+        route_chain=route_chain,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
 

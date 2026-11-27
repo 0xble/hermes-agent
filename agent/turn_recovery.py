@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- earliest-route copy is coupled to the existing recovery response surface.
 """Recovery-branch handlers for the conversation turn's inner retry loop.
 
 When the model call raises, one-shot recovery chains run before the generic retry/backoff
@@ -34,6 +35,7 @@ from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy, provider_label_for, site_copy, stamp_failure,
 )
 from agent.route_verdicts import route_visit
+from agent.turn_failure_routes import exhausted_route_labels, fallback_chain_path
 from agent.turn_retry_state import TurnRetryState
 from agent.notice_style import ContextNotice
 from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
@@ -453,6 +455,12 @@ def _recover_welcome_tier(agent: Any, classified: Any, _retry: TurnRetryState) -
         requested = str(getattr(agent, "model", "") or "")
         target = alternates[0] if alternates else None
         if target and target != requested:
+            pinned = getattr(agent, "_pinned_fallback_model", None)
+            if isinstance(pinned, str):
+                from hermes_cli.fallback_config import same_fallback_model
+                if not same_fallback_model(pinned, target):
+                    logger.info("Explicit model %s refused Nous free-tier fallback to %s", pinned, target)
+                    return False
             try:
                 agent.model = target
                 agent._nous_model_switch = (requested, target)
@@ -968,7 +976,7 @@ def nonretryable_client_error_result(
         _vlines(
             agent,
             f"   💡 {CONTENT_POLICY_NEXT_STEPS}",
-            "      To route future blocks to another provider automatically: hermes fallback add",
+            f"      To route future blocks to another provider, list backups under {fallback_chain_path(agent)}.",
         )
     # TLS certificate failures are environment problems — name the knobs for each cause.
     if classified.reason == FailoverReason.ssl_cert_verification:
@@ -1150,9 +1158,15 @@ def max_retries_exhausted_result(
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
         _reset_at = classified.error_context.get("reset_at")
+        _earliest_s = None
+        if _reset_at is not None or is_rate_limited or _is_billing:
+            from agent.shared_primary_cooldown import earliest_route_delay
+            _earliest_s = earliest_route_delay(agent, failing_route=(provider, base_url, model))
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
+            earliest_route_seconds=_earliest_s, chain_path=fallback_chain_path(agent),
+            exhausted_routes=exhausted_route_labels(agent, provider, model),
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
@@ -1169,6 +1183,8 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
+    from agent.fallback_endpoint_domain import append_attempt_summary
+    _final_response = append_attempt_summary(agent, _final_response)
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
@@ -1274,13 +1290,20 @@ def abort_turn_on_interrupt(
     agent._drop_trailing_empty_response_scaffolding(messages)
     close_interrupted_tool_sequence(messages, interrupt_text, stopped=True)
     agent._persist_session(messages, conversation_history)
-    # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
-    # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
-    agent.clear_interrupt(hard_cancel=True)
-    return {
+    # This helper returns directly from the API-error path, bypassing the normal
+    # finalizer. Stamp the cause before clear_interrupt() drops the pending state;
+    # otherwise a message-less system preemption is indistinguishable from a user
+    # stop to the gateway.
+    result = {
         "final_response": interrupt_text, "messages": messages, "api_calls": api_call_count,
         "completed": False, "interrupted": True,
     }
+    from agent.interrupt_control import stamp_interrupt_result
+    stamp_interrupt_result(agent, result, interrupted=True)
+    # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
+    # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
+    agent.clear_interrupt(hard_cancel=True)
+    return result
 
 
 def interruptible_backoff_sleep(
@@ -1338,13 +1361,15 @@ def reset_hint(api_error: Exception) -> str:
 
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
-    is_zai_coding_overload: bool, base_url: Any, model: Any,
+    is_zai_coding_overload: bool, base_url: Any, model: Any, retry_wait_cap: Optional[float] = None,
 ) -> float:
     """Pick the wait before the next API retry and announce it. Retry-After wins for
     rate limits and any other retryable error (capped at ``RETRY_AFTER_CAP_S``); otherwise
     jittered backoff, replaced by the adaptive policy for 429s / Z.AI overloads. Retries are
     buffered (replayed only if every retry fails); a long Z.AI Coding wait or a non-rate-limit
-    ``Retry-After`` over ``LIVE_RETRY_WAIT_CAP_S`` is announced when it starts."""
+    ``Retry-After`` over ``LIVE_RETRY_WAIT_CAP_S`` is announced when it starts. ``retry_wait_cap``
+    is reserved for a route that is about to fail over; it bounds only that one short same-provider
+    retry and leaves the normal no-fallback policy unchanged."""
     # Imported lazily so tests that patch ``agent.retry_utils.jittered_backoff`` /
     # ``adaptive_rate_limit_backoff`` (incl. the run_agent conftest fast-backoff fixture) intercept.
     from agent.retry_utils import (
@@ -1361,12 +1386,18 @@ def compute_error_backoff(
     if _retry_after is not None:
         _retry_after = min(_retry_after, RETRY_AFTER_CAP_S)
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    if retry_wait_cap is not None:
+        wait_time = min(wait_time, max(0.0, float(retry_wait_cap)))
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
     if _adaptive and _retry_after is None:
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
+    if retry_wait_cap is not None:
+        # Adaptive provider policies can replace the default wait after the first cap; the
+        # fast-failover route still owns this retry's hard upper bound.
+        wait_time = min(wait_time, max(0.0, float(retry_wait_cap)))
     _reset = reset_hint(api_error) if _adaptive else ""
     _free_busy = is_rate_limited and on_free_model(agent, base_url)
     _wait_reason = ("The free model is busy" if _free_busy
@@ -1673,14 +1704,17 @@ def route_classified_error(
     messages: list[dict[str, Any]], api_messages: Any, system_message: Any,
     active_system_prompt: Any, conversation_history: Any, retry_count: int, max_retries: int,
     compression_attempts: int, max_compression_attempts: int, api_call_count: int,
-    effective_task_id: Any,
+    effective_task_id: Any, hold_noninteractive_transient: Optional[bool] = None,
 ) -> ClassifiedErrorVerdict:
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
     (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
-    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
+    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once.
+
+    ``hold_noninteractive_transient`` (the caller's once-per-error decision; ``None`` computes
+    it) suppresses the eager transient fallbacks while an unattended route's window is open."""
     from agent.conversation_compression import (
         compression_pool_saturated,
         conversation_history_after_compression,
@@ -1688,6 +1722,14 @@ def route_classified_error(
     from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
 
+    if hold_noninteractive_transient is None:
+        from agent.fallback_cooldown import hold_noninteractive_transient_retry
+        hold_noninteractive_transient = hold_noninteractive_transient_retry(
+            agent, classified, error_message=error_msg,
+        )
+    from agent.fallback_endpoint_domain import note_endpoint_failure
+
+    note_endpoint_failure(agent, classified)
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
     _wrapped_output_cap_budget = None
@@ -1813,6 +1855,15 @@ def route_classified_error(
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        # OpenAI TPM responses from the local multiplexer include explicit accounting.
+        # That is stronger evidence than a gateway's occasionally absurd prose Retry-After
+        # (e.g. 138h): arm this route for the short token bucket window and let the shared
+        # cooldown record carry the event across child processes.
+        from agent.retry_utils import tpm_overage_cooldown_seconds
+        tpm_window = tpm_overage_cooldown_seconds(api_error)
+        if tpm_window is not None:
+            reset_at = time.time() + tpm_window
+            logger.info("TPM overage detected (Limit/Used/Requested); recording %.0fs route cooldown", tpm_window)
         from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
         if (
             not pool_may_recover
@@ -1835,7 +1886,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    _should_fallback = not hold_noninteractive_transient and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or _provider_wide_overload
         or (_is_transport_failure and retry_count >= 2)
@@ -1852,6 +1903,10 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+            from agent.retry_utils import tpm_overage_cooldown_seconds
+            tpm_window = tpm_overage_cooldown_seconds(api_error)
+            if tpm_window is not None:
+                reset_at = time.time() + tpm_window
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 
@@ -1862,6 +1917,7 @@ def route_classified_error(
         classified.is_auth
         and classified.should_fallback
         and not _retry.auth_failover_attempted
+        and not hold_noninteractive_transient
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True

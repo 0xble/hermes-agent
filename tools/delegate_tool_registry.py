@@ -163,7 +163,10 @@ def steer_subagent(
         if agent is None:
             return False
         try:
-            return bool(agent.steer(text))
+            try:
+                return bool(agent.steer(text, human=False))
+            except TypeError:
+                return bool(agent.steer(text))
         except Exception as exc:
             logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
             return False

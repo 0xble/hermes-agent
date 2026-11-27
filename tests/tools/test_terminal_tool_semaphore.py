@@ -1,0 +1,434 @@
+"""Local terminal commands run their test suites and CI gates inside the machine-wide semaphore."""
+
+from __future__ import annotations
+
+import os
+import stat
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from tools import terminal_tool_semaphore as semaphore
+from tools.terminal_tool_semaphore import classify_command, wrap_semaphore_command
+
+HELPER = "/opt/semaphore/bin/semaphore"
+
+
+@pytest.fixture
+def helper(monkeypatch):
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)  # the suite itself may run inside a slot
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: HELPER)
+
+
+@pytest.mark.parametrize(("command", "label"), [
+    ("pytest -q tests", "pytest"),
+    ("node scripts/run-workspace-checks.mjs", "workspace-checks"),
+    ("python -m unittest discover", "unittest"),
+    ("agentkit evals admit --trials 12", "evals-admit"),
+    ("agentkit evals run --trials 12", "evals-run"),
+    ("./bin/check --fast", "check"),
+    ("node viewer/check.js", "check"),
+    ("python pm/launch.py install --test-environment", "pm-install"),
+    ("go test ./...", "go-test"),
+    ("scripts/run_tests.sh tests/agent/test_foo.py -k test_x", "run_tests"),
+    ("python scripts/run_tests_parallel.py tests/test_a.py", "run_tests"),
+    ("python -m compileall -j 4 .", "compileall"),
+    ("pnpm build", "build"),
+    ("turbo run build", "build"),
+    ("pnpm --filter test build", "build"),
+    ("npm run check", "check"),
+    ("npx playwright test", "playwright"),
+    ("python -m pytest tests/", "pytest"),
+    (".venv/bin/python -m pytest -n 8 tests/tools/test_a.py", "pytest"),
+    ("cd repo && uv run pytest -q", "pytest"),
+    ("uv run --frozen pytest tests/test_store.py tests/x/", "pytest"),
+    ("scripts/run_tests.sh", "run_tests"),
+    ("bash scripts/run_tests.sh tests/gateway/", "run_tests"),
+    ("vitest run", "vitest"),
+    ("npx vitest", "vitest"),
+    ("pnpm test", "test"),
+    ("pnpm --filter app test:unit", "test"),
+    ("npm run test", "test"),
+    ("turbo run test --filter=app", "test"),
+    ("yarn workspace app test", "test"),
+    ("yarn workspaces foreach run test", "test"),
+    ("npm -w packages/app run test:unit", "test"),
+    ("pnpm -r test", "test"),
+    ("nx run-many -t test", "test"),
+    ("lerna run test", "test"),
+    ("tox -e py311", "tox"),
+    ("CI_EXPECTED_SHA=abc ./bin/ci gate deadbeef", "ci-gate"),
+    ("./bin/ci", "ci-full"),
+    ("bash -c 'cd x && pytest'", "pytest"),
+    ("if true; then pytest; fi", "pytest"),
+    ("env -u FOO PYTHONPATH=. timeout 600 pytest tests", "pytest"),
+    # Targeted file runs that may still fan out keep the slot (unknown options fail toward it).
+    ("pytest -n 8 tests/tools/test_a.py", "pytest"),
+    ("pytest --numprocesses=auto tests/tools/test_a.py", "pytest"),
+    ("jest --maxWorkers=4 src/a.test.js", "jest"),
+    ("jest -w 8", "jest"),
+    ("vitest --pool=threads src/a.test.ts", "vitest"),
+    ("vitest run --maxWorkers 4 src/a.test.ts", "vitest"),
+    ("vitest --watch=false", "vitest"),
+    ("vitest run --watch=false", "vitest"),
+    ("jest --watch=false", "jest"),
+    ("pnpm test --watch=false", "test"),
+    ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
+    # Redirections never hide a broad run.
+    ("pytest tests > out.txt 2>&1", "pytest"),
+    ("pytest -n 8 tests/tools/test_a.py 2>&1 | tail -20", "pytest"),
+    ("pytest tests &", "pytest"),
+    # unittest discovery imports every matching module; a glob pattern is still broad.
+    ("python -m unittest", "unittest"),
+    ("python3 -m unittest discover -s scripts/tests", "unittest"),
+    ("python -m unittest discover -p 'test_*.py'", "unittest"),
+    ("python -m unittest tests/", "unittest"),
+    ("bun test", "test"),
+    ("bun test src/", "test"),
+])
+def test_recognizes_semaphore_commands(command, label, helper):
+    assert classify_command(command) == label
+    assert f"hermes {label}" in wrap_semaphore_command(command, env_type="local")
+
+
+@pytest.mark.parametrize("command", [
+    "git status",
+    "ls",
+    "cat scripts/run-workspace-checks.mjs",
+    "rg eslint .",
+    "node viewer/serve.js",
+    "agentkit evals list",
+    "go version",
+    "python pm/launch.py status",
+    "uv --version",
+    "uv run --frozen python -c 'print(1)'",
+    "grep -rn pytest .",
+    "rg 'pytest -q' tools",
+    "echo 'a; pytest b'",
+    "printf '%s' pytest",
+    "git log --grep='x && pytest -q'",
+    "git commit -m 'run pytest -q'",
+    "ls # pytest",
+    "python - <<'PY'\nprint('pytest -q tests')\nPY",
+    "cat <<EOF > notes.md\npytest -q tests\nEOF",
+    "./bin/ci preflight",
+    "~/.hermes/plugins/git-guard/bin/ci-gate deadbeef",  # ci-gate takes its own slot
+    "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
+    "vitest run src/a.test.ts",  # targeted
+    "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
+    # Agents usually redirect output; redirection words are not runner arguments.
+    ".venv/bin/python -m pytest -q tests/test_a.py 2>&1 | tail -30",
+    "pytest -q tests/test_a.py > /tmp/out.txt",
+    "pytest -q tests/test_a.py &>/tmp/log",
+    "pytest -q tests/test_a.py >&2",
+    "timeout 300 npx vitest run lib/a.test.ts lib/b.test.ts 2>&1 | tail",
+    "pytest -p no:xdist -q tests/test_a.py::test_b --junitxml=/tmp/red.xml",
+    "pytest -q tests/test_a.py -rA --maxfail=1 --no-cov --durations=5",
+    "python3 -m unittest test_capture_poll_reads test_capture_poll_inputs",
+    "python -m unittest -v tests.test_store.StoreTest.test_put",
+    "python3 -m unittest discover -s tests/hermes -p test_agent_fleet.py",
+    "bun --cwd apps/loops test test/daily-brief-agent-prompt.test.ts",
+    # Dependency installation, type checks and lint release a slot in seconds.
+    "uv sync --locked --quiet",
+    "uv sync --compile-bytecode",
+    "uv pip install pytest",
+    "poetry install",
+    "pip install -r requirements.txt",
+    "python -m pip install pytest",
+    "npm ci",
+    "npm install test",
+    "pnpm add -D vitest",
+    "yarn workspace app add -D test",
+    "bun install --frozen-lockfile",
+    "npx playwright install",
+    "npx tsc --noEmit",
+    "npx eslint .",
+    "pnpm typecheck",
+    "pnpm lint",
+    "npm run lint:fix",
+    "command pytest tests",  # `command` deliberately bypasses shell functions: left alone
+    "exec pytest tests",  # would replace the session shell: left alone
+])
+def test_leaves_light_commands_alone(command):
+    assert classify_command(command) is None
+
+
+@pytest.mark.parametrize(("command", "label"), [
+    ("tsc --watch", None),
+    ("tsc -b --watch", None),
+    ("tsc -w", None),
+    ("vitest --watch", None),
+    ("vitest -w", None),
+    ("jest --watch", None),
+    ("pnpm build --watch", None),
+    ("npm run build:watch", None),
+    ("pnpm watch", None),
+    ("turbo run watch", None),
+    ("tsc --version", None),
+    ("vitest --help", None),
+    ("jest -h", None),
+    ("pytest --version", None),
+    ("./bin/ci --help", None),
+    ("pnpm build", "build"),
+])
+def test_watch_info_and_non_watch_build_classification(command, label, helper):
+    assert classify_command(command) == label
+    wrapped = wrap_semaphore_command(command, env_type="local")
+    if label is None:
+        assert wrapped == command
+    else:
+        assert f"hermes {label}" in wrapped
+
+
+def test_foreground_dispatcher_passes_bounded_queue_wait(helper):
+    wrapped = wrap_semaphore_command("pytest -q tests", env_type="local", max_wait_seconds=30)
+    dispatcher, body = wrapped.split("\n", 1)
+    assert "SEMAPHORE_MAX_WAIT=30" in dispatcher
+    assert body == "_hermes_semaphore 'hermes pytest' pytest -q tests"
+
+
+def test_routes_only_the_semaphore_simple_command(helper):
+    wrapped = wrap_semaphore_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
+    dispatcher, body = wrapped.split("\n", 1)
+    assert dispatcher.startswith("_hermes_semaphore() {") and HELPER in dispatcher
+    assert body == "cd repo && export X=1 && _hermes_semaphore 'hermes pytest' pytest -q tests; echo done"
+
+
+def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
+    wrapped = wrap_semaphore_command("pytest -q tests", env_type="local", max_wait_seconds=None)
+    dispatcher, _body = wrapped.split("\n", 1)
+    assert "SEMAPHORE_MAX_WAIT" not in dispatcher
+
+
+@pytest.mark.parametrize("origin", ["user", "cron", "unknown"])
+@pytest.mark.parametrize(("background", "env_type", "timeout", "expected"), [
+    (False, "local", 180, 60),
+    (False, "local", 600, 120),
+    (False, "local", 6, 10),
+    (True, "local", 180, None),
+    (False, "docker", 180, None),
+])
+def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected, origin):
+    from gateway.session_context import preserved_session_context, set_turn_origin
+    from tools.terminal_tool import _semaphore_max_wait_for
+
+    with preserved_session_context():
+        set_turn_origin(origin)
+        assert _semaphore_max_wait_for(
+            background=background, env_type=env_type, effective_timeout=timeout,
+        ) == (None if origin == "cron" else expected)
+
+
+@pytest.mark.parametrize(("remaining", "expected_timeout"), [(2.75, 1), (1.5, None), (0.5, None)])
+def test_cron_cell_reserves_cleanup_budget(tmp_path, monkeypatch, remaining, expected_timeout):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from gateway.session_context import preserved_session_context, set_turn_origin
+    from tools import terminal_tool
+    from tools.code_execution_rpc import cell_deadline
+
+    env = SimpleNamespace(execute=Mock(return_value={"returncode": 0, "output": "completed"}))
+    plan = terminal_tool._ExecPlan(config={}, env_type="local", effective_task_id="budget",
+                                   image="", cwd=str(tmp_path), host_cwd=None, effective_timeout=30)
+    monkeypatch.setattr(terminal_tool, "finalize_foreground_result", lambda **_: '{}')
+    with preserved_session_context():
+        set_turn_origin("cron")
+        token = cell_deadline.set(time.monotonic() + remaining)
+        try:
+            result = json.loads(terminal_tool._run_foreground(
+                "true", env, plan, task_id="budget", session_id=None, session_key="budget",
+                workdir=None, approval_note=None, clear_interrupt=False, metered=False,
+            ))
+        finally:
+            cell_deadline.reset(token)
+    if expected_timeout is None:
+        env.execute.assert_not_called()
+        assert result["exit_code"] == 124
+        assert "not started" in result["error"].lower()
+    else:
+        env.execute.assert_called_once()
+        assert env.execute.call_args.kwargs["timeout"] == expected_timeout
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    ("env -u FOO PYTHONPATH=. timeout 600 pytest tests",
+     "_hermes_semaphore 'hermes pytest' env -u FOO PYTHONPATH=. timeout 600 pytest tests"),
+    ("FOO=1 nice -n 5 pytest", "FOO=1 _hermes_semaphore 'hermes pytest' nice -n 5 pytest"),
+    ("nohup pnpm test", "_hermes_semaphore 'hermes test' nohup pnpm test"),
+    ("time pytest tests", "time _hermes_semaphore 'hermes pytest' pytest tests"),
+])
+def test_exec_prefix_utilities_run_inside_the_dispatcher(helper, command, expected):
+    """env/nice/timeout/nohup exec their argument and cannot run a shell function."""
+    assert wrap_semaphore_command(command, env_type="local").split("\n", 1)[1] == expected
+
+
+def test_redirections_stay_on_the_wrapped_command(helper):
+    body = wrap_semaphore_command("cd repo && pytest tests 2>&1 | tail -5", env_type="local").split("\n", 1)[1]
+    assert body == "cd repo && _hermes_semaphore 'hermes pytest' pytest tests 2>&1 | tail -5"
+
+
+def test_routes_each_semaphore_command_once(helper):
+    body = wrap_semaphore_command("pnpm test && ./bin/ci gate abc", env_type="local").split("\n", 1)[1]
+    assert body == "_hermes_semaphore 'hermes test' pnpm test && _hermes_semaphore 'hermes ci-gate' ./bin/ci gate abc"
+
+
+@pytest.mark.parametrize("env_type", ["docker", "ssh", "modal", "managed_modal", "singularity", "daytona"])
+def test_non_local_backends_are_not_wrapped(helper, env_type):
+    assert wrap_semaphore_command("pytest -q tests", env_type=env_type) == "pytest -q tests"
+
+
+@pytest.mark.parametrize("environment", [{"SEMAPHORE_HELD": "1"}, {"HERMES_SEMAPHORE": "off"},
+                                         {"HERMES_SEMAPHORE": "0"}])
+def test_nested_slot_and_opt_out_are_not_wrapped(helper, environment):
+    assert wrap_semaphore_command("pytest -q tests", env_type="local", environment=environment) == "pytest -q tests"
+
+
+def test_process_env_opt_out_and_missing_helper(helper, monkeypatch):
+    monkeypatch.setenv("HERMES_SEMAPHORE", "off")
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
+    monkeypatch.delenv("HERMES_SEMAPHORE")
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: None)
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
+
+
+def test_classifier_failure_runs_the_command_unwrapped(helper, monkeypatch):
+    def boom(_command):
+        raise RuntimeError("parser bug")
+    monkeypatch.setattr(semaphore, "_heavy_positions", boom)
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
+
+
+def _fake_helper(tmp_path: Path) -> str:
+    """A stand-in semaphore: records its argv and runs the command with SEMAPHORE_HELD set."""
+    log = tmp_path / "helper.log"
+    script = tmp_path / "semaphore"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {log}\n"
+        "while [ \"$1\" != -- ]; do shift; done; shift\n"
+        "SEMAPHORE_HELD=1 exec \"$@\"\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return str(script)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, monkeypatch, shell):
+    """A user's own pytest function or ./bin/ci alias runs as before; external programs take the slot."""
+    if not shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
+    fake = _fake_helper(tmp_path)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: fake)
+    runner = tmp_path / "vitest"
+    runner.write_text("#!/bin/sh\necho \"external $* held=$SEMAPHORE_HELD\"\n")
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+    command = wrap_semaphore_command(
+        f"pytest -q 'a b' && FOO=1 tox -e x && {runner} run 'c d' && env BAR=2 timeout 30 {runner} --all",
+        env_type="local")
+    setup = ("pytest() { echo \"function $* FOO=$FOO\"; }\n"
+             "tox() { echo \"tox-fn FOO=$FOO\"; }\n")
+    if shell == "bash":
+        setup = "shopt -s expand_aliases\n" + setup
+    out = subprocess.run([shell, "-c", setup + command], capture_output=True, text=True, cwd=tmp_path, check=False)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [
+        "function -q a b FOO=", "tox-fn FOO=1", "external run c d held=1", "external --all held=1"]
+    assert (tmp_path / "helper.log").read_text().count("--label") == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
+def test_wrapped_command_keeps_shell_state_and_runs_in_slot(tmp_path, monkeypatch):
+    """cd and exports around the semaphore command still reach the session shell."""
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
+    fake = _fake_helper(tmp_path)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: fake)
+    (tmp_path / "sub").mkdir()
+    runner = tmp_path / "pytest"
+    runner.write_text("#!/bin/sh\necho \"held=$SEMAPHORE_HELD\"\n")
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        command = f"cd sub && export HS_PROBE=kept && {runner} -q"
+        wrapped = wrap_semaphore_command(command, env_type="local", environment=env.env)
+        assert wrapped != command
+        result = env.execute(wrapped)
+        assert result["returncode"] == 0, result
+        assert "held=1" in result["output"]
+        assert env.cwd.endswith("/sub")
+        assert "kept" in env.execute("echo $HS_PROBE")["output"]
+    finally:
+        env.cleanup()
+    assert (tmp_path / "helper.log").read_text().startswith("--label hermes pytest (in ")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.live_system_guard_bypass  # kills the semaphore tree it started itself
+def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monkeypatch):
+    """The real helper under the process registry: kill stops the whole tree and frees the slot."""
+    real = Path.home() / ".local" / "bin" / "semaphore"
+    if not os.access(real, os.X_OK):
+        pytest.skip("semaphore helper not installed")
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
+    slots = tmp_path / "slots"
+    monkeypatch.setenv("SEMAPHORE_DIR", str(slots))  # private slots: never touch the host's
+    monkeypatch.setenv("SEMAPHORE_STOP_GRACE", "1")
+    monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 1.0))
+    monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
+    runner = tmp_path / "pytest"
+    runner.write_text("#!/bin/sh\necho started held=$SEMAPHORE_HELD\nexec sleep 60\n")
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+    command = wrap_semaphore_command(f"{runner} tests/", env_type="local")
+    assert str(real) in command
+    reg = ProcessRegistry()
+    session = reg.spawn_local(command, cwd=str(tmp_path), env_vars={"SEMAPHORE_DIR": str(slots)})
+    try:
+        deadline = time.monotonic() + 20
+        while "started" not in session.output_buffer and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "started held=0" in session.output_buffer or "started held=1" in session.output_buffer
+        result = reg.kill_process(session.id)
+        assert result["status"] == "killed", result
+    finally:
+        subprocess.run(["pkill", "-f", str(runner)], check=False)
+
+    deadline = time.monotonic() + 10
+    while subprocess.run(["pgrep", "-f", str(runner)], capture_output=True, check=False).returncode == 0 \
+            and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert subprocess.run(["pgrep", "-f", str(runner)], capture_output=True, check=False).returncode != 0
+    deadline = time.monotonic() + 10
+    while any(p.stat().st_size for p in slots.glob("slot-*.lock")) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not any(p.stat().st_size for p in slots.glob("slot-*.lock"))
+
+
+def test_helper_lookup_prefers_terminal_path_then_home_bin(tmp_path, monkeypatch):
+    on_path = tmp_path / "path-bin"
+    home_bin = tmp_path / "home" / ".local" / "bin"
+    for directory in (on_path, home_bin):
+        directory.mkdir(parents=True)
+        helper = directory / "semaphore"
+        helper.write_text("#!/bin/sh\n")
+        helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    assert semaphore._semaphore_executable({"PATH": str(on_path)}) == str(on_path / "semaphore")
+    assert semaphore._semaphore_executable({"PATH": str(tmp_path / "empty")}) == str(home_bin / "semaphore")
+    (home_bin / "semaphore").unlink()
+    assert semaphore._semaphore_executable({"PATH": str(tmp_path / "empty")}) is None

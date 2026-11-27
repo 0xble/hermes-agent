@@ -12,6 +12,7 @@ exactly-once are the admission contract's. With a viewer attached it runs as the
 except a local cron result, which is always a note; messaging, Kanban, ``/loop`` and heartbeat wakes
 never reach here.
 """
+import asyncio
 import json
 from functools import partial
 
@@ -65,7 +66,7 @@ async def note_if_unviewed(authority, ref, row):
     from gateway.session_viewer_close import _physical_target
     metadata = {'completion_note': sorted(set(descriptor.get('identities') or ()) | {descriptor['identity']})}
     metadata.update({key: descriptor[key] for key in ('display_text', 'notification_category') if key in descriptor})
-    target = _physical_target(authority, ref.session_id)
+    target = await asyncio.to_thread(_physical_target, authority, ref.session_id)
     # Keyed by its admission: a claim is never replayed, and this keeps a write retry exact.
     await tracked_write(authority, partial(
         authority.db.append_completion_note, target, row['admission_id'], row['payload']['text'],

@@ -65,3 +65,5 @@ not numeric PID-only signal authority.
 Run the MCP lifecycle/shutdown and gateway shutdown files through
 `scripts/run_tests.sh`, lint touched source/tests, and require
 `python scripts/check_fork_patches.py --repo . --source-only` to return zero problems.
+
+Contract tests: `tests/tools/test_mcp_reaper_grace.py`.

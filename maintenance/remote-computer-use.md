@@ -95,3 +95,5 @@ owners.
 Retire this divergence only when upstream provides the same shared-node,
 no-fallback, persistent-session, node-bound file/process and native-image contracts
 without requiring a new service, and exact-target integration checks still pass.
+
+Contract tests: `tests/tools/test_computer_use_nodes.py`, `tests/tools/test_named_node_execution.py`, `tests/tools/test_node_process.py`.

@@ -118,3 +118,71 @@ async def test_retry_redispatch_admits_natively_under_session_authority(
             authority.db.close()
         for _, home in homes:
             process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_callback_rebinds_dead_transport_reference(
+        tmp_path, monkeypatch):
+    """A reconnect can leave an event's weak transport reference dead before callback admission.
+
+    The callback and current registry binding are still authoritative.  The source may rebind to
+    that current adapter, while a live reference to another adapter remains rejected.
+    """
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=())
+    runner = _runner(root, homes)
+    process_ownership.reserve([home for _, home in homes])
+    try:
+        await initialize_gateway_runtime(runner)
+        register_transport_home(runner, None, root)
+        adapter = _FakeAdapter()
+        runner.adapters = {Platform.DISCORD: adapter}
+        runner._is_user_authorized_for_source = lambda *a, **k: True
+
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
+            user_id='probe-user', user_name='probe')
+        dead_adapter = _FakeAdapter()
+        source._transport_adapter_ref = weakref.ref(dead_adapter)
+        del dead_adapter
+        event = MessageEvent(text='probe', source=source, message_id='probe-msg')
+
+        with native_callback(runner, event, root, None):
+            provenance = capture_provenance(runner, event)
+
+        assert provenance is not None
+        assert runner._transport_owner(source) == (adapter, None)
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        for _, home in homes:
+            process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_callback_rejects_live_foreign_transport_reference(
+        tmp_path, monkeypatch):
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=())
+    runner = _runner(root, homes)
+    process_ownership.reserve([home for _, home in homes])
+    try:
+        await initialize_gateway_runtime(runner)
+        register_transport_home(runner, None, root)
+        adapter = _FakeAdapter()
+        foreign = _FakeAdapter()
+        runner.adapters = {Platform.DISCORD: adapter}
+        runner._is_user_authorized_for_source = lambda *a, **k: True
+
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
+            user_id='probe-user', user_name='probe')
+        source._transport_adapter_ref = weakref.ref(foreign)
+        event = MessageEvent(text='probe', source=source, message_id='probe-msg')
+
+        with native_callback(runner, event, root, None):
+            with pytest.raises(RuntimeStoreError, match='not_found'):
+                capture_provenance(runner, event)
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        for _, home in homes:
+            process_ownership.release(home)

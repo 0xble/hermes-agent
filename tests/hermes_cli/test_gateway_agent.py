@@ -100,6 +100,16 @@ def test_streamed_reply_reaches_stream_delta_callback(make_agent):
     assert [m["content"] for m in result["messages"]] == ["old", "hi", "Hello"]
     submit = dict(client.calls)["prompt.submit"]
     assert submit["text"] == "hi" and submit["session_id"] == SID
+    assert "turn_origin" not in submit
+
+
+@pytest.mark.parametrize("origin", ["user", "goal_loop", "process"])
+def test_submit_preserves_turn_origin(make_agent, origin):
+    agent, client = make_agent([
+        frame("message.complete", {"text": "done", "outcome": "completed"}),
+    ])
+    agent.run_conversation("same prompt", turn_origin=origin)
+    assert dict(client.calls)["prompt.submit"]["turn_origin"] == origin
 
 
 def test_tool_events_drive_progress_and_complete_callbacks(make_agent):

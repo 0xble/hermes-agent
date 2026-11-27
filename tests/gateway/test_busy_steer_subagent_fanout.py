@@ -21,7 +21,7 @@ class _Agent:
         self._active_children = list(children)
         self._active_children_lock = threading.Lock()
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         self.payload = text
         return True
 

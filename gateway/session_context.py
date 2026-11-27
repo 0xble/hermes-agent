@@ -254,7 +254,7 @@ def set_session_vars(
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, cron_session, parent_chat_id,
-        turn_origin if turn_origin in _TURN_ORIGINS else "unknown",
+        normalize_turn_origin(turn_origin),
         user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
@@ -265,9 +265,13 @@ def set_session_vars(
     return tokens
 
 
+def normalize_turn_origin(value: object) -> str:
+    return value if isinstance(value, str) and value in _TURN_ORIGINS else "unknown"
+
+
 def set_turn_origin(turn_origin: str) -> None:
     """Bind this task's turn provenance after ``set_session_vars``; unknown values default-deny."""
-    _TURN_ORIGIN.set(turn_origin if turn_origin in _TURN_ORIGINS else "unknown")
+    _TURN_ORIGIN.set(normalize_turn_origin(turn_origin))
 
 
 def bound_turn_origin() -> str:

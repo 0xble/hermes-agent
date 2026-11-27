@@ -119,7 +119,7 @@ def test_busy_interrupt_mode_still_redirects_without_compression(monkeypatch):
     seen = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: seen.append(text) or True,
+        redirect=lambda text, **_kwargs: seen.append(text) or True,
     )
     session = _session(agent=agent)
 
@@ -162,7 +162,7 @@ def test_session_steer_queues_while_compressing(monkeypatch):
 def test_session_redirect_queues_while_compressing(monkeypatch):
     monkeypatch.setattr(server, "_session_compression_in_flight", lambda session: True)
     seen = []
-    agent = types.SimpleNamespace(_supports_active_turn_redirect=True, redirect=lambda t: seen.append(t) or True)
+    agent = types.SimpleNamespace(_supports_active_turn_redirect=True, redirect=lambda t, **_kwargs: seen.append(t) or True)
     session = _session(agent=agent)
     monkeypatch.setitem(server._sessions, "sid", session)
     try:

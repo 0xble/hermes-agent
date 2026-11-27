@@ -138,6 +138,29 @@ def test_build_models_payload_returns_expected_shape():
     assert payload["providers"][1:] == rows
 
 
+def test_only_acp_inventory_defers_aggregator_metadata(monkeypatch):
+    from hermes_cli import providers
+
+    reads = []
+
+    def provider_info(provider, *, allow_network=True):
+        reads.append(allow_network)
+        return None
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", provider_info)
+    # ACP alone opts an uncataloged slug out of registry discovery.
+    row = {"slug": "catalog-provider", "models": ["m1"], "is_user_defined": False}
+    with _list_auth_returning([row]):
+        build_models_payload(_empty_ctx(), non_blocking_catalogs=True, registry_cache_only=True)
+    assert reads and not any(reads)
+    for non_blocking in (False, True):
+        reads.clear()
+        with _list_auth_returning([row]):
+            build_models_payload(_empty_ctx(), non_blocking_catalogs=non_blocking)
+        assert reads and all(reads)
+    assert providers.is_aggregator("custom:proxy", allow_network=False)
+
+
 def test_build_models_payload_hides_moa_without_raw_preset():
     """Strict opt-in (#63353): no ``moa`` row when the raw config has no enabled preset —
     the DEFAULT_CONFIG ``default`` preset everyone gets via ``load_config()`` is not a user choice."""

@@ -5,10 +5,12 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone, UTC
@@ -176,6 +178,11 @@ def drain_deferring_stores(deadline: float) -> None:
         store.drain_deferred(busy_timeout_ms=remaining_ms)
 
 
+def _store_busy(exc: BaseException) -> bool:
+    """Contention (another connection holds the store), as opposed to a real store failure."""
+    return isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc))
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -216,7 +223,7 @@ class SharedMetricsStore:
         _ensure_private(self.outbox_directory, 0o700)
         _ensure_private(self.database_path, 0o600)
         self._ensure_schema()
-        self._deferred: list[Callable[[sqlite3.Connection], None]] = []
+        self._deferred: list[Callable[[sqlite3.Connection], object]] = []
         self._deferred_lock = threading.Lock()
         self._drain_at_exit = False
 
@@ -250,10 +257,12 @@ class SharedMetricsStore:
         self, state_key: str, metric_name: str, dimensions: dict[str, str],
         resource: dict[str, str],
     ) -> bool:
-        """Transactional compare-and-set latch shared by concurrent Hermes processes."""
+        """Transactional compare-and-set latch shared by concurrent Hermes processes. False when the
+        latch is already set, or when a busy store deferred it (see ``_write_or_defer``)."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             row = connection.execute(
                 "SELECT value FROM telemetry_state WHERE key = ?", (state_key,)
             ).fetchone()
@@ -277,7 +286,9 @@ class SharedMetricsStore:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (state_key, _isoformat(now)),
             )
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
 
     def record_counter(
         self, metric_name: str, dimensions: dict[str, str], resource: dict[str, str],
@@ -350,13 +361,15 @@ class SharedMetricsStore:
 
     def record_counter_once_per_day(self, metric_name: str, dimensions: dict[str, str], resource: dict[str, str]) -> bool:
         """Count at most once per UTC day per dimension set, whatever the surface (``surface`` is
-        attribution of the first one that day). One state row per dimension set, overwritten daily."""
+        attribution of the first one that day). One state row per dimension set, overwritten daily.
+        False when already counted today, or when a busy store deferred it."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
         today = now.date().isoformat()
         key = f"{_DAILY_ONCE_STATE_PREFIX}{metric_name}:" + _compact_json(
             {k: v for k, v in dimensions.items() if k != "surface"})
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             changed = connection.execute(
                 "INSERT INTO telemetry_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE"
                 " SET value = excluded.value WHERE telemetry_state.value != excluded.value",
@@ -366,7 +379,9 @@ class SharedMetricsStore:
                 return False
             self._install_id(connection)
             self._record_counter_in_transaction(connection, metric_name, dimensions, resource, today)
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
     # ---- end v5 signals ----
 
     def _latched(self, prefix: str) -> frozenset[str]:
@@ -379,9 +394,12 @@ class SharedMetricsStore:
     def _record_once_ever(
         self, state_key: str, metric_name: str, dimensions: dict[str, str], resource: dict[str, str],
     ) -> bool:
+        """Compare-and-set latch, once per install ever. False when already latched, or when a busy
+        store deferred it."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             inserted = connection.execute(
                 "INSERT INTO telemetry_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 (state_key, _isoformat(now)),
@@ -392,7 +410,9 @@ class SharedMetricsStore:
             self._record_counter_in_transaction(
                 connection, metric_name, dimensions, resource, now.date().isoformat()
             )
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
 
     @staticmethod
     def _validate_counter(
@@ -431,18 +451,21 @@ class SharedMetricsStore:
                 break
         return self._export_and_prune()
 
-    def _write_or_defer(self, write: Callable[[sqlite3.Connection], None]) -> None:
-        """Run ``write`` (after any deferred ones) in one write transaction. A store another writer
-        holds past the short busy timeout keeps them in memory for the next write or process exit
-        instead of losing them or stalling the caller."""
+    def _write_or_defer(self, write: Callable[[sqlite3.Connection], object]) -> object:
+        """Run ``write`` (after any deferred ones) in one write transaction and return its result. A
+        store another writer holds past the short busy timeout keeps them in memory for the next write
+        or process exit instead of losing them, raising, or stalling the caller, which then gets None.
+        Every caller-path write goes through here: a deferred compare-and-set latch re-reads its state
+        when it finally runs, so concurrent processes still latch exactly once."""
         with self._deferred_lock:
             pending, self._deferred = [*self._deferred, write], []
         try:
             with self._write() as connection:
-                for item in pending:
+                for item in pending[:-1]:
                     item(connection)
+                result = write(connection)
         except sqlite3.OperationalError as exc:
-            busy = "locked" in str(exc) or "busy" in str(exc)
+            busy = _store_busy(exc)
             with self._deferred_lock:
                 # A failure that is not contention drops only this write: the earlier ones stay queued.
                 self._deferred = [*(pending if busy else pending[:-1]), *self._deferred][-_DEFERRED_WRITES_MAX:]
@@ -453,6 +476,8 @@ class SharedMetricsStore:
                     _DEFERRING_STORES.append(self)
             if not busy:
                 raise
+            return None
+        return result
 
     def drain_deferred(self, busy_timeout_ms: int = _SCHEMA_BUSY_TIMEOUT_MS) -> None:
         """Write the deferred writes (process exit / export waits longer than the user's path does)."""
@@ -465,16 +490,23 @@ class SharedMetricsStore:
                 for item in pending:
                     item(connection)
         except Exception as exc:
-            if isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc)):
+            if _store_busy(exc):
                 with self._deferred_lock:  # still contended: keep them for the next write or exit drain
                     self._deferred = [*pending, *self._deferred][-_DEFERRED_WRITES_MAX:]
                 return
             logger.warning("Unable to write %d deferred shared-metrics updates", len(pending), exc_info=True)
 
     def create_and_export_package_if_due(self) -> list[Path]:
-        """Create pending packages at most once per UTC day, then export them."""
+        """Create pending packages at most once per UTC day, then export them. A store another writer
+        holds past the short busy timeout leaves packaging to the next export (nothing is committed,
+        so nothing is lost) and still exports the packages already committed."""
         self.drain_deferred(_BUSY_TIMEOUT_MS)
-        self._create_pending_packages_if_due()
+        try:
+            self._create_pending_packages_if_due()
+        except sqlite3.OperationalError as exc:
+            if not _store_busy(exc):
+                raise
+            logger.debug("Shared-metrics store busy; packaging waits for the next export", exc_info=True)
         return self._export_and_prune()
 
     def _export_and_prune(self) -> list[Path]:
@@ -566,17 +598,15 @@ class SharedMetricsStore:
         # after the transaction preserves the normal busy wait for an existing
         # writer while making subsequent short writes multi-process safe.
         try:
-            with closing(
-                open_db(
-                    self.database_path,
-                    db_label="shared-metrics",
-                    busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
-                    wal=True,
-                    wal_lock_retries=3,
-                    row_factory=sqlite3.Row,
-                )
-            ):
-                pass
+            anchor = open_db(
+                self.database_path,
+                db_label="shared-metrics",
+                busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
+                wal=True,
+                wal_lock_retries=3,
+                row_factory=sqlite3.Row,
+                check_same_thread=False,
+            )
         except sqlite3.OperationalError as exc:
             if str(exc).lower() != "database is locked":
                 raise
@@ -584,6 +614,30 @@ class SharedMetricsStore:
                 "Unable to switch shared-metrics store to WAL while it is busy; "
                 "leaving its current journal mode for a later construction"
             )
+            return
+        # Every store call opens and closes its own short connection. Without another connection
+        # holding the database, each of them was the last one: its BEGIN rebuilt the WAL index and its
+        # close checkpointed the WAL into the database and deleted it, several disk syncs per counter
+        # under locks other writers cannot wait out within the short busy timeout. On a slow disk a
+        # burst of Relay events kept the subscriber (and the flush that waits on it) in that work for
+        # seconds. This idle connection keeps the WAL and its index open for the store's lifetime, so
+        # a write costs its one commit; the commit-time auto-checkpoint still folds the WAL back.
+        # Windows cannot delete open files, and deleting the local state must keep resetting it there.
+        # It is kept only once the store is confirmed in WAL (the conversion above ran on it) and never
+        # holds a transaction, so writers, readers and checkpoints never wait on it. It is closed
+        # explicitly when the store goes away or the process exits: the connection's own statement
+        # cache is a reference cycle that would otherwise keep it, and its WAL, open until a GC pass.
+        try:
+            with closing(anchor.execute("PRAGMA journal_mode")) as cursor:
+                wal = str(cursor.fetchone()[0]).lower() == "wal"
+            if wal and os.name != "nt":
+                with closing(anchor.execute("SELECT 1 FROM telemetry_state LIMIT 1")) as cursor:
+                    cursor.fetchall()  # maps the WAL index; a plain SELECT leaves no transaction open
+                self._close_wal_anchor = weakref.finalize(self, anchor.close)
+                anchor = None
+        finally:
+            if anchor is not None:
+                anchor.close()
 
 
     def _install_id(self, connection: sqlite3.Connection) -> str:
@@ -756,12 +810,19 @@ class SharedMetricsStore:
                 path, json.loads(row["payload_json"]), indent=None, separators=(",", ":"),
                 sort_keys=True, mode=0o600,
             )
-            with self._connection() as connection:
-                connection.execute(
-                    "UPDATE package_outbox SET exported_at = ?"
-                    " WHERE package_id = ? AND exported_at IS NULL",
-                    (_isoformat(_utc_now()), package_id),
-                )
+            try:
+                with self._connection() as connection:
+                    connection.execute(
+                        "UPDATE package_outbox SET exported_at = ?"
+                        " WHERE package_id = ? AND exported_at IS NULL",
+                        (_isoformat(_utc_now()), package_id),
+                    )
+            except sqlite3.OperationalError as exc:
+                if not _store_busy(exc):
+                    raise
+                # The file write is idempotent: the next export rewrites it and marks it exported.
+                logger.debug("Shared-metrics store busy; export resumes at %s", package_id, exc_info=True)
+                break
             exported.append(path)
         return exported
 

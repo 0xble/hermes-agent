@@ -922,6 +922,8 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             recover_api_turns(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
+        from gateway.missed_inbound_recovery import schedule_missed_inbound_recovery
+        schedule_missed_inbound_recovery(self, platform)
 
     def _schedule_planned_restart_replay(self) -> None:
         """Replay the owed planned-restart notice after a reconnect, in the background: notification delivery

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import gateway, gateway_guardian as guardian
+from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
 
 
 @pytest.mark.platforms("macos")
@@ -23,8 +24,10 @@ def test_automatic_guardian_reinstall_is_an_idempotent_noop(tmp_path, monkeypatc
     # The pre-lifetime renderer had no session eligibility key, even for GUI jobs.
     original = plistlib.dumps({
         "Label": guardian.GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": guardian.INTERVAL,
-        "ProgramArguments": [str(home / "current/.venv/bin/python"), "-m", "hermes_cli.gateway_guardian", "run",
-                             "--gateway-plist", str(path), "--gateway-label", label, "--domain", domain],
+        "ProgramArguments": launchd_program_arguments(
+            [str(home / "current/.venv/bin/python"), "-m", "hermes_cli.gateway_guardian", "run",
+             "--gateway-plist", str(path), "--gateway-label", label, "--domain", domain],
+            home / "logs/guardian/stdout.log", home / "logs/guardian/stderr.log"),
         "WorkingDirectory": str(home / "current"), "EnvironmentVariables": {"HERMES_HOME": str(home)},
         "StandardOutPath": str(home / "logs/guardian/stdout.log"),
         "StandardErrorPath": str(home / "logs/guardian/stderr.log"),

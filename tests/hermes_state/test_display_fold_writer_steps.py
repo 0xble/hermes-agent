@@ -81,6 +81,39 @@ def test_writer_backlog_uses_bounded_steps_and_matches_full_fold(tmp_path, plann
             db._conn.rollback()
 
 
+def test_new_rows_keep_inserted_display_identity_without_writer_decode(tmp_path, monkeypatch):
+    import hermes_state_display_fold as folding
+
+    with closing(SessionDB(tmp_path / "new-row.sqlite")) as db:
+        db.create_session("s", source="test")
+        db.append_messages_batch("s", [
+            {"role": "assistant", "content": f"old {i}", "timestamp": 1.7e9 + i}
+            for i in range(8)])
+        plan = db._display_fold_plan("s")
+        assert plan is not None
+        decoded = []
+        original = folding._stale_payload_rows
+
+        def observed(conn, row_ids):
+            decoded.extend(row_ids)
+            return original(conn, row_ids)
+
+        monkeypatch.setattr(folding, "_stale_payload_rows", observed)
+        db._conn.execute("BEGIN IMMEDIATE")
+        try:
+            selection = db._begin_display_fold(db._conn, plan)
+            db._insert_message_rows(db._conn, "s", [
+                {"role": "assistant", "content": "new", "timestamp": 1.8e9}])
+            new_id = db._conn.execute("SELECT MAX(id) FROM messages WHERE session_id = 's'").fetchone()[0]
+            db._reconcile_display_orders(db._conn, "s", selection)
+            assert new_id not in decoded
+            row = db._conn.execute(
+                "SELECT display_identity, display_order FROM messages WHERE id = ?", (new_id,)).fetchone()
+            assert row[0] is not None and row[1] <= new_id
+        finally:
+            db._conn.rollback()
+
+
 @pytest.mark.parametrize("named", [False, True])
 def test_archive_payload_repair_pages_stay_bounded(tmp_path, monkeypatch, named):
     import hermes_state_display_fold as folding

@@ -5,7 +5,10 @@ is only a viewer, so the owner stamps it when the last subscription goes or the 
 a writer, source='acp' rows stay open forever and the ended-session guard keeps prune/archive away.
 A later ``session/load`` + prompt reopens the row (``session_local_recovery.reopen_local_session``).
 """
+import asyncio
+from functools import partial
 import logging
+from threading import Event
 
 from hermes_state_local import POLICY_PREFIX, end_idle_local_session, local_receipt
 from hermes_state_runtime import RuntimeStoreError
@@ -58,15 +61,38 @@ async def reopen_if_reattached(authority, session_id, ended):
     it watches is live again (the stamp would make active work prune/archive eligible)."""
     live = authority.sessions.get(session_id)
     if ended and live is not None and live.subscribers:
-        import asyncio
         target = local_receipt(authority.db, session_id)['entry']['session_id']
         await asyncio.to_thread(authority.db.reopen_session, target)
     return ended
 
 
-def end_idle_acp_sessions(authority):
-    """Gateway shutdown: every ACP session nobody is viewing, attached this run or not."""
+def _end_idle_acp_sessions(authority, stopped):
+    """Include unviewed ACP sessions that were never attached during this run."""
+    if stopped.is_set():
+        return 0
     with authority.db._read_ctx() as conn:
         ids = [row[0][len(POLICY_PREFIX):] for row in conn.execute(
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
-    return sum(end_idle_acp_session(authority, sid) for sid in ids)
+    ended = 0
+    for session_id in ids:
+        if stopped.is_set():
+            break
+        ended += end_idle_acp_session(authority, session_id)
+    return ended
+
+
+async def end_idle_acp_sessions(authority, deadline):
+    """Close unviewed ACP sessions within shutdown's remaining settle budget."""
+    from gateway.session_runtime_workers import tracked_write
+
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        return 0
+    stopped = Event()
+    try:
+        close = partial(_end_idle_acp_sessions, authority, stopped)
+        return await asyncio.wait_for(tracked_write(authority, close), remaining)
+    finally:
+        # A waiting SQLite call may still be running. It retains authority ownership,
+        # but it must not start closing more sessions after the deadline or cancellation.
+        stopped.set()

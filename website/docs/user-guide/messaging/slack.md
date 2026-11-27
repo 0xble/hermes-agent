@@ -527,6 +527,44 @@ replies. A cleanup failure produces 1 notice in the DM naming the failed
 operation or reply. Cleanup is not retried, and deleting messages while Hermes
 is offline is not caught up later.
 
+### Messages Sent While Hermes Was Offline
+
+Slack does not hold events for a Socket Mode app that is not connected. A message sent
+while the gateway was stopped, restarting, or cut off from Slack would otherwise never be
+seen. When the Slack connection comes back, Hermes reads the offline interval back from
+Slack and answers what it missed:
+
+- every message in a 1:1 DM with the bot,
+- @-mentions in group DMs and in channels the bot is a member of,
+- replies in threads the bot already has a session for.
+
+Each missed message goes through the same handler as a live one, so the allowlist, mention
+rules, channel gating, session routing and threading are unchanged. Messages from
+unauthorized users are never answered. The agent is told the message is late, when it was
+sent, and how long the gateway was offline, so it acknowledges the delay and confirms before
+acting on anything time-sensitive. A late `/command` or `!command` is not executed. It
+reaches the agent as text.
+
+The interval starts at the last moment Slack was known connected and ends at the reconnect.
+It is capped at 24 hours. Messages sent while Hermes was up are never replayed, and a message
+is answered at most once, also across restarts and crash loops. A message the bot already
+replied to is skipped. At most 20 messages are answered per reconnect, oldest first. Past
+that, each affected conversation gets 1 line saying how many more messages were not answered.
+
+The scan needs the history scopes from Step 2 (`im:history`, `mpim:history`,
+`channels:history`, `groups:history`). It is rate-limit bounded: it stops at the first Slack
+rate limit, so a workspace with very many channels may not be read completely.
+
+```yaml
+gateway:
+  missed_inbound_recovery:
+    enabled: true   # default; set false to leave missed messages unanswered
+```
+
+`gateway.missed_inbound_recovery.enabled` applies to every platform that supports recovery.
+Slack is the only one today. Telegram already redelivers updates queued while the gateway was
+offline, through its normal polling.
+
 ### Channel Thread Titles
 
 Channel threads have no native Slack title. With

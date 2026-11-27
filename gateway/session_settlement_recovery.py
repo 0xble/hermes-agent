@@ -195,10 +195,9 @@ def owner_stop_notice(captured, outcome, row=None):
     notice = {_INTERRUPT_REASON_GATEWAY_RESTART: RESTART_INTERRUPT_NOTICE,
               _INTERRUPT_REASON_GATEWAY_SHUTDOWN: SHUTDOWN_INTERRUPT_NOTICE}.get(cause)
     if notice is not None and row is not None:
-        from gateway.session_unattended_unknown import is_unattended
+        from gateway.session_unattended_unknown import interrupted_notice, is_unattended
         if is_unattended(row):
-            from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
-            return AUTOMATION_INTERRUPTED_NOTICE
+            return interrupted_notice(row)
     return notice
 
 

@@ -5,7 +5,7 @@ from hermes_cli.doctor_state import unpruned_cache_hogs
 
 def test_unpruned_cache_hogs_skips_pruned_dirs_and_small_entries(tmp_path):
     cache = tmp_path / "cache"
-    for name in ("scratch", "terminal", "campaign-x", "web"):
+    for name in ("scratch", ".scratch-trash", "terminal", "campaign-x", "web"):
         (cache / name).mkdir(parents=True)
         with open(cache / name / "blob", "wb") as fh:
             fh.truncate(2048)

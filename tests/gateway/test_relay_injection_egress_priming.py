@@ -65,6 +65,25 @@ def test_prime_routing_cache_warms_egress_discriminators():
     assert meta.get("scope_id") == "T0AAAA111"
 
 
+@pytest.mark.parametrize('live_profile', ['newer-profile', None])
+def test_restored_priming_preserves_the_newer_live_route(live_profile):
+    adapter = _bare_relay_adapter()
+    live = _synth_event_with_origin()
+    live.source.user_id = 'newer-user'
+    live.source.scope_id = 'newer-scope'
+    live.source.profile = live_profile
+    live.message_id = 'newer-message'
+    adapter._capture_scope(live)
+    restored = _synth_event_with_origin()
+    restored.source.profile = 'older-profile'
+    adapter.prime_routing_cache(restored)
+    expected = {'scope_id': 'newer-scope', 'user_id': 'newer-user'}
+    if live_profile:
+        expected['profile'] = live_profile
+    assert adapter._with_scope(live.source.chat_id, None) == expected
+    assert adapter._last_inbound_ts_by_chat[live.source.chat_id] == 'newer-message'
+
+
 @pytest.mark.asyncio
 async def test_injection_path_primes_before_handle_message():
     """End-to-end wiring: _inject_watch_notification must call

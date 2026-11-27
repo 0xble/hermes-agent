@@ -107,6 +107,37 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
+async def test_manual_compress_reads_persisted_reasoning_off_the_gateway_loop():
+    from hermes_loop_guard import LoopGuardedLock, set_loop_thread
+
+    history = _make_history()
+    runner = _make_runner(history)
+    store_lock = LoopGuardedLock("session-store lock")
+    expected_reasoning = {"enabled": True, "effort": "high"}
+
+    def load_reasoning(_session_key):
+        with store_lock:
+            return expected_reasoning.copy()
+
+    runner.session_store.get_reasoning_override.side_effect = load_reasoning
+    runner._resolve_session_agent_runtime_async = AsyncMock(
+        return_value=("test-model", {"api_key": "test-key"}),
+    )
+    runner._build_manual_compression_agent = AsyncMock(
+        side_effect=RuntimeError("stop after preparing the compression agent"),
+    )
+
+    set_loop_thread(threading.get_ident())
+    try:
+        await runner._handle_compress_command(_make_event())
+    finally:
+        set_loop_thread(None)
+        runner._shutdown_executor()
+
+    assert runner._build_manual_compression_agent.call_args.args[2]["reasoning_config"] == expected_reasoning
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("warning_notifications", [True, False])
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered(tmp_path, monkeypatch, warning_notifications):
     """When the user's configured ``auxiliary.compression.model`` errors out

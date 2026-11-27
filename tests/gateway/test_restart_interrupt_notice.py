@@ -157,7 +157,7 @@ def send(frame):
 send({'type': 'hello', 'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]})
 for line in sys.stdin.buffer:
     frame = json.loads(line)
-    if frame == {'type': 'stop'}:
+    if frame.get('type') == 'stop':
         send({'type': 'result', 'result': {'final_response': '', 'interrupted': True, 'completed': False}})
     elif frame == {'type': 'finish'}:
         send({'type': 'finished'})
@@ -317,15 +317,16 @@ def test_restart_after_a_pending_redirect_still_gets_the_restart_notice():
 ])
 def test_automation_turn_the_owner_stop_interrupted_is_never_asked_to_resend(cause, row):
     """#134889 GW-20: nobody sent an unattended turn, so the owner-stop notice is the neutral
-    automation copy (GW-10's rule), never "Send your message again"."""
-    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+    automation copy (GW-10's rule) naming the automation, never "Send your message again"."""
+    from gateway.session_unattended_unknown import interrupted_notice
     stream = _Stream()
     live = SimpleNamespace(controls=SimpleNamespace(snapshot=lambda *a: None), event_stream=stream)
     _publish_completion(SimpleNamespace(runner=None), live, SimpleNamespace(session_id='s'),
                         {'admission_id': 'adm-1', 'request_id': 'sub-1', **row},
                         {'outcome': 'interrupted'}, '', _cause(cause))
     (frame,) = stream.frames
-    assert frame['warning'] == AUTOMATION_INTERRUPTED_NOTICE
+    assert frame['warning'] == interrupted_notice({'request_id': 'sub-1', **row})
+    assert 'was interrupted and was not run again' in frame['warning']
     assert 'again' not in frame['warning'].replace('not run again', '')
 
 

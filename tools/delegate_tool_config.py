@@ -538,6 +538,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     return _credential_bundle(
         v["model"], provider, v["base_url"], v["api_key"], api_mode,
         _merge_request_overrides(request_overrides, explicit_request_overrides),
+        no_parent_api_key=bool(v.get("_no_parent_api_key")),
     )
 
 def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
@@ -545,7 +546,9 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
     configured_provider = v["provider"]
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+        # A route's own key (an explicit model alias's) wins over the provider's resolved one.
+        explicit = {"explicit_api_key": v["api_key"]} if v["api_key"] else {}
+        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **explicit)
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
@@ -592,7 +595,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
-    values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
+    values: dict[str, Any] = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
+    values["_no_parent_api_key"] = bool(cfg.get("_no_parent_api_key"))
     values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
@@ -635,7 +639,9 @@ _ROUTING_FILTER_DEFAULTS = (
 _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
 
 
-def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) -> Optional[list[dict[str, Any]]]:
+def _resolve_child_fallback_chain(
+    parent_agent, routing_cfg: Any, pinned: bool, *, allow_billing_fallback: bool = False,
+) -> Optional[list[dict[str, Any]]]:
     """Fallback chain for a child, owned by the same config block as its route.
 
     Pinned children (provider, endpoint or model override) never borrow the parent chain;
@@ -646,7 +652,7 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
     return scoped_fallback_chain(
         getattr(parent_agent, "_fallback_chain", None),
         routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None,
-        pinned=pinned, owner="delegation")
+        pinned=pinned and not allow_billing_fallback, owner="delegation")
 
 
 class ResolvedReasoning(NamedTuple):
@@ -682,7 +688,8 @@ def _child_reasoning(parent_agent, delegation_cfg: dict, route_effort: Any) -> A
 
 def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
-    override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
+    override_base_url: Optional[str], override_api_key: Optional[str], prevent_parent_api_key: bool = False,
+    override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[list[str]],
     routing_cfg: Optional[dict[str, Any]] = None, override_reasoning_effort: Any = None,
 ) -> dict[str, Any]:
@@ -752,18 +759,35 @@ def _resolve_child_runtime(
 
     child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
+    route_config = delegation_cfg if routing_cfg is None else routing_cfg
+    fallback_chain_owned = isinstance(route_config, dict) and route_config.get("fallback_providers") is not None
+    allow_billing_fallback = bool(
+        (route_config or {}).get("allow_billing_fallback", delegation_cfg.get("allow_billing_fallback", False))
+    )
+    # The tool passes an authored route separately from its resolved model, so a
+    # provider-only route's default model is not a pin. For direct callers without
+    # an authored route, a supplied model is itself the explicit selection.
+    selected_model = model if routing_cfg is None else routing_cfg.get("model")
+    model_pinned = bool(str(selected_model or "").strip()) or (routing_cfg or {}).get("_model_pinned") is True
 
     kwargs: dict[str, Any] = {
-        "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
+        "base_url": effective_base_url, "api_key": None if prevent_parent_api_key else (override_api_key or parent_api_key), "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,
         # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
         # model never borrows the parent's chain; an explicitly declared child chain still remains available.
+        # The role primary always stays the child's primary, even when another process already cooled
+        # it: construction adopts the shared cooldown (``_adopt_shared_primary_cooldown``), which walks
+        # this chain through the spare guards and lets the child return to the primary mid-turn.
+        "model_pinned": model_pinned,
+        "fallback_chain_owned": fallback_chain_owned,
+        "allow_billing_fallback": allow_billing_fallback,
         "fallback_model": _resolve_child_fallback_chain(
-            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
+            parent_agent, route_config,
+            pinned=bool(model_pinned or override_provider or override_base_url or model),
+            allow_billing_fallback=allow_billing_fallback),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

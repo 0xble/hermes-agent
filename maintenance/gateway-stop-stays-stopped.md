@@ -59,3 +59,5 @@ holds stop-produced completions until the next user turn, and this regression
 passes without the local code. To roll back, revert the patch commit. The latch
 is process-local and the pause reason is an ordinary goal row value, so nothing
 needs to be migrated.
+
+Contract tests: `tests/gateway/test_stop_pauses_goal_and_holds_wakes.py`, `tests/hermes_cli/test_goals.py`, `tests/tools/test_async_delegation.py`.
