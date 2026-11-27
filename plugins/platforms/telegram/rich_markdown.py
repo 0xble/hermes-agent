@@ -309,7 +309,7 @@ _MATH_DELIMITERS = (("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"))
 # it: ``$5 and refs ... $6`` is currency, not math, so references between the amounts stay prose.
 _INLINE_DOLLAR_MATH_RE = re.compile(
     r"(?<![\\$])\$(?![\s$])"
-    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z])[^\W\d_])+)\b)"
+    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z\u0370-\u03ff\u1f00-\u1fff\u2100-\u214f])[^\W\d_])+)\b)"
     r"[^$\n`]*?(?<![\s([{,:;])\$(?![\w$])"
 )
 # Inline HTML whose content Telegram shows literally; formatting tags such as <b> still wrap prose.

@@ -83,6 +83,9 @@ def test_rich_payload_escapes_currency_but_keeps_math_and_code(adapter, markdown
         ("$5 价格 10$", "\\$5 价格 10$"),
         # A single ASCII letter may be a TeX variable, so it stays math.
         ("$$x=1$$ so $5 a 10$", "$$x=1$$ so $5 a 10$"),
+        # Greek letters are math variables, not prose.
+        ("Circumference: $2 π r$.", "Circumference: $2 π r$."),
+        ("$2 πr$ and $3 α$", "$2 πr$ and $3 α$"),
     ],
 )
 def test_rich_payload_keeps_spaced_numeric_math_whole(adapter, markdown, expected):

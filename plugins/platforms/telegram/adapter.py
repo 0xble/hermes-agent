@@ -497,11 +497,12 @@ _RICH_CODE_RE = re.compile(
 # Preserve closed math, but not dollar-prefixed tickers or prose such as "$6 per US$ unit". A numeric
 # amount followed by an ordinary word is currency here; single-letter variables and backslash math
 # commands survive.
-# An amount followed by prose is currency: a word of 2+ ASCII letters, or any word in a non-Latin
-# script (TeX variables are ASCII, so "$5 и 10$" is prose while "$5 a 10$" may be math). Math never
+# An amount followed by prose is currency: a word of 2+ ASCII letters, or a word in a script that
+# math does not use for variables. ASCII, Greek and letterlike symbols stay math, so "$5 и 10$" is
+# prose while "$5 a 10$" and "$2 π r$" may be math. Math never
 # spans a backtick, so "$5 (`$`" cannot swallow the opener of a following code span.
 _RICH_AMOUNT_BEFORE_WORD = (
-    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z])[^\W\d_])+)\b)")
+    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z\u0370-\u03ff\u1f00-\u1fff\u2100-\u214f])[^\W\d_])+)\b)")
 _RICH_CURRENCY_PROTECTED_RE = re.compile(
     _RICH_CODE_RE.pattern
     + r"|(?<![\\$])\$\$.*?\$\$"
