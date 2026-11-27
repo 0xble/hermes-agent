@@ -2812,25 +2812,26 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                             job_id, expected_owner=owner):
                         last_confirmed = time.monotonic()
                         continue
-                    lost_ownership.set()
+                    # A heartbeat miss is not proof that the live worker is stale. Under load,
+                    # the jobs store can be temporarily unreadable or a recovery tick can race
+                    # this worker's refresh. The process that already owns the side effect is the
+                    # safer authority: let it finish, while the compare-and-refresh continues to
+                    # fence terminal writes and delivery if another owner really took the claim.
                     logger.warning(
-                        "Job '%s': fire claim ownership lost; interrupting stale run",
+                        "Job '%s': fire claim heartbeat could not confirm ownership; "
+                        "allowing the live run to finish",
                         job_id)
-                    return
+                    continue
                 last_confirmed = time.monotonic()
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
-                if (
-                    time.monotonic() - last_confirmed
-                    >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
-                ):
-                    lost_ownership.set()
-                    logger.warning(
-                        "Job '%s': fire_claim could not be renewed within %.1fs; "
-                        "interrupting uncertain run",
-                        job_id,
-                        _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS)
-                    return
+                # A failed renewal is advisory only. A live process must not be SIGKILLed merely
+                # because the scheduler could not acquire the jobs lock under host load. The next
+                # sample retries; completion remains fenced by the owner check.
+                logger.warning(
+                    "Job '%s': fire claim heartbeat failed; allowing the live run to finish",
+                    job_id,
+                    exc_info=True)
 
     heartbeat_thread = _start_heartbeat_thread(
         _heartbeat_loop, "cron-fire-claim-heartbeat",

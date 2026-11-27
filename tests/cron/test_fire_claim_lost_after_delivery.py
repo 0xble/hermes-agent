@@ -232,11 +232,9 @@ def _drive_heartbeat_thread(monkeypatch, *, misses, steal=False):
     return sched, job, hb, delivered, run_cancel
 
 
-@pytest.mark.parametrize("misses, latched", [(1, False), (2, True)], ids=["one-sample", "latched"])
-def test_heartbeat_miss_mid_run_keeps_completed_run(temp_home, monkeypatch, misses, latched):
-    """#113357: the heartbeat thread's miss is a sample, not the verdict. One miss is re-sampled
-    and never cancels the run; two consecutive misses latch, but a claim the store still validates
-    at completion records the completed run — not ``_OWNERSHIP_LOST_INTERRUPTED``."""
+@pytest.mark.parametrize("misses", [1, 2], ids=["one-sample", "repeated-miss"])
+def test_heartbeat_miss_mid_run_keeps_completed_run(temp_home, monkeypatch, misses):
+    """Heartbeat misses are advisory: even repeated misses must not cancel a live run."""
     from cron.executions import get_execution
     from cron.jobs import get_job
 
@@ -246,7 +244,7 @@ def test_heartbeat_miss_mid_run_keeps_completed_run(temp_home, monkeypatch, miss
     assert sched.drain_delivery_queue({}, None) == 1
 
     assert hb.missed == misses
-    assert run_cancel == [latched], "only a confirmed miss reaches the run's cancel event"
+    assert run_cancel == [False], "heartbeat misses must never cancel an active run"
     assert delivered == ["the report"]
     record = get_job(job["id"])
     assert record["last_status"] == "ok"
@@ -254,9 +252,12 @@ def test_heartbeat_miss_mid_run_keeps_completed_run(temp_home, monkeypatch, miss
     assert get_execution(job["execution_id"])["status"] == "completed"
 
 
-def test_confirmed_claim_loss_mid_run_still_yields(temp_home, monkeypatch):
-    """A genuinely re-owned claim (two misses, stored ``by`` rewritten) still fences the run out:
-    nothing delivered, no terminal write over the new owner, ledger records the discard."""
+def test_reowned_claim_does_not_kill_live_run(temp_home, monkeypatch):
+    """A claim rewritten by a competing recovery tick must not kill the active process.
+
+    The owner fence still prevents this run from writing the replacement owner's terminal state,
+    but the side effect is allowed to finish rather than being SIGKILLed.
+    """
     from cron.executions import get_execution
     from cron.jobs import get_job
 
@@ -265,9 +266,15 @@ def test_confirmed_claim_loss_mid_run_still_yields(temp_home, monkeypatch):
 
     assert sched.run_one_job(job) is True
 
-    assert run_cancel == [True]
-    assert delivered == []
+    assert run_cancel == [False]
+    assert delivered == [], "a replacement owner fences delivery, but must not kill the process"
     record = get_job(job["id"])
+    assert record is not None
     assert record["last_status"] is None
-    assert record["fire_claim"]["by"] == "replacement:deadbeef"
-    assert "discarded" in get_execution(job["execution_id"])["error"]
+    claim = record["fire_claim"]
+    assert claim is not None
+    assert claim["by"] == "replacement:deadbeef"
+    execution = get_execution(job["execution_id"])
+    assert execution is not None
+    assert execution["status"] == "failed"
+    assert "ownership" in (execution.get("error") or "").lower()
