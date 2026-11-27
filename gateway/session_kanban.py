@@ -116,15 +116,16 @@ async def run_task(connection, params):
     if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
     from gateway.run import _load_gateway_config
-    from gateway.session_local import create_local_session
+    from gateway.session_local import create_local_session_async
     from gateway.session_contract import Submission
     from gateway.session_local_recovery import local_identity
     from hermes_state_local import local_receipt
     from gateway.session_policy import restore_policy
     authority = connection.authority
-    # Resolved off-loop up front: no await separates the saved-claim check from session
-    # creation. The Kanban claim check and its marker share one off-loop transaction; a
-    # concurrent retry of the same attempt meets that marker (same session) or a stale claim.
+    # Resolved off-loop up front. Creation now awaits its commit off the loop: a concurrent retry
+    # of the same attempt commits the identical receipt (an exact-retry no-op) and restores the
+    # same session. The Kanban claim check and its marker share one off-loop transaction, so it
+    # then meets that marker (same session) or a stale claim.
     owner_db = str(await asyncio.to_thread(Path(authority.db.db_path).resolve))
     # The dispatcher attempt is the durable request identity, including after the
     # task closes. Retry checks the saved claim, never reinterprets updated cards.
@@ -137,12 +138,13 @@ async def run_task(connection, params):
         if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
                 or any(params[k] != context.get(k) for k in params)):
             raise RuntimeStoreError('permission_denied')
-        from gateway.session_local_recovery import restore_local_session
-        ref = restore_local_session(authority, sid)
+        from gateway.session_local_recovery import restore_local_session_settled
+        ref = await restore_local_session_settled(authority, sid)  # store lock: off the loop
     else:
         policy, private = build_kanban_policy(connection, params, _load_gateway_config())
-        ref = create_local_session(authority, connection.actor, {'request_id': request_id},
-                                   trusted_policy=policy, trusted_secrets=private)
+        # The creation commit (state.db writer) and the store restore run off the loop.
+        ref = await create_local_session_async(authority, connection.actor, {'request_id': request_id},
+                                               trusted_policy=policy, trusted_secrets=private)
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     import os

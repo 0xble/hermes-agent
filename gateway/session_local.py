@@ -256,6 +256,23 @@ def create_local_session(authority, actor, params, *, trusted_policy=None, trust
     return staged
 
 
+async def create_local_session_async(authority, actor, params, *, trusted_policy=None, trusted_secrets=None,
+                                     skills_prompt=None, client_local=False):
+    """``create_local_session`` for event-loop callers: the creation commit (state.db writer) and the
+    session-store restore run off the loop, so a Kanban card admission never freezes the gateway."""
+    from functools import partial
+    from gateway.session_local_recovery import restore_local_session_settled
+    from gateway.session_runtime_workers import tracked_write
+    from hermes_state_local import commit_local_session
+    staged = stage_local_session(authority, actor, params, trusted_policy=trusted_policy,
+                                 trusted_secrets=trusted_secrets, skills_prompt=skills_prompt,
+                                 client_local=client_local)
+    if isinstance(staged, dict):
+        await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=staged))
+        staged = await restore_local_session_settled(authority, staged['session_id'])
+    return staged
+
+
 def staged_creation_follows(authority, actor, request_id):
     """Whether a retry of *request_id* may ask to follow the profile.
 
