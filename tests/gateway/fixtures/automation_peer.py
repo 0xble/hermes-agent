@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import patch
 
 import websockets
 from tests.gateway.test_normal_runtime_boot import control
@@ -176,15 +177,45 @@ async def _arm_peer_goal_wait(root, env, home, desc, sid):
     return instance
 
 
+def _owner_is_running(pid):
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    try:
+        if hasattr(os, 'waitid'):
+            return os.waitid(os.P_PID, pid, flags) is None
+        if sys.platform != 'darwin':
+            raise RuntimeError('Owner fixture requires non-reaping waitid')
+
+        # Older macOS Python builds omit os.waitid, but Darwin's libc exposes it.
+        import ctypes as c
+
+        class Siginfo(c.Structure):
+            # Darwin siginfo_t (sys/signal.h); only si_pid is read.
+            _fields_ = [('si_signo', c.c_int), ('si_errno', c.c_int), ('si_code', c.c_int),
+                        ('si_pid', c.c_int), ('si_uid', c.c_uint), ('si_status', c.c_int),
+                        ('si_addr', c.c_void_p), ('si_value', c.c_void_p),
+                        ('si_band', c.c_long), ('pad', c.c_ulong * 7)]
+
+        waitid = c.CDLL(None, use_errno=True).waitid
+        waitid.argtypes = (c.c_int, c.c_uint, c.POINTER(Siginfo), c.c_int)
+        waitid.restype = c.c_int
+        info = Siginfo()
+        if waitid(os.P_PID, pid, c.byref(info), flags) == -1:
+            errno = c.get_errno()
+            raise OSError(errno, os.strerror(errno))
+        return info.si_pid == 0
+    except ChildProcessError:
+        return False  # The watcher already reaped it.
+
+
 def _signal_owner(proc):
     if proc.returncode is not None:
         return
     try:
         if os.name == 'nt':
             proc.kill()  # TerminateProcess does not compete for waitpid.
-        else:
-            # In Python 3.11, Process.kill() calls Popen.poll(), which can
-            # consume the exit status before asyncio's child watcher sees it.
+        elif _owner_is_running(proc.pid):
+            # Process.kill() on Python 3.11 can reap via Popen.poll(). WNOWAIT leaves
+            # that to asyncio. A small check-to-kill race with exit/reaping remains.
             os.kill(proc.pid, signal.SIGKILL)  # windows-footgun: ok
     except ProcessLookupError:
         pass  # The watcher won the race with kill; still use its status.
@@ -211,6 +242,9 @@ async def probe(root, base, mode):
     reply_sources = {}
     delayed_replies = []
     expose_successor_reply = False
+    successor_ws = None
+    successor_idle_ack = asyncio.Event()
+    successor_relay_drained = asyncio.Event()
     async def connector(ws):
         hello = json.loads(await ws.recv())
         assert hello['platform'] == 'telegram', hello
@@ -243,6 +277,10 @@ async def probe(root, base, mode):
                     'result': {'success': True, 'message_id': 'fixture-final'}}) + '\n')
             elif frame['type'] == 'going_idle':
                 await ws.send(json.dumps({'type': 'going_idle_ack'}) + '\n')
+                if ws is successor_ws:
+                    successor_idle_ack.set()
+        if ws is successor_ws:
+            successor_relay_drained.set()
 
     def rows():
         with sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True) as db:
@@ -478,10 +516,22 @@ async def probe(root, base, mode):
                         await wait_for(lambda: any(r['request_id'] == 'after-recovery'
                             and r['status'] == 'terminal' and r['outcome'] == 'completed'
                             and r['seq'] > follower['seq'] for r in rows()))
-                        # A terminal row can precede delivery. Observe the later turn's reply
-                        # on the same ordered relay connection before counting follower sends.
+                        # A terminal row can precede delivery. Observe the later turn's reply,
+                        # then gracefully stop only the fixture successor. The idle handshake
+                        # and completion of the relay reader fence all remaining outbound frames.
                         await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
                                                    for action in replies(_AFTER_RECOVERY_ACK)))
+                        from gateway.status import write_planned_stop_marker
+
+                        new_pid = proc.pid
+                        with patch.dict(os.environ, HERMES_HOME=str(home)):
+                            stop_requested = write_planned_stop_marker(new_pid)
+                        assert stop_requested, new_pid
+                        await wait_for(successor_relay_drained.is_set)
+                        assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
+                        returncode = await asyncio.wait_for(proc.wait(), 10)
+                        proc = None
+                        assert returncode == 0, returncode
                         revived_sends = replies(_FOLLOWER_ACK)
                         assert len(revived_sends) == 1, outgoing[sent_before_restart:]
                         assert reply_sources[id(revived_sends[0])] is successor_ws, revived_sends
@@ -496,7 +546,7 @@ async def probe(root, base, mode):
                                                  (sid,)).fetchall()
                         assert any('was interrupted and was not run again' in (text or '')
                                    for (text,) in notices), notices
-                        print(json.dumps({'old_pid': old_pid, 'new_pid': proc.pid, 'ledger': rows(),
+                        print(json.dumps({'old_pid': old_pid, 'new_pid': new_pid, 'ledger': rows(),
                                           'model_inputs': texts, 'interruption_notices': notices}))
                         return
                     await send('held', 'HOLD_AUTOMATION')
