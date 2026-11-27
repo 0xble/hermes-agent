@@ -823,6 +823,28 @@ def is_shared_multi_user_session(
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
 
 
+def label_shared_sender(
+    source: SessionSource, text: str, *, group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+) -> str:
+    """``[Name] text`` in a session shared across participants, so the agent can tell who spoke; the
+    same label whether the message opens a turn or lands mid-turn (steer / redirect). Display names
+    are attacker-influenceable: newlines and control characters are neutralized, or a hostile name
+    masquerades as a markdown section. On Slack the speaker's verifiable ``<@U…>`` id rides along, a
+    trusted target for "mention me" (#17916)."""
+    if not (source.user_name and is_shared_multi_user_session(
+            source, group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user)):
+        return text
+    # The tag's own delimiters are dropped too, so a name can neither end the [Name] prefix early,
+    # forge bracketed structure, nor a second "| Slack user <@id>" span (#127053).
+    from gateway.platforms.helpers import tag_safe_display_name
+    name = tag_safe_display_name(source.user_name)
+    if source.platform == Platform.SLACK and source.user_id:
+        name = f"{name} | Slack user <@{source.user_id}>"
+    return f"[{name}] {text}"
+
+
 def _session_key_namespace(profile: Optional[str]) -> str:
     """``agent:<ns>`` prefix for a session key: default/None profile → ``agent:main``
     (BYTE-IDENTICAL to every historical key); named profile → ``agent:<name>`` so two
@@ -1638,6 +1660,33 @@ class SessionStore(
                         len(dropped), "y" if len(dropped) == 1 else "ies", session_id)
         return len(dropped)
 
+    def release_route(self, session_key: str, session_id: str) -> bool:
+        """Drop *session_key*'s routing entry while it still names *session_id*: the conversation
+        moved onto another lane (a handoff into another Telegram topic), so this one starts a fresh
+        conversation at its next message instead of sharing it. Nothing is ended. True = dropped."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.session_id != session_id:
+                return False
+            self._entries.pop(session_key, None)
+            self._save()
+        return True
+
+    def restore_route(self, entry: SessionEntry, *, expected_session_id: str) -> bool:
+        """Undo a ``switch_session`` that could not complete: put *entry* (the route as it was, pins
+        and overrides included) back while its key still names *expected_session_id*, and reopen the
+        row the switch ended. False = the route moved on since (a newer switch owns it)."""
+        with self._lock:
+            current = self._entry_locked(entry.session_key)
+            if current is None or current.session_id != expected_session_id:
+                return False
+            self._entries[entry.session_key] = entry
+            self._save()
+        if self._db_for_key(entry.session_key):
+            self._reopen_session_row(entry.session_key, entry.session_id)
+        self._announce_route(entry.session_key, entry)
+        return True
+
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
@@ -1657,51 +1706,45 @@ class SessionStore(
         """
         with self._lock:
             old_entry = self._entry_locked(session_key)
-            if old_entry is None:
+            refused = old_entry is None or (
+                expected_session_id is not None and old_entry.session_id != expected_session_id)
+            if refused and old_entry is not None:
+                logger.info("Session switch for %s refused: route moved from %s to %s after the caller's snapshot",
+                            session_key, expected_session_id, old_entry.session_id)
+            if refused:
                 return None
-            if expected_session_id is not None and old_entry.session_id != expected_session_id:
-                logger.info(
-                    "Session switch for %s refused: route moved from %s to %s after the caller's snapshot",
-                    session_key, expected_session_id, old_entry.session_id,
-                )
-                return None
+            # Adopt a delegate target under the route lock, after the CAS and BEFORE the route moves: a
+            # failed marker write leaves the old route intact, and a refused switch never adopts, so it
+            # has nothing to undo that an overlapping successful switch onto the same row relies on.
+            if self._db_for_key(session_key):
+                self._adopt_delegate_row(session_key, target_session_id)
             if old_entry.session_id == target_session_id:
                 return old_entry
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
-                yolo=old_entry.yolo,
-                reasoning_override=old_entry.reasoning_override,
-                # The user's activity belongs to the route, not the session row it points at.
+                yolo=old_entry.yolo, reasoning_override=old_entry.reasoning_override,
                 last_user_activity_at=old_entry.last_user_activity_at,
                 attended_route_active=old_entry.attended_route_active,
                 attended_pinned=old_entry.attended_pinned if preserve_attended_pin else False,
                 attended_pin_until=old_entry.attended_pin_until if preserve_attended_pin else None,
                 model_role=old_entry.model_role,
-                prompt_pin=(
-                    dict(old_entry.prompt_pin)
-                    if preserve_prompt_pin and old_entry.prompt_pin is not None else None
-                ),
+                prompt_pin=(dict(old_entry.prompt_pin)
+                            if preserve_prompt_pin and old_entry.prompt_pin is not None else None),
+                metadata=({"terminal_cwd": old_entry.metadata["terminal_cwd"]}
+                          if preserve_prompt_pin and "terminal_cwd" in old_entry.metadata else {}),
             )
-
         try:
             if self._db_for_key(session_key) and old_entry.session_id:
-                self._promote_session_reset(
-                    session_key, old_entry.session_id, "session_switch",
-                    log=lambda e: logger.debug("Session DB end_session failed: %s", e),
-                )
+                self._promote_session_reset(session_key, old_entry.session_id, "session_switch",
+                                            log=lambda e: logger.debug("Session DB end_session failed: %s", e))
             if self._db_for_key(session_key):
-                # An explicit /resume/handoff/branch repoint is real user activity: the row is
-                # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
-                # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
-                self._reopen_session_row(
-                    session_key, target_session_id, log_prefix="Session DB reopen_session failed"
-                )
+                self._reopen_session_row(session_key, target_session_id,
+                                         log_prefix="Session DB reopen_session failed")
                 self._record_gateway_session_peer(
                     target_session_id, session_key, new_entry.origin,
                     display_name=new_entry.display_name, include_compression_ancestors=True,
-                    transport_profile=new_entry.transport_profile,
-                )
+                    transport_profile=new_entry.transport_profile)
         finally:
             self._row_settled(target_session_id)
         self._announce_route(session_key, new_entry)

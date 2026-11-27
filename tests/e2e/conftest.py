@@ -213,7 +213,6 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> Gatew
 
     runner._running_agents = {}
     runner._pending_messages = {}
-    runner._pending_approvals = {}
     runner._shutdown_event = asyncio.Event()
     runner._exit_reason = None
     runner._exit_code = None
@@ -227,7 +226,6 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> Gatew
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._stop_task = None
     runner._busy_input_mode = "interrupt"
-    runner._running_agents_ts = {}
     runner._pending_model_notes = {}
     runner._voice_mode = {}
     runner._session_db = None
@@ -302,16 +300,15 @@ def make_adapter(platform: Platform, runner=None):
 async def send_and_capture(adapter, text: str, platform: Platform, **event_kwargs) -> AsyncMock:
     """Send a message through the full e2e flow and return the send mock.
 
-    Polls for the send rather than waiting a fixed delay: handler DB work now
-    hops to worker threads (AsyncSessionDB), so completion latency varies.
+    Join the admitted command's task: executor-backed handlers have no fixed
+    response deadline, and a send alone does not prove their cleanup finished.
     """
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
     await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
-        if adapter.send.called:
-            break
-        await asyncio.sleep(0.05)
+    task = adapter._session_tasks.get(adapter._event_session_key(event))
+    if task is not None:
+        await task
     return adapter.send
 
 

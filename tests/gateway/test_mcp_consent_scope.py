@@ -45,7 +45,7 @@ def test_gateway_scope_reaches_telegram_and_controls_resolution(monkeypatch, one
     runner: Any = object.__new__(TurnRunner)
     runner._ctx = TurnContext(
         source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345"),
-        _status_adapter=adapter, _status_chat_id="12345", _status_thread_metadata={},
+        _status_adapter_pinned=adapter, _status_chat_id="12345", _status_thread_metadata={},
         session_key=session,
     )
     runner._close_native_stream_boundary = lambda _why: None

@@ -42,10 +42,10 @@ def isolated(monkeypatch):
     monkeypatch.setattr(local, "_sweep_stale_staging_dirs", lambda: None)
     monkeypatch.setattr(local, "_ensure_background_reaper", lambda: None)
     monkeypatch.setattr(local, "_resolve_owner", lambda task: task)
-    from tools.code_execution_tool import _kill_process_group
-    monkeypatch.setattr("tools.code_execution_tool._kill_process_group",
+    original_kill = local._kill_process_group
+    monkeypatch.setattr(local, "_kill_process_group",
                         lambda proc, **_: setattr(proc, "returncode", 0))
-    yield _kill_process_group
+    yield original_kill
     local.shutdown_all_kernels()
     remote.shutdown_all_remote_kernels()
 
@@ -146,7 +146,7 @@ def test_dead_process_is_reaped_before_idle_timeout():
 def spawn_stub(monkeypatch):
     proc = Process()
     killed = Mock(side_effect=lambda *_, **__: setattr(proc, "returncode", 0))
-    monkeypatch.setattr("tools.code_execution_tool._kill_process_group", killed)
+    monkeypatch.setattr(local, "_kill_process_group", killed)
     monkeypatch.setattr(local, "_rpc_forever", lambda *_, **__: None)
     monkeypatch.setattr(local, "_stdout_reader", lambda *_, **__: None)
     monkeypatch.setattr(local, "_stderr_reader", lambda *_, **__: None)
@@ -199,9 +199,9 @@ def test_owner_boundary_during_popen_retires_late_process_once(monkeypatch, spaw
         with pytest.raises(RuntimeError, match="closed|retired"):
             pending.result(5)
     assert proc.poll() is not None
-    killed.assert_called_once_with(proc, escalate=True)
+    killed.assert_called_once_with(proc)
     kernel.teardown()
-    killed.assert_called_once_with(proc, escalate=True)
+    killed.assert_called_once_with(proc)
 
 
 def test_cell_failure_retires_once_and_does_not_log_exception_secrets(monkeypatch, caplog, spawn_stub):
@@ -220,7 +220,7 @@ def test_cell_failure_retires_once_and_does_not_log_exception_secrets(monkeypatc
     assert json.loads(result)["status"] == "error"
     assert kernel.key not in local._KERNELS
     kernel.teardown()
-    killed.assert_called_once_with(proc, escalate=True)
+    killed.assert_called_once_with(proc)
     assert secret not in caplog.text
 
 
@@ -244,7 +244,7 @@ def test_lifecycle_logs_use_current_identity_and_exclude_cell_content(monkeypatc
     assert all(record["owner"] == "shared-owner" and "caller" in record for record in records)
     assert all("attached" in record and "pinned" in record and "reason" in record for record in records)
     assert "SECRET" not in caplog.text
-    killed.assert_called_once_with(proc, escalate=True)
+    killed.assert_called_once_with(proc)
 
 
 def test_parallel_remote_acquire_uses_one_pending_record(monkeypatch):
@@ -408,7 +408,7 @@ def test_remote_spawn_failure_logs_exclude_transport_output(monkeypatch, caplog,
                 return {"output": secret if failure == "no-pid" else "PID:123", "returncode": 0}
             return {"output": secret, "returncode": 0}
 
-    monkeypatch.setattr("tools.code_execution_tool._ship_file_to_remote", lambda *_, **__: None)
+    monkeypatch.setattr(remote, "_remote_write", lambda *_, **__: None)
     monkeypatch.setattr("tools.code_execution_tool._ship_env_file_and_launch", lambda *_, **__: "launch")
     caplog.set_level(logging.DEBUG)
     assert call_remote("failed", FailedEnvironment()) is None
@@ -558,7 +558,7 @@ def test_attribution_failure_never_aborts_claimed_spawn_or_teardown(monkeypatch,
     assert tmpdir and os.path.isdir(tmpdir)
     monkeypatch.setattr("agent.redact.redact_sensitive_text", failing)
     kernel.teardown()
-    killed.assert_called_once_with(proc, escalate=True)
+    killed.assert_called_once_with(proc)
     assert not os.path.exists(tmpdir)
     env = Environment()
     remote.RemoteKernel(env, "ssh", "/isolated/attribution", "123", "token", "owner").kill()
@@ -573,7 +573,7 @@ def test_process_cleanup_failures_never_log_subprocess_secrets(monkeypatch, capl
     monkeypatch.setattr("agent.deadline.kill_process_tree", tree_kill)
     proc = SimpleNamespace(pid=424242, kill=Mock(side_effect=RuntimeError(secret)), wait=Mock())
     caplog.set_level(logging.DEBUG)
-    isolated(proc, escalate=True)
+    isolated(proc)
     tree_kill.assert_called_once()
     proc.kill.assert_called_once()
     proc.wait.assert_called_once_with(timeout=5)

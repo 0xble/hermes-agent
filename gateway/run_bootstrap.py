@@ -11,18 +11,23 @@ from gateway.config import GatewayConfig
 
 
 def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
-    """Run the store scan an unclean-exit report deferred, once the runner is live.
+    """Run the forensic store scan after the gateway is live, without owning its exit.
 
-    On the event loop it held every local listener open but unanswered for the whole
-    ``quick_check`` (minutes on a multi-GB ``state.db``), so local clients hung instead of being
-    refused. A daemon thread nothing waits on; it only appends the forensic exit-diag record.
+    The scan is diagnostic only.  It must never be able to trigger the gateway watchdog or
+    turn an otherwise healthy running gateway into an exit-75 restart loop.  The scan itself
+    is bounded by the ledger, and its result is retained in the exit diagnostics.
     """
     from agent.memory_provider import spawn_context_thread
     from gateway.lifecycle_ledger import STATE_DB_INTEGRITY_DEADLINE_S, run_deferred_integrity_check
-    # Under the caller's profile scope: the scan resolves this gateway's state.db through it.
-    spawn_context_thread(
-        run_deferred_integrity_check, args=(evidence,),
-        kwargs={"deadline_s": STATE_DB_INTEGRITY_DEADLINE_S}, name="state-db-integrity-check").start()
+
+    def _scan() -> None:
+        try:
+            run_deferred_integrity_check(evidence, deadline_s=STATE_DB_INTEGRITY_DEADLINE_S)
+        except BaseException:
+            # A forensic diagnostic is never a gateway lifecycle failure.
+            logger.debug("Deferred state.db integrity scan failed", exc_info=True)
+
+    spawn_context_thread(_scan, name="state-db-integrity-check").start()
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -210,6 +215,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
         if planned_takeover:
+            # The replacing gateway serves this home on: telling its home chats "shutting down" is
+            # false, and two services fighting over one home would repeat it every few seconds.
+            runner._planned_takeover_shutdown = True
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:
             logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")

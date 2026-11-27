@@ -197,8 +197,6 @@ def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
     descriptor for an untracked checker, SQLite's POSIX lock disappears and the
     child can take the exclusive reset lock.
     """
-    import gateway.lifecycle_ledger as ledger
-    import hermes_state_dbfile
     from hermes_state import SessionDB
 
     path = tmp_path / "state.db"
@@ -213,23 +211,15 @@ def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
                 assert release.wait(timeout=5), "test did not release the WAL scan"
             return super().execute(sql, parameters)
 
-    real_connect = sqlite3.connect
+    from hermes_cli import sqlite_safe_read
 
-    def connect_for_scan(database, *args, **kwargs):
-        kwargs["factory"] = HeldQuickCheckConnection
-        return real_connect(database, *args, **kwargs)
-
-    # The current implementation calls ledger.sqlite3.connect directly. Keep
-    # the same held connection when the fixed implementation uses the tracked
-    # state-db helper, without weakening that helper's real registration.
-    monkeypatch.setattr(ledger, "sqlite3", SimpleNamespace(connect=connect_for_scan))
-    real_tracked_connect = hermes_state_dbfile._connect_tracked_db
+    real_tracked_connect = sqlite_safe_read.connect_tracked
 
     def tracked_connect_for_scan(database, *args, **kwargs):
         kwargs["factory"] = HeldQuickCheckConnection
         return real_tracked_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(hermes_state_dbfile, "_connect_tracked_db", tracked_connect_for_scan)
+    monkeypatch.setattr(sqlite_safe_read, "connect_tracked", tracked_connect_for_scan)
 
     worker = threading.Thread(
         target=lambda: result.append(check_state_db_integrity(home=tmp_path)),

@@ -39,7 +39,7 @@ def test_current_alias_credentials_and_effort_reach_plugin_route_before_spawn(tm
         seen.append(route)
         return {"model": route["model"], "provider": route["provider"], "request_overrides": {}}
 
-    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", credentials)
+    monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials", credentials)
     monkeypatch.setattr("tools.delegate_tool_tuning.task_service_tier", lambda *args: {})
     parent = SimpleNamespace(reasoning_config={"enabled": True, "effort": "xhigh"},
                              reasoning_override={"enabled": True, "effort": "xhigh"})

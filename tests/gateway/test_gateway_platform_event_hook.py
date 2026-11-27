@@ -617,7 +617,7 @@ class TestRegisterHandlers:
 
     _HANDLER_ATTRS = (
         "_handle_text_message", "_handle_command", "_handle_location_message",
-        "_handle_media_message", "_handle_callback_query", "_on_platform_update",
+        "_handle_media_message", "_handle_dice_message", "_handle_callback_query", "_on_platform_update",
         "_handle_inline_query", "_handle_forum_topic_service_message",
     )
 

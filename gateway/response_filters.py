@@ -236,7 +236,12 @@ INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
 PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete",
                                          "supervisor_checkin"})
 MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
-# A closed producer allowlist, never a client-chosen presentation such as ``hidden``.
+# Loop exit the agent stamps when a machinery turn ends with the model adding nothing
+# (agent/turn_empty_response.py NOTIFICATION_NO_REPLY_EXIT mirrors this; agent/ cannot import gateway/).
+NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
+# What a gateway producer's card may name (a liveness tick names internal_notification for its CLI
+# receipt). Closed, and kept apart from the silence set above so a kind added there never becomes
+# nameable; never a client-chosen presentation such as ``hidden``.
 PRODUCER_CARD_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
@@ -581,10 +586,20 @@ def reaction_answered(agent_result: dict | None) -> bool:
 
 
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers or reaction-only replies suppress successful turn delivery."""
-    return isinstance(agent_result, dict) and not agent_result.get("failed") and (
-        is_intentional_silence_response(response)
-        or (reaction_answered(agent_result) and not (response or "").strip()))
+    """Silence markers or reaction-only replies suppress successful turn delivery.
+
+    A machinery turn with the quiet notification exit also counts as intentional silence,
+    but only when it has no text to deliver.
+    """
+    if not (isinstance(agent_result, dict) and not agent_result.get("failed")):
+        return False
+    if is_intentional_silence_response(response):
+        return True
+    if reaction_answered(agent_result) and not (response or "").strip():
+        return True
+    return agent_result.get("turn_exit_reason") == NOTIFICATION_NO_REPLY_EXIT and not (
+        isinstance(response, str) and response.strip()
+    )
 
 
 def display_kind_for_event(event: Any) -> str | None:

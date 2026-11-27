@@ -1,5 +1,6 @@
 """Wait-window clock, default and model-facing guidance for ``process_manage(action='wait')``."""
 
+import os
 import time
 from typing import Tuple
 
@@ -95,3 +96,26 @@ def wait_plan(
     else:
         reason = "The completion notice is not available to this session."
     return (max_timeout, f" {reason} Before finishing, wait again with a bounded timeout or kill it.")
+
+def max_wait_timeout() -> int:
+    """``TERMINAL_TIMEOUT``: the default wait, and the cap on a requested one."""
+    try:
+        return int(os.getenv("TERMINAL_TIMEOUT", "180"))
+    except (ValueError, TypeError):
+        return 180
+
+
+def process_deadline_floor(args: dict) -> float | None:
+    """Only ``wait`` blocks; it mirrors :meth:`ProcessRegistry.wait` — the requested window
+    clamped by ``TERMINAL_TIMEOUT``, or that default when none was requested."""
+    if args.get("action") != "wait":
+        return None
+    max_timeout = float(max_wait_timeout())
+    requested = args.get("timeout")
+    if requested is None:
+        return max_timeout
+    try:
+        requested = float(requested)
+    except (TypeError, ValueError):
+        return max_timeout
+    return min(requested, max_timeout) if requested > 0 else None

@@ -213,4 +213,4 @@ def test_submit_due_jobs_runs_reserved_first_then_rank_order(tmp_path, monkeypat
 @pytest.mark.parametrize("bad", [["live"], {"x": 1}, 3, "Live", "urgent"])
 def test_malformed_stored_priority_ranks_as_production_and_never_raises(bad):
     assert job_priority({"priority": bad}) == "production"
-    assert sorted([{"priority": bad}, {"priority": "live"}], key=job_priority_rank)[0] == {"priority": "live"}
+    assert min([{"priority": bad}, {"priority": "live"}], key=job_priority_rank) == {"priority": "live"}

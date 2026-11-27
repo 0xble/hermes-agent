@@ -21,6 +21,9 @@ def _owner(tmp_path, monkeypatch, handle):
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     import hermes_state_runtime as rt
+
+    # The symbolic profile resolves relative to cwd; keep its home out of the checkout.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db

@@ -405,7 +405,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         # Fail only the launchd reload callback: the durable intent, plist and
         # pointers move forward, while the live job still runs the old source.
         real_reload = gateway_launchd._reload_installed_launchd_plist
-        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: False)
+        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path, **_: False)
         update_receipt.begin_update_receipt()
         with launchd_phase(request, "migration.promote_failed_reload"):
             assert update_cmd._activate_immutable_release() is False
@@ -436,7 +436,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         observed(sha_b, a["pid"])
         repeated = []
         monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
-                            lambda path: repeated.append(path) or False)
+                            lambda path, **_: repeated.append(path) or False)
         update_receipt.begin_update_receipt()
         with launchd_phase(request, "migration.promote_recovery"):
             assert update_cmd._activate_immutable_release(sha=sha_b)

@@ -66,7 +66,7 @@ def test_warning_opt_out_preserves_other_delivery(tmp_path, monkeypatch, platfor
     gateway._delivery_adapter_for = lambda source: adapter
     gateway._thread_metadata_for_source = lambda source: {"thread_id": source.thread_id} if source.thread_id else {}
     ctx = TurnContext(source=source, user_config=config, _run_still_current=lambda: True,
-                      _status_adapter=adapter, _status_chat_id=source.chat_id,
+                      _status_adapter_pinned=adapter, _status_chat_id=source.chat_id,
                       _status_thread_metadata=gateway._thread_metadata_for_source(source))
     turn = TurnRunner(gateway, ctx)
     monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))
@@ -117,7 +117,7 @@ def test_supervisor_defers_engine_notices_until_final_delivery(monkeypatch, plat
     gateway._delivery_adapter_for = lambda source: adapter
     gateway._thread_metadata_for_source = lambda source, reply_to_message_id=None: {"thread_id": source.thread_id}
     ctx = TurnContext(source=source, user_config={}, _run_still_current=lambda: True,
-                      persist_user_display_kind=display_kind, _status_adapter=adapter,
+                      persist_user_display_kind=display_kind, _status_adapter_pinned=adapter,
                       _status_chat_id=source.chat_id, _status_thread_metadata={"thread_id": source.thread_id})
     turn = TurnRunner(gateway, ctx)
     monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))

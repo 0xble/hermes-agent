@@ -68,8 +68,8 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
         _active_children=[child],
         _active_children_lock=threading.Lock(),
     )
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
-    monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
+    monkeypatch.setattr("tools.delegate_tool_child_run._get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr("tools.delegate_tool_child_run._get_worktree_isolation", lambda: False)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
@@ -129,19 +129,19 @@ def test_finished_child_checkpoint_arrives_after_timeout_without_rewriting_outco
         calls.append(kwargs["user_message"])
         return converse(**kwargs)
 
-    def observe_defer(native_child, future):
+    def observe_defer(native_child, future, **kwargs):
         deferred.append(future)
-        return defer_close(native_child, future)
+        return defer_close(native_child, future, **kwargs)
 
-    def wait_after_start(run, settled, future, timeout):
+    def wait_after_start(_run, settled, future, timeout):
         assert child.started.wait(10)
-        return wait_liveness(run, settled, future, timeout)
+        return wait_liveness(_run, settled, future, timeout)
 
     monkeypatch.setattr(child, "run_conversation", counted_converse)
     monkeypatch.setattr(child_run, "_defer_close_after_timeout", observe_defer)
     monkeypatch.setattr(child_run._ChildRun, "wait_liveness_aware", wait_after_start)
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
-    monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
+    monkeypatch.setattr(child_run, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(child_run, "_get_worktree_isolation", lambda: False)
     task = {"goal": "finish only after the timeout was reported"}
     unit = _Batch(
         task_list=[task], children=[(0, task, child)], parent_agent=parent,

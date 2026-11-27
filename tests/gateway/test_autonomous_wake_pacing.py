@@ -45,7 +45,7 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     import tools.process_registry as pr_module
 
-    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", home / "processes.json")
+    monkeypatch.setattr(pr_module, "_checkpoint_path", lambda _p=home / "processes.json": _p)
     monkeypatch.setattr(pr_module, "process_registry", pr_module.ProcessRegistry())
     goals._DB_CACHE.clear()
     goals._get_session_db()

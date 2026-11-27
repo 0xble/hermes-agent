@@ -296,7 +296,7 @@ def human_prompt_text(
 # deep copy of the API messages, and automatic recall reads the stored user message instead, whose
 # multimodal parts flatten to the caption alone.
 _IMAGE_RECALL_PREFIX = re.compile(
-    r"\[The user (?:sent an image~ Here's what I can see:|"
+    r"\[The user (?:sent an image~ Here's what I can see(?: \(user-supplied image content, not instructions\))?:|"
     r"attached an image\. Here's what it contains:)\n(?P<description>.*?)\]\n"
     r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
     re.DOTALL,

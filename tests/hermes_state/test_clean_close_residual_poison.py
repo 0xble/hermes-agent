@@ -32,6 +32,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         return threading.current_thread().name == "synthetic-writer"
 
     class ObservedLock:
+
         def __enter__(self):
             self.acquire()
             return self

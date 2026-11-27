@@ -27,6 +27,7 @@ from gateway.platforms.helpers import clarify_text_with_choices
 from agent.i18n import t
 from gateway.relay.adapter_discord_interaction import RelayDiscordInteractionMixin
 from gateway.relay.adapter_draft_lifecycle import RelayDraftLifecycleMixin
+from gateway.relay.admitted_authors import note_delivered
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.egress import (
     EGRESS_DECLINE_CODE,
@@ -150,7 +151,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
         # chat_id -> Hermes profile the connector routed the inbound to (multiplex mode). Echoed
         # on every outbound frame's metadata so the connector can stamp the SAME profile on the
         # next passthrough_forward for that chat; empty on a single-profile gateway.
-        self._profile_by_chat: dict[str, str] = {}
+        self._profile_by_chat: dict[str, Optional[str]] = {}
         # Chats the connector has refused (see the terminal-decline latch).
         # chat_id -> (thread_id, initial_name) of the auto-thread the CONNECTOR
         # created for our latest send; read by the semantic thread-rename lane.
@@ -818,6 +819,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
         try:
             self._capture_ingress_scope(event)
+            note_delivered(event.source)  # a delivered Discord message: its author is admitted here
             await self._remember_discord_labels(event.source)
             self._stamp_slack_session_thread(event)
             # A structured prompt answer resolves its waiting primitive and is CONSUMED —
@@ -986,13 +988,13 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
                 ("chat_type", self._chat_type_by_chat),
                 ("profile", self.__dict__.setdefault("_profile_by_chat", {})),
             ):
-                if (fill_only and attr == "profile" and
-                        any(cache.get(chat) for cache in (
-                            self._dm_user_by_chat, self._scope_by_chat, self._chat_type_by_chat))):
-                    continue
                 value = getattr(src, attr, None)
                 if value:
                     put(cache, chat, str(value))
+                elif attr == "profile" and not fill_only:
+                    # Only live capture records absence, so an older restore cannot
+                    # supply the first stamp after live traffic. Keep any known stamp.
+                    self._profile_by_chat.setdefault(chat, None)
             # Latest message ts: the status anchor for typing frames that carry no turn's own anchor.
             message_id, _chat = _event_ids(event)
             if message_id:
@@ -1910,19 +1912,12 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
             )
             return True
         pending = self._pending_prompts.get(str(prompt_id)) or {}
-        from gateway.approval_actor import approval_refusal, refusal_text, runner_admin_ids
-        actor = None
-        if pending.get("kind") == "exec_approval":
-            # Identity first: this answer is consumed before handle_message, and without the transport
-            # identity the admin lookup read the routed runtime profile instead of the bot-owning one.
-            self._canonicalize(event.source)
-            actor = {"actor_id": getattr(event.source, "user_id", ""), "admin_ids": runner_admin_ids(event.source)}
-        if actor and (requester := approval_refusal(
-                str(pending.get("session_key") or ""), actor["actor_id"], admin_ids=actor["admin_ids"],
-                request_id=pending.get("request_id"))):
+        from gateway.relay.prompt_resolvers import prompt_actor, prompt_refusal
+        actor = prompt_actor(self, event) if pending.get("kind") in ("exec_approval", "slash_confirm", "clarify") else None
+        if actor and (refusal := prompt_refusal(pending, actor, option_id)):
             # Left pending: only the requester (or an approver) can consume it.
             self._send_lifecycle_ack(str(pending.get("chat_id") or getattr(event.source, "chat_id", "")),
-                                     refusal_text(requester), self._prompt_reply_metadata(event))
+                                     refusal, self._prompt_reply_metadata(event))
             return True
         state = self._pop_prompt(prompt_id)
         if state is None:

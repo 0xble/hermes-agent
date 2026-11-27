@@ -83,7 +83,9 @@ async def test_restart_before_first_model_call_is_replayed_once_by_the_successor
         assert len(rows) == 1, rows
         return rows[0]
 
-    await _until(lambda: row()['status'] != 'started')
+    # Production settles the old owner's FIFO before releasing ownership. A queued row alone
+    # isn't that barrier: the old drain may still be unwinding its delivery and next claim.
+    await asyncio.wait_for(asyncio.shield(old.sessions[sid].task), timeout=10.0)
     assert sent == []  # no "send it again" from the stopping owner
     assert (row()['status'], row()['outcome'], row()['generation']) == ('queued', None, None)
 

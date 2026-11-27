@@ -228,7 +228,7 @@ async def test_empty_logged_marker_does_not_suppress_memory_alarm(tmp_path, monk
 
 def test_interrupted_notice_write_does_not_publish_an_empty_marker(tmp_path, monkeypatch):
     from gateway import runtime_health
-    import utils
+    from utils import files
 
     home = setup_home(tmp_path, monkeypatch)
     logged = runtime_health._marker(home).with_suffix(".logged")
@@ -240,7 +240,7 @@ def test_interrupted_notice_write_does_not_publish_an_empty_marker(tmp_path, mon
         raise OSError("interrupted before rename")
 
     with monkeypatch.context() as interrupted:
-        interrupted.setattr(utils, "atomic_replace", interrupted_replace)
+        interrupted.setattr(files, "atomic_replace", interrupted_replace)
         with pytest.raises(OSError, match="interrupted before rename"):
             runtime_health._pending_notice(home)
 

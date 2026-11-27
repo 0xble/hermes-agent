@@ -266,6 +266,22 @@ def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> 
     return True
 
 
+def _on_primary_route(agent) -> bool:
+    """True when the agent's live route IS the ``_primary_runtime`` snapshot: provider, model and
+    endpoint, the triple that keys a fallback entry (``_fallback_entry_key``). A provider name
+    alone is not an identity: two ``custom`` endpoints (or one provider's other model) share it."""
+    from hermes_cli.route_identity import normalize_route_base_url
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    if not str(rt.get("provider") or "").strip():
+        return False
+
+    def ident(provider, model, base_url):
+        return (str(provider or "").strip().lower(), str(model or "").strip(), normalize_route_base_url(base_url or ""))
+
+    live = ident(getattr(agent, "provider", ""), getattr(agent, "model", ""), getattr(agent, "base_url", ""))
+    return live == ident(rt.get("provider"), rt.get("model"), rt.get("base_url"))
+
+
 def _arm_rate_limit_cooldown(
     agent, reason: FailoverReason | None, reset_at=None,
 ) -> int | None:

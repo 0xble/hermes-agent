@@ -12,6 +12,7 @@ The ``telegram`` package is mocked by ``tests/gateway/conftest.py``
 
 import asyncio
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -84,9 +85,6 @@ def _rich_api_kwargs(adapter):
     return call.kwargs["api_kwargs"]
 
 
-# --- Literal hash prefixes: Telegram's rich parser accepts "#89" as a heading without a space ---
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["send", "edit", "draft"])
 async def test_rich_delivery_keeps_literal_hash_references(operation):
@@ -115,18 +113,6 @@ async def test_rich_delivery_keeps_literal_hash_references(operation):
     adapter._bot.send_message_draft.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_always_mode_prose_starting_with_pr_number_is_not_a_heading():
-    """The reported symptom: plain prose (no rich-only construct) opening with ``#426`` rendered as a
-    heading because ``always`` mode routes every reply through the rich endpoint."""
-    adapter = _make_adapter({"rich_messages": "always"})
-    content = "#426 review clean (0.9) on the new head; #430's review is in progress."
-    assert (await adapter.send("12345", content)).success
-    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
-    assert markdown.startswith(r"\#426 review clean")
-    assert "; #430's review" in markdown  # inline reference stays untouched
-
-
 @pytest.mark.parametrize("content", [
     "# Heading\n\n## Heading 2\n\n###### Heading 6",
     "Use #89 and https://example.com/#anchor inline.",
@@ -146,6 +132,69 @@ def test_literal_hash_normalization_preserves_markdown_regions(content):
     escaped = escape_literal_hash_prefixes("1. #89\n\n> - ##tag\n\n#release")
     assert escaped == "1. \\#89\n\n> - \\#\\#tag\n\n\\#release"
     assert escape_literal_hash_prefixes(escaped) == escaped
+    # Inline ```x``` is a code span, not an unclosed block fence swallowing the rest of the reply.
+    assert escape_literal_hash_prefixes("Use ```x``` here.\n\n#89 open.") == "Use ```x``` here.\n\n\\#89 open."
+
+
+@pytest.mark.parametrize("content, expected", [
+    # A backtick run with text after it is code inside the fence, not its closer.
+    ("```\ntext ``` trailing\n#inside\n```\n#outside", "```\ntext ``` trailing\n#inside\n```\n\\#outside"),
+    ("~~~~\n~~~ x\n#inside\n~~~~\n#outside", "~~~~\n~~~ x\n#inside\n~~~~\n\\#outside"),
+    # A quoted fence ends with its blockquote.
+    ("> ```\n> #inside\n#outside", "> ```\n> #inside\n\\#outside"),
+    # A code span never pairs across a blank line.
+    ("`open\n\n#89\nclose`", "`open\n\n\\#89\nclose`"),
+    # A prose $$ is not math reaching into the fence below it, and math never crosses a paragraph.
+    ("Your shell PID is $$ here.\n\n```bash\necho $$\n#!/usr/bin/env bash\n```\n#89",
+     "Your shell PID is $$ here.\n\n```bash\necho $$\n#!/usr/bin/env bash\n```\n\\#89"),
+    ("> Use $$ x\n> ```\n> $$\n> #not math\n> ```", "> Use $$ x\n> ```\n> $$\n> #not math\n> ```"),
+    ("$$x\n\n#89\n$$", "$$x\n\n\\#89\n$$"),
+    # An empty list item ends at the blank line, so a 3-space fence after it is a top-level fence.
+    ("- \n\n   ```\n#89\n```\n#90", "- \n\n   ```\n#89\n```\n\\#90"),
+])
+def test_literal_hash_fences_close_like_commonmark(content, expected):
+    from plugins.platforms.telegram.rich_markdown import escape_literal_hash_prefixes
+
+    assert escape_literal_hash_prefixes(content) == expected
+
+
+def test_rich_payload_is_linear_in_unclosed_backtick_runs():
+    """A full rich-cap reply of unclosed backtick runs of distinct lengths (`a``a```a...) builds its
+    payload well inside one second; a per-run rescan blocked the event loop for seconds."""
+    adapter = _make_adapter()
+    runs, k = [], 1
+    while sum(map(len, runs)) < adapter.RICH_MESSAGE_MAX_CHARS:
+        runs.append("`" * k + "a")
+        k += 1
+    content = "#89\n" + "".join(runs)[: adapter.RICH_MESSAGE_MAX_CHARS - 4]
+
+    started = time.perf_counter()
+    payload = adapter._rich_message_payload(content)
+
+    assert time.perf_counter() - started < 1.0
+    assert payload["markdown"].startswith("\\#89")
+
+    # Fence-like lines that never close, and backtick runs split by paragraphs.
+    unit = "```py\ntext ``` trailing\n#89\n> ```\n`open\n\n"
+    content = (unit * (adapter.RICH_MESSAGE_MAX_CHARS // len(unit)))[: adapter.RICH_MESSAGE_MAX_CHARS]
+    started = time.perf_counter()
+    adapter._rich_message_payload(content)
+    assert time.perf_counter() - started < 1.0
+
+
+# --- Literal hash prefixes: Telegram's rich parser accepts "#89" as a heading without a space ---
+
+
+@pytest.mark.asyncio
+async def test_always_mode_prose_starting_with_pr_number_is_not_a_heading():
+    """The reported symptom: plain prose (no rich-only construct) opening with ``#426`` rendered as a
+    heading because ``always`` mode routes every reply through the rich endpoint."""
+    adapter = _make_adapter({"rich_messages": "always"})
+    content = "#426 review clean (0.9) on the new head; #430's review is in progress."
+    assert (await adapter.send("12345", content)).success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert markdown.startswith(r"\#426 review clean")
+    assert "; #430's review" in markdown  # inline reference stays untouched
 
 
 # --- Adjacent footnote refs: Telegram merges [^2][^3] into one superscript run that reads "23" ---

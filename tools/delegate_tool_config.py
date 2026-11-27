@@ -29,6 +29,7 @@ _LEGACY_MAX_ASYNC_WARNED = False
 # delegation.child_timeout_seconds opts back in.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 
+
 def _cfg() -> dict:
     """The ``delegation`` section, read through the origin so tests can patch it."""
     from tools.delegate_tool import _load_config
@@ -57,14 +58,14 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
 
 def _get_subagent_approval_callback():
     """Callback for subagent worker threads per delegation.subagent_auto_approve (default False)."""
-    if is_truthy_value(_cfg().get("subagent_auto_approve", False)):
+    if is_truthy_value(_load_config().get("subagent_auto_approve", False)):
         return _subagent_auto_approve
     return _subagent_auto_deny
 
 def _knob(key: str, env_var: Optional[str], parse, default, invalid_msg: str):
     """delegation.<key> > <env_var> > default. A config value that fails ``parse`` logs ``invalid_msg`` (``%r`` = the
     value) and yields the default; an env value that fails is silently ignored."""
-    val = _cfg().get(key)
+    val = _load_config().get(key)
     if val is not None:
         try:
             return parse(val)
@@ -112,7 +113,7 @@ def _get_max_concurrent_children() -> int:
         _DEFAULT_MAX_CONCURRENT_CHILDREN,
         f"delegation.max_concurrent_children=%r is not a valid integer; using default {_DEFAULT_MAX_CONCURRENT_CHILDREN}",
     )
-    if result > 10 and _cfg().get("max_concurrent_children") is not None:
+    if result > 10 and _load_config().get("max_concurrent_children") is not None:
         _warn_once(
             "_HIGH_CONCURRENCY_WARNED", "delegation.max_concurrent_children=%d: each child consumes API tokens "
             "independently. High values multiply cost linearly.", result,
@@ -129,7 +130,7 @@ def _get_max_queued_delegations() -> int:
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
-    return is_truthy_value(_cfg().get("independent_completions", False))
+    return is_truthy_value(_load_config().get("independent_completions", False))
 
 # delegation.gateway_mode: "background" (alias "async") always detaches; "inline" joins in the turn; anything else is
 # "auto". Read from the gateway turn's own (profile-scoped) user config, not from this process's config.
@@ -177,15 +178,14 @@ def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one
     working copy. Git-only and local-backend-only; otherwise silently ignored."""
-    return bool(_cfg().get("worktree_isolation", False))
+    return bool(_load_config().get("worktree_isolation", False))
 
 def _get_max_async_children() -> int:
     """Concurrency cap for background delegations == delegation.max_concurrent_children.
     At capacity, async-capable sessions enter the bounded pending queue; queue overflow
     is rejected without a synchronous fallback. A leftover ``delegation.max_async_children``
     key is ignored with a one-time warning."""
-    from tools.delegate_tool import _get_max_concurrent_children
-    if _cfg().get("max_async_children") is not None:
+    if _load_config().get("max_async_children") is not None:
         _warn_once(
             "_LEGACY_MAX_ASYNC_WARNED", "delegation.max_async_children is deprecated and ignored; "
             "delegation.max_concurrent_children now caps background "
@@ -226,7 +226,7 @@ def _get_max_spawn_depth() -> int:
 
 def _get_orchestrator_enabled() -> bool:
     """delegation.orchestrator_enabled kill switch (default True): False forces every child to leaf."""
-    val = _cfg().get("orchestrator_enabled", True)
+    val = _load_config().get("orchestrator_enabled", True)
     if isinstance(val, bool):
         return val
     # Accept "true"/"false" strings from YAML that doesn't auto-coerce.
@@ -236,7 +236,7 @@ def _get_orchestrator_enabled() -> bool:
 
 def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
-    return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
+    return is_truthy_value(_load_config().get("inherit_mcp_toolsets"), default=True)
 
 
 _FAST_REQUEST_OVERRIDE_KEYS = frozenset({"service_tier", "speed"})
@@ -437,7 +437,15 @@ def _resolve_child_credential_pool(
             # owns, or a fixed entry credential becomes the built-in's account on a shared endpoint.
             from agent.custom_entry_pool import custom_entry_for_endpoint, entry_scoped_pool
             owner = custom_entry_for_endpoint(effective_base_url, effective_requested_provider)
-            return entry_scoped_pool(_loaded_pool(child_key), child_key, owner[1] if owner else None)
+            return entry_scoped_pool(_loaded_pool(child_key), child_key, owner[1] if owner else None, effective_base_url)
+        from agent.custom_entry_pool import is_custom_runtime, load_runtime_pool
+        if is_custom_runtime(effective_provider, effective_requested_provider, effective_base_url):
+            # A bare slug naming a custom entry (``delegation.provider: deepseek`` with a
+            # ``providers.deepseek`` proxy) shares its slug with the built-in's pool: take the entry's
+            # origin-bound view the main resolver takes, never the raw pool, whose unrecorded rows
+            # would pass the endpoint check and lease the built-in's key to the entry's host.
+            pool = load_runtime_pool(effective_provider, effective_base_url, effective_requested_provider)
+            return pool if pool is not None and pool.has_credentials() else None
         if effective_provider == parent_provider:
             # A same-provider parent with no pool is using a fixed credential.
             # Loading a separate provider pool here can replace the inherited
@@ -541,14 +549,18 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         no_parent_api_key=bool(v.get("_no_parent_api_key")),
     )
 
-def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
-    """``delegation.provider`` branch: full bundle via the runtime provider system."""
+def _runtime_provider_credentials(v: dict, explicit_request_overrides, explicit_base_url: Optional[str] = None) -> dict:
+    """``delegation.provider`` branch: full bundle via the runtime provider system. ``explicit_base_url`` is handed
+    to the resolver the way the main agent hands it ``model.base_url``: the provider keeps its own key on it."""
     configured_provider = v["provider"]
+    from hermes_cli.auth import AuthError
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        endpoint = {"explicit_base_url": explicit_base_url} if explicit_base_url else {}
         # A route's own key (an explicit model alias's) wins over the provider's resolved one.
-        explicit = {"explicit_api_key": v["api_key"]} if v["api_key"] else {}
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **explicit)
+        if v.get("api_key"):
+            endpoint["explicit_api_key"] = v["api_key"]
+        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **endpoint)
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
@@ -559,9 +571,10 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
 
     api_key = runtime.get("api_key", "")
     if not api_key:
+        endpoint_hint = f", or set delegation.api_key for {explicit_base_url}" if explicit_base_url else ""
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'hermes auth'."
+            f"Set the appropriate environment variable or run 'hermes auth'{endpoint_hint}."
         )
     # A pinned ACP transport command must exist — refuse the spawn loudly rather than letting the child
     # silently fall back to another transport (#80450).
@@ -589,9 +602,20 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         command=pinned_command, args=list(runtime.get("args") or []),
     )
 
+def _resolver_kept_endpoint(named: dict, configured_url: str) -> bool:
+    """Whether the runtime resolver used ``configured_url``, allowing for its own path normalisation (OpenCode
+    relay path, LM Studio, Actual, and the ``/v1`` that Messages-mode resolvers strip): a resolver without a base_url
+    knob returns its default endpoint, often on the same host."""
+    from hermes_cli.runtime_provider import _finalize_base_url
+    expected = _finalize_base_url(named["provider"] or "", named["api_mode"] or "", configured_url)
+    def sans_version(url: str) -> str:
+        return (url or "").rstrip("/").removesuffix("/v1")
+    return sans_version(named["base_url"]) == sans_version(expected)
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
-    endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
+    endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work; a
+    named provider instead resolves its own key with base_url as the explicit endpoint);
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
@@ -602,6 +626,19 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
 
     if values["base_url"] and not is_native_sdk_provider:
+        if (values["provider"] or "").lower() not in ("", "custom", "auto") and not values["api_key"]:
+            # The parent's key belongs to the parent's provider: a named provider resolves its own key for this URL.
+            named = _runtime_provider_credentials(values, explicit_request_overrides, values["base_url"])
+            if not _resolver_kept_endpoint(named, values["base_url"]):
+                # The resolver ignored the override (provider without a base_url knob): don't silently reroute.
+                raise ValueError(
+                    f"Delegation provider '{values['provider']}' does not accept delegation.base_url "
+                    f"({values['base_url']}); it resolved to {named['base_url']}. Remove delegation.base_url, "
+                    f"or set delegation.api_key for a direct endpoint."
+                )
+            if values["api_mode"]:
+                named["api_mode"] = values["api_mode"]
+            return named
         return _direct_endpoint_credentials(values, explicit_request_overrides)
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.

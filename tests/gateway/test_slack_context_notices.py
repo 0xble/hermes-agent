@@ -115,7 +115,7 @@ def _turn(monkeypatch, platform="slack"):
     runner._delivery_adapter_for = lambda source: adapter
     runner._thread_metadata_for_source = lambda source: {"thread_id": "1.0"}
     ctx = TurnContext(source=source, user_config={"display": {"suppress_warning_notifications": False}},
-                      _run_still_current=lambda: True, _status_adapter=adapter,
+                      _run_still_current=lambda: True, _status_adapter_pinned=adapter,
                       _status_chat_id="C1", _status_thread_metadata={"thread_id": "1.0"})
     turn = TurnRunner(runner, ctx)
     monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))

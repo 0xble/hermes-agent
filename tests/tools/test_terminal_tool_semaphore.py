@@ -243,7 +243,7 @@ def test_cron_cell_reserves_cleanup_budget(tmp_path, monkeypatch, remaining, exp
         token = cell_deadline.set(time.monotonic() + remaining)
         try:
             result = json.loads(terminal_tool._run_foreground(
-                "true", env, plan, task_id="budget", session_id=None, session_key="budget",
+                "true", env, plan, task_id="budget", session_id=None, session_key="budget", cwd_key="budget",
                 workdir=None, approval_note=None, clear_interrupt=False, metered=False,
             ))
         finally:

@@ -22,6 +22,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.review_signals import build_review_signals, skill_review_due
 from agent.served_model import result_model_fields
 from agent.skill_review_gate import consume_skill_review_if_due, note_human_turn_for_skill_review
 
@@ -475,10 +476,12 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
 
 def _apply_output_hooks(
     agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
-    messages,
+    messages, memory_review_due=False, skill_review_due=False,
 ) -> tuple[Any, bool, Optional[Any]]:
     """Resolve the turn's ``transform_llm_output`` outcome, then fire ``post_llm_call`` once per
     turn after the tool loop. Returns ``(final_response, transformed, pre_transform_response)``.
+    ``review_signals`` carries the review decision the caller makes after the hook
+    (``agent/review_signals.py``).
 
     The transform itself normally already ran before the assistant row was first persisted
     (``apply_llm_output_transform`` from ``finish_text_response`` / ``_persist_step``); this
@@ -497,6 +500,10 @@ def _apply_output_hooks(
         except Exception:
             side_question_token = None
             logger.warning("side question lease failed", exc_info=True)
+        from hermes_cli.lifecycle import has_hook
+        review_signals = build_review_signals(
+            agent, memory_review_due=memory_review_due, skill_review_due=skill_review_due,
+        ) if has_hook("post_llm_call") else None
         _invoke_hook_safely(
             "post_llm_call", logger,
             session_id=agent.session_id,
@@ -508,6 +515,7 @@ def _apply_output_hooks(
             model=agent.model,
             platform=platform,
             side_question_token=side_question_token,
+            review_signals=review_signals,
         )
     return final_response, transformed, pre_transform
 
@@ -588,6 +596,24 @@ def settle_held_final(agent, result: Any) -> None:
     result.update(final_response=final, response_transformed=transformed, pre_transform_response=None)
 
 
+def fence_result_reply(result: Any) -> None:
+    """Strip echoed ``<memory-context>`` spans from ``final_response``/``pre_transform_response`` (#81312).
+    A non-streamed reply reaches adapters (email bodies included) only through ``final_response``;
+    ``result["messages"]`` and the stored row keep the raw text (API Runs transcripts, ``get_messages``)."""
+    if not isinstance(result, dict):
+        return
+    from agent.memory_context import fence_recalled_context
+    # ``pre_transform_response`` is display text too: replay-gap recovery and post-stream suffix
+    # painting deliver it.
+    for key in ("final_response", "pre_transform_response"):
+        raw = result.get(key)
+        fenced = fence_recalled_context(raw) if isinstance(raw, str) else raw
+        if fenced != raw:
+            result[key] = fenced
+            if key == "final_response" and result.get("error") == raw:
+                result["error"] = fenced
+
+
 def public_pre_transform(agent, pre_transform: Optional[Any]) -> Optional[Any]:
     """``pre_transform_response`` for a turn result: a held turn's original never leaves the agent
     (receipts, replay-gap recovery, post-stream suffix painting all see only the rewrite)."""
@@ -622,6 +648,24 @@ def _mirror_turn_to_memory(
             )
 
 
+def _stamp_turn_result_failure(agent, result, final_response, turn_exit_reason, failed, exit_failure) -> None:
+    """Surface the failure in the result without changing the response used for memory sync."""
+    # Persistence failures need a visible gateway error and a machine-readable cause.
+    if failed and str(turn_exit_reason) == "session_persistence_failed":
+        from hermes_constants import profile_cli_selector
+
+        result["error"] = final_response or (
+            "session storage could not be written — check the state database "
+            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
+        )
+        cause = getattr(agent, "_last_persistence_error_cause", None)
+        result["failure_reason"] = "session_persistence_failed:" + (cause or "unknown")
+    elif exit_failure is not None:
+        if failed:
+            result["error"] = final_response or str(turn_exit_reason)
+        stamp_failure(result, exit_failure.reason, exit_failure.retryable)
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -634,6 +678,7 @@ def finalize_turn(
 
     vetoed = _turn_exit_reason == PRE_LLM_BLOCK_EXIT_REASON  # a pre_llm_call block: no model call at all
 
+    agent._empty_response_retry_hint = None
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
         interrupted=interrupted, failed=failed, messages=messages,
@@ -757,6 +802,14 @@ def finalize_turn(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
 
+    # Skill trigger: decided ONCE, from the tool iterations THIS turn used and whether a human
+    # authored input has arrived since the previous automatic skill review. This decision is shared
+    # with post_llm_call and the review spawn below.
+    note_human_turn_for_skill_review(agent, original_user_message)
+    _should_review_skills = (
+        skill_review_due(agent)
+        and getattr(agent, "_skill_review_human_turn_seen", False)
+    )
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
@@ -764,6 +817,7 @@ def finalize_turn(
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+            memory_review_due=_should_review_memory, skill_review_due=_should_review_skills,
         )
 
     # Context engine observation hook: the turn finished with the finalized transcript.
@@ -828,24 +882,7 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
-    # Persistence failures already set failed=True; also stamp `error` so the gateway
-    # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
-    # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        from hermes_constants import profile_cli_selector
-
-        # Never rebind final_response here: the memory sync and the background-review gate
-        # below must still see an empty response on a persistence-failed turn.
-        result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
-        )
-        _cause = getattr(agent, "_last_persistence_error_cause", None)
-        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
-    elif _exit_failure is not None:
-        if failed:
-            result["error"] = final_response or str(_turn_exit_reason)
-        stamp_failure(result, _exit_failure.reason, _exit_failure.retryable)
+    _stamp_turn_result_failure(agent, result, final_response, _turn_exit_reason, failed, _exit_failure)
     # Cleanup failures are surfaced, but the response is returned either way (#8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
@@ -866,10 +903,9 @@ def finalize_turn(
     from agent.voice_turn_route import end_voice_turn_route
     end_voice_turn_route(agent)
 
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used and whether
-    # a human-authored turn occurred since the previous skill review.
-    note_human_turn_for_skill_review(agent, original_user_message)
-    _should_review_skills = consume_skill_review_if_due(agent)
+    # The review decision was computed before post_llm_call so the hook and the spawn agree.
+    if _should_review_skills:
+        consume_skill_review_if_due(agent)
 
     _mirror_turn_to_memory(
         agent, original_user_message=original_user_message, final_response=final_response,

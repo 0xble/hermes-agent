@@ -214,6 +214,9 @@ def write_home(root: Path, model: dict[str, Any], extra_cfg: dict[str, Any] | No
            # auto_recovery_cycles: 0 — the documented post-exhaustion ladder (15/30/60/60/60 s) would
            # otherwise park a transport-failed turn for minutes; one bounded attempt is the contract here.
            "agent": {"api_max_retries": 1, "auto_recovery_cycles": 0}, "updates": {"check": False},
+           # No background plugin provisioning in these network-isolated provider homes.
+           # Keep normal CLI boot, provider routing, and the egress sentinel in place.
+           "security": {"allow_lazy_installs": False},
            **(extra_cfg or {})}
     (home / ".hermes" / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     select_test_dependencies(home / ".hermes", REPO_ROOT)

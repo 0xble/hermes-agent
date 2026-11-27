@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -56,6 +57,7 @@ def make_restart_runner(
     adapter: BasePlatformAdapter | None = None,
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
     runner = object.__new__(GatewayRunner)
+    runner._completion_delivery_lock = threading.Lock()
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -64,9 +66,7 @@ def make_restart_runner(
     runner._exit_reason = None
     runner._exit_code = None
     runner._running_agents = {}
-    runner._running_agents_ts = {}
     runner._pending_messages = {}
-    runner._pending_approvals = {}
     runner._pending_model_notes = {}
     runner._background_tasks = set()
     runner._draining = False

@@ -123,7 +123,7 @@ processes; the slot clock itself remains process-local, an existing limitation.
 A usual brief now spends one rich request instead of multiple chunk requests.
 Flood refusals spend no fallback request.
 
-**Verification:** `tests/tools/test_send_message_tool.py::TestStandaloneTelegramRichMessages`
+**Verification:** `tests/gateway/outbound/test_send_message_tool.py::TestStandaloneTelegramRichMessages`
 drives the resolved-config dispatcher and standalone Bot API boundary with
 mocked bots only. It covers all three modes, permanent versus ambiguous errors,
 length and Desktop guards, topic routing, preview policy, media and copy blocks.
@@ -432,4 +432,4 @@ To disable rich rendering, use the supported config command to set this mode to
 set it to `true` for adaptive rich rendering or `false` for MarkdownV2. Rolling
 back while leaving `always` would reproduce the silent-disable regression.
 
-Contract tests: `tests/gateway/test_telegram_rich_copy_quotes.py`, `tests/tools/test_send_message_tool.py`, `tests/gateway/test_telegram_chat_outbound_budget.py`, `tests/gateway/test_telegram_progress_literals.py`, `tests/agent/test_display.py`, `tests/gateway/test_telegram_rich_messages.py`, `tests/gateway/test_telegram_chunk_indicator_budget.py`.
+Contract tests: `tests/gateway/test_telegram_rich_copy_quotes.py`, `tests/gateway/outbound/test_send_message_tool.py`, `tests/gateway/test_telegram_chat_outbound_budget.py`, `tests/gateway/test_telegram_progress_literals.py`, `tests/agent/test_display.py`, `tests/gateway/test_telegram_rich_messages.py`, `tests/gateway/test_telegram_chunk_indicator_budget.py`.

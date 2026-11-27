@@ -17,6 +17,8 @@ WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_o
 GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
 
+from tools import delegate_tool_config
+
 
 def _cut_is_user_stop(reason) -> bool:
     """Load stop classification lazily to avoid the delegation notification cycle."""
@@ -44,9 +46,8 @@ def acknowledge_survivor_notifications(registry, notifications) -> None:
         if event.get("type", "completion") == "completion":
             acknowledge(event.get("session_id", ""))
 
-
 _DONE = ("completed", "success")
-_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
+_REASON_STATUS = {"lost": "marked lost because the process backend disappeared"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,10 +139,9 @@ def _model_not_found_patterns() -> list[str]:
 
 
 def _delegation_config() -> dict:
-    """Active delegation config; ``{}`` on any error. Lazy: delegate_tool is heavy."""
+    """Active delegation config; ``{}`` on any error."""
     try:
-        from tools.delegate_tool import _load_config as _cfg
-        return _cfg() or {}
+        return delegate_tool_config._load_config() or {}
     except Exception:
         return {}
 
@@ -205,6 +205,81 @@ _TRUNCATED_SUMMARY_NOTE = (
 
 def _is_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
+
+
+# A stop the parent or user asked for is not a failure the parent has to recover from.
+_STOPPED = frozenset({"interrupted", "cancelled"})
+
+
+def delegation_wakes_parent(evt: dict) -> bool:
+    """True for an async delegation's FINAL result with a failed child (any status other than done or a
+    requested stop). Its unviewed local parent runs it as a turn rather than a note
+    (gateway/session_completion_notes.py), so the parent can re-dispatch or report. The early per-task
+    notice is a diagnostic: the final result that follows it is the one that wakes."""
+    if evt.get("type") != "async_delegation" or evt.get("task_failure_notice"):
+        return False
+    if evt.get("_sibling_failed"):
+        return True
+    if evt.get("role") == "cron_run":
+        return False  # a manual cron run's outcome is finished text, like a scheduled one's: a note
+    raw = evt.get("results")
+    # No child results (a single child's event, or a crashed batch's ``results=[]``): the unit's own
+    # status decides. Otherwise the children do, so an interrupted-only batch's aggregate error stays asleep.
+    results = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+    results = results or [evt]
+    # The stall monitor stops a stuck unit with the same cooperative stop a user's does; its stall
+    # context on the event is what tells the two apart (``async_delegation._finalize``).
+    stopped = () if evt.get("stalled_after_quiet_seconds") is not None else _STOPPED
+    return any(
+        (r.get("status") or ("failed" if r.get("error") else "completed")) not in (*_DONE, *stopped)
+        for r in results)
+
+
+def completion_resumes_parent(evt: dict) -> bool:
+    """True for a result the parent asked to hear about and carries on from: an async delegation's
+    final result (not the early per-task notice, not a manual cron run's finished text) or a background
+    process's exit, whatever its exit code. Its unviewed local parent runs it as a turn, as a watched one
+    does, so the work goes on while no client is connected (a laptop asleep, a closed tab).
+    ``delegation_wakes_parent`` is the failed-delegation subset, whose wakes are bounded
+    (gateway/session_completion_notes.py); a process exit is never in it."""
+    if evt.get("type") == "async_delegation":
+        if evt.get("task_failure_notice"):
+            return False
+        return bool(evt.get("_sibling_resumes")) or evt.get("role") != "cron_run"
+    return evt.get("type") == "completion"
+
+
+_CONTENT_POLICY_RECOVERY = (
+    "This model's provider refused the task (content_policy_blocked). The refusal is deterministic for "
+    "that model, so do not re-dispatch it unchanged: re-dispatch it with delegate_task on a different "
+    "model (another option/model), or tell the user it was refused.")
+
+
+def _failure_recovery_lines(r: dict) -> list[str]:
+    """What the parent should do about a failed child, when its classified reason names a remedy."""
+    from agent.error_surface import _NON_RETRYABLE_REASONS
+    reason = r.get("failure_reason")
+    if reason == "content_policy_blocked":
+        return [_CONTENT_POLICY_RECOVERY]
+    if reason in _NON_RETRYABLE_REASONS and reason != "interpreter_shutdown":
+        return [f"This failure ({reason}) repeats for the same task on the same model and provider, so do not "
+                "re-dispatch it unchanged: re-dispatch it with delegate_task on a different model or provider "
+                "only if that avoids the cause, otherwise tell the user what failed."]
+    return []
+
+
+def _auto_resume_lines(r: dict) -> list[str]:
+    """A mixed unit's line for a child ``delegation.auto_resume`` will continue (``auto_resume``); a give-up's
+    terminal failure carries its own reason in ``error``."""
+    if not r.get("subagent_id"):
+        return []
+    if r.get("auto_gave_up"):
+        lines = [f"Last transcript tail:\n{r['transcript_tail']}"] if r.get("transcript_tail") else []
+        return lines or ["Not resumed automatically any more; continue it by hand or re-dispatch it."]
+    if not isinstance(r.get("auto_resume"), dict):
+        return []
+    from tools.delegate_tool_auto_resume import notice_line
+    return [notice_line(str(r["subagent_id"]), r["auto_resume"])]
 
 
 def _notice_lines(results) -> list[str]:
@@ -369,6 +444,9 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     if evt.get("status") == "interrupted" or evt.get("cut_reason") or any(r.get("status") == "interrupted" for r in results):
         if not evt.get("cut_reason") or restart_cut:
             lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+    if evt.get("stalled_after_quiet_seconds") is not None and any(r.get("status") in _STOPPED for r in results):
+        lines.append(f"The stall monitor stopped this unit after {evt['stalled_after_quiet_seconds']:g}s without "
+                     "progress: an interrupted task below was stuck, not stopped by you or the user.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
@@ -396,6 +474,8 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
             lines += ["Partial output:", r_summary]
         else:
             lines.append(f"(no summary — status={r_status}" + (f": {r_error}" if r_error else "") + ")")
+        if r_status not in _DONE:
+            lines += _auto_resume_lines(r) or _failure_recovery_lines(r)
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
         lines += _process_accounting_lines(r)
@@ -423,7 +503,11 @@ def _process_accounting_lines(r: dict) -> list:
 
 def _retry_notice_suffix(evt: dict) -> str:
     """A serialized cut retry note must not bypass the admission stamped on the event."""
-    if evt.get("cut_reason") and not _resume_offered(evt):
+    # Only the explicit restart-resume instruction depends on the read-only
+    # resume admission stamp. Lifecycle cuts use automatic retry and must keep
+    # that instruction even when the resume probe raced the terminal write.
+    if (evt.get("cut_reason") and not _resume_offered(evt)
+            and "action='resume'" in str(evt.get("retry_note") or "")):
         return ""
     return f"\nRETRY: {evt['retry_note']}"
 
@@ -530,7 +614,7 @@ def process_completion_display_text(events: list) -> str:
     if reason == "killed":
         outcome = "Terminated"
     elif reason in _REASON_STATUS:
-        outcome = "Lost" if reason == "lost" else "Failed to Start"
+        outcome = "Lost"
     else:
         outcome = "Finished" if exit_code == 0 else "Failed"
     unknown = process_exit_unknown(evt.get("exit_code"), reason, evt.get("termination_source", ""))
@@ -629,6 +713,8 @@ def _routine_process_stop(evt: dict) -> bool:
 
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
+    if reason == "failed_start":
+        return "failed to start"
     if reason == "killed":
         if _routine_process_stop(evt):
             return "stopped before it finished"
@@ -703,3 +789,14 @@ def format_process_notification(evt: dict) -> "str | None":
     if payload is not None and evt.get("node"):
         payload += f"\nExecution node: {evt['node']} (SSH: {evt.get('ssh', '?')})"
     return f"{payload}\n{PROCESS_NOTIFICATION_END}" if payload is not None else None
+
+
+def promote_to_completion_notice(registry, session) -> None:
+    """Promote a watched job to one completion notice and give it the normal owner."""
+    session.notify_on_complete = True
+    if not session.watcher_platform or session.watcher_interval:
+        return
+    # Direct completion requests use this registration path too. Keep the
+    # import lazy to avoid the registry/tool import cycle at startup.
+    from tools.terminal_tool_background import _register_completion_watcher
+    _register_completion_watcher(registry, session, session.session_key)

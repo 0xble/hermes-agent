@@ -101,7 +101,7 @@ def record_publication_write(*, wait_s=0.0, hold_s=0.0, rows_written=0):
 
 
 @contextmanager
-def state_lock(lock, *, db_path, deadline: float | None = None):
+def state_lock(lock, *, db_path, deadline: float | None = None, db=None, site=None, patience_s: float | None = None):
     """Bound compaction publication and retention prune admission, including degraded reads.
 
     Ordinary writers retain their unbounded mutex wait: their SQLite retry budget
@@ -124,8 +124,16 @@ def state_lock(lock, *, db_path, deadline: float | None = None):
         return
     metrics = _metrics.get()
     if metrics is None:
-        with lock:
-            yield
+        # Ordinary writes use their patience budget for the local mutex too. Preserve the
+        # historical unbounded wait for an explicitly expired budget (used by callers/tests
+        # that reserve patience for SQLite's cross-process retry loop).
+        if patience_s is not None and patience_s > 0 and deadline is not None and deadline > time.monotonic():
+            from hermes_state_write import writer_mutex_until
+            with writer_mutex_until(lock, deadline, db=db, site=site):
+                yield
+        else:
+            with lock:
+                yield
         return
     started = time.monotonic()
     publication_deadline = started + metrics["patience_s"]

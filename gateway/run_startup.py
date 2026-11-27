@@ -26,7 +26,7 @@ from pathlib import Path
 from agent.i18n import t
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
-from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.delivery import looks_like_telegram_private_chat_id, prime_revived_egress
 from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
 from gateway.run_restart_recovery import RestartRecoveryMixin, ResumeCandidates
 from gateway.run_startup_secrets import GatewayStartupSecretsMixin
@@ -43,8 +43,7 @@ from gateway.restart import (
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
-    DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
-    DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
+    DEFAULT_HEARTBEAT_INTERVAL_S, loop_heartbeat_forever,
 )
 from typing import Any, Dict, Optional, Tuple
 
@@ -685,6 +684,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
 
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
+        relay = self._primary_adapters().get(Platform.RELAY) if platform == Platform.RELAY else None
+        fronts = getattr(relay, "fronts_platform", None)
         try:
             with self.session_store._lock:
                 self.session_store._ensure_loaded_locked()
@@ -694,7 +695,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or getattr(entry.origin, "platform", None) == platform)
+                    and (platform is None or getattr(entry.origin, "platform", None) == platform
+                         or (callable(fronts) and fronts(getattr(entry.origin, "platform", None))))
                 ])
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -836,35 +838,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         return True
 
     def _start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Arm the selector floor and out-of-loop watchdog before adapters. Disabled entirely with
-        ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
-
-        See #69089.
-        """
-        from gateway.shutdown_watchdog import _arm_loop_floor_timer, session_store_lock_snapshot, start_loop_liveness_watchdog
-        config = getattr(self, "config", None)
-        if config is not None and not getattr(config, "loop_watchdog", True):
-            return
-        if getattr(self, "_loop_floor_timer_handle", None) is None:
-            with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
-                self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
-        watchdog = getattr(self, "_loop_liveness_watchdog", None)
-        if watchdog is None or not watchdog.is_alive():
-            try:
-                # getattr defaults cover config=None test paths; loaded values are already clamped.
-                self._loop_liveness_watchdog = start_loop_liveness_watchdog(
-                    loop,
-                    probe_interval=float(getattr(
-                        config, "loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S
-                    )),
-                    probe_timeout=float(getattr(
-                        config, "loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
-                    )),
-                    max_strikes=int(getattr(config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES)),
-                    store_snapshot_fn=lambda: session_store_lock_snapshot(self),
-                )
-            except Exception:
-                logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        from gateway.run_startup_liveness import start_loop_liveness_guards
+        start_loop_liveness_guards(self, loop)
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
@@ -1199,10 +1174,12 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         "MATTERMOST", "MATRIX", "DINGTALK", "FEISHU", "WECOM", "WECOM_CALLBACK", "WEIXIN",
         "BLUEBUBBLES", "QQ", "YUANBAO",
     )
+
     _BUILTIN_ALLOWED_USERS_VARS = tuple(f"{p}_ALLOWED_USERS" for p in _ALLOWLIST_ENV_PLATFORMS) + (
         "SIGNAL_GROUP_ALLOWED_USERS", "TELEGRAM_GROUP_ALLOWED_USERS",
         "TELEGRAM_GROUP_ALLOWED_CHATS", "GATEWAY_ALLOWED_USERS",
     )
+
     _BUILTIN_ALLOW_ALL_VARS = tuple(f"{p}_ALLOW_ALL_USERS" for p in _ALLOWLIST_ENV_PLATFORMS)
 
     def _start_check_access_policy(self) -> bool:
@@ -1920,7 +1897,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
     _PRE_RECONNECT_WATCHERS = (
         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
-    )
+        "_delegation_auto_resume_watcher")
+
     _POST_RECONNECT_WATCHERS = (
         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_session_control_watcher", "_profile_reconcile_watcher",
     )
@@ -2231,8 +2209,11 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
                         handoff_profile = resolved
             except Exception:
                 logger.debug("Handoff: could not resolve profile namespace", exc_info=True)
+        from gateway.session_dm_threads import dm_thread_key_source, session_db_for_source
+        store = getattr(self.async_session_store, "_store", self.async_session_store)
         return build_session_key(
-            dest.source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            dm_thread_key_source(dest.source, extra, lambda: session_db_for_source(store, dest.source)),
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
     

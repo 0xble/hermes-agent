@@ -68,6 +68,7 @@ from agent.delegation_context import (
 from agent.memory_provider import ctx_bound, spawn_context_thread
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
+from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger(__name__)
 
@@ -1930,15 +1931,9 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             if not fb_provider or not fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+                from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs
 
-                fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
-                if entry.get("base_url"):
-                    fb_kwargs["explicit_base_url"] = entry["base_url"]
-                fb_api_key = resolve_entry_api_key(entry)
-                if fb_api_key:
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
+                runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so job sessions record the provider name (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
@@ -1966,9 +1961,9 @@ def _load_credential_pool(runtime: dict, job_id: str):
     if not runtime_provider:
         return None
     try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(runtime_provider)
-        if pool.has_credentials():
+        from agent.custom_entry_pool import load_route_pool
+        pool = load_route_pool(runtime_provider, runtime.get("base_url"), runtime.get("requested_provider"))
+        if pool is not None and pool.has_credentials():
             logger.info(
                 "Job '%s': loaded credential pool for provider %s with %d entries",
                 job_id, runtime_provider, len(pool.entries()))
@@ -3725,9 +3720,12 @@ def _run_one_job_body(
         from cron.scheduler_authority import CronExecutionUnknown
         if isinstance(e, CronExecutionUnknown):
             from cron.executions import give_up_execution
+            from cron.jobs_error_text import sanitize_persisted_error
             from cron.scheduler_authority import pause_for_unknown
-            pause_for_unknown(job["id"], execution_id, str(e))
-            give_up_execution(execution_id, reason=str(e))
+            # One sanitized string for both stores: _lift_pause matches the pause by its reason.
+            reason = sanitize_persisted_error(str(e)) or "unverified admission"
+            pause_for_unknown(job["id"], execution_id, reason)
+            give_up_execution(execution_id, reason=reason)
             logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
             return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
@@ -4585,7 +4583,7 @@ def _worktree_maintenance_repos() -> list[str]:
 
     # Hermes source checkout (git installs only; wheel installs have no .git).
     with contextlib.suppress(Exception):
-        install_root = Path(__file__).resolve().parent.parent
+        install_root = Path(project_root_str())
         if (install_root / ".git").exists():
             repos.add(str(install_root))
 
@@ -5001,4 +4999,7 @@ if __name__ == "__main__":
         raise SystemExit(
             0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
         )
+    from hermes_agent.compat import install as _install_compat
+
+    _install_compat()
     tick(verbose=True, headless=True)

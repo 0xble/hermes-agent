@@ -18,8 +18,11 @@ def uncounted_runtime_work(runner):
     authorities = all_authorities(runner)
     managed = sum(not worker.closed.is_set() for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
-                for authority in authorities for sid, live, _ in executing_sessions(authority))
+    # Stream execution stamps clear before outbound delivery. The existing FIFO
+    # drain task still owns that send, so count it through its final await.
+    return (managed + sum(live.task is not None and not live.task.done()
+                and live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+                for authority in authorities for sid, live in authority.sessions.items())
             + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
 
 
@@ -29,11 +32,40 @@ def managed_worker_units(authority):
             for sid, worker in list(getattr(authority, '_managed_workers', {}).items()) if not worker.closed.is_set()]
 
 
-def uncounted_runtime_work_units(runner, pid):
-    """One ``active_work`` entry per unit ``uncounted_runtime_work`` counts. Managed workers are named
-    (``managed_worker_units``); the rest of that work carries only the gateway's *pid*."""
-    units = [unit for authority in all_authorities(runner) for unit in managed_worker_units(authority)]
-    return units + [{'kind': 'managed', 'pid': pid}] * max(0, uncounted_runtime_work(runner) - len(units))
+def wedged_managed_turn_count(runner, timeout):
+    """Live managed workers that sent no frame for ``timeout`` seconds and hold no open approval or
+    clarify prompt (a human may answer it any time): the restart wait must not hold for them."""
+    import time
+    now = time.monotonic()
+    return sum(1 for authority in all_authorities(runner)
+               for sid, worker in list(getattr(authority, '_managed_workers', {}).items())
+               if not worker.closed.is_set() and now - getattr(worker, 'last_frame_at', now) >= timeout
+               and not _open_prompts(authority, sid))
+
+
+def _open_prompts(authority, sid):
+    live = getattr(authority, 'sessions', {}).get(sid)
+    return bool(getattr(getattr(live, 'controls', None), 'remote_responders', None))
+
+
+def uncounted_runtime_work_units(runner):
+    """One ``active_work`` entry per unit ``uncounted_runtime_work`` counts, each naming the real
+    unit: a managed worker's session and process, an executing session's id and route, a tracked
+    mutation task, a side agent (/bg, /btw) thread."""
+    import os
+    running = getattr(runner, '_running_agents', {})
+    units = []
+    for authority in all_authorities(runner):
+        units.extend(managed_worker_units(authority))
+        workers = getattr(authority, '_managed_workers', {})
+        units.extend({'kind': 'session', 'session': sid, 'route': live.route, 'pid': os.getpid()}
+                     for sid, live, _ in executing_sessions(authority)
+                     if live.route not in running and sid not in workers)
+        units.extend({'kind': 'mutation', 'task': task.get_name(), 'pid': os.getpid()}
+                     for task in mutation_tasks(authority))
+        units.extend({'kind': 'side_agent', 'thread': thread.name, 'pid': os.getpid()}
+                     for thread, _ in side_agents(authority))
+    return units
 
 
 def side_agents(authority):

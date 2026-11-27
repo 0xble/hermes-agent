@@ -169,7 +169,7 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         reason = ""
         try:
             from agent.route_binding import bind_route_entry
-            if bind_route_entry(agent, target, target["provider"], target["model"], explicit_switch=True) is None:
+            if bind_route_entry(agent, target, target["provider"], target["model"], commit_pool_choice=False, explicit_switch=True) is None:
                 reason = "provider not configured"
         except Exception as exc:  # health: allow BLE001 -- any bind failure falls back to the main model with a notice
             reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
@@ -180,6 +180,8 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
             _warn_once(agent, target, reason)
             agent._voice_route_state = {name: state[name] for name in _REASONING_FIELDS}
             return agent._cached_system_prompt or system_prompt
+        if (choice := getattr(agent, "_route_pool_choice", None)) is not None:
+            choice.commit()  # the voice model takes the turn: its pool key is now in use
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, agent.model, agent.provider)
         agent._turn_route_task = TASK

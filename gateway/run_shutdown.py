@@ -34,7 +34,13 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
-from gateway.session_runtime_workers import uncounted_runtime_work_units
+from gateway.session_runtime_workers import uncounted_runtime_work_units, wedged_managed_turn_count
+from gateway.run_shutdown_home_notice import (
+    HOME_NOTICE_MUTED,
+    HOME_NOTICE_SENT,
+    GatewayHomeShutdownNoticeMixin,
+    settle_home_online_notice_debt,
+)
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.run_shutdown_deadlines import GatewayShutdownDeadlinesMixin, bounded_stop_requested
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay, session_store_lock_snapshot
@@ -186,7 +192,17 @@ def _persist_shutdown_pending_messages(runner):
     return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
 
 
-class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, GatewayShutdownDeadlinesMixin, GatewayShutdownExternalDrainMixin):
+def _active_async_delegation_count() -> int:
+    """Process-local async delegations that a graceful restart must not amputate. A module
+    function, not a mixin method: every stop-path double gets it without a stub."""
+    try:
+        from tools.async_delegation import active_count
+        return active_count()
+    except Exception:  # health: allow BLE001 -- a count probe on the stop path must never raise
+        return 0
+
+
+class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, GatewayShutdownDeadlinesMixin, GatewayShutdownExternalDrainMixin, GatewayHomeShutdownNoticeMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -794,10 +810,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` the drain waits on; a managed-worker turn is a chat turn."""
+        """``(agents, cron, api, deferred, delegations)`` the drain waits on; a managed-worker turn is a chat turn."""
         return (
             self._running_agent_count() + managed_turn_count(self), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            _active_async_delegation_count(),
         )
 
     async def _drain_active_agents(
@@ -829,8 +846,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or deferred) and now < deadline) or ((cron or api) and now < cron_deadline))
+            agents, cron, api, deferred, delegations = self._drain_work_counts()
+            # A killed background delegation is a permanent loss of its result (recovered next boot only as
+            # ``outcome unknown``), so it rides the cron floor like cron/api, not the interactive deadline.
+            return bool(((agents or deferred) and now < deadline)
+                        or ((cron or api or delegations) and now < cron_deadline))
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():
@@ -1328,8 +1348,20 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                         profile=restart_profile,
                     )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        delivered: set[tuple[str, str, Optional[str]]] = set()  # the subset that really got the notice
         # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
         private_topic_parents: set[tuple[int, str]] = set()
+        # Record the loop before sending active-chat notices: a running task in a home chat must not
+        # bypass the same restart-loop cap that applies to the home broadcast (#60438).
+        home_skip_reason = self._home_shutdown_broadcast_skip_reason() if include_home_channels else None
+        muted_home_targets = set()
+        if self._home_shutdown_notice == HOME_NOTICE_MUTED:
+            muted_home_targets = {
+                _delivery_target_key(platform.value, cfg.home_channel.chat_id,
+                                     cfg.home_channel.thread_id, profile=profile)
+                for profile, platform, cfg in self._served_home_channel_configs()
+                if cfg.home_channel and cfg.home_channel.chat_id
+            }
         if update_notified and update_record:
             data = update_record[1]
             update_target = self._resolve_update_target(self._update_paths())
@@ -1341,35 +1373,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 ))
         for session_key in (self._snapshot_running_agents() if session_keys is None else list(session_keys)):
             if session_key in getattr(self, "_s2_note_session_keys", set()):
-                # Reserve the S2 note's destination in the same dedup set used by the
-                # home-channel pass. The note is sent after a timed-out drain; without this
-                # reservation an active session that is also the home channel receives the
-                # ordinary broadcast before the S2 note. A failed S2 send clears this fence by
-                # replacing _s2_note_session_keys with the delivered set before the fallback pass.
-                target = await self._shutdown_notification_target(session_key)
-                if target is None:
-                    continue
-                if len(target) == 4:
-                    source, platform_str, chat_id, thread_id = target
-                    profile = None
-                else:
-                    source, platform_str, chat_id, thread_id, profile = target
-                try:
-                    platform = Platform(platform_str)
-                    adapter = self._delivery_adapter_for(source) if source is not None else None
-                    if adapter is None:
-                        adapter = self._authorization_adapter(platform, profile)
-                    if adapter is None:
-                        continue
-                    _, delivery_profile = self._owning_profile(adapter, platform)
-                    notified.add(_delivery_target_key(
-                        platform_str, chat_id, thread_id, profile=delivery_profile,
-                    ))
-                    if (platform == Platform.TELEGRAM and thread_id is not None
-                            and getattr(source, "chat_type", None) in {"dm", "private"}):
-                        private_topic_parents.add((id(adapter), str(chat_id)))
-                except Exception as e:
-                    logger.debug("Failed to reserve S2 shutdown target for %s: %s", session_key, e)
+                from gateway.run_shutdown_targets import reserve_shutdown_note_target
+                await reserve_shutdown_note_target(self, session_key, notified, private_topic_parents, logger)
                 continue
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1391,6 +1396,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     continue
                 _, delivery_profile = self._owning_profile(adapter, platform)
                 dedup_key = _delivery_target_key(platform_str, chat_id, thread_id, profile=delivery_profile)
+                if dedup_key in muted_home_targets:
+                    notified.add(dedup_key)  # a loop-muted home chat hears nothing, active task or not
+                    continue
                 if dedup_key in notified:
                     continue
                 if not self._notice_allowed(platform, "active session"):
@@ -1402,6 +1410,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=reply_to_message_id, adapter=adapter,
                 )
+                from gateway.run import _async_profile_runtime_scope  # unserved profile: skip the chat
+                scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
+                         if source is not None else nullcontext())
             except Exception as e:
                 logger.debug("Failed to send shutdown notification to %s:%s: %s", platform_str, chat_id, e)
                 continue
@@ -1414,30 +1425,24 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                                    and getattr(source, "chat_type", None) in {"dm", "private"}):
                 if await self._send_shutdown_notice(adapter, chat_id, shutdown_message(adapter), "active chat", platform_str, metadata=metadata):
                     notified.add(dedup_key)
+                    delivered.add(dedup_key)
                     if private_topic:
                         private_topic_parents.add((id(adapter), chat_id))
             from gateway.warning_notifications import present_notification
-            from gateway.run import _async_profile_runtime_scope
-            scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
-                     if source is not None else nullcontext())
             async with scope:
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if not include_home_channels:
             return
-        if self._restart_requested and restart_source is not None:
-            logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+        # A home chat the active-session pass already told is owed "Gateway online" like one this pass reaches.
+        if self._home_got_active_session_notice(delivered):
+            self._home_shutdown_notice = HOME_NOTICE_SENT
+        # In-chat restart, planned --replace takeover, quiet drain (suppresses ONLY the home-channel
+        # broadcast; per-session pings above stay) and restart-loop mute all skip the broadcast.
+        if home_skip_reason is not None:
+            logger.info("Home-channel shutdown broadcast suppressed: %s", home_skip_reason)
             return
-        # A quiet drain (routine fleet auto-update) suppresses ONLY the home-channel broadcast; per-session
-        # pings above stay. Current-epoch marker only; a failing check fails toward the louder behaviour.
-        with _log_suppressed(logging.DEBUG, "drain_notification_suppressed check failed: %s"):
-            from gateway.drain_control import drain_notification_suppressed
-            if drain_notification_suppressed():
-                logger.info(
-                    "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
-                )
-                return
         # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
         # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
         # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
@@ -1472,6 +1477,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     **({"metadata": metadata} if metadata else {}),
                 ):
                     notified.add(dedup_key)
+                    delivered.add(dedup_key)
+                    self._home_shutdown_notice = HOME_NOTICE_SENT
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
@@ -1833,7 +1840,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             )
         watcher_env = drop_bridged_env(watcher_env)
         watcher_env.pop("_HERMES_GATEWAY", None)
-        return watcher_env
+        from gateway.restart_watcher_env import keep_running_checkout_importable
+        return keep_running_checkout_importable(watcher_env)
 
     @staticmethod
     def _spawn_windows_restart_watcher(hermes_cmd: list, current_pid: int, restart_after_s: float) -> None:
@@ -1850,13 +1858,14 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             inherited = os.environ.get("VIRTUAL_ENV")
             if inherited:
                 watcher_env["VIRTUAL_ENV"] = inherited
-        project_root = Path(__file__).resolve().parent.parent
-        # Console python under CREATE_NO_WINDOW: nothing flashes. NOT pythonw.exe — a console-less
-        # watcher makes every console-subsystem descendant allocate a visible conhost (#54220/#56747).
-        # The watcher runs sys.executable (console python) under the CREATE_NO_WINDOW detach kwargs below:
-        # it owns one hidden console, inherited by the `hermes gateway restart` child, so nothing flashes.
-        # See #54220, #56747.
+        from hermes_cli._startup_fast import project_root_str
+        project_root = Path(project_root_str())
+        # Console python (NOT pythonw.exe) under CREATE_NO_WINDOW: the watcher owns one hidden console its
+        # `hermes gateway restart` child inherits; a console-less watcher makes every descendant allocate a
+        # visible conhost (#54220/#56747).
         from hermes_cli._launchers import runtime_command
+        if hermes_cmd[1:] == ["-m", "hermes_cli.main"]:  # bootstrap drops PYTHONPATH: bind the respawn to this checkout too
+            hermes_cmd = runtime_command(project_root, python=hermes_cmd[0])
         watcher_argv = runtime_command(project_root,
             [str(current_pid), str(restart_after_s), *hermes_cmd, "gateway", "restart"],
             code=_WINDOWS_RESTART_WATCHER)
@@ -1900,11 +1909,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             GatewayShutdownMixin._spawn_windows_restart_watcher(hermes_cmd, current_pid, restart_after_s)
             return
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
-        shell_cmd = (
-            f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
-            f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
-            f"{cmd} gateway restart"
-        )
+        from gateway.restart_watcher_env import detached_restart_shell
+        shell_cmd = detached_restart_shell(cmd, current_pid, restart_after_s)
         setsid_bin = shutil.which("setsid")
         argv = [setsid_bin, "bash", "-lc", shell_cmd] if setsid_bin else ["bash", "-lc", shell_cmd]
         subprocess.Popen(  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
@@ -1968,7 +1974,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             except Exception:
                 return None
 
-        return sum(
+        return wedged_managed_turn_count(self, timeout) + sum(  # + managed worker turns (no frame)
             1
             for agent in list((getattr(self, "_running_agents", None) or {}).values())
             if agent is not None and agent is not _AGENT_PENDING_SENTINEL
@@ -2033,10 +2039,21 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                               "pid": job["worker_pid"] or os.getpid(), "external": bool(job["worker_pid"]),
                               "wedged": job["job_id"] in wedged,
                               "restart_safe": bool(job.get("restart_safe"))})
-        units.extend(uncounted_runtime_work_units(self, os.getpid()))
+        units.extend(uncounted_runtime_work_units(self))
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        # Delegations with the parent session each reports back to (restart_when_idle). Its process
+        # and notice units are not listed: the bounded wait below does not hold for them.
+        named: set = set()
+        with suppress(Exception):
+            from gateway.restart_when_idle import background_units
+            for unit in background_units(self):
+                if unit.get("kind") == "delegation":
+                    units.append(unit)
+                    named.add(unit.get("delegation_id"))
         for record in self._active_async_delegation_records():
+            if record.get("delegation_id") in named:
+                continue
             dispatched_at = record.get("dispatched_at")
             elapsed = round(max(0.0, now - float(dispatched_at)), 1) if dispatched_at else 0.0
             units.append({
@@ -2046,29 +2063,36 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
-        """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
+        """Serve normally until in-flight work finishes or its wait budget runs out.
 
-        Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
-        cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
+        Restart when idle, bounded: admission stays open for the whole wait (``request_restart``
+        closes it when this returns). Turns and delegations each wait under their own budget
+        (``agent.restart_after_turn_timeout`` / ``gateway.restart_delegation_timeout``), and a forced
+        restart (``restart_when_idle.force_restart``) ends the wait at once. Wedged turns are
+        excluded (restart is their remedy). True when drained to zero, False when a budget elapsed,
+        a force arrived or only wedged work remains (caller proceeds to ``stop()``).
         """
         active = self._active_work_count()
         if active <= 0:
             return True
+        from gateway.restart_when_idle import _log_view
+        force = getattr(self, "_restart_force_event", None)
+        if force is not None and force.is_set():
+            logger.warning("Forced restart: stopping now and interrupting: %s", _log_view(self._describe_active_work()))
+            return False
         delegation_timeout = float(getattr(self, "_restart_delegation_timeout", 0.0) or 0.0)
         turn_timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
         delegation_count = self._active_async_delegation_count()
         non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
         loop = asyncio.get_running_loop()
         wait_started = loop.time()
-        turn_deadline = (
-            wait_started + turn_timeout if non_delegation_awaitable > 0 and turn_timeout > 0 else None
-        )
-        # Per-kind deadlines are fixed from entry counts; units arriving after entry get no in-band
-        # budget and are covered only by stop()'s drain (cron_drain_timeout floor).
-        delegation_deadline = (
-            wait_started + delegation_timeout if delegation_count > 0 and delegation_timeout > 0 else None
-        )
-        if turn_deadline is None and delegation_deadline is None:
+        # Each kind's deadline runs from the start of the wait whether or not that kind is live yet:
+        # admission stays open, so a turn or delegation that starts mid-wait is waited for inside
+        # what is left of its budget, and the wait never outlasts the longer of the two budgets.
+        turn_deadline = wait_started + turn_timeout if turn_timeout > 0 else None
+        delegation_deadline = wait_started + delegation_timeout if delegation_timeout > 0 else None
+        if not ((non_delegation_awaitable > 0 and turn_deadline is not None)
+                or (delegation_count > 0 and delegation_deadline is not None)):
             logger.warning(
                 "Restart requested with %d active work unit(s), but no work has a configured wait budget "
                 "(%d wedged past the inactivity timeout, %d in restart-safe external cron workers that "
@@ -2082,7 +2106,16 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         )
         self._scale_to_zero_status("draining", "restart wait: status mark failed")
         last_status_at = wait_started - 10.0
+        poll_interval = 0.1
+        next_poll_at = wait_started + poll_interval
+        # Past the after-turn cap, work still inside its own wait budget (a delegation) is named at
+        # WARNING and keeps the wait: that budget's end or a force stops it, never this notice.
+        next_warn_at = wait_started + turn_timeout if turn_timeout > 0 else None
         while True:
+            force = getattr(self, "_restart_force_event", None)
+            if force is not None and force.is_set():
+                logger.warning("Forced restart: stopping now and interrupting: %s", _log_view(self._describe_active_work()))
+                return False
             delegation_count = self._active_async_delegation_count()
             non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
             now = loop.time()
@@ -2118,11 +2151,24 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     "(%d wedged and excluded, %d restart-safe and excluded; %s); active work: %s",
                     awaitable, self._wedged_agent_count(),
                     self._restart_safe_cron_count(), ", ".join(budgets),
-                    self._describe_active_work(),
+                    # A delegation's goal is user content: it stays out of the log.
+                    [{k: v for k, v in unit.items() if k != "goal"} for unit in self._describe_active_work()],
                 )
                 self._scale_to_zero_status("draining", "restart wait: status mark failed")
                 last_status_at = now
-            await asyncio.sleep(0.1)
+            if next_warn_at is not None and now >= next_warn_at:
+                logger.warning(
+                    "Restart still waiting after %.0fs: the after-turn cap has passed, and work inside "
+                    "its own wait budget is NOT interrupted until that budget ends or a restart is "
+                    "forced. Active work: %s", now - wait_started, _log_view(self._describe_active_work()),
+                )
+                next_warn_at = now + max(turn_timeout, 30.0)
+            next_deadline = min(deadline for deadline, count in (
+                (turn_deadline, turn_waitable), (delegation_deadline, delegation_waitable),
+            ) if deadline is not None and count)
+            if now >= next_poll_at:
+                next_poll_at = now + poll_interval
+            await asyncio.sleep(min(next_poll_at, next_deadline) - now)
         if self._active_work_count() > 0:
             logger.warning(
                 "Restart deferred wait: %d work unit(s) remain outside configured wait budgets "
@@ -2137,39 +2183,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False,
                         reason: Optional[str] = None) -> bool:
-        if getattr(self, "_client_owned", False) or self._restart_task_started:
-            return False
-        self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
-        self._restart_requested = True
-        self._restart_detached = detached
-        self._restart_via_service = via_service
-        self._restart_task_started = True
-        # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
-        from gateway.drain_control import open_restart_wait
-        open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
-        # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
-        # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
-        self._mark_api_runs_shutdown_requested()
-
-        async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
-            # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-            if detached:
-                with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
-                    await self._launch_detached_restart_command()
-            await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
-
-        # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
-        # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in
-        # self._restart_task: a bare asyncio.create_task() keeps only a weak reference, so the event loop
-        # may garbage-collect a still-pending task mid-flight. The cancel loop in _stop_impl explicitly
-        # skips _restart_task for the same reason it skips _stop_task.
-        # Empty Context: /restart is handled inside the requester's profile scope, and a copied context
-        # would run the HOST restart as that profile (watcher HERMES_HOME, stop()'s flushes).
-        self._restart_task = Context().run(lambda: asyncio.create_task(_run_restart()))
-        return True
+        from gateway.run_shutdown_handover import request_restart
+        return request_restart(self, detached=detached, via_service=via_service, reason=reason)
 
     def _start_systemd_watchdog(self) -> bool:
         """Start sd_notify only after a configured gateway is truly running."""
@@ -2383,6 +2398,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
         else:
             await notice_task
+        with _log_suppressed(logging.DEBUG, "Failed to settle home online notice: %s"):
+            settle_home_online_notice_debt(self)
         ctx.notice_elapsed = time.monotonic() - notice_started
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
@@ -2396,6 +2413,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         _cron_at_start = self._active_cron_job_count()
         _api_at_start = self._active_api_run_count()
         _deferred_at_start = ctx.deferred_count()
+        _deleg_at_start = _active_async_delegation_count()
         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
         # Under launchd the real leash is launchd's own exit timeout, not our watchdog
@@ -2407,11 +2425,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         _cron_timeout = resolve_cron_drain_budget(
             timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
         )
-        if (_cron_at_start or _api_at_start) and _cron_timeout > timeout:
+        if (_cron_at_start or _api_at_start or _deleg_at_start) and _cron_timeout > timeout:
             logger.info(
-                "Shutdown drain: %d in-flight cron job(s), %d api_server run(s) — waiting up to "
-                "%.0fs for them (cron_drain_timeout=%.0fs, restart_drain_timeout=%.0fs)",
-                _cron_at_start, _api_at_start, _cron_timeout, _cron_drain_cfg, timeout,
+                "Shutdown drain: %d in-flight cron job(s), %d api_server run(s), %d background delegation(s) "
+                "— waiting up to %.0fs for them (cron_drain_timeout=%.0fs, restart_drain_timeout=%.0fs)",
+                _cron_at_start, _api_at_start, _deleg_at_start, _cron_timeout, _cron_drain_cfg, timeout,
             )
         _drain_started_at = time.monotonic()
         ctx.active_agents, ctx.timed_out = await self._drain_active_agents(timeout, _cron_timeout)
@@ -2419,10 +2437,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
-            "deferred_at_start=%d, deferred_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
-            ctx.timed_out, len(ctx.active_agents), self._running_agent_count(), _cron_at_start,
-            self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
-            _deferred_at_start, ctx.deferred_count(),
+            "deferred_at_start=%d, deferred_now=%d, deleg_at_start=%d, deleg_now=%d)", ctx.elapsed(),
+            ctx.drain_elapsed, ctx.timed_out, len(ctx.active_agents), self._running_agent_count(),
+            _cron_at_start, self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
+            _deferred_at_start, ctx.deferred_count(), _deleg_at_start, _active_async_delegation_count(),
         )
         if ctx.timed_out:
             return
@@ -2579,77 +2597,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             return flush_pending_to_file({session_key: value}, reason=reason)
 
     def _persist_shutdown_pending_messages(self) -> int:
-        """Durably spool every queued inbound before cancellable shutdown cleanup starts.
-
-        This is deliberately synchronous and called before the bounded finalization task: a timed-out
-        restart may cancel all best-effort cleanup, but it must not cancel the only copy of a user
-        follow-up. Successfully spooled slots are removed by identity so later fallback phases do not
-        replay them; failed slots remain available to a subsequent best-effort pass.
-        """
-        persisted = 0
-
-        def _slot(mapping, key, value, *, source_value=None, overflow: bool = False) -> None:
-            nonlocal persisted
-            try:
-                if self._flush_owned_pending(
-                    key, value, reason="shutdown", overflow=overflow,
-                ):
-                    current = mapping.get(key)
-                    expected = value if source_value is None else source_value
-                    # SessionFieldView is a live Mapping, not a dict. Remove only the
-                    # exact slot we flushed; a concurrent replacement must survive.
-                    if current is expected:
-                        remover = getattr(mapping, "pop", None)
-                        if callable(remover):
-                            remover(key, None)
-                    persisted += 1
-            except Exception:
-                logger.exception("Failed to durably spool shutdown-pending message for %s", key)
-
-        pending = getattr(self, "_pending_messages", None)
-        if isinstance(pending, Mapping):
-            for key, value in list(pending.items()):
-                _slot(pending, key, value)
-
-        queued_events = getattr(self, "_queued_events", None)
-        if isinstance(queued_events, Mapping):
-            for key, events in list(queued_events.items()):
-                if events:
-                    _slot(queued_events, key, list(events), source_value=events, overflow=True)
-
-        profile_adapters = getattr(self, "_profile_adapters", {})
-        adapters = [*list(getattr(self, "adapters", {}).items())]
-        adapters.extend(
-            (platform, adapter)
-            for amap in profile_adapters.values()
-            for platform, adapter in list(amap.items())
-        )
-        for platform, adapter in adapters:
-            adapter_pending = getattr(adapter, "_pending_messages", None)
-            if not isinstance(adapter_pending, Mapping):
-                continue
-            for key, value in list(adapter_pending.items()):
-                _slot(adapter_pending, key, value)
-
-        startup_queue = getattr(self, "_startup_restore_queue", None)
-        if isinstance(startup_queue, list):
-            for event in list(startup_queue):
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None and spool.exists():
-                    continue
-                try:
-                    key = self._session_key_for_source(event.source)
-                    if self._flush_owned_pending(key, event, reason="restore_shutdown"):
-                        for index, current in enumerate(startup_queue):
-                            if current is event:
-                                del startup_queue[index]
-                                break
-                        persisted += 1
-                except Exception:
-                    logger.exception("Failed to preserve startup-restore queued event during shutdown")
-        if persisted:
-            logger.info("Shutdown phase: durably spooled %d queued inbound message(s) before cleanup", persisted)
-        return persisted
+        """Spool owned inbound slots before entering cancellable shutdown cleanup."""
+        from gateway.run_shutdown_pending import persist_shutdown_pending_messages
+        return persist_shutdown_pending_messages(self)
 
     async def _stop_finalize_agents_and_adapters(
         self, ctx: GatewayShutdownMixin._StopContext,
@@ -2834,10 +2784,12 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             with suppress(Exception):
                 self._flush_owned_pending(session_key, value, reason="shutdown")
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
-        for session_key, events in dict(getattr(self, "_queued_events", None) or {}).items():
-            if events:
+        for session_key, state in dict(self.__dict__.get("_sessions") or {}).items():
+            if state.conversation.queued_events:
                 with suppress(Exception):
-                    self._flush_owned_pending(session_key, list(events), reason="shutdown", overflow=True)
+                    self._flush_owned_pending(
+                        session_key, list(state.conversation.queued_events), reason="shutdown", overflow=True,
+                    )
         # Claimed follow-ups still have their original spool until replay accepts them.
         # Fresh inbound held by the restore gate has no spool yet and must be persisted now.
         for event in list(getattr(self, "_startup_restore_queue", None) or []):
@@ -2851,12 +2803,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 logger.exception("Failed to preserve startup-restore queued event during shutdown")
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
-        self._running_agents_ts.clear()
         self._pending_messages.clear()
-        self._pending_approvals.clear()
         for _state in list((self.__dict__.get("_sessions") or {}).values()):
             _state.turn.lease = None
-        getattr(self, "_busy_ack_ts", {}).clear()  # absent on bare shutdown-path doubles
+            _state.turn.started_ts = _state.turn.busy_ack_ts = 0.0
+            _state.persistent.approvals = None
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
@@ -2986,7 +2937,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     # Stamp restart intent after the drain.
                     from gateway.restart_loop_guard import record_planned_exit
                     record_planned_exit()
-            if self._restart_requested and self._restart_command_source is None:
+            if (self._restart_requested and self._restart_command_source is None
+                    and self._home_shutdown_notice != HOME_NOTICE_MUTED):
                 from gateway.zero_cut_standby import is_standby
                 if not is_standby():
                     # One writer for the marker (gateway/restart_notice.py): the CLI restart stamps the same

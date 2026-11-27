@@ -289,10 +289,8 @@ class SubagentLifecycleService:
             if request.correlation_id and correlation_key in _REGISTRY.correlations:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
-        from tools.delegate_tool import (
-            _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
-            DEFAULT_MAX_ITERATIONS,
-        )
+        from tools.delegate_tool import _build_child_preserving_parent_tools, _credential_overrides, DEFAULT_MAX_ITERATIONS
+        from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
         # Explicit lifecycle routes win over the configured default route.
         routing_cfg = (
             {"provider": request.provider, "model": request.model or ""}

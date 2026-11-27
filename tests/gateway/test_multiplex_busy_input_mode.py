@@ -33,6 +33,12 @@ class _ProfileAdapter(BasePlatformAdapter):
 
 
 def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
+    from hermes_constants import get_hermes_home
+    # The routed profile must really exist: a missing one is refused, never served by the launch home.
+    research = get_hermes_home() / "profiles" / "research"
+    research.mkdir(parents=True, exist_ok=True)
+    if not (research / "config.yaml").exists():
+        (research / "config.yaml").write_text("{}\n", encoding="utf-8")
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._busy_input_mode = default_mode
@@ -627,7 +633,7 @@ async def test_meeting_binding_controls_every_busy_boundary(
             event = restore_native(snapshot_native(runner, event), runner)
             assert event.auto_skill == binding
             key = runner._session_key_for_source(event.source)
-        authority = SimpleNamespace()
+        authority = SimpleNamespace(sessions={})
         monkeypatch.setattr("gateway.session_authorities.active_authority", lambda _runner: authority)
         runner._hm_post_admission_consume = AsyncMock(return_value=(False, None))
         admitted = AsyncMock(return_value=None)
@@ -642,7 +648,7 @@ async def test_meeting_binding_controls_every_busy_boundary(
     agent.interrupt.assert_not_called()
     if steered:
         assert key not in adapter._pending_messages
-        assert not runner._queued_events.get(key)
+        assert not runner._session_state(key).conversation.queued_events
     elif boundary not in ("durable", "replay"):
         assert adapter._pending_messages[key] is event
     assert runner._effective_busy_input_mode(event.source) == "queue"

@@ -429,7 +429,7 @@ def select_protected_field_fills(classified: list[ClassifiedLoginControl], seman
         if len(selected) == 3:
             complete_groups.append((score, min(f["index"] for f in selected), selected))
     if complete_groups:
-        return sorted(complete_groups, key=lambda group: (-group[0], group[1]))[0][2]
+        return min(complete_groups, key=lambda group: (-group[0], group[1]))[2]
     singles = sorted((c for c in classified if c.token == "bday"),
                      key=lambda c: (-c.score, c.control.index))
     return ([{"index": singles[0].control.index, "token": "bday", "value": value}]

@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 from typing import Optional
 
+from gateway.run_notifications_ownership import owns_notice_work
 
 logger = logging.getLogger('gateway.run')
 
@@ -146,6 +147,7 @@ class GatewayNotificationsMixin:
         warned = self.__dict__.setdefault("_completion_no_transport_warned", set())
         key = (getattr(source, "profile", None), platform) if source is not None else None
         if adapter is None:
+            evt["_no_transport"] = True  # Durable, but not work this gateway can finish.
             # The watcher requeues silently every tick; say once per outage which lane has no transport.
             if key is not None and key not in warned:
                 warned.add(key)
@@ -153,6 +155,7 @@ class GatewayNotificationsMixin:
                     source, platform, getattr(getattr(self, "config", None), "multiplex_profiles", False)))
             return False
         warned.discard(key)
+        evt.pop("_no_transport", None)
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
@@ -315,7 +318,12 @@ class GatewayNotificationsMixin:
         True means adapter admission, not model execution; None means deduplicated or
         terminal. False remains retryable. Claims are settled together for every sibling.
         """
-        async with self._completion_event_scope(evt):
+        from gateway.run_profile_home import completion_event_scope_or_refuse
+
+        scope = await completion_event_scope_or_refuse(self, evt, "process completion")
+        if scope is None:
+            return None
+        async with scope:
             return await self._deliver_completion_notification_scoped(
                 synth_text, evt, sibling_claims=sibling_claims, cleanup_state=cleanup_state)
 
@@ -608,6 +616,7 @@ class GatewayNotificationsMixin:
             getattr(self, attr).clear()
 
 
+    @owns_notice_work
     async def _enqueue_process_completion_notification(
         self, synth_text: str, evt: dict, *, session_busy: bool = False,
     ) -> Optional[bool]:
@@ -615,7 +624,12 @@ class GatewayNotificationsMixin:
         from gateway.run_notifications import asyncio
         # Filter each event before it can contaminate (or suppress) a foreground batch.
         # The shared queue may be drained outside the owning profile's runtime scope.
-        async with self._completion_event_scope(evt):
+        from gateway.run_profile_home import completion_event_scope_or_refuse
+
+        scope = await completion_event_scope_or_refuse(self, evt, "queued process completion")
+        if scope is None:
+            return None
+        async with scope:
             from tools.process_registry_notifications import should_surface_notification
             if not should_surface_notification(evt):
                 return None

@@ -21,7 +21,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pm.environments import owning_home_root, store_root
+from pm.environments import owning_home_root, payload_command_dir, store_root
 
 # ``sys`` attribute a launcher sets before ``import hermes_bootstrap``: pin HERMES_HOME to the
 # install's default root once the launch-time repair ran (``hermes_bootstrap._pin_launcher_home``).
@@ -93,6 +93,9 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
     the managed Python pin changes.
     """
     root = Path(repo_root)
+    prefix = [] if module == "hermes_cli.main" else ["--run-module", module]
+    if (sealed := sealed_service_launcher(root)) is not None:
+        return [str(sealed), *prefix, *args]
     if resolve_store_python(root) is None:
         return runtime_command(root, args, module=module, python=python, home=home)
     # Immutable release directories do not carry a mutable ``.hermes/bin`` launcher. Persisting
@@ -100,8 +103,23 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
     launcher = root / ".hermes" / "bin" / "hermes"
     if not launcher.is_file():
         return runtime_command(root, args, module=module, python=python, home=home)
-    prefix = [] if module == "hermes_cli.main" else ["--run-module", module]
     return [str(launcher), *prefix, *args]
+
+
+def sealed_service_launcher(repo_root: Path) -> Path | None:
+    """Return a macOS bundle's signed launcher, or None for other installs."""
+    root = Path(repo_root).resolve()
+    if sys.platform != "darwin" or not _is_bundled_payload(root):
+        return None
+    commands = payload_command_dir(root)
+    launcher = commands / "hermes" if commands is not None else None
+    return launcher if launcher is not None and launcher.is_file() else None
+
+
+def publishes_service_launcher(repo_root: Path) -> bool:
+    """Whether service definitions run a launcher this install must publish first."""
+    return (sealed_service_launcher(repo_root) is None
+            and resolve_store_python(repo_root, publication=True) is not None)
 
 #: Launcher command names — keep in lockstep with scripts/install.ps1
 #: Publish-UserCommand and hermes_cli/_install_repair.py.

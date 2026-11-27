@@ -269,7 +269,7 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: plist.stem)
     monkeypatch.setattr(gateway, "_launchd_domain", lambda: f"gui/{os.getuid()}")
-    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: reload())
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path, **_: reload())
     if checkpoint == "issued":
         record = releases._read_txn(releases.ReleasePaths.for_home(home))
         assert record is not None and record["reload_issued"]["attempt"] == 1
@@ -579,7 +579,7 @@ def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeyp
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_release_acknowledgement_timeout", lambda: 0)
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
-    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: callback())
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _, **_kw: callback())
     with pytest.raises(RuntimeError, match="observation-only"):
         update_cmd._finish_pending_release_transaction(home)
     # Rollback CLI retry replays its existing WAL rather than creating an
@@ -604,7 +604,7 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kw: True)
-    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: calls.append(1) or "deferred")
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _, **_kw: calls.append(1) or "deferred")
     with pytest.raises(RuntimeError, match="observation-only"):
         update_cmd._catch_up_immutable_release(defer=False, sha="B", source=source)
     assert calls == [1]
@@ -628,7 +628,7 @@ def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, 
     monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda **kwargs: intended.decode())
     calls = []
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
-                        lambda path: calls.append(path) or "deferred")
+                        lambda path, **kwargs: calls.append((path, kwargs)) or "deferred")
     processes = []
     def launch_gateway():
         env = dict(os.environ, S2_OUTPUT=str(home / "observed"))
@@ -649,7 +649,7 @@ def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, 
         receipt = update_receipt.finalize_update_receipt("success")
         assert json.loads(receipt.read_text())["outcome"] == "success"
         assert not (home / "release-txn.json").exists()
-        assert calls == [plist]
+        assert calls == [(plist, {"use_planned_handover": False})]
     finally:
         timer.join()
         for process in processes:

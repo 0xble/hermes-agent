@@ -11,12 +11,14 @@ Tests are parametrized over platforms via the ``platform`` fixture in conftest.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
+from tests.e2e import conftest as platform_helpers
 from tests.e2e.conftest import make_event, send_and_capture
 
 
@@ -50,6 +52,45 @@ class TestSlashCommands:
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
         response_lower = response_text.lower()
         assert "no" in response_lower or "stop" in response_lower or "not running" in response_lower
+
+
+    @pytest.mark.asyncio
+    async def test_leading_space_stop_waits_for_dispatch(self, adapter, runner, platform, monkeypatch):
+        """Capture waits for command completion even when the handler is still off-loop."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        handle_stop = runner._handle_stop_command
+
+        async def held_stop(event):
+            entered.set()
+            await release.wait()
+            return await handle_stop(event)
+
+        runner._handle_stop_command = held_stop
+
+        async def yield_poll(_delay):
+            await asyncio.sleep(0)
+
+        # Advance the capture helper's polling without wall time. The command remains
+        # blocked on an explicit barrier, just as slow executor work can leave it.
+        monkeypatch.setattr(platform_helpers, "asyncio", SimpleNamespace(sleep=yield_poll))
+        async def release_after_polling():
+            await entered.wait()
+            for _ in range(100):
+                await asyncio.sleep(0)
+            release.set()
+
+        releaser = asyncio.create_task(release_after_polling())
+        try:
+            send = await send_and_capture(adapter, " /stop", platform)
+            send.assert_called_once()
+            response = send.call_args.kwargs.get("content") or send.call_args.args[1]
+            assert "no" in response.lower()
+            runner._handle_message_with_agent.assert_not_awaited()
+        finally:
+            release.set()
+            await releaser
+            await asyncio.gather(*tuple(adapter._session_tasks.values()))
 
 
 

@@ -149,8 +149,8 @@ def test_terminal_ownership_reconciles_late_checkpoints(monkeypatch, path, compl
     first = {"task_index": 4, "status": "completed", "summary": "first checkpoint"}
     late = {"task_index": 9, "status": "success", "summary": "late checkpoint"}
     if path == "budgeted_primary":
-        from tools import delegate_tool
-        monkeypatch.setattr(delegate_tool, "_load_config", lambda: {"max_summary_chars": 64})
+        from tools import delegate_tool_config
+        monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {"max_summary_chars": 64})
         late["summary"] *= 1000
     execution_checkpoints.record_unit_child(did, first)
     locks = _install_terminal_path(monkeypatch, path, lambda: execution_checkpoints.record_unit_child(did, late))

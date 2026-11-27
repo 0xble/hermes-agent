@@ -115,28 +115,29 @@ def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
 
 _SCRUB_CACHE_MAX_ENTRIES = 4096
 _SCRUB_CACHE_MAX_BYTES = 32 * 1024 * 1024
-_SCRUB_CACHE: OrderedDict[tuple[str, int, str], str] = OrderedDict()
+_SCRUB_CACHE: OrderedDict[tuple[str, int, str, bool], str] = OrderedDict()
 _SCRUB_CACHE_BYTES = 0
 _SCRUB_CACHE_LOCK = threading.Lock()
 
 
-def _scrub(text: str) -> str:
+def _scrub(text: str, *, urls: bool = True) -> str:
     """The shared egress scrub. Like chat-platform and cron delivery it holds even when
     ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
-    and fails closed."""
+    and fails closed. ``urls`` also masks URL query credentials: right for what a provider stores,
+    wrong for a tool argument it may fetch (a pre-signed ``?X-Amz-Signature=`` URL to index)."""
     global _SCRUB_CACHE_BYTES
 
     try:
-        key = (hermes_home_key(), redaction_generation(), text)
+        key = (hermes_home_key(), redaction_generation(), text, urls)
         with _SCRUB_CACHE_LOCK:
             cached = _SCRUB_CACHE.get(key)
             if cached is not None:
                 _SCRUB_CACHE.move_to_end(key)
                 return cached
     except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
-        return redact_for_egress(text)
+        return redact_for_egress(text, urls=urls)
 
-    scrubbed = redact_for_egress(text)
+    scrubbed = redact_for_egress(text, urls=urls)
     try:
         # Character accounting is deliberately independent of text encoding. Transcripts can contain
         # surrogateescape values and lone surrogates that strict UTF-8 rejects.
@@ -154,7 +155,7 @@ def _scrub(text: str) -> str:
                 old_key, old_value = _SCRUB_CACHE.popitem(last=False)
                 _SCRUB_CACHE_BYTES -= len(old_key[2]) + len(old_value)
     except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
-        return redact_for_egress(text)
+        return redact_for_egress(text, urls=urls)
     return scrubbed
 
 
@@ -200,12 +201,12 @@ def _apply_learned_tokens(text: str, learned: frozenset[str]) -> str:
     return _learned_pattern(learned).sub("[redacted]", text)
 
 
-def _redact_for_provider(*values: Any) -> Any:
+def _redact_for_provider(*values: Any, urls: bool = True) -> Any:
     """Copies of ``values`` with every string scrubbed before it reaches a memory provider.
 
     Providers archive whatever they are handed (#115104), so each manager fan-out (turn sync, recall
     queries, session-end and pre-compress transcripts, memory-tool mirrors, delegation results, provider
-    tool args) goes through ``_scrub``. Walks dicts/lists/tuples so tool-call arguments and multimodal text
+    tool args) goes through ``_scrub``; tool args pass ``urls=False`` because the provider may act on them. Walks dicts/lists/tuples so tool-call arguments and multimodal text
     parts are covered; ``data:`` URLs (inline media) pass through. A value the scrub masked anywhere in the
     hand-off is then masked everywhere in it, so a key detected in a tool result is also caught where the
     model repeats it bare in prose. Never mutates the caller's objects: unchanged values come back as-is,
@@ -227,7 +228,7 @@ def _redact_for_provider(*values: Any) -> Any:
         return value
 
     def scrub(text: str) -> str:
-        out = _scrub(text)
+        out = _scrub(text, urls=urls)
         if out != text:
             learned.update(set(_TOKEN_RE.findall(text)) - set(_TOKEN_RE.findall(out)))
         return out
@@ -463,7 +464,13 @@ class MemoryManager:
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
-        provider.read_only = self.read_only
+        # Third-party providers are duck-typed.  A slots-only provider may intentionally
+        # expose no privacy flag; it must still be registerable and receive caller-scoped
+        # homes through the normal lifecycle hooks.
+        try:
+            provider.read_only = self.read_only
+        except (AttributeError, TypeError):
+            pass
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
             logger.warning(
@@ -866,7 +873,7 @@ class MemoryManager:
             kwargs = {k: v for k, v in kwargs.items() if k in accepted}
         from agent.incognito import incognito_scope
         with incognito_scope(self.read_only, self._session_id):
-            args = _redact_for_provider(args)
+            args = _redact_for_provider(args, urls=False)  # the provider may fetch a URL argument
             from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
             try:
                 result = provider.handle_tool_call(tool_name, args, **kwargs)
@@ -1242,7 +1249,7 @@ class MemoryManager:
         self._agent_context = _context if isinstance(_context, str) and _context.strip() else "primary"
         # One instance, one profile: never rebind an instance another profile's manager bound (#140058).
         for provider in [p for p in self._providers if p.name != "builtin"]:
-            if not claim_instance(provider, kwargs["hermes_home"]):
+            if not claim_instance(provider, kwargs["hermes_home"], manager=self):
                 self._drop_provider(provider)
         self._each_provider("initialize failed", lambda p: p.initialize(session_id=session_id, **kwargs),
                             level=logging.WARNING)

@@ -694,7 +694,8 @@ async def test_error_notice_after_handler_is_outbox_receipted(tmp_path):
     rows = Outbox(tmp_path).all_rows()
     assert len(rows) == 1 and rows[0].turn_id == event._outbox_turn_id
     assert rows[0].state == "delivered"
-    assert len(sends) == 1 and "encountered an error" in sends[0]
+    # The generic notice: raw exception text can carry credentials, so it is logged, never sent.
+    assert len(sends) == 1 and "Something went wrong" in sends[0]
 
 
 @pytest.mark.asyncio

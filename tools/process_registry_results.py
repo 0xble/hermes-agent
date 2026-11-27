@@ -145,6 +145,8 @@ def save_completed_result(
     session, *, completion_reason: str | None = None, termination_source: str | None = None,
     prune: bool = True, only_if_owner_done: bool = False,
 ) -> None:
+    if session.sandbox_key:
+        return
     from agent.redact import redact_sensitive_text, redact_terminal_output
 
     # An in-flight owner reconciles the kill itself; do not make the kill wait for its IO.
@@ -265,7 +267,7 @@ def prune_completed_results(*, deadline: float | None = None) -> None:
         _RESULT_WRITE_LOCK.release()
 
 
-def _owns_result(owner: str, parent: str | None) -> bool:
+def _owns_result(owner: str, parent: str | None, *, db_path=None) -> bool:
     if not parent:
         return False
     if owner == parent:
@@ -274,7 +276,13 @@ def _owns_result(owner: str, parent: str | None) -> bool:
 
     # Pure lineage read on the hot path of every retained-result load; a writable open here
     # was one more writer handle per call inside the gateway (#100896).
-    db = SessionDB(read_only=True)
+    try:
+        db = SessionDB(db_path=db_path, read_only=True) if db_path is not None else SessionDB(read_only=True)
+    except (OSError, sqlite3.Error):
+        # Ownership checks are advisory when the profile store is unavailable. The direct
+        # owner/session-key checks remain authoritative; an unavailable lineage store must
+        # not turn an otherwise valid process action into a database error.
+        return False
     try:
         return db.get_compression_tip(parent) == owner
     finally:
@@ -286,9 +294,11 @@ def load_completed_results(prefix: str = "") -> dict:
     from tools.process_registry import ProcessSession
 
     from gateway.session_context import get_session_env
+    from tools.environments.sandbox_scope import hosted_scope
 
     owner = get_session_env("HERMES_SESSION_ID", "")
-    if not owner:
+    # A hosted agent's processes leave no receipt here and it sees no local one: never read or prune them.
+    if not owner or hosted_scope() is not None:
         return {}
     results = {}
     try:
@@ -312,7 +322,7 @@ def load_completed_results(prefix: str = "") -> dict:
             fields["ssh_binding"] = restore_binding(record.get("ssh_binding"))
             session = ProcessSession(
                 **fields,
-                exited=True, output_buffer=record["output"],
+                sandbox_key=record.get("sandbox_key", ""), exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
             results[session.id] = session

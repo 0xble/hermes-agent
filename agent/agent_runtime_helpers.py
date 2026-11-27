@@ -44,7 +44,7 @@ from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 logger = logging.getLogger(__name__)
 
-_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls", "toolcall")
 # Optional XML namespace prefix: some models serialize native tool calls as <ns:function_calls>.
 _NS_PREFIX = r"(?:[\w.-]+:)?"
 _REASONING_BLOCK_PATTERNS = tuple(
@@ -684,19 +684,19 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
             # A summary carrier followed by a new user row is a deliberate durable shape after
             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
             and split_user_originated_turn(prev)[0] is None
-            # A /steer row that ended the previous run is already persisted; merging the next
-            # prompt into it would rewrite it in place and re-break replay parity.
+            # A /steer row that ended the previous run is already persisted; merging the next prompt into it would rewrite it in place and re-break replay parity.
             and prev.get("display_kind") != STEER_DISPLAY_KIND
-            # Only merge plain-text content; leave multimodal (list or undecodable sentinel) content alone.
+            # Plain-text only, and never a passive (``observed``) row into an addressed turn: the merged
+            # row keeps observed=True, so replay would fold the addressed text into the group context (#154180).
             and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))
+            and bool(prev.get("observed")) == bool(msg.get("observed"))
         ):
             prev_content, new_content = prev.get("content", ""), msg.get("content", "")
             merged_content = (
                 (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
             )
             had_api_sidecar = "api_content" in prev
-            # Read before the marker is popped below. An unpersisted turn folded in ends the claim:
-            # the dict no longer stands for durable rows only.
+            # Read before the marker is popped below. An unpersisted turn folded in ends the claim: the dict no longer stands for durable rows only.
             if (prev.get(_DB_PERSISTED_MARKER) or prev.get(MERGED_DURABLE_ROWS)) and msg.get(_DB_PERSISTED_MARKER):
                 prev[MERGED_DURABLE_ROWS] = int(prev.get(MERGED_DURABLE_ROWS) or 1) + 1
             else:
@@ -1613,12 +1613,11 @@ def dump_api_request_debug(
         from agent.session_persistence import _safe_session_filename_component
         safe_sid = _safe_session_filename_component(agent.session_id)
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
-        # Redact secrets first: this fires unconditionally on API errors and captures the full
-        # request body, so context-embedded secrets would otherwise land in cleartext on disk.
-        from agent.redact_json import redact_sensitive_json
-        _plain = json.loads(json.dumps(dump_payload, ensure_ascii=False, default=str))
+        # Redact secrets first (this fires on every API error with the full request body), leaf-wise:
+        # a whole-JSON pass can eat a string's closing quote and the dump would be dropped.
+        from agent.redact_structured import redact_structured
         from agent.request_debug import bounded_request_dump, prune_request_dumps
-        _redacted_payload = bounded_request_dump(redact_sensitive_json(_plain, force=True))
+        _redacted_payload = bounded_request_dump(redact_structured(dump_payload))
         atomic_json_write(dump_file, _redacted_payload, mode=0o600, default=str)
         prune_request_dumps(dump_file)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
@@ -1719,7 +1718,7 @@ def plan_cache_sections_for_destination(
     plan = build_prompt_cache_plan(
         messages, tools,
         # effective_cache_ttl resolves None → "5m"; cache-disabled agents never reach here.
-        cache_ttl=effective_cache_ttl(cache_ttl, provider=provider, model=model),
+        cache_ttl=effective_cache_ttl(cache_ttl, provider=provider, model=model, base_url=base_url),
         native_anthropic=native_layout,
         static_system_prefix=static_system_prefix if isinstance(static_system_prefix, str) else None,
         direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(stub, **dest),
@@ -2233,12 +2232,12 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
         return
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client
-        from agent.anthropic_credentials import resolve_anthropic_token, anthropic_route_is_oauth
+        from agent.anthropic_credentials import native_anthropic_fallback_token, anthropic_route_is_oauth
         # Only fall back to ANTHROPIC_TOKEN for native Anthropic; other anthropic_messages providers
         # must never receive Anthropic credentials.
         is_native_anthropic = new_provider == "anthropic"
         effective_key = api_key or agent.api_key or (
-            resolve_anthropic_token(model=getattr(agent, "model", None)) if is_native_anthropic else ""
+            native_anthropic_fallback_token(base_url or getattr(agent, "_anthropic_base_url", None), model=getattr(agent, "model", None)) if is_native_anthropic else ""
         ) or ""
         # MiniMax OAuth: per-request callable token provider survives 15-min expiry (rationale in
         # agent_init.py).
@@ -2321,8 +2320,8 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:
-            from agent.credential_pool import load_pool
-            agent._credential_pool = load_pool(new_provider)
+            from agent.custom_entry_pool import load_route_pool
+            agent._credential_pool = load_route_pool(new_provider, agent.base_url)
         except Exception as _pool_exc:
             logger.warning(
                 "switch_model: credential pool reload failed for %s (%s); "

@@ -14,8 +14,10 @@ tests construct a real ``TelegramAdapter``.
 """
 
 import pytest
+from markdown_it import MarkdownIt
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.rich_markdown import _rich_separate_ordered_lists
 
 
 @pytest.fixture()
@@ -82,6 +84,21 @@ class TestRichMessageNewlineNormalization:
         assert "`/new` -- Start  \n`/model` -- Switch  \n`/reset` -- Reset" in md
 
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "OAuth profile: openai:test.user@example.com",
+            "Account test.user@example.com is active",
+        ],
+    )
+    def test_email_tokens_disable_rich_entity_detection(self, adapter, content):
+        payload = adapter._rich_message_payload(content)
+        assert payload["skip_entity_detection"] is True
+
+    def test_non_email_content_keeps_entity_detection(self, adapter):
+        payload = adapter._rich_message_payload("See https://example.com/status")
+        assert "skip_entity_detection" not in payload
+
 
 class TestRichMessageTableProtection:
     """Hard-break injection must not corrupt GFM tables (rendered natively)."""
@@ -92,6 +109,52 @@ class TestRichMessageTableProtection:
         md = adapter._rich_message_payload(content)["markdown"]
         assert "  \n" not in md
         assert md == content
+
+
+class TestRichOrderedListAfterProse:
+    """CommonMark lets an ordered list interrupt a paragraph only when it starts at 1, so
+    ``Label\\n7. item`` stays one paragraph and the numbers render as literal text (#124552)."""
+
+    @pytest.mark.parametrize(
+        "content, items",
+        [
+            ("**Facts and Evidence**\n7. **Verbs.** Is.\n8. **Dates.** As of.", 2),
+            ("Intro\n\nNext steps:\n2) second\n3) third\n4) fourth", 3),
+        ],
+    )
+    def test_ordered_list_after_prose_parses_as_list(self, adapter, content, items):
+        md = adapter._rich_message_payload(content)["markdown"]
+        types = [t.type for t in MarkdownIt().parse(md)]
+
+        assert types.count("ordered_list_open") == 1
+        assert types.count("list_item_open") == items
+
+    def test_ordered_list_keeps_authored_start_number(self, adapter):
+        md = adapter._rich_message_payload("**Facts and Evidence**\n7. First\n8. Second")["markdown"]
+        lists = [t for t in MarkdownIt().parse(md) if t.type == "ordered_list_open"]
+
+        assert lists and lists[0].attrs.get("start") == 7
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "1. a\n2. b\n3. c",
+            "- a\n7. b",
+            "1. a\n   continued\n2. b",
+            "```text\nLabel\n7. literal\n```",
+            "Streaming draft\n```text\nLabel\n7. literal",
+            "`Label\n7. literal`\n\n- [x] done",
+        ],
+    )
+    def test_lists_and_code_gain_no_blank_line(self, adapter, content):
+        md = adapter._rich_message_payload(content)["markdown"]
+
+        assert md.count("\n\n") == content.count("\n\n")
+
+    def test_separation_is_idempotent(self):
+        once = _rich_separate_ordered_lists("Label\n7. item\n8. another")
+
+        assert _rich_separate_ordered_lists(once) == once
 
     def test_table_boundaries_and_rows_stay_raw(self, adapter):
         content = (
@@ -193,39 +256,3 @@ def test_rich_limit_counts_materialized_paragraph_payload(adapter):
         adapter.RICH_MESSAGE_MAX_CHARS
     )
     assert adapter._content_fits_rich_limits(content) is False
-
-
-class TestRichOrderedListAfterProse:
-    """CommonMark lets an ordered list interrupt a paragraph only when it starts
-    at 1, so ``Label\\n7. item`` renders as one paragraph with literal numbers."""
-
-    @pytest.mark.parametrize(
-        "content, items",
-        [
-            ("**Facts and Evidence**\n7. **Verbs.** Is.\n8. **Dates.** As of.", 2),
-            ("Intro\n\nNext steps:\n2) second\n3) third\n4) fourth", 3),
-        ],
-    )
-    def test_ordered_list_after_prose_line_parses_as_list(self, adapter, content, items):
-        from markdown_it import MarkdownIt
-
-        md = adapter._rich_message_payload(content)["markdown"]
-        tokens = MarkdownIt("commonmark").parse(md)
-
-        assert [t.type for t in tokens].count("ordered_list_open") == 1
-        assert [t.type for t in tokens].count("list_item_open") == items
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            "1. a\n2. b\n3. c",
-            "- a\n7. b",
-            "1. a\n   continued\n2. b",
-            "```text\nLabel\n7. literal\n```",
-            "Streaming draft\n```text\nLabel\n7. literal",
-        ],
-    )
-    def test_lists_and_code_gain_no_blank_line(self, adapter, content):
-        md = adapter._rich_message_payload(content)["markdown"]
-
-        assert md.count("\n\n") == content.count("\n\n")

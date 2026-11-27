@@ -472,6 +472,8 @@ def restore_native(payload, runner=None):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']
     event._reply_latency_receipt_id = envelope.get('reply_receipt_id')
+    from gateway.session_moa_turn import restore_moa_turn
+    restore_moa_turn(envelope, event)
     if recovery_id := envelope.get('recovery_id'):
         event._hermes_recovery_id = recovery_id
     if 'automation' in envelope:

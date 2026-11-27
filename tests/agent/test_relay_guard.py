@@ -16,6 +16,13 @@ from gateway import session_context
 from tools import mcp_tool_handlers
 
 
+@pytest.fixture
+def configured_relay(tmp_path):
+    # Exercise relay authorization after MCP admits an explicitly configured server.
+    # Transport is still mocked, and parent/ancestor calls must not reach it.
+    (tmp_path / "config.yaml").write_text("mcp_servers:\n  relay: {command: relay, trust: full}\n")
+
+
 def _bind(session_id: str, profile: str = "default"):
     return session_context.set_session_vars(session_id=session_id, profile=profile)
 
@@ -35,7 +42,7 @@ def test_child_parent_is_refused_but_other_and_top_level_targets_are_unchanged(t
         session_context.clear_session_vars(tokens)
 
 
-def test_mcp_parent_relay_is_blocked_before_call_server_acquisition(tmp_path, monkeypatch):
+def test_mcp_parent_relay_is_blocked_before_call_server_acquisition(tmp_path, monkeypatch, configured_relay):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     tokens = _bind("parent-session")
     try:
@@ -59,7 +66,7 @@ def test_mcp_parent_relay_is_blocked_before_call_server_acquisition(tmp_path, mo
 
 
 @pytest.mark.parametrize("depth", [2, 3])
-def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, depth):
+def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, depth, configured_relay):
     from contextlib import ExitStack
     from hermes_state import SessionDB
 
@@ -350,7 +357,7 @@ def test_child_terminal_relay_to_parent_is_refused_for_every_shell_spelling(tmp_
     assert lines[-1] == f"<unset> {PARENT_ADDRESS}"
 
 
-def test_top_level_mcp_parent_target_remains_allowed(tmp_path, monkeypatch):
+def test_top_level_mcp_parent_target_remains_allowed(tmp_path, monkeypatch, configured_relay):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     tokens = _bind("parent-session")
     try:

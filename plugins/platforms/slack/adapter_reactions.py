@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class SlackReactionsMixin:
+    if TYPE_CHECKING:
+        async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None: ...
+        async def _resolve_author_team(self, user_id: str, channel_id: str, team_id: str) -> str: ...
+
     # Reaction names → unicode emoji, so skills matching on ``text`` see the same character
     # whether the user typed it or reacted with it.
     _REACTION_EMOJI_MAP: ClassVar[dict[str, str]] = {
@@ -172,8 +176,15 @@ class SlackReactionsMixin:
             client, channel_id, msg_ts, event, team_id, explicit_allowlist)
         if thread_ts is None:
             return
-        await self._handle_slack_message(
-            self._synthetic_reaction_event(event, action, thread_ts, team_id))
+        synthetic = self._synthetic_reaction_event(event, action, thread_ts, team_id)
+        # The synthetic event stamps the install team, so without the reactor's own
+        # workspace an external-org user reacting in a DM — or handed off into a DM
+        # target — would pass the prefilter's external-DM gate (#143792).
+        if str(channel_id).startswith("D") or str(synthetic["channel"]).startswith("D"):
+            reactor_team = await self._resolve_author_team(user_id, channel_id, team_id)
+            if reactor_team:
+                synthetic["user_team"] = reactor_team
+        await self._handle_slack_message(synthetic)
 
     def _synthetic_reaction_event(
         self, event: dict, action: str, thread_ts: str, team_id: str) -> dict:

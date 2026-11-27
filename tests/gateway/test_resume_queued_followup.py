@@ -158,9 +158,13 @@ async def test_reconnect_note_scan_failure_still_drains_spool(tmp_path, monkeypa
     spool_home = tmp_path
     entry = runner.session_store._entries.pop(key)
     if route == "secondary":
-        spool_home = tmp_path / "other"
-        spool_home.mkdir()
+        # A really served profile: a named one the multiplexer does not serve is refused, never
+        # run from the launch home.
+        spool_home = tmp_path / "profiles" / "other"
+        spool_home.mkdir(parents=True)
+        (spool_home / "config.yaml").write_text("{}\n", encoding="utf-8")
         runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config._runtime_profile_homes = (("default", tmp_path), ("other", spool_home))
         runner._primary_profile_name = "default"
         runner._served_profile_homes = {"default": tmp_path, "other": spool_home}
         source = replace(source, profile="other")

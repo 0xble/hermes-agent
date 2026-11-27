@@ -33,7 +33,7 @@ def _make_stream_response(content: bytes = b"\xff\xd8\xff fake media", *, header
     Exposes ``raise_for_status``, a configurable ``headers`` mapping (empty
     by default, with no
     Content-Length), and an ``aiter_bytes`` async iterator yielding the body
-    in one chunk — matching how ``_read_httpx_body_with_limit`` consumes it.
+    in one chunk — matching how ``read_httpx_body_with_limit`` consumes it.
     """
     resp = MagicMock()
     resp.raise_for_status = MagicMock()

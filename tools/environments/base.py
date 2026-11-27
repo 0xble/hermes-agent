@@ -7,7 +7,8 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 ``base_session_env``, ``base_wait``, ``path_utils``).
 """
 
-import json
+import contextvars
+import hashlib
 import logging
 import os
 import shlex
@@ -16,6 +17,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -28,8 +30,10 @@ from tools.environments.base_session_env import (
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script, _split_cwd_marker,
     _wrap_command_script,
 )
+from tools.environments.base_processes import LongLivedProcessMixin
 from tools.environments.base_wait import _WaitTrace
-from utils import atomic_json_write, env_var_enabled, file_signature
+from tools.terminal_tool_sudo_askpass import fill_timeout_token, sudo_askpass_supported_once
+from utils import atomic_json_write, env_var_enabled, file_signature, read_json_or_empty
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,51 @@ _HOST_EXITING_OUTPUT = (
     "Hermes is restarting or shutting down; the command was NOT run. "
     "This turn's work will resume after restart. Do not retry this command in this turn."
 )
+
+# Task ids whose shell state a command reads and writes, own id first, then its delegation
+# ancestors; empty means the environment's own snapshot. One environment serves a parent and
+# its delegate_task children (shared sandbox, #16177), so without this a child's ``export``
+# became the parent's shell state (#84536).
+_shell_state_chain: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_chain", default=())
+_shell_state_paths: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_paths", default=())
+
+# A local delegated child may use its own environment object while inheriting its parent's shell
+# snapshot. Keep that fallback handoff in-process and environment-scoped; terminal_tool passes
+# explicit paths, and task ids alone are never used to derive a cross-process path.
+_task_snapshot_paths: dict[str, str] = {}
+_task_snapshot_paths_lock = threading.Lock()
+
+
+def _remember_task_snapshot(task_id: str, path: str) -> None:
+    if task_id:
+        with _task_snapshot_paths_lock:
+            _task_snapshot_paths[task_id] = path
+
+
+def _ancestor_task_snapshot(task_id: str) -> str | None:
+    with _task_snapshot_paths_lock:
+        return _task_snapshot_paths.get(task_id)
+
+
+def _forget_task_snapshots(snapshot_prefix: str) -> None:
+    with _task_snapshot_paths_lock:
+        for task_id, path in tuple(_task_snapshot_paths.items()):
+            if path.startswith(snapshot_prefix):
+                _task_snapshot_paths.pop(task_id, None)
+
+
+@contextmanager
+def shell_state_scope(chain: tuple[str, ...], snapshot_paths: tuple[str, ...] = ()):
+    """Run commands against the per-task snapshot of ``chain[0]`` (seeded from its ancestors)."""
+    token = _shell_state_chain.set(tuple(chain))
+    paths_token = _shell_state_paths.set(tuple(snapshot_paths))
+    try:
+        yield
+    finally:
+        _shell_state_paths.reset(paths_token)
+        _shell_state_chain.reset(token)
 
 
 def _enter_foreground_spawn() -> bool:
@@ -220,15 +269,6 @@ def get_sandbox_dir() -> Path:
     return p
 
 
-def _load_json_store(path: Path) -> dict:
-    """Treat a missing or damaged snapshot store as empty."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _save_json_store(path: Path, data: dict) -> None:
     """Write *data* as pretty-printed JSON to *path* atomically (readers never see a torn file)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +297,7 @@ def _update_json_store(path: Path, update: Callable[[dict], None]) -> None:
             ))
         except (OSError, TimeoutError):
             logger.warning("Updating %s without its lock", path, exc_info=True)
-        data = _load_json_store(path)
+        data = read_json_or_empty(path)
         before = dict(data)
         update(data)
         if data != before:
@@ -287,10 +327,12 @@ def env_uses_host_filesystem(env: object) -> bool:
 # ---------------------------------------------------------------------------
 
 
-class BaseEnvironment(ABC):
+class BaseEnvironment(LongLivedProcessMixin, ABC):
     """Common interface and unified execution flow for all Hermes backends. Subclasses
     implement ``_run_bash()`` and ``cleanup()``; the base provides ``execute()`` with
-    snapshot sourcing, CWD tracking, interrupt handling and timeout enforcement."""
+    snapshot sourcing, CWD tracking, interrupt handling and timeout enforcement, and the
+    long-lived process surface (``start_process`` / ``attach_process`` / ``stop_process``,
+    ``base_processes``)."""
 
     # How execute() hands stdin to _run_bash: "pipe" (process stdin, default),
     # "payload" (passed through as stdin_data; the backend transports it via its
@@ -319,6 +361,14 @@ class BaseEnvironment(ABC):
     # backends set this too; the name avoids the sudoers keyword the install
     # scanner flags in plugin code.
     _passwordless_sudo_probe_supported: bool = False
+
+    # Whether background processes spawned through this env are gone, for this env object, once
+    # cleanup() returns: ended with the sandbox, or no longer reachable through it (persist-mode
+    # Docker drops its container id, so the old object can't poll the job). Teardown then
+    # settles them as lost so their pollers stop. A backend whose processes outlive cleanup()
+    # and stay reachable through the same object (SSH reconnects) sets False so the poller keeps
+    # collecting the real result. Plugin contract: website/docs/developer-guide/terminal-environment-plugin.md.
+    cleanup_stops_processes: bool = True
 
     # Local and Docker override this because they resolve allowlisted values
     # through the active profile scope; other backends keep plain snapshots.
@@ -365,7 +415,9 @@ class BaseEnvironment(ABC):
 
     @abstractmethod
     def cleanup(self):
-        """Release backend resources (container, instance, connection)."""
+        """Release backend resources (container, instance, connection). Raise only while the
+        sandbox may still be live: once it is destroyed, log later failures instead, since a
+        raise skips settling its background processes (see ``cleanup_stops_processes``)."""
         ...
 
     # --- File extraction (backend -> host) ---
@@ -428,14 +480,35 @@ class BaseEnvironment(ABC):
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
-    def _snapshot_script_kwargs(self, cwd: str) -> dict:
+    def _task_snapshot_path(self, task_id: str) -> str:
+        """Return a task snapshot scoped to this environment so task-id reuse cannot reuse old state."""
+        digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+        return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
+
+    def _shell_state_snapshot_paths(self) -> list[str]:
+        """Resolve the current task locally and delegated ancestors from their owning environments."""
+        explicit = _shell_state_paths.get()
+        if explicit:
+            return list(explicit)
+        task_ids = _shell_state_chain.get()
+        paths: list[str] = []
+        for index, task_id in enumerate(task_ids):
+            path = self._task_snapshot_path(task_id) if index == 0 else _ancestor_task_snapshot(task_id)
+            if path is None:
+                path = self._task_snapshot_path(task_id)
+            if index == 0:
+                _remember_task_snapshot(task_id, path)
+            paths.append(path)
+        return paths
+
+    def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
         subclass rewrite ``C:\\...`` to ``/c/...`` so ``cd`` resolves and MSYS doesn't choke."""
         return dict(
             quoted_cwd=self._quote_cwd_for_cd(cwd),
-            quoted_snap=self._quote_shell_path(self._snapshot_path),
-            snap_tmp_template=self._quote_shell_path(self._snapshot_path + _SNAP_TMP_SUFFIX),
+            quoted_snap=self._quote_shell_path(snap or self._snapshot_path),
+            snap_tmp_template=self._quote_shell_path((snap or self._snapshot_path) + _SNAP_TMP_SUFFIX),
             cwd_marker=self._cwd_marker)
 
     def init_session(self):
@@ -504,6 +577,8 @@ class BaseEnvironment(ABC):
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
         from agent.incognito import is_incognito
+        chain = self._shell_state_snapshot_paths()
+        seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
@@ -511,7 +586,8 @@ class BaseEnvironment(ABC):
             relay_parent_address=in_process_child_relay_parent_address(),
             persist_env=self._persist_env and not is_incognito(),
             pipe_marker=self._pipe_marker,
-            **self._snapshot_script_kwargs(cwd))
+            seed_snaps=seeds,
+            **self._snapshot_script_kwargs(cwd, chain[0] if chain else None))
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
@@ -712,6 +788,13 @@ class BaseEnvironment(ABC):
         old workspace state (lobehub/lobehub#19329 class)."""
         self._recreated_notice_pending = True
 
+    def _usable_cwd(self, cwd: str) -> tuple[str, dict | None]:
+        """Directory the command may actually start in, plus ``{"requested", "used"}`` when it
+        differs. Local swaps a deleted/unenterable one (it would make the wrapper's ``cd`` exit
+        126 on every call); sandboxes resolve their own. Returned, never stored on ``self``:
+        concurrent commands share one environment."""
+        return cwd, None
+
     # --- Unified execute() ---
     def execute(
         self,
@@ -749,7 +832,10 @@ class BaseEnvironment(ABC):
         # is the smallest portable backend timeout. Strict-deadline callers must
         # skip dispatch themselves when less than one second remains.
         effective_timeout = max(1, int(timeout or self.timeout))
-        effective_cwd = cwd or self.cwd
+        exec_command = fill_timeout_token(exec_command, effective_timeout)
+        # An explicit ``cwd`` (the session's recorded cd state) can be just as dead as
+        # ``self.cwd``; resolving only the latter left every call exiting 126 at ``cd``.
+        effective_cwd, cwd_fallback = self._usable_cwd(cwd or self.cwd)
 
         # Merge sudo stdin with caller stdin.
         effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
@@ -840,6 +926,8 @@ class BaseEnvironment(ABC):
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
             result["environment_recreated"] = True
+        if cwd_fallback:
+            result["cwd_fallback"] = cwd_fallback
         return result
 
     def _kill_spawned_tree(self, spawned) -> None:
@@ -865,19 +953,20 @@ class BaseEnvironment(ABC):
             pass
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
-        """Rewrite sudo for a piped password, or leave it alone when this backend has NOPASSWD.
-
-        Also applies the macOS ``open`` frontmost raise-ladder (a pure string
-        rewrite, no-op on non-Darwin) so files opened via tool calls are
-        brought to the front instead of landing behind the Hermes window.
-        """
+        """Rewrite sudo for an askpass helper or a piped password (untouched under NOPASSWD) and
+        apply the macOS ``open`` raise-ladder (no-op off Darwin) so opened files come to the front."""
+        from tools.environments.sudo_password_note import note_sudo_password_sent
         from tools.terminal_tool_macos_open import _transform_macos_open_command
         from tools.terminal_tool_sudo import _transform_sudo_command
-        return _transform_sudo_command(
+        prepared = _transform_sudo_command(
             _transform_macos_open_command(command),
             sudo_nopasswd_check=self._sudo_nopasswd_works,
+            askpass_supported=self._sudo_askpass_supported,
         )
+        note_sudo_password_sent(self, prepared[1])  # once per non-local backend class
+        return prepared
 
+    _sudo_askpass_supported = sudo_askpass_supported_once
     _SUDO_PROBE_TIMEOUT_S = 3
 
     def _sudo_nopasswd_works(self) -> bool:

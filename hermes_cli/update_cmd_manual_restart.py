@@ -21,7 +21,8 @@ def new_supervisor_gateway_pids(candidate_pids, mapped_processes, pre_restart_pi
             # A mapped process gets the control-socket/state-file check as well as
             # the live argv fallback, scoped to that profile's home.
             try:
-                declares_external_supervisor = gateway_declares_external_supervisor(pid, proc.path)
+                declares_external_supervisor = gateway_declares_external_supervisor(
+                    pid, getattr(proc, "path", None))
             except Exception as exc:
                 logger.debug("Could not read supervisor identity for PID %s", pid, exc_info=True)
                 # An unreadable identity is ambiguous; never turn it into a

@@ -144,7 +144,8 @@ On Linux and macOS, `hermes update` stops every gateway running from this instal
 - The paused set is recorded in the Hermes home before the first stop. If the update is killed, the next `hermes` command (or `hermes update`) starts exactly those gateways again. A failed update that never changed the checkout restarts them on the old code. If the dependency sync fails after the checkout moved, they restart once a launch has synced the dependencies.
 - A gateway the updater cannot stop through its supervisor (an s6 or custom systemd unit, `--external-supervisor`, a launchd job that started this update) is left running and refreshed after the update, as before.
 - `--no-gateway-restart` stops nothing; you manage the gateways.
-- The pause never blocks an update. If it cannot list, record or stop the gateways, it restarts anything it stopped, says so, and the update continues the way it did before the pause existed: gateways run through the swap and are restarted afterwards.
+- `hermes update --force` (Linux and macOS) skips the wait for in-flight work. Each gateway is stopped at once and prints one `⏹ <gateway>: stopped by --force, interrupting N unit(s): …` line naming the chat turns, cron jobs and background delegations it was running. Those are interrupted (background delegations as resumable) and its tool and background processes are stopped; a gateway still alive about 12 seconds later is killed, and the background processes it recorded are stopped for it (`⏹ <gateway>: also stopped N background process(es) it left behind`). The update then runs and the gateways start again on the new code as usual. If a stop still has not finished after the kill (a systemd stop job still running, or a process that survives SIGKILL), the update stops before changing the checkout and names the unit or PID to check; nothing is started behind that stop, and the next `hermes` command restarts the stopped gateways once it has finished.
+- The pause never blocks an update, apart from the unfinished `--force` stop above. If it cannot list, record or stop the gateways, it restarts anything it stopped, says so, and the update continues the way it did before the pause existed: gateways run through the swap and are restarted afterwards.
 
 Windows already paused its gateways before the update (they lock files the dependency sync replaces) and restarts them once the update completes, after the builds.
 
@@ -201,7 +202,7 @@ Sessions and messages created after the update are not in that snapshot.
 
 ### Why the gateway restart can take a while
 
-The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default). Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
+The restart waits for idle: the running gateway keeps serving while in-flight work (chat turns, cron jobs, API runs) finishes, then exits. That wait is capped by `agent.restart_after_turn_timeout` (30 minutes by default); past the cap the gateway refuses new turns and stops what is still running. Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...
@@ -489,8 +490,9 @@ Follow any blocker diagnostic for the specific process and installation. Do
 not kill every process named Python or Hermes. Source updates and MSIX package
 replacement have different owners and shutdown requirements.
 
-The parser retains `--force` and `--force-venv` for Windows compatibility. They
-are not normal update instructions or a guarantee that an OS file lock can be
+On Windows, `--force` also lets the update proceed when another `hermes.exe` is
+detected, and `--force-venv` mutates the venv while other processes hold it.
+Neither is a normal update instruction or a guarantee that an OS file lock can be
 bypassed. Inspect `hermes update --plan`, the update log, and `hermes pm status`
 before retrying a failed update.
 

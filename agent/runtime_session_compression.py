@@ -103,6 +103,9 @@ class RuntimeSessionCompressionMixin:
         # Adopt the committed generation as the owner stored it: one dict per message_uid.
         from hermes_state_identity import _newest_message_uid_rows
         compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
+        # The worker's local context version (the prompt-cache clock's compaction witness): every
+        # in-place rewrite archives through here, a prune or micro-compaction included.
+        self.context_rewrites = getattr(self, 'context_rewrites', 0) + 1
         return result['value']
 
     def archive_and_compact_best_effort(self, *args, **kwargs):

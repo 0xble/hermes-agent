@@ -120,7 +120,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR ${!HERMES_BROWSER_CONTROL_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
-        f"> {tmp_path}")
+        # ``>|`` truncates the mktemp file even when the session has ``noclobber`` (``set -C``) on:
+        # mktemp pre-creates it, so a plain ``>`` fails and the snapshot never persists exports.
+        f">| {tmp_path}")
 
 
 def _shell_state_dump(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -183,7 +185,7 @@ def _wrap_command_script(
     passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
     relay_parent_address: str = "",
     pipe_marker: str = "",
-    persist_env: bool = True) -> str:
+    persist_env: bool = True, seed_snaps: Iterable[str] = ()) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``persist_env=False`` skips the re-dump, so every command starts from the login-time
     snapshot and exports from one command never reach the next (the CWD marker still runs).
@@ -195,15 +197,23 @@ def _wrap_command_script(
     same mktemp+mv atomic publish, and chains ``mv`` on the dump succeeding so a failed dump never
     replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
-    changing the command's umask. ``relay_parent_address`` (a delegated child's parent) is
-    exported after the snapshot is sourced, so every backend's command sees it, including remote
-    ones whose process env is not inherited; the re-dump unsets it, so it never persists.
+    changing the command's umask. *seed_snaps* (quoted paths) are read, first existing wins,
+    while *quoted_snap* does not exist yet: a delegated child's own snapshot starts as a copy of
+    its parent's shell state and its re-dump never writes the parent's file. ``relay_parent_address``
+    (a delegated child's parent) is exported after the snapshot is sourced, so every backend's
+    command sees it, including remote ones whose process env is not inherited; the re-dump unsets
+    it, so it never persists.
     """
     escaped = command.replace("'", "'\\''")
     capture = bool(pipe_marker) and _can_capture_pipestatus(command)
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
-    if snapshot_ready:
+    seeds = list(seed_snaps)
+    if snapshot_ready and seeds:
+        parts.append(
+            f"for __hermes_s in {quoted_snap} {' '.join(seeds)}; do "
+            'if [ -f "$__hermes_s" ]; then source "$__hermes_s" >/dev/null 2>&1 || true; break; fi; done')
+    elif snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
     if relay_parent_address:

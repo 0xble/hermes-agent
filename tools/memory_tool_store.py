@@ -227,6 +227,9 @@ class MemoryStore:
         live lists keep the raw text so the user can see and remove poisoned entries
         (dropping them silently would hide the attack)."""
         from tools.threat_patterns import scan_for_threats
+        from tools.hosted_tool_policy import host_feature_enabled
+        if not host_feature_enabled("builtin_memory"):
+            return  # hosted: this profile's MEMORY.md/USER.md are never the agent's
 
         def _sanitize(entry, filename):
             # Strict scope, same as writes; empty / already-blocked entries pass through.
@@ -360,6 +363,9 @@ class MemoryStore:
         returns is passed through verbatim and nothing is persisted: error dicts, or the
         success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``)."""
         from agent.incognito import is_incognito
+        from tools.hosted_tool_policy import host_feature_enabled
+        if not host_feature_enabled("builtin_memory"):
+            return {"success": False, "error": "Memory is not available to a hosted agent."}
         if self.read_only or is_incognito():
             return _error("Memory writes are disabled in incognito mode.", "incognito")
         path = self._path_for(target)

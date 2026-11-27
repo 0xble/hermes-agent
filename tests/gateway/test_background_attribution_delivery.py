@@ -20,7 +20,7 @@ def _runner(adapter, body):
         _provider_routing={},
         _resolve_session_reasoning_config=lambda **kwargs: None,
         _resolve_session_service_tier=lambda **kwargs: None,
-        _resolve_turn_agent_config=lambda *args: {"model": "test", "runtime": {}},
+        _resolve_turn_agent_config=lambda *args, **_kw: {"model": "test", "runtime": {}},
         _run_in_executor_with_context=AsyncMock(return_value={"final_response": body, "messages": []}),
     )
 

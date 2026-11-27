@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
@@ -153,6 +154,13 @@ _PREVIEW_ELIGIBLE_SQL = (f"(COALESCE(m.display_kind, '') <> 'hidden'"
     f" OR ({_PREVIEW_MERGED_SUMMARY_SQL}"
     f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL)}) > 0)))")
 
+# The plain head drops leading whitespace BEFORE the slice, so that whitespace never shortens the head below the
+# crop length ``_shape_preview`` cuts at (a preview that is cut is what tells its readers a word may be partial).
+# CR/LF -> space keeps character length, so it runs on the slice only.
+_PREVIEW_HEAD_SQL = (
+    f"REPLACE(REPLACE(SUBSTR({_sql_ltrim_whitespace('CAST(m.content AS TEXT)')}, 1, {_PREVIEW_HEAD_CHARS}),"
+    " X'0A', ' '), X'0D', ' ')")
+
 # ``_preview_raw`` SELECT for every listing query (scaffolded rows: head + tail around SKILL_EXCERPT_JOINT).
 _PREVIEW_RAW_SELECT = (
     f"CASE WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
@@ -161,7 +169,7 @@ _PREVIEW_RAW_SELECT = (
     f" THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
     f" || {_preview_normalized_window_sql(-_PREVIEW_SCAFFOLD_WINDOW, _PREVIEW_SCAFFOLD_WINDOW)}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
-    f" ELSE {_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS)} END")
+    f" ELSE {_PREVIEW_HEAD_SQL} END")
 
 
 def _shape_preview(raw: Any) -> str:
@@ -545,6 +553,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_read_at REAL,
     tool_names TEXT,
     transcript_revision INTEGER NOT NULL DEFAULT 0,
+    prompt_cache_clock TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -851,6 +860,21 @@ CREATE TABLE IF NOT EXISTS async_delegation_events (
 
 CREATE INDEX IF NOT EXISTS idx_async_delegation_events_delivery
     ON async_delegation_events(delivery_state, updated_at);
+
+-- Durable subagent records (tools/delegate_tool_resumable.py): what delegate_task(action='continue') rebuilds a
+-- child from after a restart or crash, and the worktree pin the startup sweep honours (``pinned``).
+CREATE TABLE IF NOT EXISTS resumable_subagents (
+    subagent_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    stop_cause TEXT,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    record_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL
+);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
@@ -1602,3 +1626,14 @@ def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
     except (json.JSONDecodeError, TypeError):
         logger.warning(warning)
         return fallback
+
+
+def path_is_under(path: Path, root: Path) -> bool:
+    """True when *path* is *root* or a file inside it (normcase, resolved)."""
+    try:
+        path_key = os.path.normcase(str(path.resolve()))
+        root_key = os.path.normcase(str(root.resolve()))
+    except OSError:
+        path_key = os.path.normcase(str(path))
+        root_key = os.path.normcase(str(root))
+    return path_key == root_key or path_key.startswith(root_key + os.sep)

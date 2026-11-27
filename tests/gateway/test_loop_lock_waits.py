@@ -79,7 +79,7 @@ def test_delegation_ledger_reconciles_schema_once_per_database_file(tmp_path, mo
     real = hermes_state_schema.reconcile_state_schema
     monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", lambda conn: (calls.append(1), real(conn)))
     monkeypatch.setattr(async_delegation, "_db_path", lambda: tmp_path / "state.db")
-    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_RECONCILED", {})
+    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_READY", {})
     for _ in range(3):
         with async_delegation._transaction() as conn:
             conn.execute("SELECT count(*) FROM async_delegations").fetchone()
@@ -102,7 +102,7 @@ def test_delegation_ledger_reconciles_same_cookie_older_replacement(tmp_path, mo
     db_path = tmp_path / "state.db"
     monkeypatch.setattr(async_delegation, "_db_path", lambda: db_path)
     from tools import async_delegation_ledger
-    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_RECONCILED", {})
+    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_READY", {})
 
     with async_delegation._transaction() as conn:
         conn.execute(

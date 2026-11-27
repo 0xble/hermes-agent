@@ -182,7 +182,7 @@ def test_guidance_present_on_schema_stub_and_listing_and_child_prompt():
     stub = generate_hermes_tools_module(["web_search"])
     assert "rounds of about 5" in stub and "Exa Lite is paused by default" in stub
     assert "rounds of about 5" in build_execute_code_schema({"web_search"}, mode="project")["description"]
-    assert "rounds of about 5" in _build_child_system_prompt("goal")
+    assert "rounds of about 5" in _build_child_system_prompt()
     # The stakes/Lite-paused wording is preserved.
     assert "Exa Lite is paused by default" in web_tools.WEB_SEARCH_SCHEMA["parameters"]["properties"]["stakes"]["description"]
 

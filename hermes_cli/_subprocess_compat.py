@@ -59,9 +59,9 @@ _GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exe
 
 def run(cmd, **kwargs) -> NoReturn:
     # Shim to suppress old updater work until relaunch. Do not start its installer.
-    from hermes_cli._old_updater import stop_for_relaunch
+    from hermes_cli._old_updater import stop_historical_updater
 
-    stop_for_relaunch()
+    stop_historical_updater("hermes_cli._subprocess_compat.run")
 
 
 def harden_git_argv(args: Sequence[str]) -> list[str]:
@@ -286,6 +286,9 @@ NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
 # GIT_CONFIG_KEY_n/VALUE_n overrides for internal git children: no credential/askpass prompts, no
 # repo-configured fsmonitor/hooks/pager/editor/external-diff programs.
 _GIT_CONFIG_INJECT_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+# Variables that point git at a repository other than its cwd (credential/ssh variables stay).
+_GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE")
 _GIT_CONFIG_OVERRIDES = {
     "credential.helper": "",
     "core.askPass": "",
@@ -465,6 +468,11 @@ def noninteractive_git_env(base: Mapping[str, str] | None = None) -> dict[str, s
         if key == "GIT_CONFIG_PARAMETERS" or key.startswith(_GIT_CONFIG_INJECT_PREFIXES):
             env.pop(key, None)
     env.pop("GIT_CONFIG_COUNT", None)
+    # An inherited GIT_DIR/GIT_WORK_TREE (a dotfiles alias, a git hook) retargets the call at the
+    # user's other repo instead of the cwd the caller names; a plugin's stash/reset would act on
+    # it (#146032). A caller that needs one sets it on the returned env.
+    for key in _GIT_LOCATION_ENV:
+        env.pop(key, None)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -553,10 +561,7 @@ def noninteractive_repo_git_env(
             return None
         origin_path = Path(origin[len("file:"):])
         if not origin_path.is_absolute():
-            # git prints repo-local origins relative to the worktree top level, not to *cwd*; with a
-            # caller-set GIT_DIR/GIT_WORK_TREE they are relative to something else, so refuse.
-            if env.get("GIT_DIR") or env.get("GIT_WORK_TREE"):
-                return None
+            # git prints repo-local origins relative to the worktree top level, not to *cwd*.
             if toplevel is None:
                 top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
                                         timeout=2, env=env)
@@ -603,6 +608,11 @@ def noninteractive_repo_git_env(
 
     start = int(env["GIT_CONFIG_COUNT"])  # always set by noninteractive_git_env
     overrides = [(key, "") for key in keys] + [(key, "false") for key in required]
+    if keys:
+        # With the filters emptied a stat refresh hashes raw bytes: `status` and `diff` must not write
+        # it back to the index, or a file that only the clean filter changes reads clean to the user.
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        overrides.append(("diff.autoRefreshIndex", "false"))
     for offset, (key, value) in enumerate(overrides):
         env[f"GIT_CONFIG_KEY_{start + offset}"] = key
         env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
@@ -676,6 +686,17 @@ def pid_exists_stdlib(pid: int) -> bool:
     except OSError:  # ProcessLookupError included
         return False
     return True
+
+
+def process_start_time_stdlib(pid: int) -> int | None:
+    """``/proc/<pid>/stat`` field 22 (start time in clock ticks since boot), stdlib only; None
+    without /proc (macOS, Windows) or when the process is gone. ``gateway.status``'s start-time
+    fingerprint reads the same field first, so the two agree on Linux."""
+    try:
+        # Field 22 counted after comm's last ")": comm may hold spaces or non-UTF-8 bytes.
+        return int(Path(f"/proc/{int(pid)}/stat").read_bytes().rsplit(b")", 1)[1].split()[19])
+    except (IndexError, ValueError, OSError):
+        return None
 
 
 def _process_start_time(pid: int) -> int | None:
@@ -829,11 +850,15 @@ def _legacy_kill_process_tree(proc: subprocess.Popen) -> None:
 def bounded_probe_run(
     argv: Sequence[str], *, timeout: float, errors: str = "replace",
     env: Mapping[str, str] | None = None, cwd: str | os.PathLike[str] | None = None,
-    raise_on_spawn_failure: bool = False, input: str | None = None,
+    raise_on_spawn_failure: bool = False, input: str | None = None, owned: bool = False,
 ) -> subprocess.CompletedProcess[str] | None:
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=…)`` for fail-open probes.
 
     ``input`` is written to the child's stdin (closed afterwards); without it stdin is ``DEVNULL``.
+
+    ``owned=True`` (POSIX) hands the probe's process group to the owner-death supervisor until it
+    finishes, so a probe still running when this process exits (one started from a daemon thread,
+    abandoned by a ``/exit``) dies with it instead of reparenting to init with its helpers.
 
     Returns a ``CompletedProcess`` when the child finished within *timeout* (any exit code), or
     ``None`` on spawn failure or timeout. With ``raise_on_spawn_failure=True`` the ``Popen``
@@ -849,7 +874,10 @@ def bounded_probe_run(
     """
     # detached-spawn: ok — awaited probe; a timeout or failure tree-kills its group (kill_and_drain)
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
-    job = None
+    owned = owned and not IS_WINDOWS
+    job = proc = None
+    gate_read = gate_write = None
+    command = list(argv)
     try:
         # Windows: contain the probe in a Job Object. `taskkill /T` walks LIVE parent pids, and a
         # Cygwin/MSYS `exec` lets the forked stub exit once the new image runs, so a Git Bash grandchild
@@ -857,15 +885,42 @@ def bounded_probe_run(
         # on windows-latest). KILL_ON_JOB_CLOSE reaches it regardless of ancestry.
         from hermes_cli.local_runtime.processes import spawn_server
 
+        if owned:
+            from hermes_cli.process_identity import own_process_groups, release_process_group_once_empty
+
+            # The CLI can exit while this daemon thread is between Popen and registration.
+            # On EOF the bootstrap exits without starting the command; after the go byte,
+            # exec retains the registered process group and the probe's original stdio.
+            gate_read, gate_write = os.pipe()
+            _popen_kwargs["pass_fds"] = (gate_read,)
+            command = [sys.executable, "-I", "-S", "-c",
+                       "import os, sys; fd = int(sys.argv[1]); go = os.read(fd, 1); os.close(fd); "
+                       "go == b'g' and os.execvp(sys.argv[2], sys.argv[2:])", str(gate_read), *argv]
         proc, job = spawn_server(
-            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
             text=True, encoding="utf-8", errors=errors,
             env=dict(env) if env is not None else None, cwd=cwd, **_popen_kwargs)
+        if gate_read is not None:
+            os.close(gate_read)
+            gate_read = None
+        if owned and gate_write is not None:
+            own_process_groups([proc.pid])
+            os.write(gate_write, b"g")
     except Exception:
+        if gate_write is not None:
+            os.close(gate_write)
+            gate_write = None
+        if proc is not None:
+            kill_and_drain(proc, 1)
         if raise_on_spawn_failure:
             raise
         return None
+    finally:
+        if gate_read is not None:
+            os.close(gate_read)
+        if gate_write is not None:
+            os.close(gate_write)
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except Exception:
@@ -873,9 +928,14 @@ def bounded_probe_run(
         # drain bounded — leaving it running would leak the suspended-descendant class this guards.
         _close_job(job)
         kill_and_drain(proc, 1)
+        if owned:
+            release_process_group_once_empty(proc.pid, proc=proc)
         return None
     # The probe exited on its own; anything it left behind (`&` jobs) goes with the job.
     _close_job(job)
+    if owned:
+        # A member it left running keeps the group covered, so it still dies with us.
+        release_process_group_once_empty(proc.pid, proc=proc, timeout=0)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
 
 

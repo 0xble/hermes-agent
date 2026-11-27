@@ -11,6 +11,7 @@ import pytest
 from hermes_cli.web_routers import display
 from tools.bot_desktop import lease
 from tests.socket_paths import short_socket_dir
+from tests.bot_desktop_lease import reset_lease
 
 
 class _Ws:
@@ -56,12 +57,12 @@ async def _bridge_once(close_code: int, home: str) -> lease.Lease:
 # the server keeps the lease; the Desktop sends an explicit 1000 when the pane is closed on purpose.
 @pytest.mark.parametrize(("close_code", "human_keeps_control"), [(1006, True), (1005, True), (1000, False)])
 def test_only_a_clean_viewer_close_hands_the_screen_back(monkeypatch, close_code, human_keeps_control):
-    lease._reset_for_tests()
+    reset_lease()
     with short_socket_dir("bot-desktop/rfb.sock") as directory:
         home = str(directory)
         lease.acquire("desk-1", profile_key=home)
         after = asyncio.run(_bridge_once(close_code, home))
-    lease._reset_for_tests()
+    reset_lease()
     assert (after.holder == lease.HUMAN) is human_keeps_control, after
 
 
@@ -123,12 +124,12 @@ def test_a_takeover_made_by_another_process_stops_input_within_the_refresh_inter
             await task
             server.close()
 
-    lease._reset_for_tests()
+    reset_lease()
     with short_socket_dir("bot-desktop/rfb.sock") as directory:
         home = str(directory)
         lease.acquire("desk-1", profile_key=home)
         elapsed = asyncio.run(_run(home))
-    lease._reset_for_tests()
+    reset_lease()
     assert elapsed < 0.5, elapsed
 
 
@@ -156,7 +157,7 @@ def test_no_bridge_task_or_socket_outlives_the_bridge():
         finally:
             server.close()
 
-    lease._reset_for_tests()
+    reset_lease()
     with short_socket_dir("bot-desktop/rfb.sock") as directory:
         home = str(directory)
         leftover = asyncio.run(_run(home))

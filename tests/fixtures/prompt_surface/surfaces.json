@@ -5,7 +5,7 @@
       "stable": 1829,
       "volatile": 1268
     },
-    "tool_tokens": 16422,
+    "tool_tokens": 14673,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -30,7 +30,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -39,7 +38,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -55,7 +53,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 16422,
+    "tool_tokens": 14673,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -80,7 +78,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -89,7 +86,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -105,7 +101,7 @@
       "stable": 1646,
       "volatile": 1267
     },
-    "tool_tokens": 16422,
+    "tool_tokens": 14673,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -130,7 +126,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -139,7 +134,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -155,7 +149,7 @@
       "stable": 2392,
       "volatile": 1265
     },
-    "tool_tokens": 16577,
+    "tool_tokens": 14828,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -180,7 +174,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -189,7 +182,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -205,7 +197,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 16422,
+    "tool_tokens": 14673,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -230,7 +222,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -239,7 +230,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -255,7 +245,7 @@
       "stable": 1228,
       "volatile": 1269
     },
-    "tool_tokens": 16422,
+    "tool_tokens": 14673,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -280,7 +270,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -289,7 +278,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -302,10 +290,10 @@
   "desktop.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1473,
+      "stable": 1495,
       "volatile": 1269
     },
-    "tool_tokens": 16694,
+    "tool_tokens": 14945,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -330,7 +318,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "read_file",
@@ -339,7 +326,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -355,7 +341,7 @@
       "stable": 1244,
       "volatile": 1269
     },
-    "tool_tokens": 16859,
+    "tool_tokens": 15110,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -380,7 +366,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "react",
@@ -390,7 +375,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",
@@ -406,7 +390,7 @@
       "stable": 1388,
       "volatile": 1270
     },
-    "tool_tokens": 16897,
+    "tool_tokens": 15148,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -431,7 +415,6 @@
       "compact_context",
       "delegate_task",
       "execute_code",
-      "manage_connections",
       "memory",
       "patch",
       "react",
@@ -441,7 +424,6 @@
       "skill_view",
       "skills_list",
       "terminal",
-      "text_to_speech",
       "tool_call",
       "tool_describe",
       "tool_search",

@@ -32,7 +32,7 @@ def test_default_child_constructor_preserves_off_contract():
 def test_private_async_refuses_before_credentials_or_disk():
     parent = _make_mock_parent()
     parent.incognito = True
-    with patch("tools.delegate_tool._resolve_delegation_credentials") as credentials:
+    with patch("tools.delegate_tool_routes._resolve_delegation_credentials") as credentials:
         result = json.loads(delegate_task(goal="do not persist", parent_agent=parent, background=True))
     assert "incognito" in result["error"].lower()
     credentials.assert_not_called()
@@ -49,7 +49,7 @@ def test_private_delegation_still_joins_children_without_live_cache():
     child.run_conversation.return_value = {"final_response": "private answer", "messages": []}
     child._interrupt_requested = False
     with (
-        patch("tools.delegate_tool._resolve_delegation_credentials", return_value={
+        patch("tools.delegate_tool_routes._resolve_delegation_credentials", return_value={
             "model": "test", "provider": "openai", "base_url": "https://example.invalid/v1",
             "api_key": "test", "api_mode": "chat_completions",
         }),

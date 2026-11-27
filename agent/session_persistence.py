@@ -602,7 +602,9 @@ class SessionPersistenceMixin:
     def _save_trajectory(self, messages: list[dict[str, Any]], user_query: str, completed: bool):
         """Save conversation trajectory to JSONL file."""
         from agent.incognito import is_incognito
-        if getattr(self, "incognito", False) or is_incognito(getattr(self, "session_id", None)) or not self.save_trajectories:
+        from tools.hosted_tool_policy import host_feature_enabled
+        if (getattr(self, "incognito", False) or is_incognito(getattr(self, "session_id", None))
+                or not self.save_trajectories or not host_feature_enabled("trajectory_export")):
             return
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
         _save_trajectory_to_file(trajectory, self.model, completed)

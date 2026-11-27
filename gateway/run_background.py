@@ -63,8 +63,8 @@ class GatewayBackgroundMixin:
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            service_tier = self._resolve_session_service_tier(source=source)
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs, tier=service_tier)
             turn_route["runtime"].pop("_preflight_fallback", None)
             turn_route["runtime"].pop("_fallback_notice", None)
 
@@ -94,7 +94,7 @@ class GatewayBackgroundMixin:
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=turn_route.get("service_tier"),
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -137,6 +137,8 @@ class GatewayBackgroundMixin:
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                from gateway.platforms.docker_media_paths import hand_back_unreadable_media
+                await hand_back_unreadable_media([p for p, _ in media_files])
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:

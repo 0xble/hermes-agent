@@ -159,7 +159,7 @@ async def test_gateway_turn_status_ownership_survives_topic_and_turn_reuse(adapt
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", thread_id=topic)
         ctx = TurnContext(source=source, session_key=f"agent:main:telegram:dm:12345:{topic}",
                           _run_still_current=lambda: True, _cleanup_progress=True,
-                          _status_adapter=adapter, _status_chat_id="12345",
+                          _status_adapter_pinned=adapter, _status_chat_id="12345",
                           _status_thread_metadata={"thread_id": topic}, user_config={})
         turn = TurnRunner(runner, ctx)
         pending = []

@@ -10,7 +10,7 @@ from gateway.config import GatewayConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionStore
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
-from tests.gateway.test_restart_interrupted_note import NoteAdapter
+from tests.gateway.test_restart_interrupted_note.test_core import NoteAdapter
 
 
 def _runner(tmp_path, monkeypatch):

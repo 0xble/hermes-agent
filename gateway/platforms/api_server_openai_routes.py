@@ -76,6 +76,26 @@ def _budget_exhausted(result: Any) -> bool:
     return reason.startswith(("budget_exhausted", "max_iterations_reached("))
 
 
+async def _write_chat_completion_tail(result, copy_filter, write_content_delta, *, content_sent):
+    """Emit a final-only reply or append the post-stream transformation to visible text."""
+    if not content_sent and isinstance(result, dict):
+        from gateway.platforms.api_server import _resolve_media_to_data_urls
+
+        # Recovery can produce a reply without firing any visible delta (#31449).
+        # Keep copy markers for the filter and skip MEDIA resolution inside copy bodies.
+        fallback_text = map_outside_copy_blocks(
+            result.get("final_response") or "", _resolve_media_to_data_urls, keep_markers=True)
+        if fallback_text:
+            # Replay the complete text without a partial marker prefix left from the stream.
+            copy_filter.reset()
+            await write_content_delta(fallback_text)
+        return
+    # Chat chunks can only append: a non-append rewrite follows the streamed text (as in the CLI).
+    tail, appended = _post_stream_transform(result)
+    if tail:
+        await write_content_delta(tail if appended else _transformed_notice() + tail)
+
+
 def _finish_reason(completed, is_partial, is_failed, err_msg, agent_error=None, *, budget_exhausted=False) -> str:
     """OpenAI ``finish_reason``: "length" for truncation, "error" for failure, else "stop"."""
     # OpenAI uses "length" for truncation, "stop" for normal completion, and downstream SDKs accept "error"
@@ -1187,7 +1207,7 @@ class OpenAICompatRoutesMixin:
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
         disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
         from gateway.platforms.api_server import (
-            _abandon_agent_task, _chat_usage_payload, _resolve_media_to_data_urls, _sse_frame)
+            _abandon_agent_task, _chat_usage_payload, _redact_api_error_text, _sse_frame)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
 
         def _chunk(delta: dict[str, Any], finish_reason=None, **extra) -> dict[str, Any]:
@@ -1241,6 +1261,8 @@ class OpenAICompatRoutesMixin:
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            if err_msg:
+                err_msg = _redact_api_error_text(err_msg)
             budget_exhausted = _budget_exhausted(result)
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error,
                                            budget_exhausted=budget_exhausted)
@@ -1249,27 +1271,11 @@ class OpenAICompatRoutesMixin:
                 (isinstance(result, dict) and result.get("_notification_presentation_suppressed") is True)
                 or getattr(agent_error, "_notification_presentation_suppressed", False) is True
             )
-            # Recovery paths (guardrail halt, partial_stream_recovery, fallback prior-turn
-            # content) can return a final_response without firing any content delta; emit it
-            # once so the client does not see an empty stream (#31449). Mirrors
-            # _ResponsesStream.collect_result for /v1/responses.
-            if not content_sent and not presentation_muted and isinstance(result, dict):
-                # Markers stay so the stream filter renders them; copy bodies skip MEDIA resolution.
-                fallback_text = map_outside_copy_blocks(
-                    result.get("final_response") or "", _resolve_media_to_data_urls, keep_markers=True)
-                if fallback_text:
-                    # Nothing visible went out: a marker prefix the filter still holds from the
-                    # stream is part of this complete text, so replay it from a clean filter.
-                    copy_filter.reset()
-                    await _write_content_delta(fallback_text)
-            elif not presentation_muted:
-                # Chat chunks can only append: a non-append rewrite follows the streamed text (as in the CLI).
-                tail, appended = _post_stream_transform(result)
-                if tail:
-                    await _write_content_delta(tail if appended else _transformed_notice() + tail)
+            if not presentation_muted:
+                await _write_chat_completion_tail(
+                    result, copy_filter, _write_content_delta, content_sent=content_sent)
             trailing = copy_filter.flush()
             if trailing:
-                content_sent = True
                 await response.write(_sse_frame(_chunk({"content": trailing})))
             if finish_reason != "stop":
                 if err_msg and not presentation_muted:

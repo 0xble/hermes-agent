@@ -14,6 +14,7 @@ command first waits until every earlier input of that reader has committed (``bu
 """
 import asyncio
 import contextvars
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 import logging
@@ -34,6 +35,7 @@ class _Burst:
     timer: asyncio.Task | None = None
     commit: asyncio.Task | None = None
     absorbed: list = field(default_factory=list)
+    charges: list = field(default_factory=list)
     # The head's ingress context, holding its off-loop authorization secrets. The commit runs in
     # it whoever flushes the burst (its timer, a command, an internal completion).
     context: contextvars.Context | None = None
@@ -78,24 +80,45 @@ def holds_busy_burst(adapter, session_key):
     return any(session_key in adapter.__dict__.get(name, ()) for name in ('_shared_bursts', '_shared_burst_commits'))
 
 
+@asynccontextmanager
+async def hold_burst_for_control(adapter, event, session_key):
+    """Keep this chat's lifecycle burst pending until the command is accepted or refused."""
+    from hermes_cli.commands import is_interrupt_then_dispatch
+    bursts = adapter.__dict__.get('_shared_bursts', {})
+    cmd = event.get_command() if bursts and _serial(adapter) else None
+    burst = bursts.get(session_key) if cmd and is_interrupt_then_dispatch(cmd) else None
+    if burst is None:
+        yield False
+        return
+    burst.timer.cancel()
+    try:
+        await _wait_for_serial_inputs(adapter, except_burst=burst)
+        yield True
+    finally:
+        if bursts.get(session_key) is burst:
+            if getattr(event, '_interrupt_accepted', False) is True:
+                discard_busy_burst(adapter, session_key)
+            else:
+                await asyncio.shield(_flush(adapter, session_key, burst))
+
+
+async def _wait_for_serial_inputs(adapter, *, except_burst=None):
+    """Settle earlier serial-reader input, except a lifecycle burst awaiting its verdict."""
+    for key, burst in list(adapter.__dict__.get('_shared_bursts', {}).items()):
+        if burst is not except_burst:
+            _flush(adapter, key, burst)
+    if pending := list(adapter.__dict__.get('_shared_burst_commits', {}).values()):
+        await asyncio.wait(pending)
+    if held := list(adapter.__dict__.get('_uncommitted_inputs', ())):
+        await asyncio.wait(held)
+
+
 async def burst_gate(adapter, event, session_key):
-    """``handle_message``'s entry check. True: a held or committing burst owns the route, so this
-    shared-runtime input must queue behind it. A command on a serial reader first waits for every
-    input that reader already returned on, as main's reader reached it only after their commits:
-    /stop, /new and /reset drop their own chat's held burst (main dropped the debounce buffer),
-    every other held burst commits now, and every pending commit lands before the command runs."""
+    """Queue shared-runtime input behind an existing burst; wait for commits before a serial command."""
     if adapter._shared_runtime_owns_input(event):
         return holds_busy_burst(adapter, session_key)
-    if (cmd := event.get_command()) and _serial(adapter):
-        from hermes_cli.commands import is_interrupt_then_dispatch
-        if is_interrupt_then_dispatch(cmd):
-            discard_busy_burst(adapter, session_key)
-        for key, burst in list(adapter.__dict__.get('_shared_bursts', {}).items()):
-            _flush(adapter, key, burst)
-        if pending := list(adapter.__dict__.get('_shared_burst_commits', {}).values()):
-            await asyncio.wait(pending)
-        if held := list(adapter.__dict__.get('_uncommitted_inputs', ())):
-            await asyncio.wait(held)  # a non-burst input released behind an earlier one, not durable yet
+    if event.get_command() and _serial(adapter):
+        await _wait_for_serial_inputs(adapter)
     return False
 
 
@@ -137,6 +160,8 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
                 burst.head, event):
             merge_pending_message_event({session_key: burst.head}, session_key, event, merge_text=kind == 'text')
             burst.absorbed.append(event)
+            if getattr(event, '_busy_bot_loop_charge', None) is not None:
+                burst.charges.append(event._busy_bot_loop_charge)
             note_busy_merged(burst.head, event)
             burst.last_ts = time.monotonic()
             _arm(adapter, session_key, burst)
@@ -153,6 +178,8 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
     now = time.monotonic()
     burst = bursts[session_key] = _Burst(event, asyncio.get_running_loop().create_future(), now, now,
                                          context=contextvars.copy_context())
+    if getattr(event, '_busy_bot_loop_charge', None) is not None:
+        burst.charges.append(event._busy_bot_loop_charge)
     _arm(adapter, session_key, burst)
     return await _accepted(adapter, burst, event)
 
@@ -264,11 +291,10 @@ def discard_busy_burst(adapter, session_key):
     burst = adapter.__dict__.get('_shared_bursts', {}).pop(session_key, None)
     if burst is not None:
         burst.timer.cancel()
+        for guard, conversation, charge in burst.charges:
+            guard.refund(conversation, charge)
         for event in (burst.head, *burst.absorbed):
-            receipt = event.__dict__.pop('_busy_bot_loop_charge', None)
-            if receipt is not None:
-                guard, conversation, charge = receipt
-                guard.refund(conversation, charge)
-                event._bot_loop_admitted = False
+            event.__dict__.pop('_busy_bot_loop_charge', None)
+            event._bot_loop_admitted = False
         settle_busy_arrival(burst.head, discarded=True)
         burst.done.done() or burst.done.set_result(None)

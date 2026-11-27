@@ -13,7 +13,7 @@ def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results."""
     from tools.async_delegation import (
-        _DB_LOCK, _ROUTING_KEYS, _owner_liveness, _transaction, json, recovered_children,
+        _DB_LOCK, _ROUTING_KEYS, _db_path, _owner_liveness, _transaction, json, recovered_children,
         redact_child_result, redact_completion_event, require_ledger_owner, time,
     )
     require_ledger_owner()
@@ -21,7 +21,13 @@ def recover_abandoned_delegations() -> int:
     if alive is None:
         return 0
     now, recovered = time.time(), 0
+    # Each child of a dead owner keeps a resumable record (``delegate_tool_resumable``). Its git probes run here,
+    # before the ledger's write lock is taken, so no other writer waits on them.
+    from tools.delegate_tool_resumable import continuable_of, plan_recovery, recover_abandoned
+    plan = plan_recovery(_db_path(), alive)
+    recovered_records: dict[str, dict[str, Any]] = {}
     with _DB_LOCK, _transaction() as conn:
+        recover_abandoned(conn, plan, recovered_records)
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
@@ -116,6 +122,19 @@ def recover_abandoned_delegations() -> int:
                 diagnostics["transcript_tails"] = tails
             if hint := git_state_hint(task.get("owner_cwd")):
                 diagnostics["git_state_hint"] = hint
+            silent = False
+            if continuable := continuable_of(conn, delegation_id):
+                diagnostics["resumable_subagent_ids"] = continuable
+                from tools.delegate_tool_auto_resume import boot_notice
+                notice, promised = boot_notice(conn, continuable, recovered_records)
+                error += notice or (
+                    " Its subagents can be continued on their own conversation and worktree: "
+                    "delegate_task(action='continue', subagent_id=..., message=...); check git state and the "
+                    "last tool before re-running side effects.")
+                n_tasks = len(task.get("task_indexes") or task.get("goals") or [0])
+                finished = any(r.get("status") != "unknown" for r in recovered_results or ())
+                silent = len(promised) >= n_tasks and not finished  # the scheduler reports each child: no wake
+                diagnostics.update({"waiting_to_resume": promised} if silent else {})
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
                 "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
@@ -130,8 +149,9 @@ def recover_abandoned_delegations() -> int:
                       **({"results": recovered_results} if recovered_results else {})}
             event, result = redact_completion_event(event), redact_child_result(result)
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
+                   updated_at=?, event_json=?, result_json=?, delivery_state=?
+                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result),
+                                              "delivered" if silent else "pending", delegation_id))
             recovered += 1
     return recovered
 
@@ -853,11 +873,14 @@ def failed_delegations_for_session(
         task, result = _json_object(task_json), redact_child_result(_json_object(result_json))
         goals = task.get("goals") if isinstance(task.get("goals"), list) and task["goals"] else [task.get("goal") or ""]
         tasks = result["results"] if isinstance(result.get("results"), list) else [] if task.get("is_batch") else [result]
+        from tools.delegate_tool_auto_resume import waiting_on_resume
+        if waiting_on_resume(result):  # every child waits on its automatic resume (or its one give-up failure)
+            continue
         if not tasks and str(state).lower() in _FAILED_TASK_STATES:
             tasks = [{"task_index": i, "error": result.get("error")} for i in task.get("task_indexes") or [0]]
         for entry in tasks:
             status = str(entry.get("status") or state or "").lower()
-            if status not in _FAILED_TASK_STATES:
+            if status not in _FAILED_TASK_STATES or waiting_on_resume(entry):
                 continue
             index = entry.get("task_index") if isinstance(entry.get("task_index"), int) else 0
             error = entry.get("error") or result.get("error")

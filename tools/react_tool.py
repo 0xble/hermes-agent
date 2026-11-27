@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""React to the triggering gateway message or persist a desktop tapback."""
+"""Agent emoji reaction in the Hermes desktop app: the counterpart to the user's tapback
+(same store, one-per-author, ``author="agent"``). Lives in the ``desktop_ui`` toolset so it
+costs nothing elsewhere; defaults to the triggering message and emits ``message.reaction``
+for live painting."""
 
 import contextlib
 import json
@@ -24,8 +27,8 @@ def _gateway_platform():
 def _react_gateway(platform, emoji: str) -> str:
     from gateway.session_context import acknowledge_current_message_reaction
     from model_tools import _run_async
-    from tools.send_message_senders import _live_adapter
-    from tools.send_message_tool import _dispatch_on_gateway_loop
+    from gateway.outbound.senders import _live_adapter
+    from gateway.outbound.send import _dispatch_on_gateway_loop
 
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID")
@@ -166,4 +169,5 @@ registry.register(
         emoji=args.get("emoji", ""), message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back")),
     emoji="👍",
+    self_checked_args=("emoji",),  # no emoji retracts the reaction
 )
