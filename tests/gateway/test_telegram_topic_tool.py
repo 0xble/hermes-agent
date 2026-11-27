@@ -610,6 +610,45 @@ async def test_edit_icon_only_keeps_the_visible_name(home):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auto_icons", [False, True])
+async def test_an_explicit_icon_edit_reports_what_telegram_acknowledged(home, auto_icons):
+    """An explicit icon is sent whatever the auto/preserve icon policies say, and the result says
+    Telegram acknowledged it rather than implying the client now shows it."""
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter, auto_icons=auto_icons)
+    runner.config.platforms[Platform.TELEGRAM].extra["preserve_manual_topic_icons"] = True
+    await create_topic_session(runner, _source(), TopicSpec(name="Keep Me", icon="💡"))
+
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(icon="🧵"))
+
+    assert adapter.renamed[-1]["icon_custom_emoji_id"] == "icon-thread"
+    assert result["icon"] == "🧵" and result["icon_status"] == "accepted_by_telegram"
+    assert any("acknowledged" in warning and "old icon" in warning for warning in result["warnings"])
+    assert home.db.get_telegram_topic_icon_state(CHAT, "4242")["custom_emoji_id"] == "icon-thread"
+
+
+@pytest.mark.asyncio
+async def test_an_icon_edit_telegram_does_not_acknowledge_is_an_error_and_records_nothing(home):
+    """The real adapter returned True whatever editForumTopic answered, so a refused icon edit
+    reported success and was recorded as the topic's manual icon."""
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    await create_topic_session(runner, _source(), TopicSpec(name="Keep Me", icon="💡"))
+    before = home.db.get_telegram_topic_icon_state(CHAT, "4242")
+
+    bot = SimpleNamespace(edit_forum_topic=AsyncMock(return_value=False))
+    real = SimpleNamespace(_bot=bot, name="Telegram", _auto_topic_icons_written={}, _manual_topic_icons={})
+    adapter.rename_dm_topic = lambda **kwargs: TelegramAdapter.rename_dm_topic(real, **kwargs)
+
+    with pytest.raises(TopicRequestError, match="rejected"):
+        await edit_topic_session(runner, _source(), "4242", TopicSpec(icon="🧵"))
+
+    bot.edit_forum_topic.assert_awaited_once()
+    assert home.db.get_telegram_topic_icon_state(CHAT, "4242") == before
+    assert real._auto_topic_icons_written == {}
+
+
+@pytest.mark.asyncio
 async def test_a_model_edit_queues_during_a_turn_and_does_not_swap_the_live_agent(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
