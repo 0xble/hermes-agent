@@ -39,6 +39,9 @@ class TurnRetryState:
     image_shrink_retry_attempted: bool = False
     multimodal_tool_content_retry_attempted: bool = False
     reasoning_mandatory_retry_visit: int | None = None
+    # The one short same-route retry before a pending fallback takes over (fast-failover-on-capacity):
+    # spent per route visit, so each fallback route gets its own.
+    fast_failover_retry_visit: int | None = None
     oauth_1m_beta_retry_attempted: bool = False
     llama_cpp_grammar_retry_attempted: bool = False
 
