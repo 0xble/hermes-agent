@@ -43,15 +43,15 @@ def _reviewing(live):
 
 
 async def retire_idle(authority, session_id, live, target):
-    """Drop *live* when nothing pins it. Called with no await since the last check before it, and
-    with none inside: the FIFO read below and the removal are one step on the loop. Input committed
-    before that read shows as a queued row (or a worker as registered) and keeps the session; input
-    committing after it is followed by a loop-side ``_schedule``/``_publish_pending``, which
-    restores the conversation (``restore_retired``) before anything indexes it."""
+    """Drop *live* when nothing pins it. The off-loop FIFO read sees work committed before it;
+    recheck loop-owned pins after it, without yielding before removal. Input that schedules after
+    removal restores the conversation through ``_schedule``/``_publish_pending``."""
     if _pinned(authority, session_id, live):
         return False
     from gateway.session_viewer_close import _busy
     if await asyncio.to_thread(_busy, authority, session_id, target):
+        return False
+    if _pinned(authority, session_id, live):
         return False
     del authority.sessions[session_id]
     authority.launch_sources.pop(session_id, None)  # a cache: re-read from the row on demand

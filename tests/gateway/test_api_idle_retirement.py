@@ -5,6 +5,7 @@ so a ``LiveSession`` kept after the FIFO goes idle only pinned its event stream 
 the life of the process. Retirement must never strand an admission committed around it.
 """
 import asyncio
+import threading
 
 import pytest
 
@@ -61,6 +62,45 @@ async def test_api_admission_committed_after_its_session_retired_runs_with_its_o
         result, _ = await asyncio.wait_for(observe_api_turn(admitted), 10)
     assert result['final_response'] == 'ok:hello'
     assert seen == [int(controls)]  # the approval projection is attached to the session the turn runs on
+
+
+@pytest.mark.asyncio
+async def test_api_admission_wakes_a_drain_during_idle_retirement(api, owner, monkeypatch):
+    from gateway import session_viewer_close
+
+    loop = asyncio.get_running_loop()
+    probed = asyncio.Event()
+    release = threading.Event()
+    original_busy = session_viewer_close._busy
+
+    def pause_after_idle_probe(*args):
+        busy = original_busy(*args)
+        if not busy and not release.is_set():
+            loop.call_soon_threadsafe(probed.set)
+            assert release.wait(10), 'the idle probe was not released'
+        return busy
+
+    monkeypatch.setattr(session_viewer_close, '_busy', pause_after_idle_probe)
+    replies, sessions = [], []
+    _answer(owner, replies, lambda: sessions.append(owner.sessions.get('conv')))
+    first = admit_api_turn(api, session_id='conv', user_message='one', conversation_history=[])
+    live = owner.sessions['conv']
+    assert (await asyncio.wait_for(observe_api_turn(first), 10))[0]['final_response'] == 'ok:one'
+    drain = live.task
+    try:
+        await asyncio.wait_for(probed.wait(), 10)
+        # The idle read already returned false, but the drain has not acted on it. The second
+        # admission must wake this same drain, not let it retire the session on a stale read.
+        _, ref, _ = admit_api_turn(api, session_id='conv', user_message='two', conversation_history=[])
+        assert not drain.done()
+        owner._schedule(ref)
+        assert live.task is drain and live.rescan
+    finally:
+        release.set()
+    await asyncio.wait_for(drain, 10)
+    assert replies == ['one', 'two']
+    assert all(session is live for session in sessions)
+    assert 'conv' not in owner.sessions  # now the FIFO really is idle
 
 
 @pytest.mark.asyncio
