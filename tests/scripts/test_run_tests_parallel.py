@@ -47,6 +47,7 @@ def _probe_root(tmp_path):
     shutil.copy2(real / "run_tests_parallel.py", scripts)
     shutil.copy2(real / "run_tests_launch.py", scripts)
     shutil.copy2(real / "run_tests_fork_child.py", scripts)
+    shutil.copy2(real / "run_tests_timeout.py", scripts)
     # The runner shares the platforms() spec resolver with the CI lane selector.
     shutil.copy2(real / "ci" / "list_os_marked_tests.py", scripts / "ci")
     return root

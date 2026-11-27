@@ -14,7 +14,7 @@ def _cache_runner(tmp_path):
     # run_tests.sh sources the live-home guard library beside it, and that library runs
     # setup_guard.py, which imports hermes_constants and pm.environments.
     for relative in ("scripts/run_tests.sh", "scripts/run_tests_parallel.py", "scripts/run_tests_launch.py",
-                     "scripts/_activation.sh",
+                     "scripts/run_tests_timeout.py", "scripts/_activation.sh",
                      "scripts/_setup_guard.sh", "scripts/setup_guard.py", "hermes_constants.py",
                      "scripts/ci/list_os_marked_tests.py"):
         target = root / relative

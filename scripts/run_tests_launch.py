@@ -143,7 +143,7 @@ class _ForkedPytest:
 def start_pytest(
     file: Path, pytest_args: list[str], repo_root: Path, env: dict[str, str], scratch_dir: str,
 ) -> tuple[Any, int | None]:
-    """Start ``python -m pytest <file> <pytest_args>``; return it and its process group.
+    """Start a per-file pytest child; return it and its process group.
 
     The group is None on Windows, where the runner kills the tree another way.
     *scratch_dir* holds a forked child's output file until the runner reads it.
@@ -157,8 +157,12 @@ def start_pytest(
         # getpgid here: until setsid runs it reports the fork server's group,
         # which is the runner's own.
         return proc, proc.pid
+    command = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    if os.name == "posix":
+        bootstrap = Path(__file__).with_name("run_tests_timeout.py").resolve()
+        command = [sys.executable, str(bootstrap), env["TMPDIR"], "pytest", str(file), *pytest_args]
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pytest", str(file), *pytest_args],
+        command,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

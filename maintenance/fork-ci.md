@@ -238,7 +238,11 @@ relax an exit-code expectation. Regenerate prompt-surface fixtures through
 runner status and presence/absence of a terminal pytest summary on every failed
 attempt. A timed-out or crashed child with no parsed outcomes is reported as
 "NO TEST OUTCOMES RECOVERED", never asserted to have run no tests. Keep the
-failure-count headline and every cause bucket visible.
+failure-count headline and every cause bucket visible. On POSIX the runner asks
+only the pytest child for its thread and live asyncio task stacks before the
+existing deadline. The dump bypasses pytest capture and is included in timeout
+output; process-tree cleanup still runs at the hard cap. Asyncio stacks are
+best-effort if the main thread cannot run Python. Windows cleanup is unchanged.
 
 Update-finish fixtures copy the native `plugins` tree as well as core packages:
 bootstrap performs real registry discovery, so an incomplete fixture creates a
