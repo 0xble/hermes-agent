@@ -69,6 +69,10 @@ class WorkInProgress(RuntimeError):
     """Execution tokens must settle normally, not be transferred or discarded."""
 
 
+class UnreportableAssignment(RuntimeError):
+    """A task whose original reporting route cannot be reassigned; it is relayed to an owner instead."""
+
+
 def open_control(raw):
     """Use the inventory's terminal semantics for successor admission too."""
     return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped", "cancelled"}
@@ -121,6 +125,8 @@ async def inventory(runner, source, state) -> list[dict]:
         if not isinstance(tasks, list):
             raise RuntimeError("Task inventory returned an incomplete response")
         for task in tasks:
+            if state.get("handoffs", {}).get("task:" + str(task["id"]), {}).get("unassigned_task"):
+                continue  # Recorded and relayed; the ledger cannot reassign it, so it must not block.
             items.append({"id": "task:" + str(task["id"]), "kind": "task", "title": task["title"], "record": task})
     return items
 
@@ -163,7 +169,7 @@ def task_actor_args(actor):
 async def assign_task(runner, source, state, task_id, target, record=None):
     actor = record.get("assigned_by") if record else target
     if not actor or (record and actor != record.get("report_to")):
-        raise RuntimeError(f"Task {task_id} has no reportable original assignment")
+        raise UnreportableAssignment(f"Task {task_id} has no reportable original assignment")
     # External requesters keep their reporting route. A self-assigned task's
     # topic-local result belongs in the replacement topic, not the deleted one.
     origin = address(source, state["session_id"])
@@ -318,8 +324,17 @@ async def receipt(runner, source, state, item, dest):
                 return {"accepted_task_id": task_id, "address": target, "destination": dest}
     if handoff.get("receipt_id"):
         return await confirm_receipt(runner, source, handoff, dest)
-    await assign_task(runner, source, state, task_id, target,
-                      item["record"] if item["kind"] == "task" else None)
+    try:
+        await assign_task(runner, source, state, task_id, target,
+                          item["record"] if item["kind"] == "task" else None)
+    except UnreportableAssignment:
+        # The ledger cannot re-point this task's reporting route, and a precondition that cannot be
+        # met must not block deletion forever. Record the obligation and relay it as plain context.
+        body = (f"📦 Topic handoff (unassigned)\nTask {task_id} was open in the retiring topic but its "
+                "reporting assignment cannot be transferred. It stays in the task ledger; take ownership "
+                "of it from there. This note requests no reply.")
+        handoff["unassigned_task"] = task_id
+        return await send_receipt(runner, source, state, item, dest, body, ("--fyi",))
     # The full resumption context is already in the canonical ledger.
     body = f"📦 Topic handoff\nContinue task {task_id} from the retiring topic. Read its current ledger context before acting."
     return await send_receipt(runner, source, state, item, dest, body, ("--task", task_id))

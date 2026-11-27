@@ -27,6 +27,26 @@ _TRANSIENT_MARKERS = (
     "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
 )
 _TRANSIENT_RETRY_LIMIT = 6
+# Telegram can keep answering for a topic it just deleted. Read the exact topic back with backoff
+# before calling a delete unconfirmed (2026-11-26: 375507 and 426261 were deleted, then reported failed).
+_DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
+
+
+class DeleteUnconfirmed(RuntimeError):
+    """The delete was dispatched but the exact-topic readback has not shown it gone yet."""
+
+
+async def _confirm_deleted(bot, source, runner):
+    for delay in (0, *_DELETE_VERIFY_DELAYS):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            if await _probe_deleted(bot, source, runner=runner):
+                return True
+        except Exception as exc:
+            if _transient_delay(exc) is None:
+                raise
+    return False
 # A failed retirement is still a standing user request. Housekeeping re-runs it with the saved
 # decisions on a doubling backoff (2026-10-30: 28 topics sat "failed" after faults that had cleared
 # or been fixed, because only a new user request ever retried one). Exhausted retries stay failed.
@@ -405,7 +425,10 @@ async def advance(runner, source):
             if not state:
                 return
             if state.get("closing_attempt"):
-                raise RuntimeError("Closing delivery is unresolved. Cancel retirement before retrying.")
+                # An interrupted send (restart, cancellation) leaves no receipt. This lock proves no
+                # send is in flight, and the topic is deleted only after a fresh confirmed note, so
+                # the worst case is one repeated note. Needing a manual cancel stranded 379149.
+                logger.info("Resending the unconfirmed closing note for %s", key)
             state["closing_attempt"] = time.time()
             await save(runner, source, state)
             from gateway.telegram_retire_prepare import closing_note
@@ -436,13 +459,22 @@ async def advance(runner, source):
                     peer = await _cli_peer(bot, source)
                     await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
                               str(peer), str(source.thread_id))
-            if not await _probe_deleted(bot, source, runner=runner):
-                raise RuntimeError("Telegram still accepts messages in the topic after deletion")
+            if not await _confirm_deleted(bot, source, runner):
+                raise DeleteUnconfirmed("Telegram still accepts messages in the topic after deletion")
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
             raise
         except RetirementSuperseded:
             return
+        except DeleteUnconfirmed as exc:
+            # The delete was dispatched and the readback is only lagging. Never post into a topic that
+            # may be gone (it falls back to the chat root) or fail it: housekeeping keeps reading it back.
+            current = await _current(runner, source, generation)
+            if current:
+                current["phase"] = "delete_unresolved"
+                current["error"] = str(exc)
+                await save(runner, source, current)
+            logger.warning("Topic deletion for %s is not yet confirmed; reconciling read-only: %s", key, exc)
         except HandoffPending:
             # The receipt is durable. Housekeeping rechecks it without
             # repeating the handoff or treating a busy destination as failure.
@@ -491,9 +523,9 @@ async def advance(runner, source):
 
 
 def _retryable(state):
-    """Only failures recorded by this executor retry, and never one whose closing note may already
-    be in the topic: that unresolved send is a person's call."""
-    return bool(state.get("failed_at")) and not state.get("closing_attempt") and not state.get("closing_receipt")
+    """Only failures recorded by this executor retry, and never one with a confirmed closing note:
+    that topic may already be deleting. An unconfirmed attempt retries by sending the note again."""
+    return bool(state.get("failed_at")) and not state.get("closing_receipt")
 
 
 async def _auto_retry(runner, source, generation):

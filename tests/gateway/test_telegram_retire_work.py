@@ -1119,3 +1119,34 @@ async def test_cron_deleted_after_its_handoff_settles(runtime, monkeypatch):
     item = {"id": "cron:gone", "kind": "cron", "title": "Nightly digest", "record": {"id": "gone"}}
     await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unreportable_task_is_relayed_and_no_longer_blocks_retirement(runtime, monkeypatch):
+    """298502: 'no reportable original assignment' blocked deletion on every retry."""
+    r = runtime
+    record = {"id": "t1", "assignment_id": "a1", "assigned_by": "hermes:default/parent", "report_to": "hermes:default/other"}
+    item = {"id": "task:t1", "kind": "task", "title": "Pay", "record": record}
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    r.state["handoffs"][item["id"]] = {"item": item, "destination": dest, "moved": False}
+    sends = []
+
+    async def command(_runner, _source, *args, **_):
+        if "send" in args:
+            sends.append(args)
+            return {"id": "r1"}
+        assert args[:3] == ("relay", "--json", "status")
+        return {"id": "r1", "target": "hermes:default/next", "status": "delivered"}
+
+    monkeypatch.setattr(work, "cli", command)
+    sent = await work.receipt(r.runner, r.source, r.state, item, dest)
+    assert sent["receipt_id"] == "r1" and "--fyi" in sends[0]
+    assert r.state["handoffs"][item["id"]]["unassigned_task"] == "t1"
+    # The relayed task no longer appears as open work that points at the retiring topic.
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("tasks",)))
+
+    async def inventory_cli(_runner, _source, *args, **_):
+        return [] if "claims" in args else [record | {"title": "Pay"}]
+
+    monkeypatch.setattr(work, "cli", inventory_cli)
+    assert await work.inventory(r.runner, r.source, r.state) == []

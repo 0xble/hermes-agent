@@ -4,10 +4,13 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.wake import admit_internal_event
+from gateway.wake import WakeNotAccepted, admit_internal_event
 from gateway.telegram_topic_sessions import TopicRequestError
+
+logger = logging.getLogger(__name__)
 
 
 def validate_decision(existing, owners, generation):
@@ -97,7 +100,14 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
                   "gateway_session_strict": True, "retirement_generation": state["generation"]},
     )
     adapter = runner._delivery_adapter_for(source)
-    await admit_internal_event(adapter, event)
+    try:
+        await admit_internal_event(adapter, event)
+    except WakeNotAccepted as exc:
+        # The wake is a model turn, so the background-turn limit or max_concurrent_sessions can
+        # refuse it. That is "no slot yet", not a failed retirement: the saved waiting state stays,
+        # the fingerprint stays unrecorded, and housekeeping admits the wake again.
+        logger.info("Topic retirement preparation for %s waits for a free slot: %s", state["session_key"], exc)
+        return False
     admitted[key] = fingerprint
     return False
 

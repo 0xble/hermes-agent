@@ -712,3 +712,51 @@ async def test_a_retiring_topic_cannot_create_new_topics(runtime):
     await retire.request(runtime, runtime.source)
     with pytest.raises(TopicRequestError, match="retiring"):
         await create_topic_session(runtime, runtime.source, TopicSpec(name="Successor"))
+
+
+@pytest.mark.asyncio
+async def test_delete_readback_lag_is_retried_not_failed(setup_retire, monkeypatch):
+    """375507/426261: Telegram kept answering briefly after a real delete and the retire failed."""
+    runner, source, adapter, _ = setup_retire
+    sleeps = []
+    monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock(side_effect=lambda s: sleeps.append(s)))
+    probes = iter([False, False, True, True])
+    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(side_effect=lambda *a, **k: next(probes)))
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    assert (await retire.load(runner, source))["phase"] == "done"
+    assert sleeps == list(retire._DELETE_VERIFY_DELAYS[:2])
+    adapter._bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_delete_stays_recoverable_without_failure_post(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock())
+    gone = [False]
+    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(side_effect=lambda *a, **k: gone[0]))
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    state = await retire.load(runner, source)
+    assert state["phase"] == "delete_unresolved"
+    assert adapter.send.await_count == 1  # the closing note only, never a failure notice
+    gone[0] = True
+    await retire.advance(runner, source)
+    assert (await retire.load(runner, source))["phase"] == "done"
+    adapter._bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_closing_attempt_is_resent_and_recovers(setup_retire):
+    """379149: an interrupted send left closing_attempt and a manual cancel was required."""
+    runner, source, adapter, _ = setup_retire
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    state.update(phase="failed", failed_at=1.0, closing_attempt=1.0)
+    await retire.save(runner, source, state)
+    await retire.advance(runner, source)
+    state = await retire.load(runner, source)
+    assert state["phase"] == "done"
+    adapter.send.assert_awaited_once()
+    assert retire._retryable({"failed_at": 1.0, "closing_attempt": 1.0})
+    assert not retire._retryable({"failed_at": 1.0, "closing_receipt": {"message_id": "1"}})

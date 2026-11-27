@@ -202,3 +202,20 @@ async def test_incomplete_merge_returns_to_quiet_preparation(runtime, monkeypatc
     else:
         assert "Owner is unavailable" in event.text
     r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capped_preparation_wake_waits_and_is_readmitted(runtime):
+    """Burst: max_concurrent_sessions refused the wake; it must not be recorded as admitted."""
+    r = runtime
+    items = [{"id": "loop", "kind": "loop", "title": "Watch Service"}]
+    r.adapter.handle_message.side_effect = AsyncMock(side_effect=lambda event: None)
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert r.runner._telegram_retire_preparations == {}
+    assert (await load(r.runner, r.source))["phase"] == "waiting"
+
+    async def accept(event):
+        event._gateway_accepted = True
+    r.adapter.handle_message.side_effect = accept
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert len(r.runner._telegram_retire_preparations) == 1
