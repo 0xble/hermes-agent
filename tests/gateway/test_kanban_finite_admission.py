@@ -238,7 +238,7 @@ def test_kanban_card_fenced_unknown_across_owner_epochs_settles_interrupted(kanb
             assert (row['status'], row['outcome']) == ('terminal', 'interrupted'), row
             notices = [m['content'] for m in owner.authority.db.get_messages(sid)
                        if m.get('display_kind') == 'failed_turn']
-            assert notices and 'automat' in notices[0].lower(), notices
+            assert notices and notices[0].startswith('A Kanban card attempt was interrupted'), notices
         finally:
             await owner.close()
 

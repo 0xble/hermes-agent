@@ -104,6 +104,37 @@ def test_agent_close_owned_loop_skips_persisted_sessions(registry, monkeypatch):
     assert persisted.exited is False
 
 
+def test_agent_close_owned_loop_skips_handed_off_sessions(registry, monkeypatch):
+    """A process transferred to the parent must survive the child's final close even
+    when the child retains the process owner in its accumulated turn-owner set."""
+    from types import SimpleNamespace
+
+    from agent.client_lifecycle import ClientLifecycleMixin
+    import tools.process_registry as registry_module
+
+    handed = _make_session(sid="proc_handed", task_id="parent-turn")
+    volatile = _make_session(sid="proc_volatile", task_id="turn-1")
+    registry._running[handed.id] = handed
+    registry._running[volatile.id] = volatile
+    calls = _fake_kill_collector(registry)
+
+    agent = SimpleNamespace(
+        _process_owner_task_ids=("turn-1", "parent-turn"),
+        _handed_off_processes=[{"session_id": handed.id}],
+    )
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    import run_agent as ra
+    monkeypatch.setattr(ra, "cleanup_vm", lambda *a, **k: None)
+    monkeypatch.setattr(ra, "cleanup_browser", lambda *a, **k: None)
+    import tools.computer_use.tool as cu
+    monkeypatch.setattr(cu, "release_computer_use_session", lambda *a, **k: None)
+
+    ClientLifecycleMixin._close_task_resources(agent, "turn-1")
+
+    assert [c[0] for c in calls] == ["proc_volatile"]
+    assert handed.exited is False
+
+
 def test_agent_close_owned_loop_skips_survive_restart_sessions(registry, monkeypatch):
     """agent.close() must not kill a restart-surviving process before the shutdown sweep."""
     from types import SimpleNamespace

@@ -49,6 +49,17 @@ def test_quiet_one_shot_passes_turn_author_from_env(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "ok"
 
 
+def test_quiet_one_shot_marks_an_explicit_query_as_user(monkeypatch):
+    recorded = _run(monkeypatch, None)
+    assert recorded[0]["turn_origin"] == "user"
+
+
+def test_quiet_kanban_worker_is_not_marked_as_user(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "test-task")
+    recorded = _run(monkeypatch, None)
+    assert recorded[0].get("turn_origin") != "user"
+
+
 def test_quiet_one_shot_consumes_the_variable_before_the_turn(monkeypatch):
     """Tool subprocesses spawned during the turn must not see the dispatcher's author."""
     seen = {}
@@ -77,7 +88,8 @@ def test_quiet_one_shot_resumes_nested_notify_on_this_session_not_parent(monkeyp
     calls = []
 
     def run_conversation(**kwargs):
-        calls.append({"key": get_current_session_key(), "msg": kwargs["user_message"]})
+        calls.append({"key": get_current_session_key(), "msg": kwargs["user_message"],
+                      "origin": kwargs.get("turn_origin")})
         if len(calls) == 1:
             process_registry.completion_queue.put({
                 "type": "completion",
@@ -98,8 +110,9 @@ def test_quiet_one_shot_resumes_nested_notify_on_this_session_not_parent(monkeyp
                 "ask C",
             )
         assert exc.value.code == 0
-        assert calls[0] == {"key": "session-B", "msg": "ask C"}
+        assert calls[0] == {"key": "session-B", "msg": "ask C", "origin": "user"}
         assert calls[1]["key"] == "session-B"
+        assert calls[1]["origin"] != "user"
         assert "marker-from-C" in calls[1]["msg"]
         assert capsys.readouterr().out.strip() == "C said marker-from-C"
     finally:

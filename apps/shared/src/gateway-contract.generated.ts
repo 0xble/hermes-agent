@@ -3727,6 +3727,7 @@ export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
   text: string
+  human?: boolean
 }
 export interface SessionCorrectionResult {
   status: CorrectionStatus
@@ -4846,6 +4847,7 @@ export interface SessionPruneParams {
   filters?: Record<string, unknown> | null
   never_active_days?: number | null
   now?: boolean | null
+  max_seconds?: number | null
 }
 export interface SessionPruneResult {
   deleted: number
@@ -5342,6 +5344,7 @@ export interface CanonicalCorrectionParams {
   session_id: string
   execution_generation: number
   text: string
+  human?: boolean
 }
 /** ``session.steer`` / ``session.redirect``: the correction verdict, or ``{voice_stopped: true}`` when the busy-time text was a bare stop phrase that ended the LOCAL voice chat. */
 export type CanonicalCorrectionResult = CanonicalCorrectionAck | CanonicalVoiceStopped
@@ -5401,6 +5404,7 @@ export interface CanonicalSubmitParams {
   display_kind?: 'hidden' | null
   title_preview?: string | null
   turn_author?: CanonicalTurnAuthor | null
+  turn_origin?: string | null
   api_text?: string | null
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean

@@ -75,8 +75,13 @@ def _model_cfg_key_env_for(model_cfg: dict[str, Any], base_url: str) -> str:
     return _key_env_secret(model_cfg, "model")
 
 
+# Endpoint spellings a ``providers:`` entry may use, in precedence order. Offline route
+# identity (agent/route_binding.py) projects these, so it sees the endpoint runtime resolution uses.
+ENTRY_URL_KEYS = ("api", "url", "base_url")
+
+
 def _entry_url(entry: dict[str, Any]) -> str:
-    return entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+    return next((entry[key] for key in ENTRY_URL_KEYS if entry.get(key)), "")
 
 
 # ── field lifting shared by ``providers:`` and legacy ``custom_providers:`` entries ────────
@@ -119,6 +124,8 @@ def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *,
     if isinstance(extra_body, dict):
         result["extra_body"] = dict(extra_body)
     _lift_extra_headers(entry, result)
+    if entry.get("hermes_request_class") is True:
+        result["hermes_request_class"] = True
     if api_mode:
         result["api_mode"] = api_mode
 

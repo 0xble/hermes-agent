@@ -80,3 +80,5 @@ Revert the `Fork-Patch: mcp-caller-identity` commit. It touches only the files l
 above, the MCP docs (user guide, config reference, multi-profile note), this unit, and
 its index row. Servers configured with `caller_identity: true` then receive plain
 calls, and a server that requires the identity (relay) refuses them.
+
+Contract tests: `tests/tools/test_mcp_caller_identity.py`.

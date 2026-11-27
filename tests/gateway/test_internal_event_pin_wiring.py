@@ -275,9 +275,27 @@ async def test_eventless_followup_keeps_effective_prompt_through_next_human(
     pending_event, pending = await runner._run_agent_drain_pending(result, adapter, source, KEY)
     assert pending_event is None
     assert pending == "follow up"
-    await runner._run_agent_queued_followup(
-        turn_ctx, adapter, pending, pending_event, "done", result, None
-    )
+    from gateway.session_context import bound_turn_origin, set_turn_origin
+
+    run_agent = runner._run_agent
+    followup_origins = []
+
+    async def capture_followup(**kwargs):
+        followup_origins.append(bound_turn_origin())
+        return await run_agent(**kwargs)
+
+    head_origin = bound_turn_origin()
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_run_agent", capture_followup)
+        set_turn_origin("goal_loop")
+        try:
+            await runner._run_agent_queued_followup(
+                turn_ctx, adapter, pending, pending_event, "done", result, None
+            )
+            assert bound_turn_origin() == "goal_loop"
+        finally:
+            set_turn_origin(head_origin)
+    assert followup_origins == ["user"]
     await _drive(runner, ((False, source),), channel_prompt=channel_prompt)
 
     assert [call["channel_prompt"] for call in calls] == [channel_prompt] * 3

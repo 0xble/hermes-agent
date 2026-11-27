@@ -53,3 +53,5 @@ Retire when the selected upstream release passes these regressions without the
 local patch. Roll back by reverting the change. Activation must use native update
 and verify the receipt, live identity, and separate functional behavior. Backup
 locking and the bounded fleet verification window remain unchanged.
+
+Contract tests: `tests/hermes_cli/test_gateway_launchd_supervised_child.py`, `tests/hermes_cli/test_gateway_proc_fallback.py`, `tests/hermes_cli/test_update_launchd_unloaded_gateway.py`, `tests/hermes_cli/test_gateway.py`.

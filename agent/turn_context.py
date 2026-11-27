@@ -696,6 +696,7 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
     # Consecutive Codex reasoning-only (no answer, no tool call) responses, kept apart from
     # the aggregate incomplete count so a visible partial resets it (#67321).
     ("_codex_reasoning_only_streak", 0),
+    ("last_served_model", None),
     ("_thinking_prefill_retries", 0), ("_post_tool_empty_retried", False),
     ("_last_content_with_tools", None), ("_last_content_tools_all_housekeeping", False),
     ("_reused_response_text", None),
@@ -713,6 +714,7 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
     agent._turn_failed_file_mutations = {}
+    agent._fallback_attribution = None
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
@@ -1044,6 +1046,7 @@ def _bind_interrupt_scope(agent: Any, ra) -> None:
     else:
         agent._interrupt_message = None
         agent._tool_interrupt_reason = None
+        agent._interrupt_source = None
     agent._interrupt_thread_signal_pending = False
 
 
@@ -1287,6 +1290,14 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
+    # Endpoint failures are turn-local, including the primary-restore selector.
+    agent._turn_failed_endpoints = []
+    agent._turn_attempted_routes = []
+    agent._turn_attempted_route_labels = []
+    agent._turn_independent_attempt_used = False
+    agent._turn_independent_attempt_active = False
+    agent._turn_independent_attempt_requested = False
+    agent._turn_fallback_chain_exhausted = False
     agent._restore_primary_runtime()
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)

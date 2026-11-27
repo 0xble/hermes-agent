@@ -212,14 +212,15 @@ def _clean_model_option(index: int, entry: dict, stored: dict[str, dict],
     return row
 
 
-def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[dict], dict]) -> dict:
+def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[dict, dict], dict]) -> dict:
+    """Replace one backend block. *build* gets the stored block and the whole loaded config."""
     from hermes_cli.config import format_managed_message, is_managed
     if is_managed():
         raise _managed_install(format_managed_message(f"save delegation.backends.{backend}"))
     with config_write_scope(profile):
         config = load_config()
         blocks = _section(_section(config, "delegation"), "backends")
-        block = build(_mapping(blocks, backend))
+        block = build(_mapping(blocks, backend), config)
         blocks[backend] = block
         save_config(config)
         return block
@@ -228,7 +229,7 @@ def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[
 @router.put("/api/delegation/backends/model_map")
 async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[str] = None):
     """Replace ``delegation.backends.model_map`` (``options`` + ``default``) after validating every route."""
-    def _build(current: dict) -> dict:
+    def _build(current: dict, config: dict) -> dict:
         stored = {_text(o, "name"): o for o in current.get("options") or [] if isinstance(o, dict)}
         declared = next((tuple(b.get("route_keys") or ()) for b in _registered_backends() if b["name"] == MODEL_MAP), ())
         options = [_clean_model_option(i, dict(o), stored, declared) for i, o in enumerate(body.options)]
@@ -237,6 +238,18 @@ async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[st
         if duplicate:
             raise _bad_request(f"Two routes are named {duplicate!r}; route names must be unique.")
         block: dict[str, Any] = {"options": options}
+        from hermes_cli.config_value_checks import _validate_model_map_options
+        validation_issues: list[Any] = []
+        # Only an option that declares a chain is held to the bar; one without is left alone.
+        # Judged against the whole config with this block in place: a route's model is usually
+        # an alias name, and ``model_aliases`` lives at the config root.
+        delegation = _mapping(config, "delegation")
+        candidate = {**config, "delegation": {
+            **delegation, "backends": {**_mapping(delegation, "backends"), MODEL_MAP: block}}}
+        _validate_model_map_options(options, validation_issues, "delegation.backends.model_map", candidate)
+        if validation_issues:
+            first = validation_issues[0]
+            raise _bad_request(f"{first.message} Hint: {first.hint}")
         default = _check_default(body.default, names, "route")
         if default:
             block["default"] = default
@@ -251,7 +264,7 @@ async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[st
 async def save_profile_routes(body: DelegationProfileRoutesUpdate, profile: Optional[str] = None):
     """Replace ``delegation.backends.profile_routes`` (``profiles`` + ``default``); every name must be an
     existing profile."""
-    def _build(_current: dict) -> dict:
+    def _build(_current: dict, _config: dict) -> dict:
         known = set(_profile_names())
         profiles: list[dict[str, str]] = []
         names: list[str] = []

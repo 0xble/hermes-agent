@@ -55,3 +55,5 @@ Retire when released upstream behavior covers both deleted-ID invalidation and
 turn/topic status ownership, or when cleanup no longer deletes status bubbles.
 Remove only fork-only adapter and gateway hunks after proving equivalent tests;
 retain this unit while any other patch it tracks remains active.
+
+Contract tests: `tests/gateway/test_telegram_status_update.py`, `tests/gateway/test_slack_status_update.py`.

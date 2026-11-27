@@ -21,10 +21,29 @@ def _mid_turn_recovery_allowed(agent):
     """Return whether this route has a real provider-fallback recovery signal."""
     # A held shared record alone is not a signal: an expired record stays cached as a recovery
     # probe after the primary returns, so it can outlive the episode that armed it.
-    return bool(
-        getattr(agent, "_provider_fallback_active", False)
-        and getattr(agent, "_fallback_episode_cooled", False)
-    )
+    if not getattr(agent, "_provider_fallback_active", False):
+        return False
+    if getattr(agent, "_fallback_episode_cooled", False):
+        return True
+    # An episode that armed no cooldown has no deadline of its own. Without this bounded
+    # re-check it lasts the whole turn, which for a delegated child is its whole life.
+    from agent.fallback_route_recovery_uncooled import uncooled_recheck_due
+    return uncooled_recheck_due(agent)
+
+
+def _restore_primary_if_allowed(agent) -> bool:
+    """Run one permitted primary restore and record an uncooled re-check's outcome."""
+    if not _mid_turn_recovery_allowed(agent):
+        return False
+    uncooled = not getattr(agent, "_fallback_episode_cooled", False)
+    restored = False
+    try:
+        restored = bool(agent._restore_primary_runtime())
+    finally:
+        if uncooled:
+            from agent.fallback_route_recovery_uncooled import settle_uncooled_recheck
+            settle_uncooled_recheck(agent, restored=restored)
+    return restored
 
 
 def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
@@ -41,7 +60,7 @@ def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
         return active_system_prompt
     # Explicit route bindings (voice turns, /model --once, etc.) also use
     # _fallback_activated, but must remain pinned until their route ends.
-    # Uncooled 5xx/transport fallbacks have no mid-turn primary recovery signal.
+    # Uncooled 5xx/transport fallbacks recover only at their bounded re-check deadline.
     if not _mid_turn_recovery_allowed(agent):
         return active_system_prompt
     # restore_primary_runtime applies primary identity before rebuilding the client and reports a
@@ -54,7 +73,7 @@ def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     restored = False
     try:
-        restored = bool(agent._restore_primary_runtime())
+        restored = _restore_primary_if_allowed(agent)
     except Exception:
         logger.warning("Mid-turn primary restore failed; keeping fallback", exc_info=True)
     if not restored:
@@ -185,6 +204,8 @@ def _try_reclaim_earlier_fallback(agent, before_index):
             continue
         commit_fallback_route(agent, reservation)
         _finalize_fallback_route(agent, provider)
+        from agent.fallback_attribution import note_fallback
+        note_fallback(agent, bound[0], agent.model, provider, "recovery_recheck")
         agent._fallback_index = index + 1
         logger.debug("Returned to earlier fallback %s via %s", agent.model, provider)
         return True
@@ -217,13 +238,13 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     committed = False
     try:
-        if _mid_turn_recovery_allowed(agent) and agent._restore_primary_runtime():
+        if _restore_primary_if_allowed(agent):
             committed = True
             restored = getattr(agent, "_cached_system_prompt", None)
             return restored if isinstance(restored, str) else active_system_prompt
 
         # An active primary cooldown still blocks restoration; an uncooled
-        # failure has no mid-turn recovery signal. Retry only entries strictly
+        # failure waits for its own re-check deadline. Retry only entries strictly
         # earlier than the current one: stay expiry must never demote a route.
         agent._fallback_index = 0
         if _try_reclaim_earlier_fallback(agent, _active_entry_position(agent, previous_index)):

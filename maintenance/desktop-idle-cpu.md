@@ -61,3 +61,5 @@ During release reconciliation retain these cost bounds unless the adopted query
 plan and signature implementation independently satisfy the regression tests.
 Retire the patch when the accepted baseline supplies equivalent bounded work.
 Rollback by reverting the commit carrying `Fork-Patch: desktop-idle-cpu`.
+
+Contract tests: `tests/tui_gateway/test_change_watcher_sessions.py`, `tests/hermes_cli/test_session_skill_previews.py`, `tests/hermes_state/test_session_signature_triggers.py`, `tests/hermes_state/test_publication_rowcounts.py`, `tests/hermes_state/test_publication_wait_budget.py`.

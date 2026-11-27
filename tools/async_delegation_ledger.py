@@ -40,22 +40,12 @@ def _connect() -> sqlite3.Connection:
     from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
     if is_worker_process():
         raise WorkerPersistenceError('worker_delegation_ledger_unavailable')
-    from hermes_cli.sqlite_util import open_db
-    # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
-    # hardening so this writer doesn't create/leave the file (and its WAL
-    # sidecars) at the process umask. See hermes_state._secure_state_db_files.
-    from hermes_constants import mkdir_under_hermes_home
-    from hermes_state import _secure_state_db_files
-
-    path = _db_path()
-    # A late replay or writer must not resurrect a removed named profile (#123265).
-    mkdir_under_hermes_home(path.parent)
-    _secure_state_db_files(path, create_main=True)
-    # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
-    _secure_state_db_files(path)
-    return conn
+    from hermes_cli.sqlite_util import open_shared_state_db
+    # The ledger shares state.db with SessionDB: use its startup lock and tracked
+    # connector, rather than exposing an unprotected empty first-open inode.
+    # wal=False: SessionDB owns the journal mode (_initialize_schema applies the barriers).
+    return open_shared_state_db(_db_path(), db_label="state.db (async_delegation)",
+                                wal=False, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -94,11 +84,17 @@ def _transaction(*, immediate: bool = False):
 def _capture_routing_origin() -> dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
-    Best-effort: empty values are omitted."""
+    Empty ``thread_id`` is retained when a route is captured so a top-level
+    completion can clear a stale restored topic. Other empty values are omitted.
+    """
     from tools.async_delegation import _ROUTING_KEYS
     try:
         from gateway.session_context import get_session_env
-        return {k: v for k in _ROUTING_KEYS if (v := get_session_env(f"HERMES_SESSION_{k.upper()}", ""))}
+        values = {k: get_session_env(f"HERMES_SESSION_{k.upper()}", "") for k in _ROUTING_KEYS}
+        return {
+            k: v for k, v in values.items()
+            if v or (k == "thread_id" and values.get("platform") and values.get("chat_id"))
+        }
     except Exception:
         return {}
 

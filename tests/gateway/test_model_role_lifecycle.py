@@ -312,6 +312,20 @@ async def test_temporary_concrete_pick_expires_back_to_named_hold(lane, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_missing_user_config_keeps_persisted_role_alias_routable(lane, monkeypatch):
+    """Manual /compress omits a turn config, but stored role aliases still resolve from the profile."""
+    runner = lane.runner
+    await runner._set_session_model_role(lane.key, "fast")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: lane.cfg)
+
+    model, runtime = await runner._resolve_session_agent_runtime_async(
+        source=lane.source, session_key=lane.key,
+    )
+
+    assert (model, runtime["provider"]) == ("first", "provider-a")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bulk", [False, True], ids=["topic-edit", "bulk-conversion"])
 async def test_busy_role_assignment_waits_for_next_turn_but_config_stays_live(lane, monkeypatch, bulk):
     runner = lane.runner

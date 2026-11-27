@@ -234,6 +234,17 @@ def _derived_api_sessions(conn, session_ids):
         (json.dumps(list(session_ids)),))}
 
 
+def prunable_ids(conn, session_ids):
+    """Select whole idle conversations and their permanently fenced derived ids."""
+    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, session_ids)
+
+    def removable(sid):
+        whole = conversations.get(sid, (sid,))
+        return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
+    quiet = [sid for sid in session_ids if removable(sid)]
+    return quiet, derived | _derived_api_sessions(conn, quiet)
+
+
 def retire_prunable(conn, session_ids, *, defer_messages=False):
     """Sweep variant of :func:`retire_sessions`: fence the idle sessions and return only those ids.
     A session with live or unknown work is skipped, so one busy row cannot abort a whole
@@ -248,13 +259,7 @@ def retire_prunable(conn, session_ids, *, defer_messages=False):
     first unfenced id, so an aged-out marker would send the next turn back to the swept generation.
     A Bot Chat's mailbox receipts also outlive the horizon. A caller-named API id is not derived:
     its marker ages out, so the caller can use that id again, as for any other swept session."""
-    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, session_ids)
-
-    def removable(sid):
-        whole = conversations.get(sid, (sid,))
-        return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
-    quiet = [sid for sid in session_ids if removable(sid)]
-    derived |= _derived_api_sessions(conn, quiet)
+    quiet, derived = prunable_ids(conn, session_ids)
     retire_sessions(conn, quiet, expiring=[sid for sid in quiet if sid not in derived], defer_messages=defer_messages)
     return quiet
 
@@ -406,14 +411,21 @@ RETRY_HORIZON_S = 7 * 86400  # exact-retry horizon: a retry within it gets the b
 _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
 
 
-def _reclaim_expired(conn, prefix, cutoff):
+def _reclaim_expired(conn, prefix, cutoff, limit=None):
     """Drop the sweep (``expires``) markers under *prefix* retired before *cutoff*."""
-    conn.execute(f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires') "
-                 "AND json_type(value, '$.cleanup') IS NULL",
-                 (prefix + '*', cutoff))
+    params = (prefix + '*', cutoff)
+    sql = (f"SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires') "
+           "AND json_type(value, '$.cleanup') IS NULL")
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    keys = conn.execute(sql, params).fetchall()
+    for (key,) in keys:
+        conn.execute("DELETE FROM state_meta WHERE key=?", (key,))
+    return len(keys)
 
 
-def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
+def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
     """Reclaim deletion tombstones retired more than *older_than* seconds ago: the terminal admission
     with its identity pointer and compacted result, terminal workers and a sweep's (``expires``)
     retired-session marker or shared routing fence. A user delete's marker is the deletion fence itself and is never
@@ -421,17 +433,38 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
     re-admitted or reissued as a Bot Chat generation.
     Tombstones written before ``retired_at`` existed are stamped now and age from this pass."""
     from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
-    prefixes = (ADMISSION_PREFIX, WORKER_PREFIX)
+    reclaimed: dict[str, int] = {}
     now = time.time()
-    for prefix in prefixes:
-        conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key GLOB ? "
-                     "AND json_valid(value) AND json_extract(value, '$.retired_at') IS NULL", (now, prefix + '*'))
+    for prefix in (ADMISSION_PREFIX, WORKER_PREFIX):
+        params = (prefix + '*',)
+        sql = ("SELECT key FROM state_meta WHERE key GLOB ? AND json_valid(value) "
+               "AND json_extract(value, '$.retired_at') IS NULL")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (limit,)
+        for (key,) in conn.execute(sql, params).fetchall():
+            conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key=?", (now, key))
     cutoff = now - older_than
-    for key, raw in conn.execute(f'SELECT key,value FROM state_meta WHERE key GLOB ? AND {_EXPIRED}',
-                                 (ADMISSION_PREFIX + '*', cutoff)).fetchall():
+    params = (ADMISSION_PREFIX + '*', cutoff)
+    sql = f'SELECT key,value FROM state_meta WHERE key GLOB ? AND {_EXPIRED}'
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    admission_rows = conn.execute(sql, params).fetchall()
+    for key, raw in admission_rows:
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
-    conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
+    reclaimed[ADMISSION_PREFIX] = len(admission_rows)
+    params = (WORKER_PREFIX + '*', cutoff)
+    sql = f'SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED}'
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    worker_rows = conn.execute(sql, params).fetchall()
+    for (key,) in worker_rows:
+        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+    reclaimed[WORKER_PREFIX] = len(worker_rows)
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
-        _reclaim_expired(conn, prefix, cutoff)
+        reclaimed[prefix] = _reclaim_expired(conn, prefix, cutoff, limit=limit)
+    return reclaimed

@@ -49,3 +49,5 @@ shared per-chat slot and flood window (see [Telegram delivery](telegram-delivery
 
 **Retire** when an upstream release passes all three regressions without this patch.
 **Roll back** by reverting the logical patch. No configuration or persistent state.
+
+Contract tests: `tests/gateway/test_run_progress_topics.py`.

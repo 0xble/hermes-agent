@@ -211,10 +211,9 @@ async def operation(authority, name, params, actor=None):
         from gateway.session_runtime_workers import tracked_write
         if isinstance(ref, dict):
             # The creation commit waits on the writer off the owner loop, like session.create (N50).
-            from gateway.session_local_recovery import restore_local_session
             from hermes_state_local import commit_local_session
             await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
-            ref = restore_local_session(authority, ref['session_id'])
+            ref = await _restore_local_session_for_cron(authority, ref['session_id'], admission_gate=True)
         receipt = await tracked_write(authority, partial(
             admit_session_input, authority.db, epoch=authority.epoch, principal_id=actor.subject,
             session_id=ref.session_id, request_id=request_id, payload={'text': params['extra_prompt'] or ''},
@@ -224,8 +223,13 @@ async def operation(authority, name, params, actor=None):
     if set(params) != {'session_id', 'admission_id'} or name not in {'status', 'cancel'}:
         raise RuntimeStoreError('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
+    # Cron admissions are local sessions. Restore a cold local session through the async
+    # recovery path before authorization so a status/cancel poll never takes the store lock
+    # synchronously on the gateway event loop.
+    if ref.session_id not in authority.sessions:
+        await _restore_local_session_for_cron(authority, ref.session_id, admission_gate=False)
     authority.authorize(actor, ref, 'session:submit')
-    row = get_session_admission(authority.db, admission_id=params['admission_id'])
+    row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=params['admission_id'])
     from gateway.owner_identity import same_owner
     if row is None or row['target_session_id'] != ref.session_id or not same_owner(row['principal_id'], actor.subject):
         raise RuntimeStoreError('permission_denied')
@@ -242,13 +246,13 @@ async def operation(authority, name, params, actor=None):
     from cron.detached_authority import recover_detached
     if row['status'] in ('started', 'unknown', 'terminal') and await asyncio.to_thread(
             recover_detached, authority.db, authority.epoch, row):
-        row = get_session_admission(authority.db, admission_id=row['admission_id'])
+        row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
         if row is None:
             raise RuntimeStoreError('not_found')
     result, flags = None, {}
     if row['status'] == 'terminal':
         from gateway.session_results import admission_result
-        saved = admission_result(authority.db, row['admission_id'])
+        saved = await asyncio.to_thread(admission_result, authority.db, row['admission_id'])
         result = saved['result'].get('cron_result') if saved else None
         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
         if result is None:

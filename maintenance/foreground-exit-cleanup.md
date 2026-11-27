@@ -54,3 +54,5 @@ Linux-only; the mocked shutdown/ownership contracts also run on macOS.
 Retire only when the accepted upstream release fences graceful spawns, avoids
 host-wide descendant scans on shutdown, and these regressions pass without the
 fork implementation. No stored-state migration is involved.
+
+Contract tests: `tests/tools/test_local_interrupt_cleanup.py`, `tests/tools/test_local_shutdown_kill.py`.

@@ -23,11 +23,11 @@ class FakeAgent:
         self.redirects = []
         self.runs = []
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         self.steers.append(text)
         return True
 
-    def redirect(self, text):
+    def redirect(self, text, *, human=True):
         self.redirects.append(text)
         return True
 

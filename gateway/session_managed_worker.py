@@ -77,8 +77,8 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
         **({'display_v1': row['payload']['display_v1']} if row['payload'].get('display_v1') else {})})
     from gateway.session_worker_construct import construct_inputs
     request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id)
-    config = _worker_config(authority, policy)
-    hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
+    config, model = _worker_config_and_model(authority, policy)
+    hydrated = replace(policy, model=model, config_json=json.dumps(config), request_json=json.dumps(request),
                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
             'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
@@ -90,21 +90,26 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
 
 
 def _worker_config(authority, policy):
-    """The frozen session config the child binds as its only config (``bind_worker_policy``).
+    """The frozen session config dict alone (see ``_worker_config_and_model``)."""
+    return _worker_config_and_model(authority, policy)[0]
+
+
+def _worker_config_and_model(authority, policy):
+    """``(config, model)``: the frozen session config the child binds as its only config (``bind_worker_policy``).
     ``command_allowlist`` is approval state rather than launch policy: an ``always`` grant an
     earlier worker of an ordinary session persisted, or one the operator removed by hand, comes
     from the live profile file, as it did before the child's config was frozen. Bypass sessions
     never read the profile."""
-    config = policy.config(authority)
+    config, model = policy.effective(authority)
     home = Path(str(authority.profile_id))
     if policy.ignore_user_config or not home.is_absolute():
-        return config
+        return config, model
     from gateway.run import _load_gateway_config
     live = _load_gateway_config(home / 'config.yaml')
     config.pop('command_allowlist', None)
     if live.get('command_allowlist') is not None:
         config['command_allowlist'] = live['command_allowlist']
-    return config
+    return config, model
 
 
 def _session_yolo(authority, route, policy):
@@ -231,7 +236,7 @@ class ManagedWorker:
     def control(self, frame):
         if self.closed.is_set():
             raise RuntimeStoreError('managed_worker_lost')
-        if frame == {'type': 'stop'}:
+        if frame.get('type') == 'stop':
             if self.stopped_at is None:
                 self.stopped_at = time.monotonic()
             self.stop.set()

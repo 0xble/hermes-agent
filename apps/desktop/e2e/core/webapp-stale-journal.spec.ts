@@ -198,18 +198,22 @@ async function phoneDiesMidTurn(browser: Browser, sandbox: CoreSandbox, provider
  *  first newest-page transcript read the reopened renderer makes for the chat. */
 async function phoneReopens(phone: Phone, sandbox: CoreSandbox): Promise<{ tab: Page; newestPage: Promise<string> }> {
   const tab = await phone.context.newPage()
-  await tab.goto(webappLaunchLink(sandbox))
-  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
+  // Listen before the launch: the renderer may restore this chat while it signs in, so a
+  // listener armed afterwards can miss the read (nightly 45874314957). The window now spans
+  // the launch too, so it is the composer's 180 s plus the original 60 s after it.
   const newestPage = tab
     .waitForResponse(
       response =>
         response.url().includes(`/sessions/${encodeURIComponent(phone.sessionId)}/messages?`) &&
         response.url().includes('order=latest'),
-      { timeout: 60_000 }
+      { timeout: 240_000 }
     )
     .then(response => response.text())
     .catch(() => '')
+
+  await tab.goto(webappLaunchLink(sandbox))
+  await expect(composer(tab)).toBeVisible({ timeout: 180_000 })
 
   await tab.evaluate(id => {
     window.location.hash = `#/${encodeURIComponent(id)}`
@@ -233,15 +237,24 @@ async function withWebapp(
   const sandbox = createCoreSandbox(label)
   writeProviderHome(sandbox.hermesHome, provider.url)
   // todo_list is deferred behind tool_search by default; the scripted model calls it directly.
+  // The 4 x 32 tool rounds cross the 64k sandbox window's compaction threshold mid-turn, and the
+  // compacted transcript re-keys the scripted turn (run 45783683759). Journal replay is this spec's
+  // contract; lineage-compaction-prompt.spec.ts owns compaction inside a turn.
   fs.appendFileSync(
     path.join(sandbox.hermesHome, 'config.yaml'),
-    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n`
+    `\nwebapp:\n  enabled: true\n  port: ${await freePort()}\ntools:\n  tool_search:\n    defer: []\n` +
+      `compression:\n  enabled: false\n`
   )
   let browser: Browser | null = null
+  let failed = false
 
   try {
     browser = await chromium.launch({ executablePath: process.env.HERMES_E2E_CHROMIUM || undefined })
     await body(sandbox, provider, browser)
+  } catch (error) {
+    failed = true
+
+    throw error
   } finally {
     await browser?.close().catch(() => undefined)
 
@@ -254,7 +267,32 @@ async function withWebapp(
     }
 
     await provider.close()
-    sandbox.cleanup()
+
+    try {
+      keepGatewayLogsOnFailure(sandbox, failed)
+    } catch (error) {
+      // Best-effort diagnostics: never replace the test's own failure or skip cleanup.
+      console.warn('could not keep the gateway logs', error)
+    } finally {
+      sandbox.cleanup()
+    }
+  }
+}
+
+// The sandbox is deleted on cleanup, taking the gateway's own account of a stalled turn with it.
+// Copy its logs into the test's output directory, which CI uploads on failure. test.info().status
+// still reads 'passed' inside the body, so the caller reports the failure.
+function keepGatewayLogsOnFailure(sandbox: CoreSandbox, failed: boolean) {
+  if (!failed) {
+    return
+  }
+
+  const info = test.info()
+
+  const logs = path.join(sandbox.hermesHome, 'logs')
+
+  if (fs.existsSync(logs)) {
+    fs.cpSync(logs, info.outputPath('gateway-logs'), { recursive: true })
   }
 }
 

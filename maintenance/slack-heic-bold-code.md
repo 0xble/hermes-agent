@@ -23,3 +23,5 @@ Retire the cache part when released upstream accepts HEIC/AVIF at the image cach
 ## Rollback
 
 Revert the `fix(slack): read HEIC screenshots…` and `fix(slack): stop blaming Slack permissions…` commits. No state or configuration changes.
+
+Contract tests: `tests/gateway/test_async_media_cache.py`, `tests/gateway/test_slack_block_kit.py`, `tests/plugins/platforms/slack/test_download_failure_diagnosis.py`.

@@ -39,6 +39,8 @@ SYSTEM_INTERRUPT_MESSAGES = frozenset({
     "gateway restarting",
     "session turn lease lost; stopping to protect the transcript.",
     "session turn lease could not be refreshed; stopping to protect the transcript.",
+    "profile runtime is stopping",
+    "profile stopping",
 })
 
 
@@ -53,8 +55,19 @@ def interrupt_issuer(agent) -> Optional[str]:
     """Slug of the system producer behind the pending interrupt, or ``None`` for a human stop."""
     reason = getattr(agent, "_tool_interrupt_reason", None)
     if not reason or reason in USER_INTERRUPT_REASONS:
-        return None
+        source = getattr(agent, "_interrupt_source", None)
+        return str(source).strip().replace(" ", "_") if source else None
     return str(reason).strip().replace(" ", "_")
+
+
+def stamp_interrupt_result(agent, result: dict, interrupted: bool) -> None:
+    """Copy the interrupt cause into the finalized result, including message-less system stops."""
+    if not interrupted:
+        return
+    if agent._interrupt_message:
+        result["interrupt_message"] = agent._interrupt_message
+    if issuer := interrupt_issuer(agent):
+        result["interrupt_source"] = issuer
 
 
 def interrupt_skip_wording(agent) -> str:
@@ -191,12 +204,15 @@ class InterruptControlMixin:
 
     def interrupt(
         self, message: Optional[str] = None, *, hard_cancel: bool = False,
-        tool_reason: Optional[str] = None, require_generation: Optional[int] = None,
+        tool_reason: Optional[str] = None, interrupt_source: Optional[str] = None,
+        require_generation: Optional[int] = None,
     ) -> bool:
         """Request the agent to interrupt its current tool-calling loop (call from another thread).
 
         ``hard_cancel``: explicit stop; compression may honor it even while ordinary interrupts are masked.
-        ``tool_reason``: trusted fixed category safe for tool output. ``require_generation``: activity-
+        ``tool_reason``: trusted fixed category safe for tool output. ``interrupt_source``: trusted
+        producer class that prevents the message from being replayed as a user follow-up.
+        ``require_generation``: activity-
         generation claim — published only if the turn's generation still matches at the final mutation edge;
         returns False if the turn resumed meanwhile.
         """
@@ -217,15 +233,19 @@ class InterruptControlMixin:
             (tool_reason or _REASON_HARD_STOP) if hard_cancel
             else (tool_reason or (_REASON_NEW_MESSAGE if message else _REASON_USER_INTERRUPT))
         )
+        _interrupt_source = interrupt_source or (
+            "system" if tool_reason is not None and tool_reason not in USER_INTERRUPT_REASONS else None
+        )
 
         def _publish_interrupt_state() -> None:
-            # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
-            # records the first cause, so it is not announced as interrupted by the restart. A pending
-            # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
-            if not (tool_reason == _REASON_GATEWAY_SHUTDOWN and getattr(self, "_interrupt_requested", False)
+            # A shutdown or other system stop never relabels a pending user Stop or message (the user
+            # wins): the turn records the first cause, so the user's text stays a durable follow-up.
+            if not ((tool_reason == _REASON_GATEWAY_SHUTDOWN or _interrupt_source == "system")
+                    and getattr(self, "_interrupt_requested", False)
                     and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
                 self._interrupt_message = message
                 self._tool_interrupt_reason = tool_interrupt_reason
+                self._interrupt_source = _interrupt_source
             self._interrupt_requested = True
             self._turn_user_intervened = True
             # The turn record and the log must agree on WHO asked for the stop (#112647).
@@ -291,6 +311,7 @@ class InterruptControlMixin:
                 if hard_cancel:
                     request_hard_interrupt(
                         child, message, tool_reason=tool_interrupt_reason,
+                        interrupt_source=getattr(self, "_interrupt_source", None),
                         delegation_reason=getattr(self, "_delegation_interrupt_reason", None))
                 else:
                     child.interrupt(message)
@@ -300,11 +321,13 @@ class InterruptControlMixin:
             self._safe_print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
         return True
 
-    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None) -> None:
+    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None,
+                       interrupt_source: Optional[str] = None) -> None:
         """Explicit stop preserving the ``interrupt()`` ABI (frontends feature-detect this and fall back to
         legacy ``interrupt()`` for third-party agents). Bypasses dynamic dispatch: legacy subclasses may
         override interrupt(message=None) without hard_cancel."""
-        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason)
+        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason,
+                                        interrupt_source=interrupt_source)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False, hard_cancel: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal. ``preserve_redirect`` is only for the
@@ -319,7 +342,7 @@ class InterruptControlMixin:
             if preserve_redirect and not _ic_slot(self, "_pending_redirect_lock", "_pending_redirect"):
                 return False
             self._interrupt_requested = False
-            self._interrupt_message = self._tool_interrupt_reason = None
+            self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
@@ -338,21 +361,26 @@ class InterruptControlMixin:
                 _set_steer_parts(self, [])
         return True
 
-    def steer(self, text: str, *, ticket=None, on_delivered: Optional[Callable[[], None]] = None) -> bool:
-        """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
-        ``on_delivered`` runs only when this submission is inserted into the running turn."""
+    def steer(
+        self, text: str, *, ticket=None, on_delivered: Optional[Callable[[], None]] = None,
+        human: bool = True,
+    ) -> bool:
+        """Queue text for delivery as its own user row after the current tool batch finishes (no
+        interrupt); multiple calls concatenate with newlines. ``human`` identifies a real user
+        intervention; unclassified callers default to True so pacing fails open."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            # A consumer must see the intervention flag before it can drain the human text.
+            if human:
+                self._turn_user_intervened = True
             _set_steer_parts(self, _steer_parts(self) + [_SteerPart(ticket, cleaned, on_delivered)])
-        # The turn no longer ran on its own (first-task-done detection reads this off the result).
-        self._turn_user_intervened = True
         return True
 
-    def redirect(self, text: str, *, on_delivered: Optional[Callable[[], None]] = None) -> bool:
+    def redirect(
+        self, text: str, *, on_delivered: Optional[Callable[[], None]] = None, human: bool = True,
+    ) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
@@ -369,7 +397,8 @@ class InterruptControlMixin:
             try:
                 accepted = bool(_native_steer(cleaned))
                 if accepted:
-                    self._turn_user_intervened = True
+                    if human:
+                        self._turn_user_intervened = True
                     if on_delivered is not None:
                         on_delivered()
                 return accepted
@@ -382,8 +411,8 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = (self.steer(cleaned, on_delivered=on_delivered)
-                        if on_delivered is not None else self.steer(cleaned))
+            accepted = (self.steer(cleaned, on_delivered=on_delivered, human=human)
+                        if on_delivered is not None else self.steer(cleaned, human=human))
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -406,7 +435,8 @@ class InterruptControlMixin:
             )
             self._interrupt_requested = True
             self._interrupt_message = None
-            self._turn_user_intervened = True
+            if human:
+                self._turn_user_intervened = True
 
         # Interrupt only the model request — no fan-out to tool workers / child agents as interrupt() does.
         _execution_thread_id = getattr(self, "_execution_thread_id", None)

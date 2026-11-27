@@ -37,6 +37,7 @@ def snapshot_refusal(backend, handle, meta, page_origin):
     Only a backend with its own context is re-read (the built-in managers' metadata read is a full
     listing, and their default context freezes nothing)."""
     from agent.vault_backends.base import LoginBackend
+    from agent.vault_store import origin_matches_lookup
 
     if type(backend).fill_context is LoginBackend.fill_context:
         return None
@@ -44,7 +45,8 @@ def snapshot_refusal(backend, handle, meta, page_origin):
 
     fresh = backend.get_meta(handle)
     fresh = apply_origin_aliases([fresh])[0] if fresh is not None else None
-    if fresh is not None and fresh.kind == meta.kind and page_origin in saved_origins(fresh):
+    if fresh is not None and fresh.kind == meta.kind and any(
+            origin_matches_lookup(saved, page_origin, kind=meta.kind) for saved in saved_origins(fresh)):
         return None
     return {"success": False, "error_type": "origin_mismatch",
             "error": (f"Refused: the saved item changed before the fill and no longer binds {page_origin}. "

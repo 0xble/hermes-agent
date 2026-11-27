@@ -3,9 +3,97 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
+
+# Minimum chain policy is shared by config validation and web-route writes.
+MIN_FALLBACK_ENTRIES = 3
+MIN_UPSTREAM_FAMILIES = 3
+
+# Model names are more reliable than a provider label when a local proxy multiplexes
+# several vendors (for example muse-* is Meta behind custom:openai-proxy).
+_MODEL_UPSTREAM_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("gpt", "openai"), ("o1", "openai"), ("o3", "openai"),
+    ("o4", "openai"), ("o-series", "openai"), ("codex", "openai"),
+    ("muse", "meta"), ("llama", "meta"),
+    ("grok", "xai"), ("gemini", "google"), ("gemma", "google"),
+    ("mistral", "mistral"), ("mixtral", "mistral"), ("deepseek", "deepseek"),
+    ("qwen", "alibaba"), ("kimi", "moonshot"), ("minimax", "minimax"),
+)
+# First-party provider ids whose vendor is known even when the model name is not. Read before
+# alias collapse: ``openai`` is also a legacy alias of an aggregator id.
+_PROVIDER_UPSTREAM_FAMILIES = {
+    "openai": "openai", "openai-codex": "openai", "anthropic": "anthropic",
+    "xai": "xai", "xai-oauth": "xai", "meta": "meta",
+}
+
+
+def infer_upstream_family(provider: Any, model: Any, explicit: Any = None) -> str:
+    """Upstream family of one concrete route: *explicit*, else the model name, else the provider.
+
+    The single resolver behind config validation and the spare-route guards, so both judge a
+    route the same way. A vendor segment is dropped before the model name is read
+    (``anthropic/claude-x`` on an aggregator is Anthropic, not the aggregator). No alias is
+    expanded here; :func:`upstream_family` does that first for config routes.
+    """
+    declared = str(explicit or "").strip().lower()
+    if declared:
+        return declared
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    for prefix, family in _MODEL_UPSTREAM_PREFIXES:
+        if name.startswith(prefix):
+            return family
+    provider_id = str(provider or "").strip().lower()
+    if provider_id in _PROVIDER_UPSTREAM_FAMILIES:
+        return _PROVIDER_UPSTREAM_FAMILIES[provider_id]
+    # _normalize_provider_id already degrades to the bare lowercase id when it cannot load.
+    return _normalize_provider_id(provider_id) or f"model:{name}"
+
+
+def _resolved_route(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return a route copy with model aliases expanded for identity/family checks."""
+    item = dict(route or {})
+    model = str(item.get("model") or "").strip()
+    if model:
+        from hermes_cli.model_alias_runtime import resolve_model_alias
+        try:
+            resolved = resolve_model_alias(model, config or {})
+        except Exception:
+            # Config validation runs at every startup and must never fail on one route's alias.
+            # An unresolvable alias is reported by validation as the malformed route it is;
+            # identity and family checks fall back to the name as written.
+            logger.debug("Fallback route alias %r did not resolve", model, exc_info=True)
+            return item
+        if resolved.name and resolved.model:
+            item["model"] = resolved.model
+            if not item.get("provider") and resolved.provider:
+                item["provider"] = resolved.provider
+            if not item.get("base_url") and resolved.base_url:
+                item["base_url"] = resolved.base_url
+    return item
+
+
+def upstream_family(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> str:
+    """Resolve the independent upstream family for a route.
+
+    An explicit ``upstream`` wins. Otherwise aliases are expanded before model-name
+    inference; provider labels are only the final fallback for unknown model names.
+    """
+    item = _resolved_route(route, config)
+    return infer_upstream_family(item.get("provider"), item.get("model"), item.get("upstream"))
+
+
+def route_identity(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> tuple[str, str, str]:
+    """Canonical provider/model/base-url identity, after model-alias expansion."""
+    item = _resolved_route(route, config)
+    return (
+        _normalize_provider_id(str(item.get("provider") or "").strip()).lower(),
+        str(item.get("model") or "").strip().lower(),
+        _normalized_base_url(item.get("base_url")).lower(),
+    )
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -121,6 +209,24 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
         str(entry.get("model") or "").strip().lower(),
         _normalized_base_url(entry.get("base_url")).lower(),
     )
+
+
+def same_fallback_model(requested: str, candidate: str) -> bool:
+    """Exact model identity, allowing the conventional Anthropic Claude namespace.
+
+    Don't infer equivalence from a vendor/family prefix, strip version or tier suffixes,
+    or case-fold opaque custom model IDs.
+    """
+    requested, candidate = requested.strip(), candidate.strip()
+    return bool(requested and candidate) and (
+        requested == candidate
+        or (requested.startswith("anthropic/claude-") and requested.removeprefix("anthropic/") == candidate)
+        or (candidate.startswith("anthropic/claude-") and candidate.removeprefix("anthropic/") == requested)
+    )
+
+
+def same_model_fallbacks(chain: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    return [entry for entry in chain if same_fallback_model(model, str(entry.get("model") or ""))]
 
 
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:

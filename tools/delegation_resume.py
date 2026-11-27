@@ -31,8 +31,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,12 @@ INELIGIBLE_PARTIAL = "partial_results_recorded"
 INELIGIBLE_STATELESS = "stateless_origin"
 INELIGIBLE_CLAIMED = "already_claimed"
 INELIGIBLE_SEALED = "execution_sealed"
+
+
+class RetrySweepDeferred(list):
+    """An empty sweep result whose busy deferral remains visible to the gateway owner."""
+
+    busy = True
 
 
 def _ad():
@@ -918,23 +926,106 @@ def classify_armed(*, now: Optional[float] = None, limit: int = 64) -> int:
     """Classify terminal rows still ``armed`` (owner died, classification crashed, or a restart)."""
     ad = _ad()
     now = time.time() if now is None else now
-    with ad._DB_LOCK, ad._transaction() as conn:
-        armed = [r[0] for r in conn.execute(
-            """SELECT delegation_id FROM async_delegations WHERE retry_state='armed'
-               AND state NOT IN ('new','queued','admitted','running','stalling','finalizing') LIMIT ?""", (limit,))]
-        # A successful result whose delivery was permanently dropped still owes the user one line.
-        conn.execute(
-            f"""UPDATE async_delegations SET retry_state='terminal', retry_reason=?, retry_due_at=NULL, updated_at=?
-               WHERE retry_state='none' AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})
-                 AND (delivery_state='dropped' OR EXISTS (
-                      SELECT 1 FROM async_delegation_events e
-                      WHERE e.delegation_id=async_delegations.delegation_id
-                        AND e.event_kind='terminal_fallback' AND e.delivery_state='dropped'))""",
-            (RESULT_UNDELIVERABLE, now, *SUCCESS_REASONS))
+    try:
+        with ad._DB_LOCK, ad._transaction() as conn:
+            armed = [r[0] for r in conn.execute(
+                """SELECT delegation_id FROM async_delegations WHERE retry_state='armed'
+                   AND state NOT IN ('new','queued','admitted','running','stalling','finalizing') LIMIT ?""", (limit,))]
+            dropped_where = f"""retry_state='none' AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})
+                     AND (delivery_state='dropped' OR EXISTS (
+                          SELECT 1 FROM async_delegation_events e
+                          WHERE e.delegation_id=async_delegations.delegation_id
+                            AND e.event_kind='terminal_fallback' AND e.delivery_state='dropped'))"""
+            dropped = [r[0] for r in conn.execute(
+                f"SELECT delegation_id FROM async_delegations WHERE {dropped_where} LIMIT ?",
+                (*SUCCESS_REASONS, limit))]
+            if dropped:
+                conn.execute(
+                    f"""UPDATE async_delegations SET retry_state='terminal', retry_reason=?, retry_due_at=NULL, updated_at=?
+                        WHERE delegation_id IN ({",".join("?" for _ in dropped)}) AND {dropped_where}""",
+                    (RESULT_UNDELIVERABLE, now, *dropped, *SUCCESS_REASONS))
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            raise
+        return 0
     for delegation_id in armed:
         schedule_retry(delegation_id, now=now)
     return len(armed)
 
+
+def _retry_candidate_ids(conn, now: float, limit: int) -> list[str]:
+    """Read retry candidates without opening a writer transaction."""
+    stale = now - RETRY_CLAIM_TTL_S
+    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
+    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
+             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
+             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
+             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
+           AND (event_json IS NULL OR delivery_state != 'pending')
+           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
+                           WHERE e.delegation_id=async_delegations.delegation_id
+                             AND e.delivery_state='pending')
+           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                           json_extract(result_json, '$.cut_reason')))
+                    AND (delivery_state='delivered' OR retry_notices > 0)
+                    AND retry_state IN ('scheduled','notified')
+                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+           """
+    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
+    return [row[0] for row in conn.execute(
+        "SELECT delegation_id FROM async_delegations" + where + " ORDER BY updated_at ASC LIMIT ?",
+        (*params, limit)).fetchall()]
+
+
+def _claimable_retry_rows(conn, now: float, limit: int, candidate_ids=None) -> list:
+    """Re-read and claim only selected ids after acquiring the writer transaction."""
+    stale = now - RETRY_CLAIM_TTL_S
+    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
+    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
+             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
+             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
+             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
+           AND (event_json IS NULL OR delivery_state != 'pending')
+           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
+                           WHERE e.delegation_id=async_delegations.delegation_id
+                             AND e.delivery_state='pending')
+           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                           json_extract(result_json, '$.cut_reason')))
+                    AND (delivery_state='delivered' OR retry_notices > 0)
+                    AND retry_state IN ('scheduled','notified')
+                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+           """
+    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
+    if candidate_ids is None:
+        candidate_ids = _retry_candidate_ids(conn, now, limit)
+    if not candidate_ids:
+        return []
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    return conn.execute(
+        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidate_ids)})"
+        + " ORDER BY updated_at ASC", (*params, *candidate_ids)).fetchall()
+
+
+
+def _read_retry_candidate_ids(ad, now: float, limit: int) -> list[str]:
+    """Read retry candidates through a deferred transaction before writer admission."""
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return _retry_candidate_ids(conn, now, limit)
+
+
+@contextmanager
+def _best_effort_retry_transaction(ad):
+    """Yield no connection when the idle sweep cannot begin under writer contention."""
+    with ExitStack() as stack:
+        try:
+            conn = stack.enter_context(ad._transaction(immediate=True))
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            yield None
+            return
+        yield conn
 
 def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     """Claim due retry work only after the original completion/outbox delivery settles.
@@ -946,25 +1037,11 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     now = time.time() if now is None else now
     classify_armed(now=now, limit=limit)
     actions = []
-    stale = now - RETRY_CLAIM_TTL_S
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
-        rows = conn.execute(
-            _RETRY_SELECT + """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
-                 OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
-                 OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
-                 OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
-               AND (event_json IS NULL OR delivery_state != 'pending')
-               AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
-                               WHERE e.delegation_id=async_delegations.delegation_id
-                                 AND e.delivery_state='pending')
-               AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
-                                               json_extract(result_json, '$.cut_reason')))
-                        AND (delivery_state='delivered' OR retry_notices > 0)
-                        AND retry_state IN ('scheduled','notified')
-                        AND COALESCE(retry_root_started_at, dispatched_at) > ?)
-               ORDER BY updated_at ASC LIMIT ?""",
-            (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
+    candidate_ids = _read_retry_candidate_ids(ad, now, limit)
+    with ad._DB_LOCK, _best_effort_retry_transaction(ad) as conn:
+        if conn is None:
+            return RetrySweepDeferred()
+        rows = _claimable_retry_rows(conn, now, limit, candidate_ids)
         for row in rows:
             record = _retry_record(row)
             # An execution seal blocks recovery work, not an already-owed

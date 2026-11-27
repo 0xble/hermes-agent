@@ -816,7 +816,7 @@ def _cmd_steer(rid, params, session, name, arg):
     agent = session.get("agent")
     if agent and hasattr(agent, "steer"):
         with contextlib.suppress(Exception):
-            if agent.steer(arg):
+            if agent.steer(arg, human=True):
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
     return _ok(rid, {"type": "send", "message": arg})  # turn still building / steer refused: next-turn message
 

@@ -668,9 +668,11 @@ display:
 ```
 
 The mode is part of a session's tool schema, which is pinned with the conversation. A
-change to `gateway_mode` or to `interim_assistant_messages` applies from the next session
-(`/new`). A running chat keeps the mode it started with across gateway restarts, agent
-cache evictions, context compaction and `/reload-mcp`. A scheduled heartbeat turn mutes
+change to `gateway_mode` converges at the next prompt-refresh or context-compaction boundary
+when the key is explicitly present in `config.yaml`; the effective interim setting is read
+at that same boundary. Other changes to `interim_assistant_messages` apply from the next
+session (`/new`). A running chat keeps the mode it started with across gateway restarts,
+agent cache evictions and ordinary `/reload-mcp`. A scheduled heartbeat turn mutes
 interim messages only for itself and does not change the chat's mode. One exception: the
 first turn after a Hermes update rebuilds the session's tool definitions from the new
 code, so the chat adopts the current setting at that turn.

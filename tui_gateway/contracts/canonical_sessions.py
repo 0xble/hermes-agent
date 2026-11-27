@@ -260,6 +260,7 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     # (memory attribution only), the model-facing text when it differs from the persisted ``text``
     # (voice prefix, model-switch / skills-reload notes) and a one-turn ``/model --once`` override.
     turn_author: CanonicalTurnAuthor | None = None
+    turn_origin: str | None = None
     api_text: str | None = None
     model_override: CanonicalModelOverride | None = None
     # The submitter answers the clarify tool's whole batch in one ``clarify`` server request (main's
@@ -301,6 +302,7 @@ class CanonicalControlParams(CanonicalSessionParams):
 
 class CanonicalCorrectionParams(CanonicalControlParams):
     text: str
+    human: bool = True
 
 
 class CanonicalCorrectionAck(Result):

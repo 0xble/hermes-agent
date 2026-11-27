@@ -16,6 +16,8 @@ from tests.agent.test_incognito_auxiliary_health import _files
 from tests.tools.alias_route_fixtures import MEDIUM, PARENT_CHAIN, PINNED_CHAIN, VENICE, _authored, config_file
 from tools import delegate_tool as delegate
 
+WORKER_SPARE = {"provider": "openrouter", "model": "worker-model", "reasoning_effort": "low"}
+
 
 @pytest.mark.parametrize("private_parent", [False, True])
 @pytest.mark.parametrize("caller_identity", [None, "unrelated-public-caller"])
@@ -29,7 +31,8 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
         raw["delegation"] = {"max_spawn_depth": 3}
     else:
         raw["delegation"].update(model="worker-model", provider="custom:worker",
-                                 base_url="https://worker.test/v1", reasoning_effort="low")
+                                 base_url="https://worker.test/v1", reasoning_effort="low",
+                                 fallback_providers=[*PINNED_CHAIN, WORKER_SPARE])
     raw["context_file_max_chars"] = 256
     config_file(raw)
     workspace = tmp_path / "workspace"
@@ -82,11 +85,14 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
             else:
                 assert not child.incognito and not child._persist_disabled
                 assert child._session_db is not None
+            pinned_model = getattr(child, "_pinned_fallback_model")
+            fallback_chain = getattr(child, "_fallback_chain")
             if route == "inherit":
                 assert child.model == parent.model == VENICE
                 assert child.provider == parent.provider
                 assert child.base_url == parent.base_url
-                assert child._fallback_chain == PARENT_CHAIN
+                assert pinned_model is None
+                assert fallback_chain == PARENT_CHAIN
                 assert child.reasoning_config == MEDIUM
                 with patch.object(delegate, "_run_batch", side_effect=collect):
                     assert json.loads(delegate.delegate_task(goal="PRIVATE_NESTED_GOAL", parent_agent=child)) == {"ok": True}
@@ -101,7 +107,10 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
             else:
                 assert child.model == "worker-model"
                 assert child.base_url == "https://worker.test/v1"
-                assert child._fallback_chain == PINNED_CHAIN
+                # The route declares its own chain, so the child owns all of it (cross-model
+                # entries included) rather than filtering it to same-model spares.
+                assert pinned_model is None
+                assert fallback_chain == [*PINNED_CHAIN, WORKER_SPARE]
                 assert child.reasoning_config == {"enabled": True, "effort": "low"}
             for agent in created:
                 agent._ensure_db_session()

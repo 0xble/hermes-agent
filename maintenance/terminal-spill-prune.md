@@ -48,3 +48,5 @@ Retire when a selected upstream release removes the per-call scan or moves it to
 a rate-limited background job, and `TestSpillPruning` passes without this patch.
 If upstream lengthens spill retention, keep the interval well below it. Roll
 back by reverting the commit carrying `Fork-Patch: terminal-spill-prune`.
+
+Contract tests: `tests/tools/test_base_environment.py`, `tests/tools/test_terminal_truncation_spill.py`.

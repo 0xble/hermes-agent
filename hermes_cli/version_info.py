@@ -12,6 +12,7 @@ Resolution order:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import tomllib
@@ -84,6 +85,30 @@ def _resolve_repo_dir() -> Path | None:
     if (candidate / ".git").exists():
         return candidate
     return None
+
+
+_RECORDED_BASELINE_RE = re.compile(r"Accepted release baseline:\s*`(v[^`\n]+)`,\s*`([0-9a-f]{40})`")
+
+
+def _recorded_release_baseline(repo_dir: Path, revision: str) -> tuple[str, str] | None:
+    """The upstream release a fork's ``MAINTENANCE.md`` records at *revision*: ``(version, sha)``.
+
+    A fork updates by branch, which fetches no tags, and its own remote need not carry upstream's.
+    The newest LOCAL tag is then an older release: it named a v0.23.1 install 0.20.0, and plugins'
+    ``requires_hermes`` refused to load on the release that satisfied them. The recorded baseline
+    travels with the tree, so it counts only when its commit is an ancestor of *revision*.
+    """
+    match = _RECORDED_BASELINE_RE.search(_run_git(repo_dir, "show", f"{revision}:MAINTENANCE.md") or "")
+    if not match or not STABLE_TAG_RE.fullmatch(match.group(1)):
+        return None
+    try:
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", match.group(2), revision],
+            capture_output=True, timeout=3, cwd=str(repo_dir), check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (match.group(1)[1:], match.group(2)) if ancestor.returncode == 0 else None
 
 
 def _parse_nonnegative(value: str | None) -> int | None:
@@ -206,6 +231,10 @@ def _stamp_version_info() -> VersionInfo | None:
 # --- Git provenance (source/dev installs) -----------------------------------
 
 
+def _release_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def _git_version_info(repo_dir: Path, *, include_untracked: bool = False, revision: str = "HEAD") -> VersionInfo:
     commit = _run_git(repo_dir, "rev-parse", revision)
     # A detached HEAD has no branch. Leave the field None: every formatter
@@ -244,12 +273,14 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False, revisi
         for tag in (tags or "").splitlines()
         if STABLE_TAG_RE.fullmatch(tag)
     ]
-    base_version = (
-        max(releases, key=lambda value: tuple(int(part) for part in value.split(".")))
-        if releases else "unknown"
-    )
+    base_version = max(releases, key=_release_key) if releases else "unknown"
+    release_ref = f"v{base_version}"
+    recorded = _recorded_release_baseline(repo_dir, revision)
+    if recorded and (not releases or _release_key(recorded[0]) > _release_key(base_version)):
+        releases.append(recorded[0])
+        base_version, release_ref = recorded
     distance = _parse_nonnegative(
-        _run_git(repo_dir, "rev-list", "--count", f"v{base_version}..{revision}")
+        _run_git(repo_dir, "rev-list", "--count", f"{release_ref}..{revision}")
     ) if releases else None
     if not releases:
         base_version, distance = _calver_release_version(repo_dir, revision) or ("unknown", None)

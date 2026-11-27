@@ -221,7 +221,7 @@ async def initialize_gateway_runtime(runner):
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
     if claim:
-        release_unknown_turn_markers(runner)
+        await asyncio.to_thread(release_unknown_turn_markers, runner)
 
 
 async def claim_gateway_runtime(runner):
@@ -246,7 +246,7 @@ async def claim_gateway_runtime(runner):
             await _park_live_secondary(runner, authority, exc, 'promotion epoch claim failed')
     runner.session_runtime_descriptor['authority_epoch'] = launch.epoch
     _publish_served_set(runner)
-    release_unknown_turn_markers(runner)
+    await asyncio.to_thread(release_unknown_turn_markers, runner)
     for authority in [a for a in registry if a is not None]:
         await _recover_profile_bot_mailbox(runner, authority)
     # Promotion starts deferred secondaries from the served set recorded at boot: re-record it
@@ -381,7 +381,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
             continue
         worker.stop_cause = reason
         try:
-            worker.control({'type': 'stop'})
+            worker.control({'type': 'stop', 'source': 'system'})
         except RuntimeStoreError as exc:
             # A full control queue: control() latched worker.stop first, and the owner's read
             # loop escalates on that latch alone (terminate after STOP_ACK_SECONDS).
@@ -403,7 +403,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             authority.pending_stops[sid] = generation
         else:
-            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown')
+            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown', interrupt_source="system")
         signalled += 1
     return signalled
 
@@ -842,12 +842,14 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
     from gateway.session_acp_lifecycle import end_idle_acp_sessions
     for authority in _authorities(runner):
         try:
-            end_idle_acp_sessions(authority)
+            await end_idle_acp_sessions(authority, deadline)
+        except TimeoutError:
+            logger.warning('ACP shutdown cleanup for %s exceeded the settle budget',
+                           getattr(authority, 'profile_id', '?'))
         except Exception:
             # Best-effort bookkeeping: a store that cannot answer must not abort the stop sequence.
-            import logging
-            logging.getLogger(__name__).warning('ACP sessions of %s not ended at shutdown',
-                                                getattr(authority, 'profile_id', '?'), exc_info=True)
+            logger.warning('ACP sessions of %s not ended at shutdown',
+                           getattr(authority, 'profile_id', '?'), exc_info=True)
     from gateway.run_api import stop_gateway_api
     store = getattr(runner, 'session_ticket_store', None)
     if store is not None:

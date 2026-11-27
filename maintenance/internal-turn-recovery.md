@@ -29,4 +29,4 @@ heartbeat continuation stamps or exact generated prefixes), not broad notificati
 text that a user may type (including `/skill` arguments).
 
 Contract tests: `tests/gateway/test_internal_failed_turn_recovery.py`,
-`tests/hermes_cli/test_cli_goal_interrupt.py::TestHealthyTurnStillRuns::test_failed_synthetic_continuation_is_requeued_without_judging`.
+  `tests/hermes_cli/test_cli_goal_interrupt.py::TestHealthyTurnStillRuns::test_failed_synthetic_continuation_is_requeued_without_judging`.

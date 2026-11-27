@@ -111,6 +111,16 @@ AUTOMATION_INTERRUPTED_NOTICE = (
     "An automated delivery was interrupted and was not run again. Some "
     "actions may already have run; verify their effects."
 )
+
+
+def automation_interrupted_notice(name: Optional[str]) -> str:
+    """``AUTOMATION_INTERRUPTED_NOTICE`` naming the automation that stopped (a cron job, goal, loop,
+    process or delegation), so the reader knows which work to check or restart; the generic copy
+    when the admission does not say."""
+    if not name:
+        return AUTOMATION_INTERRUPTED_NOTICE
+    return (f"{name[:1].upper()}{name[1:]} was interrupted and was not run again. Some actions "
+            "may already have run; verify their effects.")
 # Durable tail roles a failed turn leaves open: its accepted ``user`` row, or the ``tool`` row of a
 # call that ran before the failure. An ``assistant`` tail is already closed (a reply or a boundary).
 OPEN_TURN_TAIL_ROLES = frozenset({"user", "tool"})
@@ -449,8 +459,8 @@ _ONE_OFF_COPY: dict[str, str] = {
         "produce a summary. Send `continue` to keep going, or raise `max_iterations` in your config."
     ),
     "nous_rate_limit": (
-        "Wait for the reset and send /retry, or switch models with /model. To avoid waits, add "
-        "a backup provider with `hermes fallback add`."
+        "Wait for the reset and send /retry, or switch models with /model. To avoid waits, list "
+        "backup providers under `fallback_providers` in `{home}/config.yaml`."
     ),
 }
 _SITE_COPY: dict[str, str] = {**_FAILURE_CODE_COPY, **_ONE_OFF_COPY}
@@ -463,10 +473,13 @@ def site_copy(code: str, **fields: Any) -> str:
 
 
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
-                   earliest_route_seconds: Optional[float] = None, error: Any = None) -> str:
+                   earliest_route_seconds: Optional[float] = None, error: Any = None,
+                   chain_path: Optional[str] = None, exhausted_routes: Optional[list[str]] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
     limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401).
     ``earliest_route_seconds`` must belong to a different configured route than the failing one.
+    ``chain_path`` names the backup list that feeds the failing agent (``turn_failure_routes``);
+    ``exhausted_routes`` are named only when the turn ran out of more than the one route.
     A stream cut by ``agent.stream_max_lifetime`` names the setting: the provider was responding,
     so neither waiting nor a backup provider helps."""
     if isinstance(error, StreamLifetimeExceeded):
@@ -490,10 +503,11 @@ def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, rese
                      "Send /retry after that, or switch models with /model.")
     else:
         situation = f"it looks temporarily unavailable. {_NEXT_STEPS_RETRY}"
-    return (
-        f"{lead} — {situation} To avoid this in future, "
-        f"add a backup provider with `hermes fallback add`.\n\nProvider said: {summary}"
-    )
+    where = chain_path or f"`fallback_providers` in `{display_hermes_home()}/config.yaml`"
+    hint = f"To avoid this in future, list backup providers under {where}."
+    if exhausted_routes and len(exhausted_routes) > 1:
+        hint += f" Routes that ran out this turn: {', '.join(exhausted_routes)}."
+    return f"{lead} — {situation} {hint}\n\nProvider said: {summary}"
 
 
 def limit_reset_copy(resets_at: float, now: Optional[float] = None) -> str:

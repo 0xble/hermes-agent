@@ -9,3 +9,5 @@ Reproduction: the real Telegram contract harness sets both `HOME` and `HERMES_HO
 Proof surfaces: `tests/hermes_cli/test_gateway_service.py::test_launchd_account_identity_survives_profile_home_override`, plus `tests/e2e/core/platforms/test_telegram_contract.py` on macOS with a local stand-in token. Retire when current upstream uses one account authority for launchd label and plist identity and these invariants pass without the fork implementation.
 
 The preexisting systemd identity class is Linux-marked. Its synthetic account-home fixture tests systemd names and sudo unit adoption, not launchd ownership. The separate native macOS invariant verifies both the isolated home and the real account default.
+
+Contract tests: `tests/hermes_cli/test_gateway_service.py`, `tests/e2e/core/platforms/test_telegram_contract.py`.

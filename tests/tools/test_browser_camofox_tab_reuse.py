@@ -49,7 +49,7 @@ class _Camofox:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 parsed = urlsplit(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 stub.calls.append(("GET", parsed.path, query))
@@ -69,7 +69,7 @@ class _Camofox:
                     return self._send({"snapshot": f"- heading {tab_id} [e1]", "refsCount": 1})
                 return self._send({"error": "not found"}, 404)
 
-            def do_POST(self):  # noqa: N802
+            def do_POST(self):
                 parsed = urlsplit(self.path)
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
                 stub.calls.append(("POST", parsed.path, body))
@@ -99,7 +99,7 @@ class _Camofox:
                     return self._send({"ok": True})
                 return self._send({"error": "not found"}, 404)
 
-            def do_DELETE(self):  # noqa: N802
+            def do_DELETE(self):
                 parsed = urlsplit(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 stub.calls.append(("DELETE", parsed.path, query))
@@ -159,6 +159,7 @@ def camofox(tmp_path, monkeypatch):
             getattr(cf, "_stale_tab_ids", {}).clear()
             getattr(cf, "_owned_tabs", {}).clear()
             cf._closing_tabs.clear()
+            cf._handoffs_in_flight.clear()  # a handoff a test abandoned mid-flight
         cf._protected_tab_ids.clear()
         cf._protected_tab_owners.clear()
 
@@ -770,7 +771,7 @@ def test_ephemeral_close_deletes_protected_owned_tab_and_releases_lease(camofox,
     from agent.redact import register_vault_date_component
     from tools import browser_camofox_leases as leases
     cf = camofox.cf
-    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    monkeypatch.setattr(cf, "_get_camofox_config", dict)
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "ephemeral")["success"]
     session = cf._sessions["ephemeral"]
     assert session["managed"] is False
@@ -798,7 +799,7 @@ def test_ephemeral_close_deletes_protected_owned_tab_and_releases_lease(camofox,
 @pytest.mark.parametrize("exclusion", ["live-protection", "handoff", "shared-tab", "unreadable", "tab-delete-failure"])
 def test_ephemeral_close_does_not_bypass_tab_retention(camofox, monkeypatch, exclusion):
     cf = camofox.cf
-    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    monkeypatch.setattr(cf, "_get_camofox_config", dict)
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "ephemeral")["success"]
     session = cf._sessions["ephemeral"]
     tab, user_id = session["tab_id"], session["user_id"]
@@ -1101,7 +1102,7 @@ def test_temporary_agent_close_does_not_clean_another_agents_live_browser(camofo
     tab = cf._sessions["live-owner"]["tab_id"]
     # Do not mock cleanup_browser: generic close-time cleanup shares the session ID too.
     temporary = ClientLifecycleMixin()
-    setattr(temporary, "_process_owner_task_ids", set())
+    temporary._process_owner_task_ids = set()
     with patch("run_agent.cleanup_vm"):
         temporary._close_task_resources("live-owner")
     assert cf._sessions["live-owner"]["tab_id"] == tab
@@ -1114,7 +1115,7 @@ def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "tool-owner")["success"]
     tab = cf._sessions["tool-owner"]["tab_id"]
     owner = ClientLifecycleMixin()
-    setattr(owner, "_process_owner_task_ids", {"tool-owner"})
+    owner._process_owner_task_ids = {"tool-owner"}
     with patch("run_agent.cleanup_vm"):
         owner._close_task_resources("different-session-id")
     assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]

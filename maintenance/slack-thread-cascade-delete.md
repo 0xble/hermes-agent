@@ -17,3 +17,5 @@ Upstream contribution is not submitted. Fork publication and runtime activation 
 The invariant tests are `tests/plugins/platforms/slack/test_thread_cascade_delete.py`. Existing Slack message-edit and unfurl tests are the surrounding regression surface. Runtime qualification must independently exercise deleting roots from both authors and verify that the parent placeholder disappears.
 
 Retire the patch only when the selected upstream release passes the owner/workspace/author restrictions and the deletion contract without this local implementation. Revert this patch to roll back. No stored state requires migration.
+
+Contract tests: `tests/plugins/platforms/slack/test_thread_cascade_delete.py`.

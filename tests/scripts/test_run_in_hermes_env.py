@@ -60,10 +60,12 @@ def checkout(tmp_path: Path) -> Path:
     state lives in ``state/`` (facts.json beside the input stamps)."""
     root = tmp_path / "checkout"
     (root / "scripts").mkdir(parents=True)
-    (root / "pm").mkdir()
+    shutil.copytree(REPO_ROOT / "pm", root / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(REPO_ROOT / "pm/environments.py", root / "pm/_runtime_environments.py")
     (root / "state").mkdir()
-    for name in (RUNNER.name, "_activation.sh"):
+    for name in (RUNNER.name, "_activation.sh", "_setup_guard.sh", "setup_guard.py"):
         shutil.copy2(REPO_ROOT / "scripts" / name, root / "scripts" / name)
+    shutil.copy2(REPO_ROOT / "hermes_constants.py", root / "hermes_constants.py")
     for name in ACTIVATION_INPUTS:
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).touch()
@@ -80,10 +82,12 @@ def checkout(tmp_path: Path) -> Path:
     )
     (root / "pm" / "__init__.py").touch()
     (root / "pm" / "environments.py").write_text(
+        "from pm._runtime_environments import dependency_home_root, store_root\n"
         "import sys\n"
-        "assert sys.argv[1:] == ['--format', 'sh'], sys.argv\n"
-        f"print(\"export __HERMES_ACTIVATED='{posix(root)}/state/facts.json'\")\n"
-        f"print('export PATH=\"{posix(root)}/shim:$PATH\"')\n",
+        "if __name__ == '__main__':\n"
+        "    assert sys.argv[1:] == ['--format', 'sh'], sys.argv\n"
+        f"    print(\"export __HERMES_ACTIVATED='{posix(root)}/state/facts.json'\")\n"
+        f"    print('export PATH=\"{posix(root)}/shim:$PATH\"')\n",
         encoding="utf-8",
     )
     return root

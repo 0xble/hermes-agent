@@ -32,3 +32,5 @@ browser/vision consumer suites and native Codex app-server fault scenarios.
 Retire this adaptation when accepted upstream startup metadata reads preserve the same
 cache-only boundary. Rollback restores synchronous discovery in the capability gates
 and removes the regressions, without changing runtime image input mode defaults.
+
+Contract tests: `tests/gateway/test_startup_capabilities_offline.py`, `tests/tools/test_browser_exec_startup_offline.py`, `tests/tools/test_model_tools.py`, `tests/agent/test_vision_capability_network_policy.py`.

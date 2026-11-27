@@ -38,12 +38,16 @@ _PER_TURN_THREAD_LOCALS = (
 def reset_reused_thread_state() -> None:
     """Drop the calling thread's turn-keyed state (call from the worker itself, between items)."""
     tid = threading.get_ident()
-    interrupt = sys.modules.get("tools.interrupt")
-    if interrupt is not None:
-        interrupt.set_interrupt(False, tid)  # clears the bit, its reason and a pending yield
+    # A first import running on another thread puts the module in sys.modules before its body
+    # finishes. Until the name below exists nothing could have stored state for this thread, so
+    # there is nothing to drop; reading it unguarded raised and retired the worker on every start.
+    set_interrupt = getattr(sys.modules.get("tools.interrupt"), "set_interrupt", None)
+    if set_interrupt is not None:
+        set_interrupt(False, tid)  # clears the bit, its reason and a pending yield
     sudo = sys.modules.get("tools.terminal_tool_sudo")
-    if sudo is not None:
-        with sudo._sudo_password_cache_lock:
+    sudo_lock = getattr(sudo, "_sudo_password_cache_lock", None)  # defined after the cache dict
+    if sudo_lock is not None:
+        with sudo_lock:
             sudo._sudo_password_cache.pop(f"thread:{tid}", None)
     for module_name, attr in _PER_TURN_THREAD_LOCALS:
         local = getattr(sys.modules.get(module_name), attr, None)

@@ -9,6 +9,12 @@ Also preserve the process-exit ownership contract in
 
 ## Preserve
 
+- Keep exactly one reserved worker per profile. The general, reserved and person-send executors stay FIFO; only due-scan submission order and the script lane use rank.
+- Business-impact lanes are an optional per-job `priority`: `live` (a person/customer is waiting), `production` (ordinary business work), and `background` (best-effort work). Unset is production and remains absent in stored legacy records. Brian approved the 3 lanes and their order on 2026-11-17.
+- The reserved worker is assigned to the eligible protected job with the best priority rank; ties retain job-store order. If the previous owner is still held, a replacement uses general overflow until release.
+- Due jobs are submitted in stable rank order. The script lane keeps four workers and runs the best queued rank first, FIFO within a rank, across ticks. It wraps the public ThreadPoolExecutor API with one inner task per queued entry, so shutdown with `cancel_futures=False` still drains every queued script. A person-send handoff into the script lane keeps its rank.
+- Detached workers and no-agent scripts receive `HERMES_WORK_PRIORITY` (`live`, `production`, or `background`), set from the job and never inherited. It is neutral metadata for consumers such as heavy-slot and does not set `HEAVY_SLOT_URGENCY`, worker counts, schedules, or timeouts. In-process agent runs do not export it, because a process-global variable would leak across concurrent jobs.
+- `priority` is an optional field in the existing job record, so there is no migration.
 Interval schedules of at most 120 seconds form the protected class, derived
 from schedule data rather than names, IDs, or job flags. Their completion-based
 next eligibility spends 30 seconds of headroom before the natural interval.
@@ -17,8 +23,9 @@ often than once per minute.
 All other schedules retain their existing rearm calculation.
 
 Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`
-(default 4). Add exactly 1 reserved worker, select the first enabled, unpaused,
-nonterminal protected job in store order, and send it to the reserved executor.
+(default 4). Add exactly 1 reserved worker, selecting the eligible protected job
+with the best business-impact rank (`live`, then `production`/unset, then
+`background`); ties remain in job-store order. Send it to the reserved executor.
 If selection changes while the previous owner still holds the reservation,
 treat the replacement as overflow in the general pool until the slot is free.
 Additional protected agent jobs log an error once per loaded class and use the
@@ -68,7 +75,8 @@ hazard in upstream #73804 must not return: current script spawning uses subproce
 
 Preserve the common execution journal, copied profile context, per-job guard,
 cancellation and process-exit fences. Departure and shutdown reclaim all auxiliary
-lanes. No new dependency, config, job-store schema, provider or transport is added.
+lanes. No new dependency, config, migration, provider or transport is added; the
+optional `priority` value is an authored field in the existing job record.
 
 ### Person-send evidence and upstream design
 
@@ -165,7 +173,7 @@ string clears it through the tool; CLI edit supports an explicit clear flag.
 No live job or runtime configuration is part of this source-only patch.
 
 Contract tests: `tests/cron/test_catch_up_lateness.py` and
-`tests/tools/test_cronjob_catch_up_lateness.py`; qualification also covers all
+  `tests/tools/test_cronjob_catch_up_lateness.py`; qualification also covers all
 `tests/cron/` and existing cron tool tests. Retire this patch when the selected
 upstream release preserves both admission/start deadlines and the durable,
 local-lane-independent owner notice. Rollback reverts these source hooks and

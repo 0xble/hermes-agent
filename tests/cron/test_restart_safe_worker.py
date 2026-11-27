@@ -116,6 +116,39 @@ def test_launchd_gateway_dispatches_cron_in_detached_session(monkeypatch):
     ).mode == "in_process"
 
 
+@pytest.mark.parametrize("launchd_label,supervised,outlives_parent,expected", [
+    ("ai.hermes.gateway", True, False, "detached"),
+    ("ai.hermes.gateway", False, False, "in_process"),
+    ("application.com.microsoft.VSCode.1", True, False, "in_process"),
+    ("ai.hermes.gateway", True, True, "in_process"),
+])
+def test_darwin_dispatch_detaches_only_the_supervised_launchd_gateways_cron(
+    monkeypatch, launchd_label, supervised, outlives_parent, expected,
+):
+    """Stops a launchd gateway from running cron in its own process group again, where a restart's
+    bootout kills the job (the Darwin host is described as input, so every platform's gate runs this)."""
+    from functools import partial
+
+    from gateway import restart
+    from tools import process_registry
+
+    command = [sys.executable, "-m", "cron.scheduler"]
+    monkeypatch.setattr(process_registry.platform, "system", lambda: "Darwin")
+    for name in ("XPC_SERVICE_NAME", restart.LAUNCHD_LABEL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    # The launchd wrapper re-exports the job label; the real reader takes the host platform as data.
+    monkeypatch.setenv(restart.LAUNCHD_LABEL_ENV, launchd_label)
+    monkeypatch.setattr(restart, "launchd_service_label", partial(restart.launchd_service_label, platform="darwin"))
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: supervised)
+
+    dispatch = process_registry.restart_safe_gateway_child_argv(
+        command, unit_suffix="cron-macos", require_restart_safe_scope=True, outlives_parent=outlives_parent,
+    )
+
+    assert dispatch.mode == expected
+    assert dispatch.argv is command
+
+
 @pytest.mark.platforms("linux")
 def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
     from tools import process_registry
@@ -215,6 +248,42 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     # Post-ack the worker owns the stderr capture: a gateway that restarted mid-run
     # would otherwise leave one orphan per surviving run.
     assert not stderr_capture.exists()
+
+
+
+def test_external_worker_cancel_marker_sets_run_cancel_event(tmp_path, monkeypatch):
+    """A durable cancel marker for (job, execution) must reach the worker's run as cancel_event."""
+    from cron import scheduler
+    from cron.detached_authority import _cancel_path
+
+    payload = tmp_path / "payload.json"
+    ack = tmp_path / "exec-watch.ready"
+    payload.write_text(
+        json.dumps({
+            "job": {"id": "job-watch", "execution_id": "exec-watch"},
+            "profile_home": str(tmp_path / "profile"),
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cron.executions.adopt_claimed_execution",
+        lambda execution_id: {"id": execution_id, "status": "running"},
+    )
+    seen = {}
+
+    def run(job, *, cancel_event, **_kwargs):
+        assert not cancel_event.is_set()
+        marker = _cancel_path(job["id"], job["execution_id"])
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"cancelled": True}), encoding="utf-8")
+        # Same file cancel_detached writes; the worker's watcher must turn it into the event.
+        seen["cancelled"] = cancel_event.wait(5)
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+
+    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert seen == {"cancelled": True}
 
 
 def test_external_worker_ack_is_never_observable_half_written(tmp_path, monkeypatch):
@@ -604,6 +673,7 @@ def test_external_worker_exit_rechecks_exact_execution_before_failure(monkeypatc
         process, execution_id="exec-1"
     ) is True
     assert get.call_count == 2
+
 
 
 def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_path):

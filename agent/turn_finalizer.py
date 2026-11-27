@@ -16,7 +16,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
-from agent.interrupt_control import interrupted_during_api_call_reason
+from agent.interrupt_control import interrupted_during_api_call_reason, stamp_interrupt_result
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
@@ -447,10 +447,11 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
             and _stripped[-1:] not in _SENTENCE_END
         )
         if _is_empty_terminal or _is_partial_fragment or str(_turn_exit_reason) == "partial_stream_recovery":
+            from agent.fallback_endpoint_domain import attempted_routes_summary
             _explanation = agent._format_turn_completion_explanation(
                 _turn_exit_reason, getattr(agent, "_last_persistence_error_cause", None),
                 db_path=getattr(getattr(agent, "_session_db", None), "db_path", None),
-                model=str(getattr(agent, "model", "") or ""),
+                model=str(getattr(agent, "model", "") or ""), routes=attempted_routes_summary(agent),
             )
             if _explanation:
                 # Replace the bare sentinel; keep a partial fragment and append why.
@@ -789,6 +790,7 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    model_fields = result_model_fields(agent, api_call_count=api_call_count, failed=failed)
     result = {
         "final_response": final_response,
         "last_reasoning": _last_turn_reasoning(messages),
@@ -807,7 +809,7 @@ def finalize_turn(
         "response_reused": bool(final_response) and final_response == getattr(agent, "_reused_response_text", None),
         "model": agent.model,
         # requested_model / served_model: proxy-reported deployment or Hermes' own fallback route.
-        **result_model_fields(agent),
+        **model_fields,
         "provider": agent.provider,
         "base_url": agent.base_url,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},
@@ -855,11 +857,7 @@ def finalize_turn(
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
     agent._reused_response_text = None
-    if interrupted and agent._interrupt_message:
-        result["interrupt_message"] = agent._interrupt_message
-        from agent.interrupt_control import interrupt_issuer
-        if (issuer := interrupt_issuer(agent)):
-            result["interrupt_source"] = issuer
+    stamp_interrupt_result(agent, result, interrupted)
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 

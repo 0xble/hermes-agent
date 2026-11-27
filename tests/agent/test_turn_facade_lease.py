@@ -139,6 +139,18 @@ def test_interrupt_before_any_wait_does_not_blame_another_process():
     assert "another Hermes process" in _admit(agent).early_result["final_response"]
 
 
+def test_message_less_system_interrupt_keeps_its_source():
+    """A gateway preemption carries no message; the early return must still name its source."""
+    agent = _agent(_Db(acquired=False), _interrupt_requested=True,
+                   _tool_interrupt_reason="gateway user turn preemption", _interrupt_source="system")
+    agent.clear_interrupt = lambda: None
+    result = _admit(agent).early_result
+    assert result is not None
+    assert result["interrupted"] is True
+    assert "interrupt_message" not in result
+    assert result["interrupt_source"] == "gateway_user_turn_preemption"
+
+
 def _active_lease(db):
     agent = _agent(db)
     calls = []

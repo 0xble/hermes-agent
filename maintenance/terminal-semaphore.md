@@ -85,3 +85,5 @@ budget; the classifier table exercises classification **and wrapping** for
 heavy commands plus light read-only negatives.
 
 Retire when the host stops using `semaphore` or when Hermes gains a native concurrency limit for heavy terminal work. No stored-state migration is involved. Rollback reverts the commits carrying this identity.
+
+Contract tests: `tests/tools/test_terminal_tool_semaphore.py`, `tests/tools/test_terminal_semaphore_handoff.py`, `tests/tools/test_terminal_semaphore_lifecycle.py`, `tests/cron/test_lifecycle_guard_semaphore_minimal.py`, `tests/cron/test_lifecycle_guard_semaphore_round_two.py`, `tests/cron/test_lifecycle_guard_semaphore_urgency.py`.

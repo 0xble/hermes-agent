@@ -13,3 +13,5 @@ The maintained fork adds this route to avoid paid extraction for plain files (ab
 ## Proof and retirement
 
 Run `scripts/run_tests.sh tests/tools/test_web_*.py -q`, `ruff check tools/web_extract_direct.py tools/web_tools_extract.py tests/tools/test_web_extract_direct.py`, and `python3 scripts/check-windows-footguns.py tools/web_extract_direct.py tools/web_tools_extract.py tests/tools/test_web_extract_direct.py`. Retire the fork implementation when a released upstream version passes this contract's safety and routing tests without it. Revert this patch's four behavior/config/test/doc files and this maintenance-unit row only; preserve other web extraction changes and the remaining maintenance units.
+
+Contract tests: `tests/tools/test_web_extract_direct.py`.

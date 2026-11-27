@@ -725,7 +725,7 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> float | None:
     return next((f for f in map(get_reasoning_stale_timeout_floor, candidates) if f is not None), None)
 
 
-def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=None):
+def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=None, allow_retry: bool = True):
     """Pop the Hermes routing keys and call ``converse`` / ``converse_stream`` (boto3 directly) with the
     adapter's shared recovery: a cachePoint rejection (Nova: toolConfig.tools, #97281) or a replayed sealed
     reasoning rejection resends once without the offending blocks inside the same attempt; a streaming IAM
@@ -742,14 +742,19 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     try:
         raw_response = method(**api_kwargs)
     except Exception as exc:
+        # Evicting a dead pool sends nothing, so it is not a retry: do it even when the
+        # independent attempt forbids one, or later turns keep reusing the stale client.
+        if is_stale_connection_error(exc):
+            invalidate_runtime_client(region)
+            raise
+        if not allow_retry:
+            raise
         retry_kwargs = (recover_from_cache_point_rejection(exc, api_kwargs)
                         or recover_from_redacted_reasoning_rejection(exc, api_kwargs))
         if retry_kwargs is not None:
             return finish(method(**retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
             return on_stream_denied(client, api_kwargs, exc)
-        if is_stale_connection_error(exc):
-            invalidate_runtime_client(region)
         raise
     return finish(raw_response)
 
@@ -771,7 +776,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client("anthropic_messages_request", kind="anthropic_messages")
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
-        return _bedrock_converse_call(api_kwargs, stream=False)
+        return _bedrock_converse_call(api_kwargs, stream=False,
+            allow_retry=getattr(agent, "_turn_independent_attempt_active", False) is not True)
     if agent.provider == "moa":
         # MoA is a virtual provider backed by the in-process MoAClient facade — never
         # rebuild a request-local client from the virtual metadata. After a client
@@ -1998,6 +2004,7 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
 def _fallback_chain_exhausted(agent, reason: FailoverReason | None, cooldown_armed: bool = False) -> bool:
     """Always False; briefly cool an exhausted chain if the primary has no cooldown.
     Gate next-turn restore even when a rate limit or overload came from an active fallback."""
+    agent._turn_fallback_chain_exhausted = True
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
@@ -2033,6 +2040,11 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     if not fb_provider or not fb_model:
         return True
+    from agent.route_binding import resolve_route_identity
+    from agent.fallback_endpoint_domain import failed_connection_domain
+    fb_ident = resolve_route_identity(fb)
+    if failed_connection_domain(agent, fb_ident):
+        return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
@@ -2055,7 +2067,6 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
     # This preserves alias retry eligibility for all existing failover reasons, not only 5xx.
     # Keep earlier unavailability/connection-domain skips authoritative.
     if should_skip_candidate(fb_ident, current_ident) and fb_provider == current_ident.provider:
@@ -2185,11 +2196,17 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
         route = route_from_record(record)
         outage_id = str(record["outage_id"])
         if claim_outage_notice(route, outage_id, fallback=target):
-            try:
-                reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
-            except (KeyError, TypeError, ValueError, OSError, OverflowError):
-                reset_label = "the cooldown expiry"
             state = "overloaded" if record.get("reason") == FailoverReason.overloaded.value else "rate-limited"
+            try:
+                reset_at = float(record["reset_at"])
+                reset_label = datetime.fromtimestamp(reset_at).astimezone().strftime("%H:%M %Z")
+            except (KeyError, TypeError, ValueError, OSError, OverflowError):
+                reset_at, reset_label = None, "the cooldown expiry"
+            if reset_at is not None and reset_at <= time.time():
+                # The recorded reset already passed. Do not imply an active
+                # recovery window or promise that the primary is back.
+                return False, (f"⚠️ {old_model} was {state}; using {fb_model} via "
+                               f"{fb_provider} while the primary is rechecked.")
             return False, f"⚠️ {old_model} is {state} until {reset_label}; using {fb_model} via {fb_provider} until then."
         if announced_fallback(route, outage_id) == target:
             return False, None
@@ -2219,14 +2236,16 @@ def try_activate_fallback(
     ``_shared_cooldown_record`` is used only by a newly-created agent adopting an outage that
     another process already armed; it must not re-arm the record or emit a duplicate notice.
     """
-    from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    if getattr(agent, "_turn_independent_attempt_active", False) is True:
+        return False
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown, mark_fallback_route, switch_deferred_by_reset
     from agent.fallback_notice import buffer_fallback_route_notice, resolved_route
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
-        # A stale monotonic deadline from an older episode must not authorize
-        # mid-turn recovery for an uncooled fallback.
-        agent._fallback_episode_cooled = False
+        # An older episode's deadline must not authorize recovery; an uncooled one gets a bounded re-check.
+        from agent.fallback_route_recovery_uncooled import begin_uncooled_episode
+        begin_uncooled_episode(agent, reason)
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     if shared_adoption:
@@ -2267,10 +2286,20 @@ def try_activate_fallback(
         try:
             from agent.route_binding import bind_route_entry
             old_route = resolved_route(agent)
+            agent._billing_fallback_attempt = reason == FailoverReason.billing
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
+            agent._billing_fallback_attempt = False
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
-                unavailable.add(fb_key)
+                from hermes_cli.fallback_config import same_fallback_model
+                pinned = getattr(agent, "_pinned_fallback_model", None)
+                pin_rejection = (
+                    isinstance(pinned, str)
+                    and pinned
+                    and not same_fallback_model(pinned, fb_model)
+                )
+                if not pin_rejection:
+                    unavailable.add(fb_key)
                 _release_spare_lease(agent, reservation)
                 continue
             old_model, old_provider = bound
@@ -2283,15 +2312,18 @@ def try_activate_fallback(
             reservation_committed = True
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
-            # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
-            # provenance so the restore path only emits a recovery notice after a real fallback.
+            # Provenance apart from ``_fallback_activated`` (`/model --once`): recovery notice + turn-scoped row (#152333).
             agent._provider_fallback_active = True
             _finalize_fallback_route(agent, fb_provider)
+            mark_fallback_route(agent, fb_model)
+            from agent.fallback_attribution import note_fallback
+            note_fallback(agent, old_model, fb_model, fb_provider, reason)
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             return True
         except Exception as e:
+            agent._billing_fallback_attempt = False
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             if not reservation_committed:
@@ -2754,7 +2786,8 @@ class _BedrockStream:
         return _on
 
     def _open_stream(self, next_api_kwargs: dict[str, Any]):
-        return _bedrock_converse_call(dict(next_api_kwargs), stream=True, on_stream_denied=self._fall_back_to_converse)
+        return _bedrock_converse_call(dict(next_api_kwargs), stream=True, on_stream_denied=self._fall_back_to_converse,
+            allow_retry=getattr(self.agent, "_turn_independent_attempt_active", False) is not True)
 
     def _fall_back_to_converse(self, client, final_kwargs: dict, exc: Exception):
         # InvokeModel-only IAM policies cannot stream; fall back inside the same Relay
@@ -3767,12 +3800,15 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
-        import httpx as _httpx
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
+        if getattr(self.agent, "_turn_independent_attempt_active", False) is True:
+            self.result["error"] = e
+            return False
+        import httpx as _httpx
         e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.

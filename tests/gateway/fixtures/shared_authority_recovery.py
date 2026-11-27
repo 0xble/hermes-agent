@@ -114,6 +114,9 @@ async def recover_probe(runner, adapter, source, peer):
     task = authority.sessions[safe_sid].task
     if task is not None:
         await asyncio.wait_for(task, 35)
+    notices = list(getattr(authority, 'pause_announcements', {}).values())
+    if notices:
+        await asyncio.wait_for(asyncio.gather(*notices, return_exceptions=True), 35)
     safe = rows(authority, safe_sid)
     blocked = rows(authority, blocked_sid)
     assert safe[0]['status'] == 'terminal' and safe[0]['outcome'] == 'completed', safe
@@ -124,10 +127,17 @@ async def recover_probe(runner, adapter, source, peer):
     assert authority.agent(SessionRef('default', blocked_sid)) is None
     already_completed = initial[0]['status'] == 'terminal'
     assert len(peer.requests) == (0 if already_completed else 1), peer.requests
+    # The blocked chat's person has a message saved behind the lost turn: the boot that fenced that
+    # turn tells them once (restart-pause-notice), and no later recovery repeats it.
+    paused = [d['chat_id'] for d in adapter.deliveries if 'This conversation is paused' in d['content']]
+    turn = [d for d in adapter.deliveries if 'This conversation is paused' not in d['content']]
     if not already_completed:
         assert 'RECOVER_EXACTLY_ONCE' in json.dumps(peer.requests[0])
-        assert adapter.deliveries and all(d['chat_id'] == 'recover-chat' for d in adapter.deliveries)
-        assert any('LOCAL_ACK' in d['content'] for d in adapter.deliveries)
+        assert turn and all(d['chat_id'] == 'recover-chat' for d in turn), adapter.deliveries
+        assert any('LOCAL_ACK' in d['content'] for d in turn)
+        assert paused == [source.chat_id], adapter.deliveries
+    else:
+        assert paused == [], adapter.deliveries
     evidence = {'safe': safe, 'blocked': blocked, 'model_calls': len(peer.requests),
                 'deliveries': adapter.deliveries, 'recovery': recovered}
     Path(os.environ['HERMES_HOME'], 'recovery-receipt.json').write_text(json.dumps(evidence, indent=2))

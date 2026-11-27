@@ -113,23 +113,17 @@ def _is_explicit_synthetic_turn(text: Any) -> bool:
     return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
 
 
+class ScheduledWakeup(str):
+    """CLI queue input produced by a goal, loop, or heartbeat scheduler."""
+
+
 def _turn_origin_for_cli_message(text: Any) -> str:
-    """Match gateway provenance using the CLI's runtime markers, not message wording."""
-    try:
-        from tools.process_registry_notifications import TimelineNotification
-        if isinstance(text, TimelineNotification):
-            return "process"
-        from hermes_cli.goals import is_goal_continuation_text
-        from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
-        from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
-        if isinstance(text, str) and (
-            is_goal_continuation_text(text)
-            or text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
-        ):
-            return "goal_loop"
-    except ImportError:
-        logging.getLogger(__name__).debug("CLI turn-origin markers unavailable", exc_info=True)
-    return "user"
+    """Classify inputs by their producer, never by text a human can type."""
+    from tools.process_registry_notifications import TimelineNotification
+
+    if isinstance(text, TimelineNotification):
+        return "process"
+    return "goal_loop" if isinstance(text, ScheduledWakeup) else "user"
 
 
 def _is_self_injected_turn(text: Any) -> bool:
@@ -631,7 +625,7 @@ class CLILoopsMixin:
             _cprint(f"  {t('cli.steer.usage')}")
         elif self._agent_running and self.agent is not None and hasattr(self.agent, "steer"):
             try:
-                accepted = self.agent.steer(payload)
+                accepted = self.agent.steer(payload, human=True)
             except Exception as exc:
                 _cprint(f"  {t('cli.steer.failed', error=exc)}")
             else:
@@ -777,7 +771,7 @@ class CLILoopsMixin:
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._pending_input.put(ScheduledWakeup(prompt))
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -811,7 +805,7 @@ class CLILoopsMixin:
                     _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 since = mgr.state.waiting_since
                 instance = mgr.state.created_at
-                self._pending_input.put(prompt)
+                self._pending_input.put(ScheduledWakeup(prompt))
                 mgr.mark_automatic_continuation_dispatched(expected_instance=instance)
                 mgr.clear_lifted_wait(since)
         except Exception as exc:
@@ -857,7 +851,7 @@ class CLILoopsMixin:
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
             _cprint(f"  {_DIM}{t('cli.loop.wakeup_firing', tick=tick_no)}{_RST}")
-            self._pending_input.put(wakeup)
+            self._pending_input.put(ScheduledWakeup(wakeup))
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -1016,7 +1010,7 @@ class CLILoopsMixin:
                 self._goal_failed_retry_count = getattr(self, "_goal_failed_retry_count", 0) + 1
                 prompt = mgr.next_continuation_prompt()
                 if prompt:
-                    getattr(self, "_pending_input").put(prompt)
+                    self._pending_input.put(ScheduledWakeup(prompt))
             return
         _active_deleg = 0
         self._goal_failed_retry_count = 0
@@ -1037,6 +1031,6 @@ class CLILoopsMixin:
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._pending_input.put(ScheduledWakeup(prompt))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)

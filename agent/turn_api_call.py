@@ -105,6 +105,8 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        from agent.fallback_endpoint_domain import note_route_request
+        note_route_request(agent)
         with relay_llm.capture_provider_request(next_api_kwargs) as provider_kwargs:
             if _use_streaming:
                 result = agent._interruptible_streaming_api_call(
@@ -246,6 +248,7 @@ class NousRateGuardVerdict:
 def nous_rate_limit_guard(
     agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
     active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,
+    approx_tokens: Any = None,
 ) -> NousRateGuardVerdict:
     """Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
     SDK retries) counts against RPH. Never lets the guard itself break the agent loop."""
@@ -256,6 +259,21 @@ def nous_rate_limit_guard(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    # A response header can tell us that the next request cannot fit in the current TPM
+    # bucket. Check before any SDK call; otherwise a large prompt predictably produces a
+    # second 429. With a fallback that can take the turn it restarts cleanly there. With none
+    # the request is sent anyway and no fallback state is touched: the estimate is approximate,
+    # and the provider's own 429 carries the real reset into the normal wait-and-retry path.
+    from agent.turn_api_call_admission import has_admissible_fallback, predicted_tpm_overage
+    overage = predicted_tpm_overage(agent, approx_tokens)
+    if overage and has_admissible_fallback(agent):
+        agent._buffer_diagnostic_status(f"⏳ {overage} Trying fallback.")
+        if agent._try_activate_fallback():
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            retry_count = 0
+            compression_attempts = 0
+            return _verdict("break")
 
     if agent.provider == "nous":
         # A gateway ``x-nous-model-switch`` recorded on the previous response moves this session

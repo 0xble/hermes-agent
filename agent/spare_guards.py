@@ -13,8 +13,8 @@ Both apply only to the fallback walk. A spare that is the role PRIMARY (the quot
 deliberate drain) never passes through :func:`reserve_fallback_route`, and usage is recorded only
 while ``_provider_fallback_active`` is set.
 
-NOTE: :func:`resolve_upstream_family` is a deliberately minimal local helper; deduplicate it with
-the upstream-family resolver on the model-fallback-resilience branch when the two merge.
+:func:`resolve_upstream_family` delegates to ``hermes_cli.fallback_config.infer_upstream_family``,
+the resolver config validation uses, so a route is one family to both.
 """
 from __future__ import annotations
 
@@ -60,12 +60,6 @@ class FallbackRouteReservation:
 
     def __bool__(self) -> bool:
         return True
-
-_MODEL_PREFIX_FAMILIES = (("gpt", "openai"), ("claude", "anthropic"), ("muse", "meta"), ("grok", "xai"))
-_PROVIDER_FAMILIES = {
-    "openai": "openai", "openai-codex": "openai", "anthropic": "anthropic",
-    "xai": "xai", "xai-oauth": "xai", "meta": "meta",
-}
 
 
 def _state_path() -> Path:
@@ -123,14 +117,8 @@ def spare_settings(config: dict[str, Any] | None = None) -> tuple[frozenset[str]
 
 def resolve_upstream_family(provider: Any, model: Any, entry: dict[str, Any] | None = None) -> str:
     """Upstream family of a route: explicit ``upstream:``, else the model name, else the provider."""
-    if isinstance(entry, dict) and (explicit := str(entry.get("upstream") or "").strip().lower()):
-        return explicit
-    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    for prefix, family in _MODEL_PREFIX_FAMILIES:
-        if name.startswith(prefix):
-            return family
-    provider_name = str(provider or "").strip().lower()
-    return _PROVIDER_FAMILIES.get(provider_name, provider_name)
+    from hermes_cli.fallback_config import infer_upstream_family
+    return infer_upstream_family(provider, model, entry.get("upstream") if isinstance(entry, dict) else None)
 
 
 def _empty_state() -> dict[str, Any]:
@@ -313,6 +301,28 @@ def reserve_fallback_route(agent: Any, entry: dict[str, Any]) -> FallbackRouteRe
         family, lease=lease, prior_lease=held, prior_upstream=prior_upstream,
         newly_acquired=newly_acquired,
     )
+
+
+def fallback_route_admissible(agent: Any, entry: dict[str, Any]) -> bool:
+    """Whether ``reserve_fallback_route`` would admit *entry* now. Reads only: no lease is
+    taken and nothing is written, so a caller can ask before it commits to a switch."""
+    family = resolve_upstream_family(entry.get("provider"), entry.get("model"), entry)
+    spares, cap, budgets = spare_settings()
+    if family not in spares:
+        return True
+    day, now, budget = _local_day(), time.time(), budgets.get(family, 0)
+    try:
+        with _locked_state() as (_path, state):
+            _prune(state, now, day)  # on the in-memory copy only
+            if budget > 0 and _used_today(state, day, family) >= budget:
+                return False
+            if not _in_delegated_child():
+                return True
+            rows = state["leases"].get(family) or {}
+            held = _held_lease(agent)
+            return bool(held and held[0] == family and held[1] in rows) or len(rows) < cap
+    except OSError:
+        return True  # advisory state, same as the reservation: unreadable admits
 
 
 def _remove_lease(lease: tuple[str, str]) -> None:

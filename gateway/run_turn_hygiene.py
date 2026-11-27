@@ -842,6 +842,7 @@ class GatewayTurnHygieneMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
+        _hyg_runtime.pop("_preflight_fallback", None)
         _hyg_agent = AIAgent(
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
@@ -856,7 +857,7 @@ class GatewayTurnHygieneMixin:
 
     async def _hmwa_hygiene_detached_attempt(
         self, attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-        source, session_entry, session_key, _quick_key, run_generation,
+        source, session_entry, session_key, _quick_key, run_generation, hygiene_origin="unknown",
     ):
         """Run one detached hygiene compression attempt end to end; publishes the transcript to
         continue with (compressed or original) on ``attempt.history``."""
@@ -880,6 +881,16 @@ class GatewayTurnHygieneMixin:
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
             # agent-work slot. MUST run in the caller's contextvars (multiplex secret scope).
             attempt.commit_fence = _hyg_commit_fence
+            from agent.proxy_request_class import bind_aux_request_origin
+            # The detached worker inherits the live request's effective origin. Without this
+            # binding all hygiene summaries fall back to the compression task default (background).
+            def _run_hygiene_compression():
+                with bind_aux_request_origin(hygiene_origin):
+                    return _hyg_agent._compress_context(
+                        _hyg_msgs, "", approx_tokens=plan.approx_tokens, commit_fence=_hyg_commit_fence,
+                        task_id=session_entry.session_id or "default", trigger="gateway_hygiene",
+                    )
+
             attempt.future = loop.run_in_executor(
                 None,
                 # But it MUST run inside the caller's contextvars: under multiplex_profiles the profile
@@ -889,10 +900,7 @@ class GatewayTurnHygieneMixin:
                 # lossy truncation (#100849 bundle).
                 copy_context().run,
                 # task_id = the live turn's dedup bucket (session row id), never "" (= reset every task).
-                lambda: _hyg_agent._compress_context(
-                    _hyg_msgs, "", approx_tokens=plan.approx_tokens, commit_fence=_hyg_commit_fence,
-                    task_id=session_entry.session_id or "default", trigger="gateway_hygiene",
-                ),
+                _run_hygiene_compression,
             )
             # Register the live worker with shutdown NOW, not only once it is deferred: the default
             # executor is outside self._executor's quiesce, so an untracked in-flight summary would let
@@ -927,6 +935,8 @@ class GatewayTurnHygieneMixin:
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
         from gateway.run import HygieneTurnHoldExceeded
+        from gateway.platforms.event import turn_origin_for_event
+        hygiene_origin = turn_origin_for_event(event)
         if not history or len(history) < 4:
             return history
 
@@ -955,7 +965,7 @@ class GatewayTurnHygieneMixin:
                 if len(_hyg_msgs) >= 4:
                     await self._hmwa_hygiene_detached_attempt(
                         attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-                        source, session_entry, session_key, _quick_key, run_generation,
+                        source, session_entry, session_key, _quick_key, run_generation, hygiene_origin,
                     )
         except HygieneTurnHoldExceeded:
             # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.

@@ -41,7 +41,7 @@ def test_bridge_publishes_committed_completion_and_rejects_another_principal(tmp
         ref = SessionRef('profile', 'parent')
         scope = dict(profile_id='profile', session_id='parent', execution_id='worker', generation=0,
                      pid=worker.pid, birth=worker_birth(psutil.Process(worker.pid)), secret='private-worker-secret')
-        claim = _claim(connection, ref, scope)
+        claim = asyncio.run(_claim(connection, scope))
         register_worker_execution(db, epoch=epoch, execution_id='worker', session_id='parent', generation=0,
                                   kind='compute', adoption_secret=claim)
         payload = dict(delegation_id='deleg_owned', task={'goal': 'inert'}, dispatched_at=time.time(),

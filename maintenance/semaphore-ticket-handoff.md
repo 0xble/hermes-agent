@@ -60,3 +60,5 @@ Also run `scripts/check-windows-footguns.py --all` and `git diff --check`.
 Retire when upstream or the host no longer requires terminal admission handoff.
 Revert the commit carrying `Fork-Patch: semaphore-ticket-handoff`.
 No persistent-state migration or live queue changes are involved.
+
+Contract tests: `tests/tools/test_terminal_semaphore_handoff.py`, `tests/tools/test_terminal_tool_semaphore.py`, `tests/tools/test_terminal_foreground_timeout_cap.py`, `tests/tools/test_base_environment.py`, `tests/tools/test_local_interrupt_cleanup.py`, `tests/tools/test_terminal_bounded_execute.py`.

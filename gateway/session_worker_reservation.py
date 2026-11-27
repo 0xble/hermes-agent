@@ -107,7 +107,9 @@ def reserve_admission_worker(authority, *, admission_id, process, principal_id, 
                      (execution_id, sid, authority.epoch, generation, _secret_digest(claim)))
         return scope | {'epoch': authority.epoch}
 
-    return authority.db._execute_write(write)
+    from hermes_state_runtime_privacy import admission_owners, execute_owned_write
+    return execute_owned_write(authority.db, write, (),
+        resolve=lambda conn: admission_owners(conn, admission_id))
 
 
 def lose_admission_worker(authority, row, scope):

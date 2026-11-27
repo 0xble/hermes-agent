@@ -58,3 +58,5 @@ stages consolidation rather than silently permitting an unjournaled delete.
 Retire when upstream ships an equivalent per-profile opt-out. Rollback reverts
 this commit. An existing `background_review_allow_delete` key then becomes an
 unread no-op and the gate stages again.
+
+Contract tests: `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_transactions.py`, `tests/agent/test_background_review_memory_scope.py`.

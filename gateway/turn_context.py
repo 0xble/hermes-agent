@@ -101,6 +101,9 @@ class TurnContext:
     _cleanup_progress: bool = False
     _status_delivery: Any = None
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _card_recorder: Optional[Callable[[str], None]] = None
+    _card_writes: set = field(default_factory=set)
+    _card_forgotten: set = field(default_factory=set)  # ids whose record is forgotten; a late record is dropped
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None
@@ -176,8 +179,17 @@ class TurnContext:
     # Current turn worker, assigned before agent resolution so its completion events can bind the agent.
     _worker: Optional[TurnWorker] = None
 
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Remember a temporary progress card for end-of-turn deletion, and record it durably."""
+        self._cleanup_msg_ids.append(message_id)
+        if self._card_recorder is not None:
+            self._card_recorder(message_id)
+
     def bind_agent_lifetime(self, agent: Any) -> None:
-        """Keep only drain fences on the agent, never the entire turn context."""
+        """Keep only drain fences on the agent, never the entire turn context. A soft machine-turn
+        preemption aimed at an earlier turn is dropped here, before this turn can run the agent."""
+        from gateway.run_turn_pending_preemption import settle_stale_preemption
+        settle_stale_preemption(agent, self)
         if self.agent_holder:
             self.agent_holder[0] = agent
         if self._worker is not None:

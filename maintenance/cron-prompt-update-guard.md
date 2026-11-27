@@ -37,3 +37,5 @@ refuses placeholder and drastic-shrink prompt updates on both the tool and CLI
 paths with an explicit override, and these regressions pass there.
 
 Rollback: revert the commits carrying `Fork-Patch: cron-prompt-update-guard`.
+
+Contract tests: `tests/tools/test_cronjob_tools.py`, `tests/hermes_cli/test_cron.py`.
