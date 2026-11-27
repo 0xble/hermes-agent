@@ -275,6 +275,12 @@ def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
         return ()
     depunctuated = _strip_edge_silence_punctuation(stripped)
     forms = (stripped,) if depunctuated == stripped else (stripped, depunctuated)
+    # Treat model-inserted spacing as part of the control token only when
+    # square brackets enclose the whole response. Bare prose keeps its spacing.
+    if stripped.startswith("[") and stripped.endswith("]"):
+        compact = "[" + "".join(stripped[1:-1].split()) + "]"
+        if compact not in forms:
+            forms = (*forms, compact)
     return tuple(_canonical_silence_candidate(f) for f in forms)
 
 
