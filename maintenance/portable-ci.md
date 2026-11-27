@@ -429,22 +429,33 @@ Run `git fetch origin main` and `./bin/ci ready "$(git rev-parse HEAD)"` from a
 clean PR checkout. `ready` compares the exact head with its merge base against
 `origin/main`. It keeps the existing static and Node gate (including lint and
 type checks) and runs selected Python/E2E files through `scripts/run_tests.sh`.
-Only changes to runnable test files or to `gateway/response_filters.py` and its
-covered tests can narrow the suite. The response-filter pilot keeps all PR-safe
-E2E and the agent, gateway, cron, CLI, TUI and tools consumer suites. The mapping
-is an allowlist, not an import-graph guarantee; review it before expanding it.
-Shared fixtures, conftests, config and lockfiles, CI changes, unknown or mixed
-paths, deletions and renames, shallow or missing history, and empty diffs run
-the full existing PR Python/E2E inventory. Native, integration, upgrade and
-other nightly-only coverage remain unchanged.
+Only edits confined to existing test bodies in the explicit leaf-test allowlist
+can narrow the suite. The pilot admits `tests/gateway/test_response_filters.py`:
+its assertions run in isolation, it does not provide fixtures or pytest plugins,
+and no other tracked code imports it. Re-audit the allowlist before adding paths
+or sharing an existing entry. A `test_*.py` name or presence in the test inventory
+does not prove isolation. Both revisions must match the audited Git blob's
+module structure outside existing test bodies. Changes to imports, test
+signatures, decorators or other module-level code run the full inventory,
+including when those changes have already landed on the base branch.
+
+All production changes run the full PR Python/E2E inventory. For example,
+`gateway/response_filters.py` has indirect ACP consumers outside the former
+pilot directories. Imported test modules, pytest plugins, fixture providers, CI
+and config, additions, deletions, mode changes, renames, and uncertainty reading
+Git or parsing audited modules also select the full inventory. If the canonical
+inventory itself cannot be built, CI fails rather than reporting a partial pass.
+Native, integration, upgrade and other nightly-only coverage are unchanged.
 
 Draft PRs against `main` use `ready --shard` for Python/E2E feedback only. A
 draft cannot pass `qualification`, even on full fallback. Marking a PR ready
 starts the unchanged full Python/E2E matrix and static/Node gate at its exact
-head. `bin/ci gate`, `bin/ci nightly`, and `bin/ci full` do not use selection or
-consume its manifest. Landing still requires the full hosted `qualification` and
-applicable local proof. To roll back hosted narrowing, use `gate` for every PR
-shard again.
+head. Unsharded `bin/ci gate <sha>` runs static, Node, and every PR Python/E2E
+shard locally. The hosted static/Node job requests those two lanes explicitly
+so that it does not repeat the ten hosted Python/E2E shard jobs. `gate`, `nightly`,
+and `full` do not use selection or consume its manifest. Landing still requires
+the full hosted `qualification` and applicable local proof. To roll back hosted
+narrowing, use `gate` for every PR shard again.
 
 If `CI_AFFECTED_MANIFEST` names a nonexistent absolute path with an existing
 parent, an unsharded `ready` writes the selected files, head, merge base, mode,

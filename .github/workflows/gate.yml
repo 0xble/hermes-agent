@@ -73,7 +73,7 @@ jobs:
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci setup
           bash ci/prepare-electron-sandbox.sh
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
+          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --lane static --lane node-gate
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest

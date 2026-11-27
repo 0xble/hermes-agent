@@ -47,7 +47,8 @@ OPTIONAL_LANES = {
 
 # Keep the existing full/check interface for maintainers. Hosted CI selects these
 # explicit profiles rather than treating partial --lane runs as qualification.
-GATE_LANES = ('static', 'node-gate')
+GATE_LANES = ('static', 'node-gate', 'python-gate')
+PR_SHARDS = 10
 # Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
 # torture chamber remains nightly-only while its environment race is resolved.
 NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
@@ -102,10 +103,10 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
 
 def ready_plan(sha: str, count: int) -> tuple[affected.Selection, list[list[str]]]:
     buckets = shard_files(ROOT, count)
-    tracked = set(git('ls-files', '-z', '--cached').split('\0'))
-    inventory = [p for bucket in buckets for p in bucket
-                 if p in tracked and (ROOT / p).is_file() and not (ROOT / p).is_symlink()]
-    selection = affected.select(git, sha, inventory)
+    inventory = [p for bucket in buckets for p in bucket]
+    selection = affected.select(lambda *args: git(*args, timeout=30), sha, inventory)
+    if selection.selection == 'full':
+        return selection, buckets
     tests = set(selection.tests)
     return selection, [[p for p in bucket if p in tests] for bucket in buckets]
 
@@ -233,9 +234,10 @@ def run(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None 
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
-def git(*args: str, cwd: Path | None = None) -> str:
+def git(*args: str, cwd: Path | None = None, timeout: int | None = None) -> str:
     cwd = ROOT if cwd is None else cwd
-    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd)).decode('utf-8', errors='surrogateescape')
+    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd),
+                                   timeout=timeout).decode('utf-8', errors='surrogateescape')
 
 
 def source_files(root: Path | None = None) -> list[str]:
@@ -1234,6 +1236,18 @@ def ci_environment() -> Iterator[dict[str, str]]:
         yield resolve_local_toolchain(environment(home))
 
 
+def python_batches(env: dict[str, str], batches: list[list[str]], workers: int) -> None:
+    # Keep each argv below OS limits, including the full unsharded gate.
+    run_all(lambda files=files: python_files(env, files, workers) for files in batches if files)
+
+
+def python_gate(env: dict[str, str], workers: int) -> None:
+    batches = shard_files(ROOT, PR_SHARDS)
+    if not any(batches):
+        raise RuntimeError('Empty canonical Python/E2E inventory')
+    python_batches(env, batches, workers)
+
+
 def run_ready(args: argparse.Namespace, index: int, count: int) -> int:
     sha = args.expected_sha
     assert_exact_checkout(sha)
@@ -1242,11 +1256,12 @@ def run_ready(args: argparse.Namespace, index: int, count: int) -> int:
         manifest = Path(target)
         if count or not manifest.is_absolute() or not manifest.parent.is_dir() or os.path.lexists(manifest):
             raise RuntimeError('CI_AFFECTED_MANIFEST requires unsharded ready and a nonexistent absolute path with an existing parent')
-    # Keep each argv below OS limits even when full fallback selects thousands of files.
-    selection, buckets = ready_plan(sha, count or 10)
+    selection, buckets = ready_plan(sha, count or PR_SHARDS)
     batches = [buckets[index - 1]] if count else buckets
     print(f'READY: {selection.selection}; {sum(map(len, batches))} Python/E2E files; {selection.reason}', flush=True)
     if count and not batches[0]:
+        if selection.selection == 'full':
+            raise RuntimeError(f'Empty Python shard {index}/{count}')
         print('READY: no tests in this shard; not a qualification result')
         return 0
     with ci_environment() as env:
@@ -1255,8 +1270,7 @@ def run_ready(args: argparse.Namespace, index: int, count: int) -> int:
         actions: list[tuple[str, Callable[[], None]]] = []
         if not count:
             actions.extend((('static', lambda: static(env)), ('node-gate', lambda: node_gate(env, args.node_workers))))
-        actions.append(('affected-python', lambda: run_all(
-            lambda files=files: python_files(env, files, args.workers) for files in batches if files)))
+        actions.append(('affected-python', lambda: python_batches(env, batches, args.workers)))
         passed = aggregate(actions)
         assert_exact_checkout(sha)
     if passed and manifest is not None:
@@ -1314,6 +1328,7 @@ def main() -> int:
         lanes = {
             'static': lambda: static(env),
             'node-gate': lambda: node_gate(env, args.node_workers),
+            'python-gate': lambda: python_gate(env, args.workers),
             'nightly-only-e2e': lambda: nightly_only_e2e(env, args.workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: e2e_tests(env, args.workers),
@@ -1331,7 +1346,8 @@ def main() -> int:
         passed = aggregate([(name, lanes[name]) for name in dict.fromkeys(selected)])
         if exact:
             assert_exact_checkout(args.expected_sha)
-        scope = ('GATE' if args.command == 'gate' else 'NIGHTLY' if exact else
+        scope = ('GATE' if args.command == 'gate' and not (args.lane or args.shard) else
+                 'GATE (partial)' if args.command == 'gate' else 'NIGHTLY' if exact else
                  'PARTIAL' if args.lane else f'FULL SOURCE GATE ({sys.platform})')
         print(f'{scope}: {"PASS" if passed else "FAIL"}. Native OS, external integration and release lanes are separate.')
         return 0 if passed else 1

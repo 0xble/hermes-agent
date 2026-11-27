@@ -1,6 +1,7 @@
 """Conservative Python/E2E file selection for PR feedback, not qualification."""
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -8,12 +9,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-# Pilot one production file. Its consumers span direct and transitive callers
-# (gateway, agent, cron, CLI, TUI and tools); keep all PR-safe E2E for it.
-SILENCE_SOURCE = 'gateway/response_filters.py'
-SILENCE_TEST_ROOTS = ('tests/agent/', 'tests/cron/', 'tests/e2e/', 'tests/gateway/',
-                      'tests/hermes_cli/', 'tests/tools/', 'tests/tui_gateway/')
+# Audited at 06b13de1c77: standalone assertions, no fixture/plugin exports or
+# repo code importing this module. Re-audit before adding paths or making an
+# entry shared. Being collected by pytest is not evidence of being private.
+AUDITED_LEAF_TESTS = {
+    'tests/gateway/test_response_filters.py': 'a77abdc539c9fa9e4336ab09e7a3a2156c47ae65',
+}
 SHA = re.compile(r'[0-9a-f]{40}')
+REGULAR_MODIFICATION = re.compile(r':100644 100644 ([0-9a-f]{40}) ([0-9a-f]{40}) M')
 
 
 @dataclass(frozen=True)
@@ -30,11 +33,23 @@ class Selection:
             stream.write('\n')
 
 
+def module_contract(source: str) -> str:
+    # Git uses surrogateescape for paths. Never treat undecodable source as
+    # audited Python, even if the invalid bytes would only occur in a comment.
+    content = source.encode('utf-8')
+    compile(content, '<audited test>', 'exec', dont_inherit=True)
+    tree = ast.parse(content, type_comments=True)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith('test_'):
+            node.body = []
+    return ast.dump(tree)
+
+
 def select(git: Callable[..., str], sha: str, inventory: list[str],
            base_ref: str = 'refs/remotes/origin/main') -> Selection:
-    """Read NUL-delimited Git paths; any uncertainty selects the full inventory."""
+    """Narrow only edits inside existing test bodies in explicitly audited modules."""
     all_tests = tuple(sorted(set(inventory)))
-    candidates = set(all_tests)
+    eligible = AUDITED_LEAF_TESTS.keys() & set(all_tests)
     base = None
 
     def full(reason: str) -> Selection:
@@ -49,28 +64,29 @@ def select(git: Callable[..., str], sha: str, inventory: list[str],
         if len(bases) != 1 or not SHA.fullmatch(bases[0]):
             return full('no unique merge base')
         base = bases[0]
-        raw = git('diff', '--name-status', '-z', '--no-renames', '--no-ext-diff', base, sha, '--')
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return full('Git could not resolve the merge base or diff')
-    if not raw:
-        return full('empty diff')
-    fields = raw.split('\0')
-    if fields.pop() or len(fields) % 2:
-        return full('unreadable diff')
-    changed = set()
-    for status, path in zip(fields[::2], fields[1::2], strict=True):
-        if status not in {'A', 'M'} or not path:
-            return full('deletion, rename, type change or unknown Git status')
-        changed.add(path)
-    if changed <= candidates:
-        return Selection(base, 'affected', tuple(sorted(changed)), 'runnable test files only')
-    if SILENCE_SOURCE in changed and all(
-        path == SILENCE_SOURCE or (path in candidates and path.startswith(SILENCE_TEST_ROOTS))
-        for path in changed
-    ):
-        tests = tuple(p for p in all_tests if p.startswith(SILENCE_TEST_ROOTS)
-                      or (p.startswith('tests/') and p.count('/') == 1)
-                      or p.startswith('candidate-extensions/'))
-        if 'tests/gateway/test_response_filters.py' in tests:
-            return Selection(base, 'affected', tests, 'response filter pilot: consumer suites and PR-safe E2E')
-    return full('mixed changes or paths outside the pilot')
+        raw = git('diff', '--raw', '-z', '--no-abbrev', '--no-renames', '--no-ext-diff',
+                  '--no-relative', '--ignore-submodules=none', base, sha, '--')
+        if not raw:
+            return full('empty diff')
+        fields = raw.split('\0')
+        if fields.pop() or len(fields) % 2:
+            return full('unreadable diff')
+        changed = {}
+        for change, path in zip(fields[::2], fields[1::2], strict=True):
+            blobs = REGULAR_MODIFICATION.fullmatch(change)
+            if not blobs or not path or path in changed:
+                return full('addition, deletion, rename, mode change or unreadable diff')
+            changed[path] = blobs.groups()
+        if not changed.keys() <= eligible:
+            return full('path outside the audited leaf-test allowlist')
+        for path, (before, after) in changed.items():
+            audited = AUDITED_LEAF_TESTS[path]
+            contract = module_contract(git('cat-file', 'blob', audited))
+            for blob in {before, after} - {audited}:
+                if module_contract(git('cat-file', 'blob', blob)) != contract:
+                    return full('audited test module differs from its audited module structure')
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return full('Git could not read comparison history, paths or test blobs')
+    except (SyntaxError, ValueError, RecursionError):
+        return full('could not parse an audited test module')
+    return Selection(base, 'affected', tuple(sorted(changed)), 'audited leaf test bodies only')
