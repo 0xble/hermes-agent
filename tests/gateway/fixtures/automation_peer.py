@@ -20,11 +20,16 @@ from tests.waiting import async_wait_until
 from tests.gateway.fixtures.local_recovery_probe import child_env, websocket, rpc
 
 
+_FOLLOWER_ACK = 'FIFO_FOLLOWER_ACK'
+_AFTER_RECOVERY_ACK = 'AFTER_RECOVERY_ACK'
+
+
 class AutomationServer(ThreadingHTTPServer):
     requests: list[dict[str, Any]]
     blocked: threading.Event
     release: threading.Event
     hold_completion: bool
+    recovery_replies: bool
     completion_blocked: threading.Event
     completion_release: threading.Event
     checkin: bool
@@ -54,6 +59,11 @@ class Model(BaseHTTPRequestHandler):
             server.completion_blocked.set()
             server.completion_release.wait(120)
         message: dict[str, Any] = {'role': 'assistant', 'content': 'AUTOMATION_ACK'}
+        if getattr(server, 'recovery_replies', False):
+            if 'HUMAN_FIFO_FOLLOWER' in str(last):
+                message['content'] = _FOLLOWER_ACK
+            elif 'AFTER_RECOVERY' in str(last):
+                message['content'] = _AFTER_RECOVERY_ACK
         if getattr(server, 'checkin', False):
             if '[Supervisor check-in]' in str(last):
                 server.checkin_turns += 1
@@ -119,6 +129,7 @@ def _model_for(home, mode):
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
     model.hold_completion = mode.startswith('restart-')
+    model.recovery_replies = mode == 'restart-started'
     model.completion_blocked, model.completion_release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
     peer_checkin = mode.startswith('peer-checkin')
@@ -165,13 +176,22 @@ async def _arm_peer_goal_wait(root, env, home, desc, sid):
     return instance
 
 
-async def _kill_and_reap(proc, phase):
-    # The asyncio child watcher reaps with a blocking waitpid on macOS (or a pidfd
-    # on Linux), independent of the relay. Avoid Popen.wait(timeout)'s sleep/poll loop.
+def _signal_owner(proc):
+    if proc.returncode is not None:
+        return
     try:
-        proc.kill()
+        if os.name == 'nt':
+            proc.kill()  # TerminateProcess does not compete for waitpid.
+        else:
+            # In Python 3.11, Process.kill() calls Popen.poll(), which can
+            # consume the exit status before asyncio's child watcher sees it.
+            os.kill(proc.pid, signal.SIGKILL)  # windows-footgun: ok
     except ProcessLookupError:
-        pass  # The watcher won the race with kill; still wait for its status.
+        pass  # The watcher won the race with kill; still use its status.
+
+
+async def _kill_and_reap(proc, phase):
+    _signal_owner(proc)
     try:
         return await asyncio.wait_for(proc.wait(), 10)
     except TimeoutError as exc:
@@ -203,9 +223,9 @@ async def probe(root, base, mode):
             frame = json.loads(line)
             action = frame.get('action', {})
             if (frame['type'] == 'outbound' and action.get('op') == 'send'
-                    and action.get('content') == 'AUTOMATION_ACK'):
+                    and action.get('content') in (_FOLLOWER_ACK, _AFTER_RECOVERY_ACK)):
                 reply_sources[id(action)] = ws
-                if (mode == 'restart-started' and old_ws is not None and ws is not old_ws
+                if (action['content'] == _FOLLOWER_ACK and old_ws is not None and ws is not old_ws
                         and not expose_successor_reply):
                     # Hold only observation, not the wire acknowledgement or durable settlement.
                     delayed_replies.append(frame)
@@ -232,7 +252,8 @@ async def probe(root, base, mode):
     async def wait_for(predicate, seconds=35):
         await async_wait_until(predicate, timeout=seconds)
 
-    proc = None
+    proc = old_proc = None
+    old_pid = None
     try:
         async with websockets.serve(connector, '127.0.0.1', 0) as relay:
             url = f'http://127.0.0.1:{model.server_port}/v1'
@@ -393,8 +414,9 @@ async def probe(root, base, mode):
                         old_pid, old_epoch = proc.pid, desc['authority_epoch']
                         old_ws = ws
                         sent_before_restart = len(outgoing)
-                        old_proc, proc = proc, None  # Exactly one reap attempt for the old owner.
+                        old_proc, proc = proc, None  # Teardown may signal it, but never waits again.
                         returncode = await _kill_and_reap(old_proc, 'old owner')
+                        old_proc = None
                         if os.name == 'nt':
                             assert returncode == 1, returncode  # TerminateProcess exit code.
                         else:
@@ -437,10 +459,10 @@ async def probe(root, base, mode):
                         follower = next(r for r in rows() if r['request_id'] == 'human-follower')
                         assert follower['outcome'] == 'completed', follower
 
-                        def recovered_replies():
+                        def replies(marker):
                             return [f['action'] for f in outgoing[sent_before_restart:]
                                 if f.get('type') == 'outbound' and f.get('action', {}).get('op') == 'send'
-                                and f['action'].get('content') == 'AUTOMATION_ACK']
+                                and f['action'].get('content') == marker]
 
                         # The first predicate check sees a busy notice and a settled ledger, but
                         # cannot see the real reply until it yields back to the relay connector.
@@ -451,15 +473,19 @@ async def probe(root, base, mode):
                             delayed_replies.clear()
 
                         asyncio.get_running_loop().call_soon(expose_replies)
-                        await wait_for(recovered_replies)
-                        revived_sends = recovered_replies()
-                        assert len(revived_sends) == 1, outgoing[sent_before_restart:]
-                        assert reply_sources[id(revived_sends[0])] is successor_ws, revived_sends
-                        assert revived_sends[0].get('metadata', {}).get('user_id') == 'fixture-user', revived_sends
+                        await wait_for(lambda: replies(_FOLLOWER_ACK))
                         await send('after-recovery', 'AFTER_RECOVERY')
                         await wait_for(lambda: any(r['request_id'] == 'after-recovery'
                             and r['status'] == 'terminal' and r['outcome'] == 'completed'
                             and r['seq'] > follower['seq'] for r in rows()))
+                        # A terminal row can precede delivery. Observe the later turn's reply
+                        # on the same ordered relay connection before counting follower sends.
+                        await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
+                                                   for action in replies(_AFTER_RECOVERY_ACK)))
+                        revived_sends = replies(_FOLLOWER_ACK)
+                        assert len(revived_sends) == 1, outgoing[sent_before_restart:]
+                        assert reply_sources[id(revived_sends[0])] is successor_ws, revived_sends
+                        assert revived_sends[0].get('metadata', {}).get('user_id') == 'fixture-user', revived_sends
                         texts = [next((m.get('content', '') for m in reversed(r['messages'])
                             if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]
                         assert sum('REAL_TERMINAL_COMPLETION' in str(t) for t in texts) == 1, texts
@@ -506,7 +532,7 @@ async def probe(root, base, mode):
                     try:
                         (home / 'boundary-release').touch()
                         if (home / 'state.db').exists():
-                            print(json.dumps({'ledger_at_failure': rows(), 'outgoing': outgoing,
+                            print(json.dumps({'old_pid': old_pid, 'ledger_at_failure': rows(), 'outgoing': outgoing,
                                 'model_inputs': [next((m.get('content', '') for m in reversed(r['messages'])
                                     if m['role'] == 'user'), '') for r in model.requests if r.get('messages')]}),
                                 file=sys.stderr)
@@ -521,6 +547,11 @@ async def probe(root, base, mode):
     finally:
         primary = sys.exception()
         try:
+            if old_proc is not None and old_proc.returncode is None:
+                # Preserve the first failure and leave reaping to the watcher.
+                assert primary is not None
+                primary.add_note(f'Old owner PID {old_proc.pid} still unreaped at teardown; sending best-effort kill')
+                _signal_owner(old_proc)
             if proc is not None:
                 await _kill_and_reap(proc, 'fixture cleanup')
         except Exception as exc:
