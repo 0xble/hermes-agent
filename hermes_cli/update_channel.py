@@ -245,6 +245,14 @@ def set_install_channel(
 
 def handle_metadata_args(args, project_root: Path) -> bool:
     """Handle metadata-only update commands before any update side effect."""
+    if getattr(args, "expect_sha", None):
+        # A usage error: refused before any update state exists, so there is no receipt to record.
+        if not getattr(args, "branch", None):
+            print("✗ --expect-sha requires --branch: the pin names the commit that branch must resolve to.")
+            raise SystemExit(2)
+        if any(getattr(args, flag, False) for flag in ("rollback", "check", "plan", "list_venv_holders")):
+            print("✗ --expect-sha only applies to an update that fetches and installs the branch.")
+            raise SystemExit(2)
     if getattr(args, "install_id", False):
         print(install_id(project_root))
         return True

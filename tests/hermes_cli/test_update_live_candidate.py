@@ -522,7 +522,7 @@ def test_failed_ref_prune_still_finishes_activation(installed, monkeypatch, caps
 
 def test_a_pinned_branch_applies_when_the_fetched_commit_is_the_pin(installed):
     active = apply(installed, "--branch", "main", "--expect-sha", installed.target)
-    assert active.name == installed.target
+    assert git(installed.source, "show", "-s", "--format=%P", active.name).split()[0] == installed.target
 
 
 def test_a_pinned_branch_mismatch_refuses_before_staging(installed, monkeypatch):
