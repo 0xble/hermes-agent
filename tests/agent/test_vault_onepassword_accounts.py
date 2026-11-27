@@ -28,6 +28,9 @@ with (Path(__file__).parent / "audit.jsonl").open("a") as stream:
 if account is None:
     print("authentication rejected", file=sys.stderr)
     sys.exit(1)
+if args == ["whoami", "--format", "json"]:
+    print(json.dumps({"url": account + ".example.com", "integration_id": "synthetic-" + account}))
+    sys.exit(0)
 item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
         "business": ("item-b", "vault-b", (lambda f: f.read_text().strip() if f.exists() else "https://business.example/login")(
             Path(__file__).parent / "business_url"))}[account]
@@ -111,6 +114,19 @@ def test_each_account_lists_and_resolves_only_with_its_own_token(env):
 
     # Every business-account call used the business token and never Connect.
     assert calls() and all(c["account"] == "business" and c["connect"] == [] for c in calls())
+
+
+def test_named_account_mismatch_fails_before_listing(env):
+    _home, op, calls = env
+    op.write_text(op.read_text().replace('account + ".example.com"', '"personal.example.com"'))
+    backend = OnePasswordLoginBackend({
+        "binary_path": str(op),
+        "account": "business.example.com",
+        "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN_BUSINESS",
+    }, alias="business")
+    with pytest.raises(RuntimeError, match=r"account mismatch.*business\.example\.com"):
+        backend.list_items()
+    assert [call["argv"] for call in calls()] == [["whoami", "--format", "json"]]
 
 
 def test_business_handle_cannot_resolve_personal_item(env):
@@ -230,10 +246,13 @@ def test_display_listing_is_reused_but_never_across_tokens(env, monkeypatch):
     business.list_items()
     assert len(_listings(calls)) == 1
 
-    # A rotated token is a new identity: it must list for itself, not reuse the old answer.
+    # A rotated token for another account is rejected before any result can be returned.
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "dummy-personal-token")
-    assert [m.id for m in backend_for_handle("op@business:item-b").list_items()] == ["op@business:item-p"]
-    assert len(_listings(calls)) == 2
+    rotated = backend_for_handle("op@business:item-b")
+    assert rotated is not None
+    with pytest.raises(RuntimeError, match="account mismatch"):
+        rotated.list_items()
+    assert len(_listings(calls)) == 1
 
 
 def test_fill_authorization_sees_a_website_change_the_display_cache_has_not(env):

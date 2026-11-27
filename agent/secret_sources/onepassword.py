@@ -2,9 +2,9 @@
 
 Users map env-var names to ``op://vault/item/field`` references in
 ``secrets.onepassword.env``; refs are resolved in one ``op run`` batch with
-per-reference ``op read`` fallback using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
-headless, ``OP_SESSION_*`` interactive) — Hermes never authenticates on the
-user's behalf, and failures never block startup. Complete pulls are cached
+per-reference ``op read`` fallback using the configured account's auth; named accounts are verified with
+``op whoami`` before cache hits or reads (``OP_SERVICE_ACCOUNT_TOKEN`` headless, ``OP_SESSION_*`` interactive)
+— Hermes never authenticates on the user's behalf, and failures never block startup. Complete pulls are cached
 in-process and under ``<hermes_home>/op_cache.json`` (values only; auth
 material is fingerprinted, never stored).
 """
@@ -22,6 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from agent.secret_sources._cache import (
     CachedFetch, SecretCache, atomic_write_json, fingerprint as _fingerprint, resolve_cache_home,
@@ -192,14 +193,58 @@ def _scrub(text: str) -> str:
     return strip_ansi(text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> dict[str, str]:
+def _op_child_env(token_value: str, *, named_account: bool = False) -> dict[str, str]:
     source_env = get_source_environment()
     env = {k: source_env[k] for k in _OP_ENV_ALLOWLIST if k in source_env}
     env.update((k, v) for k, v in source_env.items() if k.startswith("OP_SESSION_"))
+    if named_account:
+        # A process-wide token can belong to a different account and op gives it
+        # precedence over --account. Never let it cross a named-account boundary.
+        env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     if token_value:
         env["OP_SERVICE_ACCOUNT_TOKEN"] = token_value
     env["NO_COLOR"] = "1"
     return env
+
+
+def _account_host(value: str) -> str:
+    """Normalize an account URL or hostname without exposing auth material."""
+    raw = value.strip().lower().rstrip("/")
+    parsed = urlsplit(raw if "://" in raw else "//" + raw)
+    return (parsed.hostname or raw).rstrip(".")
+
+
+def _verify_selected_account(op: Path, account: str, token_value: str) -> None:
+    """Fail closed when ``op`` authenticates a different account than requested.
+
+    Official ``op`` can let a service-account token override ``--account``. A
+    successful secret read therefore is not proof that it came from the named
+    account; verify the provider identity before consulting the cache or reading
+    any reference.
+    """
+    requested = account.strip()
+    if not requested:
+        return
+    proc = run_cli([str(op), "whoami", "--format", "json"],
+                   env=_op_child_env(token_value, named_account=True),
+                   timeout=_OP_RUN_TIMEOUT, label="op",
+                   timeout_message=f"op whoami timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
+    if proc.returncode != 0:
+        err = _scrub(proc.stderr or "")
+        raise RuntimeError(f"1Password account authentication failed for {requested}: "
+                           f"{err[:300] or 'whoami failed'}")
+    try:
+        identity = json.loads(proc.stdout or "{}")
+    except (TypeError, ValueError):
+        raise RuntimeError(f"1Password account authentication failed for {requested}: "
+                           "whoami returned invalid identity") from None
+    authenticated = identity.get("url") if isinstance(identity, dict) else None
+    if not isinstance(authenticated, str) or not authenticated.strip():
+        raise RuntimeError(f"1Password account authentication failed for {requested}: "
+                           "whoami returned no account URL")
+    if _account_host(authenticated) != _account_host(requested):
+        raise RuntimeError(f"1Password account mismatch: requested {requested}, "
+                           f"authenticated {authenticated}")
 
 
 def _batch_safe_reference(reference: str) -> bool:
@@ -241,7 +286,7 @@ def _run_op_batch(op: Path, references: dict[str, str], *, account: str = "",
         if account:
             cmd += ["--account", account]
         cmd += ["--", sys.executable, "-c", child, str(output), *names]
-        proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT,
+        proc = run_cli(cmd, env=_op_child_env(token_value, named_account=bool(account)), timeout=_OP_RUN_TIMEOUT,
                        label="op", timeout_message=f"op run timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
         if proc.returncode != 0:
             err = _scrub(proc.stderr or "")[-300:]
@@ -266,7 +311,7 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
         cmd += ["--account", account]
     cmd += ["--", reference]  # `--` so a reference can never parse as an op flag
 
-    proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT, label="op",
+    proc = run_cli(cmd, env=_op_child_env(token_value, named_account=bool(account)), timeout=_OP_RUN_TIMEOUT, label="op",
                    timeout_message=f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}", stdin=None)
 
     if proc.returncode != 0:
@@ -285,6 +330,22 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     if not value.strip():
         raise RuntimeError(f"op read returned an empty value for {reference!r}")
     return value
+
+
+def _cached_subset(
+    cache_key: _CacheKey, valid: dict[str, str], *, use_cache: bool,
+    cache_ttl_seconds: float, home_path: Optional[Path],
+) -> tuple[dict[str, str], Optional[float], bool]:
+    """Return a complete hit, or the partial values and their original timestamp."""
+    if not use_cache:
+        return {}, None, False
+    cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
+    if cached is None:
+        return {}, None, False
+    if all(name in cached.secrets for name in valid):
+        return dict(cached.secrets), cached.fetched_at, True
+    return ({n: v for n, v in cached.secrets.items() if n in valid},
+            cached.fetched_at, False)
 
 
 def fetch_onepassword_secrets(
@@ -310,17 +371,21 @@ def fetch_onepassword_secrets(
     cache_key: _CacheKey = (_auth_fingerprint(token_env), account or "",
                             str(home_path) if home_path is not None else "", _refs_fingerprint(valid))
 
-    # Values carried over from a fresh-but-incomplete cache entry, and the fetch time
-    # they were recorded under (reused so carried-over values never get a fresh lease).
-    prefetched: dict[str, str] = {}
-    prefetched_at: Optional[float] = None
-    if use_cache:
-        cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
-        if cached is not None:
-            if all(name in cached.secrets for name in valid):
-                return dict(cached.secrets), warnings
-            prefetched = {n: v for n, v in cached.secrets.items() if n in valid}
-            prefetched_at = cached.fetched_at
+    # A named account must be verified before a cache hit can return values. The
+    # cache key identifies auth material, but cannot prove that the provider
+    # honored the requested account selector.
+    if account:
+        selected_op = binary or find_op(binary_path)
+        if selected_op is None:
+            raise RuntimeError("op CLI not found.  Install the 1Password CLI "
+                               "(https://developer.1password.com/docs/cli/get-started/) or set "
+                               "secrets.onepassword.binary_path to its absolute location.")
+        _verify_selected_account(selected_op, account, token_value)
+
+    prefetched, prefetched_at, complete = _cached_subset(
+        cache_key, valid, use_cache=use_cache, cache_ttl_seconds=cache_ttl_seconds, home_path=home_path)
+    if complete:
+        return prefetched, warnings
 
     op = binary or find_op(binary_path)
     if op is None:

@@ -122,6 +122,45 @@ def test_fetch_happy_path(monkeypatch, tmp_path):
 
 
 
+def test_named_account_mismatch_fails_before_cache_or_read(monkeypatch, tmp_path):
+    """A token for one account must not satisfy a different configured account."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "personal-token")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "business-token")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs["env"]))
+        assert kwargs["env"].get("OP_SERVICE_ACCOUNT_TOKEN") == "business-token"
+        if argv[1:3] == ["whoami", "--format"]:
+            return _ok(json.dumps({"url": "https://personal.1password.com/"}))
+        return _ok("must-not-be-read")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match=r"account mismatch.*business\.1password\.com"):
+        op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, account="business.1password.com",
+            token_env="OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", binary=fake_op, cache_ttl_seconds=300,
+            home_path=tmp_path,
+        )
+    assert calls[0][0] == [str(fake_op), "whoami", "--format", "json"]
+
+
+def test_named_account_auth_failure_is_not_a_missing_reference(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "personal-token")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, "not signed in"))
+
+    with pytest.raises(RuntimeError, match=r"authentication failed for business\.1password\.com"):
+        op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, account="business.1password.com",
+            binary=fake_op, use_cache=False,
+        )
+
+
+
 def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
