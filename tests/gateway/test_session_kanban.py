@@ -269,3 +269,20 @@ def test_card_admission_commits_and_restores_off_the_loop(monkeypatch):
     ref = asyncio.run(admit())
     assert ref.session_id == 'card-session'
     assert threads['commit'] != threads['loop'] and threads['restored'] == 'card-session'
+
+
+def test_settled_restore_rereads_once_after_a_live_cache_race(monkeypatch):
+    """A concurrent retry of the same card restores the same session: the loser re-reads once."""
+    import asyncio
+    from gateway.session_local_recovery import _LiveSessionChanged, restore_local_session_settled
+    calls = []
+
+    async def restore(authority, sid, *, admission_gate=True):
+        calls.append(sid)
+        if len(calls) == 1:
+            raise _LiveSessionChanged('admission_conflict')
+        return SimpleNamespace(session_id=sid)
+
+    monkeypatch.setattr('gateway.session_local_recovery.restore_local_session_async', restore)
+    assert asyncio.run(restore_local_session_settled(object(), 'card-session')).session_id == 'card-session'
+    assert calls == ['card-session', 'card-session']
