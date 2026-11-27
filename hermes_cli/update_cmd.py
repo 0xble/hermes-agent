@@ -269,7 +269,8 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
 
 def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                                 source: Path | None = None,
-                                source_python: Path | None = None) -> bool:
+                                source_python: Path | None = None,
+                                expected_current: Path | None = None) -> bool:
     """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
         ReleasePaths, activate_release, read_pointer, release_sha, stage_release,
@@ -304,7 +305,7 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         # A pending record owns its target, even if its pointers already moved.
         # Complete it before evaluating a new candidate. The release manager
         # persists the exact intended plist before touching any mutable state.
-        recovered = _finish_pending_release_transaction(home)
+        recovered = _finish_pending_release_transaction(home) if expected_current is None else None
         if recovered is not None and recovered.get("current") == str(candidate):
             result = recovered
             first = recovered.get("source_sha") is not None
@@ -324,7 +325,8 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
             result = activate_release(home, candidate, source=source if first else None,
                                       source_python=source_python if first else None,
                                       plist_path=plist, plist_body=plist_body,
-                                      reload_callback=reload_callback)
+                                      reload_callback=reload_callback,
+                                      **({"expected_current": expected_current} if expected_current is not None else {}))
         if result.get("reload_pending"):
             if _await_release_acknowledgement(home):
                 result = _finish_pending_release_transaction(home) or {key: value for key, value in result.items()
@@ -1319,7 +1321,7 @@ def _handle_update_called_process_error(
     if unrestored := _unrestored_autostash_notice():
         print(unrestored)  # a stash taken this run that no settle step reported (#122557)
     stage = _format_update_failure_stage(e)
-    if _should_zip_fallback_on_update_error(e):
+    if getattr(args, "expect_release", None) is None and _should_zip_fallback_on_update_error(e):
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
@@ -1637,9 +1639,13 @@ _POST_SWAP_FORWARDED_FLAGS = (
 
 def _post_swap_argv_tail(args) -> list[str]:
     tail = [flag for attr, flag in _POST_SWAP_FORWARDED_FLAGS if getattr(args, attr, False)]
-    # Selection-only flags stay behind: the child runs the target's parser, which may predate them.
+    # Selection-only flags stay behind. A pinned child must also enforce the release pin.
     branch = getattr(args, "branch", None)
-    return tail + (["--branch", str(branch)] if branch else [])
+    if branch:
+        tail.extend(("--branch", str(branch)))
+    if pin := getattr(args, "expect_release", None):
+        tail.extend(("--expect-release", ":".join(pin)))
+    return tail
 
 
 def _post_swap_payload(
@@ -1744,6 +1750,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
     interpreter, driven from a hand-off payload."""
     from dataclasses import replace as _replace
     import hermes_cli.update_cmd_config as _cfg
+    from hermes_cli.update_cmd_candidate import refuse_release_pin, require_pinned_live_release
     from hermes_cli.update_inventory import UpdatePlan
 
     _cfg._LAST_SIBLING_SNAPSHOTS = dict(payload.get("sibling_snapshots") or {})
@@ -1762,6 +1769,10 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
             paths = ReleasePaths.for_home(get_hermes_home())
             if release.parent != paths.releases.resolve() or release.name != payload["candidate_sha"]:
                 raise RuntimeError("immutable handoff release identity mismatch")
+            if pin := getattr(args, "expect_release", None):
+                if release.name != pin[1]:
+                    refuse_release_pin(f"expected candidate {pin[1]}, handoff selected {release.name}")
+                require_pinned_live_release(paths.home, pin[0])
             if _m().PROJECT_ROOT.resolve() != release:
                 raise RuntimeError("immutable post-swap child did not import the staged release")
             # This child imports from the staged release. Shared-state changes
@@ -1793,9 +1804,12 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                     _write_gateway_update_exit_code(False)
                 _finalize_receipt("partial", "Immutable release maintenance incomplete: %s")
                 raise SystemExit(1)
+            if pin:
+                require_pinned_live_release(paths.home, pin[0])
             if not _activate_immutable_release(defer=opts.no_gateway_restart,
                                                 sha=release.name, source=Path(payload["source"]),
-                                                source_python=Path(payload["source_python"]) if payload.get("source_python") else None):
+                                                source_python=Path(payload["source_python"]) if payload.get("source_python") else None,
+                                                **({"expected_current": paths.releases.resolve() / pin[0]} if pin else {})):
                 detail = _immutable_phase_error("immutable_activation", release, paths.home)
                 _record_update_step("immutable_activation", False, detail)
                 print(f"✗ {detail}")

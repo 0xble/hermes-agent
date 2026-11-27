@@ -2196,6 +2196,15 @@ def _update_preflight_handled(args) -> bool:
     from hermes_cli.update_channel import handle_metadata_args
     from hermes_cli.update_cmd_common import _record_stop
 
+    if getattr(args, "expect_release", None) is not None:
+        incompatible = ("check", "plan", "list_venv_holders", "set_channel",
+                        "install_id", "channel", "replace_candidate", "allow_drop_main", "no_backup")
+        branch = bool(getattr(args, "branch", None))
+        rollback = bool(getattr(args, "rollback", False))
+        if branch == rollback or any(getattr(args, flag, False) for flag in incompatible):
+            print("✗ --expect-release requires either --branch or --rollback without overrides.")
+            _record_stop("commit_point_refused", without_receipt="refused")
+            raise SystemExit(2)
     if handle_metadata_args(args, PROJECT_ROOT):
         sys.exit(0)
     if is_managed():

@@ -62,10 +62,15 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--allow-drop-main", action="store_true", default=False,
         help="Allow an intentional rollback that would drop commits already live and on origin/main; record the override in the update receipt.",
     )
-    from hermes_cli.update_cmd_candidate import candidate_sha
+    from hermes_cli.update_cmd_candidate import candidate_sha, parse_release_pin
     update_parser.add_argument(
         "--replace-candidate", default=None, metavar="SHA", type=candidate_sha,
         help="Explicitly replace this exact live candidate instead of carrying it into the update target.")
+    update_parser.add_argument(
+        "--expect-release", metavar="LIVE_SHA:CANDIDATE_SHA", type=parse_release_pin,
+        help="Require an exact immutable release pair. With --branch, fetch the candidate "
+             "and require a quick snapshot and live ancestry. With --rollback, require "
+             "the candidate SHA to match the previous release.")
     update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "
