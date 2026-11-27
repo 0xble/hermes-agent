@@ -3,6 +3,88 @@
 from __future__ import annotations
 
 
+def _update_preflight_handled(args, project_root, resolve_update_branch) -> bool:
+    """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
+    import json
+    import sys
+
+    from hermes_cli.config import is_managed, managed_error
+    from hermes_cli.update_channel import handle_metadata_args
+    from hermes_cli.update_cmd_common import _record_stop
+
+    if getattr(args, "expect_release", None) is not None:
+        incompatible = ("check", "plan", "list_venv_holders", "set_channel",
+                        "install_id", "channel", "replace_candidate", "allow_drop_main", "no_backup")
+        branch = bool(getattr(args, "branch", None))
+        rollback = bool(getattr(args, "rollback", False))
+        if branch == rollback or any(getattr(args, flag, False) for flag in incompatible):
+            print("✗ --expect-release requires either --branch or --rollback without overrides.")
+            _record_stop("commit_point_refused", without_receipt="refused")
+            raise SystemExit(2)
+    if handle_metadata_args(args, project_root):
+        sys.exit(0)
+    if is_managed():
+        managed_error("update Hermes Agent")
+        if not any(getattr(args, flag, False) for flag in ("plan", "check", "list_venv_holders")):
+            _record_stop("managed_install", without_receipt="refused")  # an update attempt: a metrics row only
+        return True
+
+    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
+    # docker/nix/apt refusal gates: on an image/package-managed install the
+    # plan itself reports "not updatable in place" plus the right mechanism.
+    if getattr(args, "plan", False):
+        # Read-only plan phase (#91277 Phase 2): inventory every running Hermes runtime across profiles, its
+        # supervisor, and its running code version — without mutating anything. Safe on a live fleet.
+        from hermes_cli.update_inventory import (
+            collect_runtime_inventory,
+            print_update_plan,
+        )
+
+        print_update_plan(collect_runtime_inventory())
+        return True
+
+    if getattr(args, "list_venv_holders", False):
+        # Read-only twin of the Windows venv-holder refusal (#117246): same scan and classifiers,
+        # machine-readable, exit 3 when holders remain so automation can stop those PIDs and retry.
+        import json
+
+        from hermes_cli.update_cmd_windows import VENV_HOLDERS_EXIT, list_venv_holders
+
+        holders = list_venv_holders()
+        print(json.dumps(holders, indent=2))
+        if holders:
+            sys.exit(VENV_HOLDERS_EXIT)
+        return True
+
+    # Image/package-managed admission gate (#91277 Phase 3): baked provenance marker first (fail-closed
+    # on malformed), then docker/nix/apt heuristics; one shared decision for every mutation surface, so
+    # --check never reports git state for an image-managed install. Prints the real update command,
+    # records a `refused` receipt and exits 2 (refused-by-contract, distinct from exit 1 errors).
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
+    )
+
+    refusal = evaluate_update_admission(project_root)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
+
+    if getattr(args, "check", False):
+        # --check honors --branch so its answer matches what update would pull.
+        branch = resolve_update_branch(args)
+        from hermes_cli.update_cmd import _cmd_update_check
+
+        _cmd_update_check(
+            branch=branch,
+            branch_explicit=bool(getattr(args, "branch", None)),
+            **({"channel": args.channel} if getattr(args, "channel", None) else {}),
+        )
+        return True
+    return False
+
+
 def _run_immutable_rollback(args, gateway_mode: bool) -> None:
     """Recover or apply a rollback and verify its acknowledged fleet."""
     from hermes_cli.update_cmd import (
