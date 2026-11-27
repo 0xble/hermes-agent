@@ -52,7 +52,7 @@ async def test_delivery_persist_delete_probe_unbind_order(setup_retire):
     order = []
     async def close(*args, **kwargs):
         order.append("close")
-        assert kwargs["metadata"] == {"thread_id": "42"}
+        assert kwargs["metadata"] == {"thread_id": "42", "telegram_topic_retire_closing": True}
         assert not adapter._bot.delete_forum_topic.called
         return SendResult(True, message_id="10")
     async def delete(**kwargs):
@@ -122,7 +122,8 @@ async def test_cancel_during_closing_invalidates_delete(setup_retire):
     await retire.request(runner, source)
     await retire.advance(runner, source)
     adapter._bot.delete_forum_topic.assert_not_awaited()
-    assert (await retire.load(runner, source))["phase"] == "cancelled"
+    final = await retire.load(runner, source)
+    assert final is not None and final["phase"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -508,6 +509,33 @@ async def test_flood_wait_during_preparation_retries_instead_of_failing(runtime,
 
 
 @pytest.mark.asyncio
+async def test_cap_refused_preparation_retries_without_posting_a_failure(runtime, monkeypatch):
+    from gateway.telegram_retire_prepare import queue_preparation
+
+    async def prepare(runner, source, state):
+        return await queue_preparation(runner, source, state, [])
+
+    # The adapter does not accept a wake when its turn cannot claim capacity.
+    runtime.adapter.handle_message = AsyncMock()
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", prepare)
+    schedule_retry = MagicMock()
+    monkeypatch.setattr(retire, "_schedule_retry", schedule_retry)
+
+    await retire.request(runtime, runtime.source)
+    original = await retire.load(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+
+    state = await retire.load(runtime, runtime.source)
+    assert state is not None and original is not None
+    assert state["phase"] == "waiting"
+    assert state["generation"] == original["generation"]
+    assert state["transient_retries"] == 1
+    schedule_retry.assert_called_once_with(runtime, runtime.source, 30)
+    runtime.adapter.send.assert_not_awaited()
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_transient_errors_stop_retrying_after_the_limit(runtime, monkeypatch):
     monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError(_FLOOD)))
     monkeypatch.setattr(retire, "_schedule_retry", lambda runner, source, delay: None)
@@ -767,5 +795,131 @@ async def test_unresolved_closing_attempt_is_resent_and_recovers(setup_retire, m
     final = await retire.load(runner, source)
     assert final is not None and final["phase"] == "done"
     adapter.send.assert_awaited_once()
-    assert retire._retryable({"failed_at": 1.0, "closing_attempt": 1.0})
-    assert not retire._retryable({"failed_at": 1.0, "closing_receipt": {"message_id": "1"}})
+    now = retire.time.time()
+    assert retire._retryable({"failed_at": now, "closing_attempt": now})
+    assert not retire._retryable({"failed_at": now, "closing_attempt": now, "error": "Closing reply was not fully acknowledged"})
+    assert not retire._retryable({"failed_at": now, "closing_attempt": now, "closing_delivery_unconfirmed": True})
+    assert not retire._retryable({"failed_at": now, "closing_receipt": {"message_id": "1"}})
+
+
+@pytest.mark.asyncio
+async def test_old_failed_closing_attempt_is_not_auto_retried(setup_retire, monkeypatch):
+    """374814: failed 2026-10-31 with a closing attempt. Deploying the resend must not delete it."""
+    runner, source, adapter, _ = setup_retire
+    now = 10_000_000.0
+    monkeypatch.setattr(retire.time, "time", lambda: now)
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    assert state is not None
+    old = now - 26 * 24 * 3600
+    state.update(phase="failed", failed_at=old + 11, closing_attempt=old, auto_retries=1,
+                 error="Closing delivery is unresolved. Cancel retirement before retrying.")
+    await retire.save(runner, source, state)
+    await retire.advance(runner, source)
+    after = await retire.load(runner, source)
+    assert after is not None and after["generation"] == state["generation"] and after["phase"] == "failed"
+    adapter.send.assert_not_awaited()
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    SendResult(True, message_id="10", raw_response={"thread_fallback": True}),
+    SendResult(True, message_id="10", raw_response={"undelivered_chunks": [1]}),
+    SendResult(True, message_id="10", deferred=True), SendResult(True, message_id="10", held=True),
+    SendResult(True)])
+async def test_returned_unconfirmed_closing_send_is_never_resent_or_deleted(setup_retire, monkeypatch, result):
+    """Second opinion test 6: a returned send may already be visible (in the root, after a fallback)."""
+    runner, source, adapter, _ = setup_retire
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    runner._async_profile_scope_for_source = lambda _: nullcontext()
+    adapter.send.return_value = result
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    state = await retire.load(runner, source)
+    assert state is not None and state["phase"] == "failed" and state["closing_delivery_unconfirmed"]
+    sends = adapter.send.await_count  # the closing note and one failure notice in the topic
+    for _ in range(retire._AUTO_RETRY_LIMIT + 1):
+        clock[0] += retire._AUTO_RETRY_MAX_SECONDS
+        await retire.advance(runner, source)
+    assert adapter.send.await_count == sends
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_closing_send_is_thread_strict():
+    from plugins.platforms.telegram.telegram_dm_topic_send import text_topic_must_refuse
+    meta = {"thread_id": "42", "telegram_topic_retire_closing": True}
+    assert text_topic_must_refuse("100", meta, retried=False, thread_id="42")
+    assert text_topic_must_refuse("100", meta, retried=True, thread_id="42")
+    assert text_topic_must_refuse("-1001", meta, retried=True, thread_id="42")
+    assert not text_topic_must_refuse("100", {"thread_id": "42"}, retried=True, thread_id="42")
+
+
+@pytest.mark.asyncio
+async def test_interrupted_closing_resend_deletes_only_after_a_fresh_exact_receipt(setup_retire):
+    """Second opinion test 5: after a cancel, resend once; the stale attempt never authorizes a delete."""
+    runner, source, adapter, _ = setup_retire
+    adapter.send.side_effect = asyncio.CancelledError
+    await retire.request(runner, source)
+    with pytest.raises(asyncio.CancelledError):
+        await retire.advance(runner, source)
+    adapter.send.side_effect = None
+    adapter.send.return_value = SendResult(True, message_id="10", raw_response={"requested_thread_id": 99})
+    await retire.advance(runner, source)  # wrong topic: not a receipt for this one
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    state = await retire.load(runner, source)
+    assert state is not None and state["closing_delivery_unconfirmed"] and not state.get("closing_receipt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["before_send", "before_delete"])
+async def test_cancel_during_resend_never_deletes(setup_retire, monkeypatch, boundary):
+    """Second opinion test 8: a generation change between attempt save and send, or receipt and delete."""
+    runner, source, adapter, _ = setup_retire
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    assert state is not None
+    state["closing_attempt"] = retire.time.time()  # interrupted earlier
+    await retire.save(runner, source, state)
+    real_save = retire.save
+
+    async def save(r, s, current, **kw):
+        await real_save(r, s, current, **kw)
+        if (boundary == "before_send" and current.get("closing_attempt") and not current.get("closing_receipt")
+                or boundary == "before_delete" and current.get("phase") == "deleting"):
+            monkeypatch.setattr(retire, "save", real_save)
+            if boundary == "before_send":
+                await retire.request(runner, source, cancel=True)
+            else:  # a deleting phase refuses cancel; any superseding write must still fence the delete
+                await real_save(r, s, {**current, "generation": "other", "phase": "cancelled"}, force=True)
+    monkeypatch.setattr(retire, "save", save)
+    await retire.advance(runner, source)
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+    final = await retire.load(runner, source)
+    assert final is not None and final["phase"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_user_activity_after_failed_closing_blocks_the_resend(setup_retire, monkeypatch):
+    """Second opinion test 9."""
+    runner, source, adapter, _ = setup_retire
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    runner._async_profile_scope_for_source = lambda _: nullcontext()
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    assert state is not None
+    state.update(phase="failed", failed_at=clock[0], closing_attempt=clock[0])
+    await retire.save(runner, source, state)
+    clock[0] += 5
+    assert await retire.intercept(runner, MessageEvent(text="still here", source=source)) is None
+    after = await retire.load(runner, source)
+    assert after is not None and after["user_active_at"]
+    clock[0] += retire._AUTO_RETRY_MAX_SECONDS
+    await retire.advance(runner, source)
+    final = await retire.load(runner, source)
+    assert final is not None and final["generation"] == state["generation"]
+    adapter.send.assert_not_awaited()
+    adapter._bot.delete_forum_topic.assert_not_awaited()

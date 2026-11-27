@@ -17,6 +17,7 @@ from dataclasses import asdict
 from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.telegram_topic_sessions import TopicRequestError
+from gateway.wake import WakeNotAccepted, WakeSuperseded
 
 logger = logging.getLogger(__name__)
 PREFIX = "telegram_retire:"
@@ -27,6 +28,9 @@ _TRANSIENT_MARKERS = (
     "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
 )
 _TRANSIENT_RETRY_LIMIT = 6
+# A closing attempt resumes automatically only within this window of its failure, so a failure
+# recorded before the resend existed cannot turn into a delete after a deploy. User retries are unaffected.
+_AUTO_RETRY_FRESHNESS_SECONDS = 24 * 60 * 60
 # Telegram can keep answering for a topic it just deleted. Read the exact topic back with backoff
 # before calling a delete unconfirmed (2026-11-26: 375507 and 426261 were deleted, then reported failed).
 _DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
@@ -57,6 +61,9 @@ _AUTO_RETRY_MAX_SECONDS = 6 * 3600
 
 def _transient_delay(exc) -> float | None:
     """Seconds to wait before retrying a transient failure, or None when it is not transient."""
+    if isinstance(exc, WakeNotAccepted):
+        # Admission did not run the turn; leave the saved preparation waiting for capacity.
+        return 30.0 if not exc.permanent and not isinstance(exc, WakeSuperseded) else None
     text = str(exc).lower().replace("\\", "").replace(" ", "")
     if not (isinstance(exc, asyncio.TimeoutError) or any(marker in text for marker in _TRANSIENT_MARKERS)):
         return None
@@ -367,6 +374,53 @@ async def _recover_retirement(runner, source, state, bot):
         return True
 
 
+async def _close_for_deletion(runner, source, state, adapter):
+    """Persist exact-topic closing authority before the caller may delete the topic."""
+    generation = state["generation"]
+    if state.get("closing_attempt"):
+        # Only an interrupted send (cancellation or restart: no result came back) reaches
+        # here, and this lock proves no send is in flight. The next advance() resends at once
+        # and deletes only after a fresh confirmed receipt, so the worst case is one repeated
+        # note. A returned-but-unconfirmed send, or
+        # an interruption too old to be this executor's own, stays a person's call.
+        if (state.get("closing_delivery_unconfirmed") or time.time() - float(state["closing_attempt"])
+                > _AUTO_RETRY_FRESHNESS_SECONDS):
+            raise RuntimeError("Closing delivery is unresolved. Cancel retirement before retrying.")
+        logger.info("Resending the interrupted closing note for %s", state["session_key"])
+    state["closing_attempt"] = time.time()
+    await save(runner, source, state)
+    from gateway.telegram_retire_prepare import closing_note
+    try:
+        # Thread-strict: a gone topic refuses rather than falling back to the chat root, so
+        # a retry can never repeat the note outside the topic.
+        result = await adapter.send(
+            str(source.chat_id), closing_note(state),
+            metadata={"thread_id": str(source.thread_id), "telegram_topic_retire_closing": True},
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # A send that raised may have reached the chat (a lost response). Not interrupted.
+        await _mark_closing_unconfirmed(runner, source, generation)
+        raise
+    state = await _current(runner, source, generation)
+    if not state:
+        return None
+    if not confirmed(result, source):
+        # A result came back, so this was not an interruption. The note may already be
+        # visible (thread fallback, partial chunks, held/deferred, no message ID): never
+        # resend it automatically and never let it authorize deletion.
+        await _mark_closing_unconfirmed(runner, source, generation)
+        raise RuntimeError("Closing reply was not fully acknowledged in this topic. The topic was kept.")
+    state["closing_receipt"] = {
+        "generation": generation, "message_id": str(result.message_id),
+        "chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "delivered_at": time.time(),
+    }
+    state["phase"] = "deleting"
+    await save(runner, source, state)
+    return state
+
+
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
     from gateway.telegram_retire_work import HandoffPending
@@ -424,26 +478,9 @@ async def advance(runner, source):
             state = await _current(runner, source, generation)
             if not state:
                 return
-            if state.get("closing_attempt"):
-                # An interrupted send (restart, cancellation) leaves no receipt. This lock proves no
-                # send is in flight, and the topic is deleted only after a fresh confirmed note, so
-                # the worst case is one repeated note. Needing a manual cancel stranded 379149.
-                logger.info("Resending the unconfirmed closing note for %s", key)
-            state["closing_attempt"] = time.time()
-            await save(runner, source, state)
-            from gateway.telegram_retire_prepare import closing_note
-            result = await adapter.send(str(source.chat_id), closing_note(state), metadata={"thread_id": str(source.thread_id)})
-            state = await _current(runner, source, generation)
+            state = await _close_for_deletion(runner, source, state, adapter)
             if not state:
                 return
-            if not confirmed(result, source):
-                raise RuntimeError("Closing reply was not fully acknowledged in this topic. The topic was kept.")
-            state["closing_receipt"] = {
-                "generation": generation, "message_id": str(result.message_id),
-                "chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "delivered_at": time.time(),
-            }
-            state["phase"] = "deleting"
-            await save(runner, source, state)
             # Cancellation changes the generation before this check. No await
             # separates the final fence from initiating the destructive request.
             if not await _current(runner, source, generation):
@@ -523,9 +560,26 @@ async def advance(runner, source):
 
 
 def _retryable(state):
-    """Only failures recorded by this executor retry, and never one with a confirmed closing note:
-    that topic may already be deleting. An unconfirmed attempt retries by sending the note again."""
-    return bool(state.get("failed_at")) and not state.get("closing_receipt")
+    """Fresh failures retry automatically. A confirmed closing note never does (the topic may be
+    deleting), nor does a closing send that returned unconfirmed (it may already be visible), nor a
+    closing attempt that failed outside the freshness window."""
+    failed_at = float(state.get("failed_at") or 0.0)
+    # Before closing_delivery_unconfirmed existed, a returned-but-unconfirmed send failed with this text.
+    legacy_unconfirmed = str(state.get("error") or "").startswith("Closing reply was not fully acknowledged")
+    if (not failed_at or state.get("closing_receipt") or state.get("closing_delivery_unconfirmed")
+            or legacy_unconfirmed):
+        return False
+    # Only a closing attempt can lead to a delete on resume: an old one is not today's approval (374814).
+    if state.get("closing_attempt") and time.time() - failed_at > _AUTO_RETRY_FRESHNESS_SECONDS:
+        return False
+    return True
+
+
+async def _mark_closing_unconfirmed(runner, source, generation):
+    current = await _current(runner, source, generation)
+    if current:
+        current["closing_delivery_unconfirmed"] = True
+        await save(runner, source, current)
 
 
 async def _auto_retry(runner, source, generation):

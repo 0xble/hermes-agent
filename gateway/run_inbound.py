@@ -2216,6 +2216,14 @@ class GatewayInboundMixin(
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             await self._release_unsettled_loop_tick(event, ran=False)
+            from gateway.session_synthetic import is_synthetic
+            if is_internal or is_synthetic(event):
+                # A machine wake never ran. The limit text is for a person; posting it would make a
+                # wake visible. A refused retire preparation must also not stay deduplicated.
+                from gateway.telegram_retire_prepare import forget_refused_preparation
+                forget_refused_preparation(self, event)
+                event._gateway_accepted = False
+                return None
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)

@@ -107,10 +107,28 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
                   "gateway_session_strict": True, "retirement_generation": state["generation"]},
     )
     adapter = runner._delivery_adapter_for(source)
-    await admit_internal_event(adapter, event)
-    admitted[key] = fingerprint
-    stamps[key] = time.time()
+    # Recorded before admission so a cap refusal in the turn task (which can run before this
+    # coroutine resumes) always clears it afterwards; a refused admission clears it here.
+    admitted[key], stamps[key] = fingerprint, time.time()
+    try:
+        await admit_internal_event(adapter, event)
+    except BaseException:
+        admitted.pop(key, None)
+        stamps.pop(key, None)
+        raise
     return False
+
+
+def forget_refused_preparation(runner, event) -> None:
+    """A preparation wake the session cap refused never ran: drop its dedupe so the next pass re-wakes."""
+    metadata = getattr(event, "metadata", None) or {}
+    generation, session_id = metadata.get("retirement_generation"), metadata.get("gateway_session_id")
+    if not generation or not session_id:
+        return
+    key = (session_id, generation)
+    for name in ("_telegram_retire_preparations", "_telegram_retire_prepared_at"):
+        (getattr(runner, name, None) or {}).pop(key, None)
+    logger.info("Retirement preparation for %s was refused by the session cap; it will be re-woken", session_id)
 
 
 def closing_note(state: dict) -> str:

@@ -218,3 +218,58 @@ async def test_wake_dropped_by_the_session_cap_is_readmitted_when_stale(runtime,
     clock[0] += 300
     assert not await queue_preparation(r.runner, r.source, r.state, items)
     assert r.adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cap_refused_preparation_leaves_no_dedupe_and_sends_nothing(runtime, monkeypatch, tmp_path):
+    """Second opinion test 1. A real _handle_message cap refusal of the preparation wake must not post the
+    limit text or keep the fingerprint. The next advance() with a free slot admits exactly once."""
+    from tests.gateway.test_duplicate_user_message import _bootstrap
+    r = runtime
+    gw = _bootstrap(monkeypatch, tmp_path)
+    # One runner in production: share retire state and the dedupe maps with the gateway double.
+    gw._session_db = r.runner._session_db
+    r.runner._telegram_retire_preparations = gw._telegram_retire_preparations = {}
+    r.runner._telegram_retire_prepared_at = gw._telegram_retire_prepared_at = {}
+    gw._claim_active_session_slot = lambda _key, _source: (None, "Hermes is at the active session limit (4/4).")
+    replies = []
+
+    async def handle(event):
+        # The adapter accepts before the turn task runs, as _start_session_processing does.
+        event._gateway_accepted = True
+        replies.append(await gw._handle_message(event))
+    r.adapter.handle_message.side_effect = handle
+    items = [{"id": "loop", "kind": "loop", "title": "Watch Service"}]
+    with pytest.raises(WakeNotAccepted):
+        await queue_preparation(r.runner, r.source, r.state, items)
+    assert replies == [None]  # no limit text returned for the adapter to send
+    r.adapter.send.assert_not_awaited()
+    key = (r.state["session_id"], r.state["generation"])
+    assert key not in r.runner._telegram_retire_preparations
+    assert (await load(r.runner, r.source))["phase"] == "waiting"
+    # Slot free again: the same decision is admitted once, then deduplicated.
+    async def accept(event):
+        event._gateway_accepted = True
+    r.adapter.handle_message.side_effect = accept
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert r.adapter.handle_message.await_count == 2
+    r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cap_refusal_racing_admission_still_clears_the_dedupe(runtime):
+    """Second opinion test 2: the turn task is refused after admission returns, not inside it."""
+    from gateway.telegram_retire_prepare import forget_refused_preparation
+    r = runtime
+    admitted = []
+
+    async def accept_later(event):
+        event._gateway_accepted = True
+        admitted.append(event)
+    r.adapter.handle_message.side_effect = accept_later
+    items = [{"id": "loop", "kind": "loop", "title": "Watch Service"}]
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    forget_refused_preparation(r.runner, admitted[0])  # the background turn hit the cap
+    assert not await queue_preparation(r.runner, r.source, r.state, items)
+    assert r.adapter.handle_message.await_count == 2
