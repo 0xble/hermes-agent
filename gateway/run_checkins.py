@@ -91,7 +91,10 @@ async def poll_checkins(runner):
         seen = runner._checkin_seen = {}
     scope_key = functools.partial(GatewayTurnMixin._profile_scope_key_for_source, runner)
     by_scope = {}
-    entries = await runner._run_in_executor_with_context(runner.session_store.list_sessions)
+    # Grouping by scope and reconciling each session is order-independent, so skip the
+    # newest-first sort of the whole roster (tens of thousands of routes) on every poll.
+    entries = await runner._run_in_executor_with_context(
+        functools.partial(runner.session_store.list_sessions, newest_first=False))
     for index, entry in enumerate(entries):
         if index and not index % _SCAN_YIELD_EVERY:
             await asyncio.sleep(0)  # the roster is every routed session: let the loop breathe
