@@ -752,22 +752,6 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     return result
 
 
-def _review_value(raw: Optional[str], *, clear: bool = False) -> Optional[dict]:
-    if clear and raw is not None:
-        raise ValueError("review_json and clear_review are mutually exclusive")
-    if clear:
-        return None
-    if raw is None:
-        return None
-    try:
-        value = json.loads(raw) if isinstance(raw, str) else raw
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"review_json must be valid JSON: {exc.msg}") from None
-    if not isinstance(value, dict):
-        raise ValueError("review_json must be a JSON object")
-    return value
-
-
 def _action_create(a: dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
@@ -824,7 +808,7 @@ def _action_create(a: dict[str, Any]) -> str:
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
-            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]), **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]), **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
            if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
@@ -1029,8 +1013,6 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["job_timezone"] is not None:
         # CLI-only lane like reasoning_effort; update_job validates the IANA name, '' clears.
         updates["timezone"] = a["job_timezone"] or None
-    if a["review_json"] is not None or a["clear_review"]:
-        updates["review"] = _review_value(a["review_json"], clear=bool(a["clear_review"]))
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1217,8 +1199,6 @@ def cronjob(
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
     max_catch_up_lateness_seconds: Optional[float | str] = None,
-    review_json: Optional[str] = None,
-    clear_review: bool = False,
     allow_shrink: bool = False,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int | str] = None) -> str:
@@ -1324,14 +1304,6 @@ CRONJOB_SCHEMA = {
                 "type": "boolean",
                 "description": "For create/update: set true when the user asked for this job's output in a specific chat or topic, so the lane converter leaves that fixed delivery lane unchanged. Default false."
             },
-            "review_json": {
-                "type": "string",
-                "description": "CLI/operator lane: JSON with contract, subject, optional deadline_minutes (default 10), rerun_deadline_minutes (default 20) and max_reruns (0 or 1, default 1). Requires deliver=local."
-            },
-            "clear_review": {
-                "type": "boolean",
-                "description": "CLI/operator lane: clear the job's review declaration."
-            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1418,7 +1390,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "priority", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
+    "paused_reason", "pinned", "allow_shrink",
     "max_catch_up_lateness_seconds", "timezone", "grace_minutes", "catch_up", "wrap_response")
 
 

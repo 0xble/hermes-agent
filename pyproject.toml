@@ -764,7 +764,6 @@ include = [
 ]
 
 [tool.setuptools.package-data]
-cron = ["contracts/**/*.yaml"]
 hermes_cli = [
   "observability/schemas/*.json",
   "data/*.json",

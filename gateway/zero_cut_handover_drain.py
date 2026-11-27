@@ -343,8 +343,6 @@ def request_handover(runner, main_loop: asyncio.AbstractEventLoop) -> dict[str, 
             "idle": False, "failed": None,
         }
     runner._external_drain_active = True
-    from cron.scheduler_review import stop_reviews
-    stop_reviews()
     main_loop.call_soon_threadsafe(
         lambda: runner._retain_background_task(asyncio.create_task(_handover(runner), name="zero-cut-handover")))
     return _status(runner)

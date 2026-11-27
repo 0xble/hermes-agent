@@ -2,10 +2,9 @@
 
 A restart-safe cron worker executes outside the gateway cgroup.  It cannot own
 relay/E2EE adapter objects, so it queues the final send here.  A gateway claims
-each row at most once.  Reviewed rows use ``reviewing`` until the final send
-starts, so a restart can replay the side-effect-free review instead of losing
-the report.  If the gateway dies after the final send begins, the outcome is
-marked unknown and never retried.
+each row at most once.  If the gateway dies after the send begins, the outcome
+is marked unknown and never retried.  The ``reviewing`` status is legacy from
+retired reviewed delivery: recovery returns such a row to ``pending``.
 """
 
 from __future__ import annotations
@@ -371,10 +370,6 @@ def claim_next() -> Optional[dict]:
             "SELECT execution_id, job_json, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
             "ORDER BY julianday(created_at), created_at, execution_id"
         ).fetchall()
-        from cron.scheduler_review import reviews_stopped
-        if reviews_stopped():
-            # A stopping gateway leaves held reports pending for the next gateway.
-            rows = [candidate for candidate in rows if not _is_review_row(candidate)]
         row = None
         suppressed_missing = False
         # Read all gated executions from one ledger connection rather than opening
@@ -438,12 +433,11 @@ def claim_next() -> Optional[dict]:
             _prune_terminal_unlocked(conn)
         if row is None:
             return None
-        status = "reviewing" if _is_review_row(row) else "delivering"
         cur = conn.execute(
-            """UPDATE deliveries SET status=?, owner_process_id=?,
+            """UPDATE deliveries SET status='delivering', owner_process_id=?,
                owner_pid=?, owner_started_at=?
                WHERE execution_id=? AND status='pending'""",
-            (status, _PROCESS_ID, pid, started, row["execution_id"]),
+            (_PROCESS_ID, pid, started, row["execution_id"]),
         )
         if cur.rowcount != 1:
             return None
@@ -456,41 +450,6 @@ def claim_next() -> Optional[dict]:
     return result
 
 
-def _is_review_row(row) -> bool:
-    return not row["for_failure"] and bool(json.loads(row["job_json"]).get("review"))
-
-
-def record_review_progress(execution_id: str, owner_process_id: str, **fields) -> bool:
-    """Persist review progress so a replay never repeats a decided review or a rerun."""
-    with _transaction() as conn:
-        row = conn.execute(
-            """SELECT job_json FROM deliveries WHERE execution_id=? AND status='reviewing'
-                 AND owner_process_id=? AND owner_pid=?""",
-            (str(execution_id), owner_process_id, os.getpid()),
-        ).fetchone()
-        if row is None:
-            return False
-        job = json.loads(row["job_json"])
-        job.update(fields)
-        conn.execute(
-            "UPDATE deliveries SET job_json=? WHERE execution_id=?",
-            (json.dumps(job, ensure_ascii=False, sort_keys=True), str(execution_id)),
-        )
-    return True
-
-
-def begin_final_delivery(execution_id: str, owner_process_id: str) -> bool:
-    """Claim a reviewed row for the only phase whose outcome may be unknown."""
-    with _transaction() as conn:
-        cur = conn.execute(
-            """UPDATE deliveries SET status='delivering'
-               WHERE execution_id=? AND status='reviewing'
-                 AND owner_process_id=? AND owner_pid=?""",
-            (str(execution_id), owner_process_id, os.getpid()),
-        )
-    return cur.rowcount == 1
-
-
 def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False, job_id: Optional[str] = None) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
@@ -501,7 +460,7 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE deliveries SET status=?, finished_at=?, error=?
-               WHERE execution_id=? AND status IN ('reviewing','delivering')
+               WHERE execution_id=? AND status='delivering'
                  AND owner_process_id=? AND owner_pid=?""",
             (
                 status,
@@ -520,11 +479,10 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
 
 
 def recover_abandoned() -> int:
-    """Replay abandoned reviews, but never replay uncertain final sends."""
+    """Requeue legacy ``reviewing`` rows, but never replay uncertain final sends."""
     changed = 0
     terminal_ids: list[str] = []
     terminal_jobs: list[tuple[str | None, str]] = []
-    unknown_receipts: list[dict] = []
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT execution_id, job_json, status, owner_process_id, owner_pid, owner_started_at "
@@ -567,24 +525,12 @@ def recover_abandoned() -> int:
                 terminal_ids.append(row["execution_id"])
                 job = json.loads(row["job_json"])
                 terminal_jobs.append((job.get("id"), row["execution_id"]))
-                if job.get("review"):
-                    unknown_receipts.append({
-                        "job_id": job.get("id"), "run_id": row["execution_id"],
-                        "subject": job["review"].get("subject"), "decision": "DELIVERY_UNKNOWN",
-                        "candidates": [], "text_sent": None, "message_id": None, "error": error})
         _prune_terminal_unlocked(conn)
     _reflect_terminal_deliveries(terminal_ids, "unknown")
     _mark_terminal_projected(terminal_ids)
     from cron.delivery_outcome import settle_quietly
     for job_id, receipt_id in terminal_jobs:
         settle_quietly(job_id, receipt_id)
-    # The receipt file is an audit trail; a failed write must never stall the queue drain.
-    for receipt in unknown_receipts:
-        try:
-            from cron.review import append_receipt
-            append_receipt(receipt)
-        except Exception:
-            logger.exception("Cron review receipt for %s could not be written", receipt["run_id"])
     return changed
 
 
@@ -593,9 +539,6 @@ def _send_claimed(row, send):
         try:
             error = send(row["job"], row["content"], bool(row["for_failure"]))
         except BaseException as exc:
-            from cron.scheduler_review import ReviewAbandoned
-            if isinstance(exc, ReviewAbandoned):
-                return  # Keep the original and admission deadline for the next gateway.
             logger.exception("Cron delivery failed for %s", row["execution_id"])
             error = f"{type(exc).__name__}: {exc}"
         finished = _finish(row["execution_id"], error=error,
@@ -622,16 +565,7 @@ def drain(
             break
         with _lock:
             _ACTIVE_DELIVERIES.add(row["execution_id"])
-        if row["job"].get("review") and not row["for_failure"]:
-            row["job"]["_review_queue_claim"] = (row["execution_id"], row["owner_process_id"])
-            # A held report uses delivery capacity, never one of the four cron run slots,
-            # and never blocks the drain of unrelated notices. Profile context follows it.
-            import contextvars
-            context = contextvars.copy_context()
-            threading.Thread(target=context.run, args=(_send_claimed, row, send),
-                             name="cron-review-delivery", daemon=True).start()
-        else:
-            _send_claimed(row, send)
+        _send_claimed(row, send)
         processed += 1
     return processed
 
@@ -639,7 +573,7 @@ def drain(
 def _terminalize_wait_timeout(execution_id: str) -> str:
     """Fence a delivery whose worker can no longer wait for confirmation.
 
-    A row still ``pending`` or ``reviewing`` has no outbound effects, so it is left queued
+    A row still ``pending`` (or legacy ``reviewing``) has no outbound effects, so it is left queued
     for whichever gateway comes up next (a restart that includes an update can
     easily exceed the worker's wait budget).  That is a deferral, not a
     failure: report success so the job is not recorded ``delivery_failed`` for

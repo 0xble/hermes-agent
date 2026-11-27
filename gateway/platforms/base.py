@@ -4615,13 +4615,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         # merged event is likewise unaddressed; a typed human event restores the visible fallback.
         from gateway.response_filters import apply_agent_origin_reply_expectation
         apply_agent_origin_reply_expectation(event)
-        from gateway.cron_review import fail_busy_review
-        if fail_busy_review(event):
-            # A hidden cron review must never queue behind a live turn: a queued event is
-            # later drained in-band without its capture and would post its reply. The
-            # scheduler sends the original report on time instead.
-            event._gateway_accepted = True  # handled: the busy cause reaches the caller
-            return
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
             from gateway.session_ingress_burst import dispatch_busy_burst
@@ -5391,8 +5384,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
         delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
-        from gateway.cron_review import ReviewCapture
-        review_capture = ReviewCapture(event)
 
         def _record_delivery(result, *, required: bool = False):
             nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
@@ -5405,7 +5396,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         _typing_metadata = typing_metadata_for_turn(
             self, event.source.chat_id, _reply_anchor_for_event(event), typing_metadata_for_event(event))
-        typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
+        typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5422,10 +5413,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
-            # A cron review is always muted, but its reply is the scheduler's verdict, not a
-            # presentation: review_capture keeps it off every send path instead.
             with self._media_delivery_scope(event.source):
-                if review_capture.future is None and diagnostic_wake_muted(event):
+                if diagnostic_wake_muted(event):
                     response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
@@ -5435,7 +5424,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            response = review_capture.capture_reply(response, event)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -5526,7 +5514,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
-            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -5537,7 +5524,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             self._resolve_deferred_command(event)  # a deferred command's turn-error notice is its outcome
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            await review_capture.notify_error(self, event, e, session_key)
+            await self._notify_turn_error(event, e, session_key)
             from hermes_cli.config_backend import ConfigBackendUnavailable as _outage  # this turn only
             if isinstance(e, (SystemExit, KeyboardInterrupt)) and not isinstance(e, _outage):  # rest contained
                 raise

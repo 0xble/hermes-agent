@@ -139,11 +139,10 @@ def test_post_turn_dict_is_authoritative_over_legacy_display_stashes(model_text)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_text", ["", "[SILENT]", "Verified.\nLOOP_COMPLETE"])
 async def test_muted_diagnostic_turn_still_captures_model_text(monkeypatch, model_text):
-    from gateway import warning_notifications
+    from gateway import run_turn_persistence
     from gateway.run_turn import GatewayTurnMixin
 
-    # Delivery privacy is decided by cron_review.private_turn_response, which reads this helper.
-    monkeypatch.setattr(warning_notifications, "diagnostic_wake_muted", lambda event: True)
+    monkeypatch.setattr(run_turn_persistence, "diagnostic_wake_muted", lambda event: True)
     event = SimpleNamespace()
     result = {"final_response": model_text, "completed": True}
     delivered = await GatewayTurnMixin()._hmwa_deliver_turn_response(

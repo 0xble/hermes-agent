@@ -180,14 +180,9 @@ def _maybe_mirror_cron_delivery(
         # removed). A user-role turn collapses safely via repair_message_sequence's consecutive-user merge
         # on every provider, and the prefix preserves the "this came from cron" context that the dropped
         # SQLite mirror metadata would otherwise lose on replay.
-        # The invisible review already ends with an assistant decision. A labelled user
-        # mirror keeps that protocol reply separate from the report on transcript replay.
-        review_session = job.get("_review_mirror_session")
         ok = mirror_to_session(
             platform_name, str(chat_id), _cron_mirror_message(job, text),
-            source_label="cron", thread_id=thread_id, user_id=user_id,
-            role="user",
-            **({"session_id": review_session} if review_session else {}))
+            source_label="cron", thread_id=thread_id, user_id=user_id, role="user")
         if ok:
             logger.info(
                 "Job '%s': mirrored delivery into %s:%s session transcript",

@@ -20,6 +20,24 @@ job's real delivery lane:
   derived from `_CRON_HINT` by replacing only the DELIVERY sentence, and import fails
   if that sentence drifts.
 
+## Authored lane fields
+
+`keep_pinned_lane` and `output_local_only` are authored job-definition fields in
+`cron/job_definition.py::JOB_DEFINITION_FIELDS`. The external lane converter in the scripts
+repository reads them, and live jobs set both. Distribution imports preserve them on new jobs
+and replace either boolean on updates without touching scheduler-owned state.
+`hermes cron create/edit --keep-pinned-lane/--no-keep-pinned-lane` and the cron tool's
+`keep_pinned_lane` argument go through the shared job API. Omitting the flag on edit keeps the
+current value.
+
+`cron.wrap_response: false` also drops the pre-agent provider fallback notice from the
+delivered report, so raw output stays exact. Default wrapping still prepends the notice, and
+fallback resolution and its scheduler log records are unchanged. Silence, empty output and
+failure markers stay unmodified in either mode.
+
+These behaviors moved here from the retired [reviewed cron delivery](reviewed-cron-delivery.md)
+unit on 2026-11-27.
+
 ## Upstream
 
 Upstream `main` still prepends the unconditional "automatically delivered" hint.
@@ -40,4 +58,4 @@ Retire when a released upstream cron hint distinguishes local-only delivery and 
 instruction-required self-relay. Rollback: revert the commit carrying
 `Fork-Patch: cron-local-delivery-hint`. No state or config migration is involved.
 
-Contract tests: `tests/cron/test_cron_local_delivery_hint.py`.
+Contract tests: `tests/cron/test_cron_local_delivery_hint.py`, `tests/hermes_cli/test_cron_pinned_lane.py`, `tests/cron/test_cron_pre_agent_fallback_notice.py`.

@@ -876,10 +876,8 @@ class GatewayTurnPersistenceMixin:
         with suppress(Exception):
             from hermes_cli.goal_turn_outcome import model_final_response
             event._agent_final_response = model_final_response(agent_result)
-        from gateway.cron_review import private_turn_response
-        private, captured_response = private_turn_response(event, agent_result, response)
-        if private:
-            return captured_response
+        if diagnostic_wake_muted(event):
+            return None
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).

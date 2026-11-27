@@ -26,7 +26,6 @@ from pathlib import Path
 from agent.attachment_context import CHANNEL_MESSAGE_BOUNDARY
 from agent.i18n import t
 from gateway.config import Platform
-from gateway.cron_review import is_review_event
 from gateway.inbound_reply_context import reply_pointer
 from gateway.platforms.base import EphemeralReply, as_command_reply
 from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename, turn_origin_for_event
@@ -1218,11 +1217,6 @@ class GatewayInboundMixin(
             schedule_activity(event, source, _quick_key)
         if turn_origin_for_event(event) == "user":  # a queued restart resume's preclaim may hold this slot
             self._promote_background_admission(_quick_key)
-        from gateway.cron_review import fail_busy_review
-        if fail_busy_review(event):
-            # The runner slot can still be live when the adapter guard is not (reconnect,
-            # handoff turn); a hidden review must neither interrupt nor queue behind it.
-            return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         if (self._draining and not self._hm_is_registered_command(event)
                 and getattr(event, "_admitted_before_drain", False) is not True
@@ -2691,9 +2685,9 @@ class GatewayInboundMixin(
         return paths
 
     async def _mark_durable_active_turn(self, event: MessageEvent, session_key: str) -> bool:
-        """Persist the exact resolved routing key for this running turn; never a cron review's, which boot would resume."""
+        """Persist the exact resolved routing key for this running turn."""
         try:
-            token = None if is_review_event(event) else await self.async_session_store.mark_turn_active(
+            token = await self.async_session_store.mark_turn_active(
                 session_key, human=bool(getattr(self, "_is_user_turn_event", lambda _event: not event.internal)(event))
             )
         except Exception as exc:

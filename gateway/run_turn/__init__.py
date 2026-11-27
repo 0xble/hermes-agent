@@ -31,7 +31,6 @@ from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway import loop_completion
 from gateway.config import Platform
-from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
@@ -1596,12 +1595,10 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
         if session_key and policy_for_source(self, source) is None:
             await self._rehydrate_session_model_selection_async(session_key)
             await self._expire_attended_temporary_picks_async(session_key, disp.user_config)
-        cron_review = (event_metadata or {}).get("_cron_review_capture") is not None
-        if scheduled_heartbeat or cron_review:
+        if scheduled_heartbeat:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
-            # Keep status callbacks intact for approvals and actionable failures. An invisible
-            # cron review turn stays equally private until its report is presented.
+            # Keep status callbacks intact for approvals and actionable failures.
             disp = dataclasses.replace(
                 disp, tool_progress_enabled=False, _thinking_enabled=False, _native_slack_task_cards=False,
                 needs_progress_queue=False,
@@ -1636,12 +1633,10 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
             _post_delivery_adapter=_post_delivery_adapter,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
-        turn_ctx.mute_notification_reply |= cron_review
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours, or a cron review) and a
-        # scheduled heartbeat.
+        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
@@ -1680,7 +1675,6 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
-            pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
             from gateway.run_turn_silence_recovery import apply_terminal_reply_metadata, silence_recovery_due
             apply_terminal_reply_metadata(turn_ctx, response, result)
             if pending_event or pending:

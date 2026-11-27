@@ -78,7 +78,6 @@ def test_handover_stops_polling_and_settles_queued_updates_without_destroying_bo
 def test_handover_verb_accepts_once_and_reports_status(monkeypatch):
     async def scenario():
         runner = _Runner()
-        monkeypatch.setattr("cron.scheduler_review.stop_reviews", lambda: None)
         monkeypatch.setattr("gateway.zero_cut_standby.is_standby", lambda: False)
         first = request_handover(runner, asyncio.get_running_loop())
         second = request_handover(runner, asyncio.get_running_loop())
@@ -224,7 +223,6 @@ async def test_completed_handover_stop_sends_no_shutting_down_notice(monkeypatch
         calls.append("notice")
 
     runner._notify_active_sessions_of_shutdown = notify
-    monkeypatch.setattr("cron.scheduler_review.stop_reviews", lambda: None)
     ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, active_agents={}, timed_out=False,
                                            started_at=0.0)
     await runner._stop_begin_teardown(ctx)

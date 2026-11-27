@@ -569,7 +569,6 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     record_delivery_outcome, recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
-from cron.scheduler_review import enqueue_review, record_review_suppression
 from cron.scheduler_worker_failure import finish_interrupted_run
 from cron.scheduler_bookkeeping import _classify_delivery_outcome
 from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
@@ -3173,7 +3172,7 @@ def _run_delivery_outcome(d: _RunDelivery) -> str:
     job = d.job
     return _classify_delivery_outcome(
         delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued") or job.get("_review_pending"),
+        delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
@@ -3237,7 +3236,6 @@ def _save_compose_deliver(
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
 
     if not d.should_deliver:
-        record_review_suppression(job, deliver_content, d.success)
         if commit_result is not None:
             commit_result()
         return
@@ -3280,8 +3278,6 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            if d.success and enqueue_review(job, deliver_content, commit_result):
-                return
             # Queue before committing terminal: a worker killed between those
             # writes cannot lose the notice. The gateway claims only after the
             # ledger is terminal (delivery_queue.claim_next).
