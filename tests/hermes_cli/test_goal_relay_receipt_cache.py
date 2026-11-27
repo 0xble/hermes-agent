@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from hermes_cli import goals
+from hermes_cli import goals, goals_relay_receipts
 
 
 def _row(rid: str, **extra) -> str:
@@ -23,7 +23,7 @@ def test_spaced_rows_fall_back_to_a_full_parse(_ledger):
 @pytest.fixture(autouse=True)
 def _ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("RELAY_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(goals, "_RELAY_RECEIPT_CACHE", {})
+    monkeypatch.setattr(goals_relay_receipts, "_RELAY_RECEIPT_CACHE", {})
     return tmp_path / "receipts.jsonl"
 
 
@@ -52,7 +52,7 @@ def test_second_call_parses_only_the_appended_rows(_ledger, monkeypatch):
 
     parsed = []
     real_loads = json.loads
-    monkeypatch.setattr(goals.json, "loads", lambda line, *a, **k: parsed.append(line) or real_loads(line, *a, **k))
+    monkeypatch.setattr(goals_relay_receipts.json, "loads", lambda line, *a, **k: parsed.append(line) or real_loads(line, *a, **k))
     assert "z" in goals._relay_ledger_receipts(["z"])
     # only the wanted row is parsed; the 50 old rows and the appended row's index entry are not
     assert len(parsed) == 1
