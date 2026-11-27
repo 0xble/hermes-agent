@@ -1,31 +1,11 @@
-# CommandCode Provider Key Alias
-
-## Patch Identity
+# Retired CommandCode provider key alias
 
 The maintenance unit identity is `commandcode-key-alias`.
 
-## Required Behavior
+Retired on 2026-11-27. Upstream `hermes_cli/providers.py` has carried the `commandcode` overlay with `extra_env_vars=("COMMANDCODE_API_KEY",)`, the CommandCode endpoint and `COMMANDCODE_BASE_URL` since `v0.23.2`, and still does in `v0.23.4`. A models.dev catalog hit that names `CMD_API_KEY` therefore keeps the plugin's `COMMANDCODE_API_KEY`. That is the complete contract of this unit, and the fork's runtime code now differs from upstream only in a comment.
 
-The CommandCode provider must accept the user-facing `COMMANDCODE_API_KEY`
-credential even when the models.dev catalog names its key `CMD_API_KEY`. The
-provider keeps its configured CommandCode endpoint and the plugin's canonical
-credential name remains available to the model picker and runtime resolver.
+The fork's 2 test additions in `tests/plugins/model_providers/test_commandcode_profile.py` stay: one keeps `test_resolve_provider_full` independent of the live models.dev catalog, and one covers the catalog-hit merge, which upstream doesn't test. Both exercise upstream code only.
 
-## Provenance And Verification
-
-models.dev currently advertises the provider with `CMD_API_KEY`, while the
-CommandCode plugin and user-facing configuration use `COMMANDCODE_API_KEY`.
-No released upstream equivalent was identified for this fork-specific
-catalog-to-plugin mismatch. The fork delivery is the `commandcode` entry in
-`hermes_cli/providers.py`, which appends the plugin key without dropping the
-catalog key and keeps the CommandCode endpoint and base-URL override.
-
-Verify with
-`tests/plugins/model_providers/test_commandcode_profile.py`, including the
-synthetic models.dev catalog-hit merge test, and the repository
-provider-resolution checks.
-
-Retire this unit when models.dev and the provider plugin use the same canonical
-credential name and the focused contract passes without the overlay.
+This record stays so published `Fork-Patch: commandcode-key-alias` trailers keep an accountable owner.
 
 Contract tests: `tests/plugins/model_providers/test_commandcode_profile.py`.
