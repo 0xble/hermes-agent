@@ -21,6 +21,12 @@ Not quarantined because the failures were real regressions or had a quick repair
 - `tests/gateway/test_telegram_final_delivery.py` failed on a deterministic floating-point string assertion. That is a correctness regression, not a scheduling flake, so it remains blocking.
 - The `rcedit` "Unable to commit changes" lines are deliberate mocked retry cases inside a passing test, not a production failure.
 
+## Known nightly flakes
+
+`.github/known-flakes.json` lists nightly test failures that already have an owner task and a fix in progress. The serial lander (`repo lander`, see `docs/lander.md` in `0xble/repo`) reads it at the exact main commit of a red Repository nightly. When every failure in that run is listed with an unexpired entry, the run does not start a `main-red` pause. It never counts as green, never clears an existing pause, and never skips a test: the nightly still runs and reports every listed test.
+
+Each entry names the exact pytest node ID, including any parameter ID, the owner task UUID, the reason with its run evidence, and an exclusive UTC expiry date. Remove the entry in the PR that fixes the flake. An expired entry counts as unknown, so the lane pauses again rather than extending it silently.
+
 ## Verification and retirement
 
 Run active quarantined files on every nightly with `scripts/run_tests.sh --file-retries 0`. A withdrawn implementation retires its selector with an explicit coverage disposition. A maintained implementation leaves quarantine only after its race has a deterministic fix and exact-SHA evidence passes.
