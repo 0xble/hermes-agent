@@ -108,7 +108,7 @@ from tools.browser_tool_lifecycle import cleanup_browser
 from tools.connectors.turn import agent_connection_surface, scoped_connection_surface
 
 from agent.synthetic_prompt import auto_recall_query
-from agent.message_content import flatten_message_text
+from session_rules.turns import flatten_message_text
 from agent.client_lifecycle import ClientLifecycleMixin
 from agent.stream_delivery import StreamDeliveryMixin
 from agent.status_output import StatusOutputMixin
