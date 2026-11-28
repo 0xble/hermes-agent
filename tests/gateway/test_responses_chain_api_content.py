@@ -1,9 +1,13 @@
 """A chained Responses turn replays the earlier turn's user row as the model saw it, including
 its ``api_content`` (memory prefetch, plugin context), not a synthetic row rebuilt from the raw
 request text."""
+import asyncio
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.platforms.api_server_openai_routes import _iter_stream_items
 
 
 @pytest.mark.asyncio
@@ -36,3 +40,22 @@ async def test_previous_response_chain_keeps_turn_user_api_content(api, owner, s
     assert users[0]['content'] == 'first'
     assert users[0].get('api_content', '').endswith('ALPHA</user_memory>'), seen[1]
     assert [m['role'] for m in seen[1]] == ['user', 'assistant']
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_handles_agent_completion_before_eos_callback():
+    """An agent can finish before its done callback gets a chance to publish EOS."""
+    stream_q = asyncio.Queue()
+    agent_task = asyncio.get_running_loop().create_future()
+    class Response:
+        async def write(self, _data):
+            pass
+
+    async def consume():
+        return [item async for item in _iter_stream_items(stream_q, agent_task, Response())]
+
+    consumer = asyncio.create_task(consume())
+    agent_task.set_result(None)
+    # No EOS is published yet: completion must still hand control back to the
+    # Responses writer, which emits the terminal event after collect_result.
+    assert await asyncio.wait_for(consumer, timeout=0.1) == []
