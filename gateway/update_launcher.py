@@ -53,6 +53,25 @@ def validate_agent_update_reason(reason: object) -> str:
     return cleaned
 
 
+def _with_request_origin(pending: dict[str, Any]) -> dict[str, Any]:
+    from agent.incognito import is_incognito
+    from gateway.session_context import bound_session_env, session_context_engaged
+
+    # The plugin's marker fields may use the legacy process-global env mirror.
+    # Never use it (or a caller-provided session ID) as a durable origin pin.
+    pending = {k: v for k, v in pending.items() if k != "origin_session_id"}
+    if pending.get("source") != "request_update" or not session_context_engaged():
+        return pending
+    sid = bound_session_env("HERMES_SESSION_ID")
+    if sid and not is_incognito(sid) and all(pending.get(field) == bound_session_env(env) for field, env in (
+        ("session_key", "HERMES_SESSION_KEY"), ("platform", "HERMES_SESSION_PLATFORM"),
+        ("chat_id", "HERMES_SESSION_CHAT_ID"),
+    )) and pending.get("session_key"):
+        pending["origin_session_id"] = sid
+        pending["profile"] = bound_session_env("HERMES_SESSION_PROFILE")
+    return pending
+
+
 def launch_native_update(
     *, home: Path, hermes_cmd: list[str], pending: dict[str, Any], spawn: Callable[[list[str], Path, Path], None],
 ) -> dict[str, Any]:
@@ -61,9 +80,10 @@ def launch_native_update(
     A claimed marker is still an active admission marker: it is the pending file
     after the updater atomically takes ownership.  Do not overwrite its reason.
     """
-    from gateway.update_notifications import final_outcome, locked_update_marker, read_pending
+    from gateway.update_notifications import final_outcome, has_update_origin, locked_update_marker, read_pending
 
     home = Path(home)
+    pending = _with_request_origin(pending)
     pending_path = home / ".update_pending.json"
     claimed_path = home / ".update_pending.claimed.json"
     output_path = home / ".update_output.txt"
@@ -84,6 +104,10 @@ def launch_native_update(
         if pending_path.exists():
             old = read_pending(home)
             if not old or old[0] != pending_path or old[1].get("notification_version") != 2:
+                return {"started": False, "pending": True}
+            # A newer update would overwrite the receipt and exit evidence before
+            # this result is durably admitted to its owning session.
+            if has_update_origin(old[1]):
                 return {"started": False, "pending": True}
             outcome = final_outcome(home, old[1])
             # Only the actual process-exit sentinel permits reuse; a pre-restart exit
