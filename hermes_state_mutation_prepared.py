@@ -1,6 +1,6 @@
 """Optimistic preparation snapshots revalidated inside the receipt transaction."""
 import json
-from hermes_state_local import POLICY_PREFIX, decode_receipt
+from hermes_state_local import POLICY_PREFIX, decode_receipt, encode_receipt
 from hermes_state_local_lineage import validate_local_lineage
 from hermes_state_mutation_guards import require_target_advanceable
 from hermes_state_runtime import RuntimeStoreError
@@ -31,11 +31,10 @@ def validate_prepared(db, conn, session_id, prepared):
 
 def _commit_policy(db, conn, session_id, prepared):
     """Write the prepared policy over the snapshot it was derived from and bump the generation."""
-    from hermes_state_runtime import _json
     snapshot = validate_prepared(db, conn, session_id, prepared)
     saved = snapshot['receipt']
     saved['policy'] = prepared['policy']
-    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(saved), POLICY_PREFIX + session_id))
+    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (encode_receipt(conn, saved), POLICY_PREFIX + session_id))
     conn.execute('UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id=?', (session_id,))
     generation = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (session_id,)).fetchone()[0]
     return snapshot, generation

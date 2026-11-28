@@ -77,3 +77,53 @@ def test_a_changed_config_gets_its_own_row(db):
 
     assert local_receipt(db, "local-a")["policy"]["config_json"] == CONFIG
     assert local_receipt(db, "local-b")["policy"]["config_json"] == changed
+
+
+def _committed_session(db, epoch, cwd, request_id):
+    from dataclasses import asdict
+
+    from gateway.config import Platform
+    from gateway.session import SessionEntry, SessionSource
+    from gateway.session_lifecycle import _now
+    from gateway.session_local_recovery import local_identity
+    from gateway.session_policy import build_policy
+    from hermes_state_local import commit_local_session
+
+    sid = local_identity("profile", "human", request_id)
+    source = SessionSource(platform=Platform.LOCAL, chat_id=sid, user_id="human", chat_type="dm")
+    now = _now()
+    entry = SessionEntry("local:" + sid, sid, now, now, origin=source, platform=Platform.LOCAL)
+    policy = build_policy({"source": "cli", "cwd": str(cwd), "model": "m", "toolsets": []},
+                          {"platform_toolsets": {"cli": []}}, private_secrets={})
+    receipt = {"profile_id": "profile", "principal_id": "human", "request_id": request_id, "session_id": sid,
+               "route": entry.session_key, "entry": entry.to_dict(), "policy": asdict(policy)}
+    commit_local_session(db, epoch=epoch, receipt=receipt)
+    return sid, receipt
+
+
+def test_created_sessions_share_one_config_row_and_survive_retry_and_reset(db, tmp_path):
+    import hermes_state_runtime as rt
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+
+    epoch = begin_runtime_epoch(db, instance_id="owner")
+    first, receipt = _committed_session(db, epoch, tmp_path, "r1")
+    second, _ = _committed_session(db, epoch, tmp_path, "r2")
+
+    shared = db._conn.execute("SELECT COUNT(*) FROM state_meta WHERE key GLOB ?", (CONFIG_PREFIX + "*",)).fetchone()[0]
+    assert shared == 1
+    assert "config_ref" in json.loads(_stored(db, first))["policy"]
+    assert local_receipt(db, first)["policy"] == json.loads(_json(receipt["policy"]))
+    assert local_receipt(db, second)["policy"]["config_json"] == receipt["policy"]["config_json"]
+
+    # An exact creation retry compares against the decoded stored receipt and is accepted.
+    from hermes_state_local import commit_local_session
+    commit_local_session(db, epoch=epoch, receipt=receipt)
+
+    session = db.get_session(first)
+    rt.mutate_runtime_session(db, epoch=epoch, principal_id="human", session_id=first, request_id="reset-1",
+                              operation="reset", expected_revision=session["runtime_revision"],
+                              expected_generation=session["runtime_generation"], payload={})
+
+    after = local_receipt(db, first)
+    assert after["policy"]["config_json"] == receipt["policy"]["config_json"]
+    assert after["entry"]["session_id"] != first  # the reset moved the target and kept the policy readable

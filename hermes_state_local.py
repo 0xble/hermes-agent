@@ -108,7 +108,7 @@ def commit_local_session(db, *, epoch, receipt):
              _json(entry['origin']), started))
         conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
                      (route, _json(entry), started))
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encode_receipt(conn, receipt)))
         if on_create is not None:
             on_create.publish()  # before the row is visible, so no reader lazy-loads around it
         return receipt

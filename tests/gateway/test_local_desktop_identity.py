@@ -334,7 +334,7 @@ async def test_a_desktop_chat_saved_before_the_mark_moved_still_resumes_and_runs
     from gateway.session_local_recovery import local_source
     from gateway.session_policy import local_desktop_turn
     from hermes_cli.anon_auth import on_local_desktop_backend
-    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local import POLICY_PREFIX, decode_receipt
 
     conn = await _connect(tmp_path, monkeypatch,
                           config="model:\n  provider: openrouter\n  default: anthropic/claude-sonnet-4\n")
@@ -346,7 +346,7 @@ async def test_a_desktop_chat_saved_before_the_mark_moved_still_resumes_and_runs
 
         def saved_the_old_way(c):
             key = POLICY_PREFIX + stored
-            receipt = json.loads(c.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0])
+            receipt = decode_receipt(c, c.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0])
             policy = receipt["policy"]
             config = json.loads(policy["config_json"])
             config.pop("desktop_local")

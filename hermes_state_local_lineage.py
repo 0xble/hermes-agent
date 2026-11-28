@@ -6,7 +6,7 @@ not re-key idempotency digests, queued inputs, subscribers or uncertain claims.
 import json
 import time
 
-from hermes_state_local import POLICY_PREFIX, decode_receipt
+from hermes_state_local import POLICY_PREFIX, decode_receipt, encode_receipt
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 import itertools
 
@@ -63,7 +63,7 @@ def _commit_local_target(conn, receipt, routed):
     """Store *receipt* and its route's entry *routed* and bump the logical revision, in one transaction."""
     conn.execute("UPDATE gateway_routing SET entry_json=? WHERE scope='' AND session_key=?",
                  (_json(routed), receipt['route']))
-    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(receipt), POLICY_PREFIX + receipt['session_id']))
+    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (encode_receipt(conn, receipt), POLICY_PREFIX + receipt['session_id']))
     conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (receipt['session_id'],))
 
 
