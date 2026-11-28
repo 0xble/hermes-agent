@@ -6,7 +6,7 @@ not re-key idempotency digests, queued inputs, subscribers or uncertain claims.
 import json
 import time
 
-from hermes_state_local import POLICY_PREFIX
+from hermes_state_local import POLICY_PREFIX, decode_receipt
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 import itertools
 
@@ -157,7 +157,7 @@ def adopt_untracked_compression(db, *, epoch, session_id, expected):
     def write(conn):
         _epoch(conn, epoch)
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
-        receipt = json.loads(saved[0])
+        receipt = decode_receipt(conn, saved[0])
         if receipt != expected:
             return
         adoptable = adoptable_compression(conn, receipt)
