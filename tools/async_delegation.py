@@ -1078,9 +1078,13 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
         lease.release()  # a finalized unit can no longer answer an approval prompt
     if (was_queued or was_admitted_unstarted) and snapshot.get("cancel_fn") is not None:
         try:
-            snapshot["cancel_fn"]("queued delegation cancelled")
+            entries = snapshot["cancel_fn"]("queued delegation cancelled")
         except Exception:
+            entries = None
             logger.debug("Queued delegation %s cleanup failed", delegation_id, exc_info=True)
+        if isinstance(entries, list) and entries and isinstance(result, dict) and result.get("results") == []:
+            # Each never-started child's entry: one a restart stopped reads as waiting on its automatic resume.
+            result = {**result, "results": entries}
     _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
     with _records_lock:
         live = _records.get(delegation_id)

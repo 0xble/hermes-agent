@@ -269,9 +269,7 @@ def record_start(run: Any) -> None:
         return
     path = _db_path_for(run.parent_agent)
     cwd = _child_cwd(run)
-    from tools.delegate_tool_registry import _recent_subagents, _active_subagents_lock
-    owners = {str(getattr(child, "_parent_session_id", "") or "") or str(getattr(run.parent_agent, "session_id", "")
-                                                                         or "")}
+    child._delegate_queued_row = False  # its queued row (``record_queued``), if any, is this run's from here
     # The git probes run before the write transaction (seconds on a slow repo; no state.db lock held through them).
     earlier = _write(path, lambda conn: _row(conn, sid)) or {}
     start_cwd = earlier.get("start_cwd") or cwd
@@ -296,13 +294,9 @@ def record_start(run: Any) -> None:
             if cancelled := admit_start(conn, sid):
                 return cancelled
         prev = _row(conn, sid) or {}
-        with _active_subagents_lock:
-            owners.update((_recent_subagents.get(sid) or {}).get("ancestor_owner_session_ids") or ())
-        owners.update(prev.get("owners") or ())
-        owners.update(_ancestor_sessions(child))
-        owners.discard("")
         record = {**prev, **spec, **_owner_identity(), "subagent_id": sid,
-                  "delegation_id": getattr(child, "_delegation_id", None), "owners": sorted(owners),
+                  "delegation_id": getattr(child, "_delegation_id", None),
+                  "owners": _owner_sessions(child, run.parent_agent, sid, prev),
                   # The async unit whose ledger row reports this run (``<call>-k`` with independent completions).
                   "unit_id": getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None),
                   "start_cwd": start_cwd, "cwd": durable["cwd"], "worktree": prev.get("worktree")
@@ -312,6 +306,7 @@ def record_start(run: Any) -> None:
                   # A promise belongs to one stop: this run's own stop (or boot recovery) makes it afresh.
                   "run_origin": origin, "run_started_at": time.time(), "auto_promised": False, **auto}
         record["repo_baselines"] = durable["baselines"]
+        record.pop("never_started", None)  # its queued row (``record_queued``) is a run now
         # A running record pins too (its paths are resolved at sweep time): a crash before boot recovery ran must
         # not hand its tree to the sweep. Bounded by the same TTL.
         _upsert(conn, sid, record, state="running", pinned=True, expires_at=time.time() + _settings()[0] * 3600)
@@ -329,6 +324,82 @@ def record_start(run: Any) -> None:
         return
     durable["pending"] = None if outcome else _do
     child._delegate_durable = durable
+
+
+def _owner_sessions(child: Any, parent_agent: Any, sid: str, prev: dict[str, Any]) -> list[str]:
+    """The sessions that may continue this child: its parent's, the registry's retained ancestors, the row's own."""
+    from tools.delegate_tool_registry import _recent_subagents, _active_subagents_lock
+    owners = {str(getattr(child, "_parent_session_id", "") or "") or str(getattr(parent_agent, "session_id", "") or "")}
+    with _active_subagents_lock:
+        owners.update((_recent_subagents.get(sid) or {}).get("ancestor_owner_session_ids") or ())
+    owners.update(prev.get("owners") or ())
+    owners.update(_ancestor_sessions(child))
+    owners.discard("")
+    return sorted(owners)
+
+
+def record_queued(children: Iterable[Any], parent_agent: Any) -> None:
+    """The children of a background unit queued for an async pool slot: each gets a ``running`` row marked
+    ``never_started`` (rebuild spec, owner, unit), so a restart or crash before its own ``record_start`` leaves it
+    AUTO_ON_BOOT instead of lost. ``record_start`` takes the row over when the child starts; a child stopped before
+    it started settles it (``settle_unstarted``). Continuing such a row runs the original goal afresh."""
+    path = _db_path_for(parent_agent)
+    queued = [(sid, child, spec) for child in children
+              if isinstance(sid := getattr(child, "_subagent_id", None), str) and sid and (spec := _spec(child))]
+    if path is None or not queued:
+        return
+    expires_at = time.time() + _settings()[0] * 3600
+
+    def _do(conn):
+        for sid, child, spec in queued:
+            if conn.execute("SELECT 1 FROM resumable_subagents WHERE subagent_id=?", (sid,)).fetchone():
+                continue  # a row a run or a claim already owns is never replaced
+            cause = GATEWAY_SHUTDOWN if getattr(child, "_delegate_stop_cause", None) == GATEWAY_SHUTDOWN else None
+            record = {**spec, **_owner_identity(), "subagent_id": sid,
+                      "delegation_id": getattr(child, "_delegation_id", None),
+                      "owners": _owner_sessions(child, parent_agent, sid, {}),
+                      "unit_id": getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None),
+                      "outcome": "queued", "never_started": True, "resume_mode": None, "run_origin": "spawn",
+                      "auto_attempts": 0, "auto_off": None, "auto_first_stopped_at": None, "auto_promised": False}
+            _upsert(conn, sid, record, state="running", pinned=False, expires_at=expires_at, stop_cause=cause)
+        return True
+    if _write(path, _do):
+        for _sid, child, _spec_ in queued:
+            child._delegate_queued_row = True  # settled by ``settle_unstarted`` unless ``record_start`` takes it
+
+
+def settle_unstarted(child: Any, parent_agent: Any, entry: dict[str, Any]) -> None:
+    """A queued child stopped before it started: its ``never_started`` row ends like a run's own stop (a restart:
+    resumable, with the same automatic-resume promise; a person: stopped), and *entry* says so (``stamp_entry``)."""
+    if getattr(child, "_delegate_queued_row", None) is not True:
+        return
+    child._delegate_queued_row = False
+    sid, path = getattr(child, "_subagent_id", None), _db_path_for(parent_agent)
+    if not isinstance(sid, str) or not sid or path is None:
+        return
+    live = GATEWAY_SHUTDOWN if getattr(child, "_delegate_stop_cause", None) == GATEWAY_SHUTDOWN else None
+
+    def _do(conn):
+        record = _row(conn, sid)
+        if not record or record.get("state") != "running" or not record.get("never_started") \
+                or record.get("owner_pid") != os.getpid():
+            return None
+        # An unregistered child misses the in-memory shutdown mark; ``note_gateway_shutdown`` marked its row.
+        cause = live or record.get("stop_cause")
+        state, mode, next_at = classify(entry, cause)
+        auto = None
+        if state == "resumable" and record.get("unit_id"):
+            from tools.delegate_tool_auto_resume import promise
+            auto = promise({"resume_mode": mode, "next_attempt_at": next_at})
+        record["auto_promised"] = bool(auto)
+        _finish(conn, sid, record, entry, cause, cwd=None, pins=[])
+        return (mode, auto) if state == "resumable" else None
+
+    if settled := _write(path, _do):
+        entry.setdefault("subagent_id", sid)
+        entry["resume_mode"] = settled[0]
+        if settled[1]:
+            entry["auto_resume"] = settled[1]
 
 
 def _flush(durable: dict[str, Any]) -> bool:

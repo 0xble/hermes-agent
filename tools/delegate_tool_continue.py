@@ -169,12 +169,16 @@ def _start(
     with _transcript_store(parent_agent) as db:
         session_id = _segment_tip(db, sid, spec["session_id"])
         history = db.get_messages_as_conversation(session_id, repair_alternation=True) if db is not None else []
-        if not history:
+        # Queued behind its siblings when the gateway stopped (``record_queued``): it runs its original goal afresh.
+        fresh = not history and bool(spec.get("never_started"))
+        if not history and not fresh:
             return None, f"Subagent '{sid}' has no saved transcript to continue from. Spawn a new task instead."
         err = _oneshot_spawn_budget(parent_agent, 1)
         if err:
             return None, err
         task_list = [{"goal": message}]  # the run's user turn; the system prompt is rebuilt from the original goal
+        if fresh:
+            task_list = [{"goal": spec["goal"] if run_origin == "auto" else f"{spec['goal']}\n\n{message}"}]
         live_home = _parent_live_home(parent_agent)
         live_id, writers, paths = create_live_transcripts(
             task_list, None, model=spec.get("model"), provider=route.creds.get("provider"), home=live_home,
@@ -189,11 +193,12 @@ def _start(
         )
         if err:
             return None, err
-        db.reopen_session(session_id)  # its close() ended it; the continued child's close() ends it again
-        children[0][2]._delegate_continue_history = history
         children[0][2]._delegate_run_origin = run_origin  # a parent's own continue ends automatic resumes of it
         from tools.delegate_tool_resumable import hold_claim, last_workspace
-        children[0][2]._delegate_continue_workspace = last_workspace(parent_agent, sid)
+        if not fresh:  # a fresh start seeds its workspace (and isolation worktree) the way a spawn does
+            db.reopen_session(session_id)  # its close() ended it; the continued child's close() ends it again
+            children[0][2]._delegate_continue_history = history
+            children[0][2]._delegate_continue_workspace = last_workspace(parent_agent, sid)
         if record is not None:  # a run that fails before it records itself hands the claim back
             hold_claim(children[0][2], parent_agent, sid, record)
         if run_origin == "auto":  # the last word is the parent's: a stop, /stop, /new or replacement since the claim
