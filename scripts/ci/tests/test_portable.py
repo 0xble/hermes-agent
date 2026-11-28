@@ -915,7 +915,7 @@ try {
     def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
         calls = []
 
-        def fake(env, roots, workers, file_timeout=None):
+        def fake(env, roots, workers, pytest_args=None, file_timeout=None):
             calls.append((roots, file_timeout))
             if file_timeout is None:
                 raise subprocess.CalledProcessError(1, ['run_tests.sh'])
@@ -949,7 +949,7 @@ try {
         buckets = ci.shard_files(ci.ROOT, 10)
         calls = []
 
-        def fake(env, roots, workers, file_timeout=None):
+        def fake(env, roots, workers, pytest_args=None, file_timeout=None):
             calls.append((list(roots), file_timeout))
             if file_timeout is None:
                 raise subprocess.CalledProcessError(1, ['run_tests.sh'])
@@ -978,7 +978,7 @@ try {
         soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'
         calls = []
 
-        def fake(env, roots, workers, file_timeout=None):
+        def fake(env, roots, workers, pytest_args=None, file_timeout=None):
             calls.append(file_timeout)
             if file_timeout is None:
                 raise RuntimeError('checkout Python environment missing')

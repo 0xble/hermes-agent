@@ -108,15 +108,20 @@ FILE_TIMEOUTS = {
     'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py': 600,
     # Clean hosted runs took 286-300 s (40533318818, 40506266645 attempt 2).
     'tests/e2e/core/cli_tmux/test_classic_cli_live_session.py': 900,
+    # Hosted macOS native runs were killed at 300 s with 385 of 394 tests passed and none
+    # failed (nightlies 46097871114 and 46112075628, 2026-11-27).
+    'tests/tools/test_search_filename_globs.py': 600,
 }
 
 
-def python_files(env: dict[str, str], files: list[str], workers: int) -> None:
+def python_files(env: dict[str, str], files: list[str], workers: int,
+                 pytest_args: list[str] | None = None) -> None:
     """Run files under the default bound, then each FILE_TIMEOUTS group under its own."""
     groups: dict[int | None, list[str]] = {}
     for path in files:
         groups.setdefault(FILE_TIMEOUTS.get(path), []).append(path)
-    run_all([lambda roots=roots, timeout=timeout: python_tests(env, roots, workers, file_timeout=timeout)
+    run_all([lambda roots=roots, timeout=timeout: python_tests(
+                env, roots, workers, pytest_args=pytest_args, file_timeout=timeout)
              for timeout, roots in sorted(groups.items(), key=lambda item: item[0] or 0)])
 
 
@@ -1078,7 +1083,7 @@ def native_os(env: dict[str, str], workers: int) -> None:
     files = [line.strip() for line in selected.splitlines() if line.strip()]
     if not files:
         raise RuntimeError(f'No files selected for {marker}. Refusing an empty native OS lane.')
-    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
+    actions = [(marker, lambda: python_files(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
     if sys.platform == 'win32':
         for shell in ('powershell', 'pwsh'):
             for case in ('longpath', 'node-compatibility', 'uv-shim-validation'):

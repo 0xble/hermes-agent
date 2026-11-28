@@ -25,8 +25,26 @@ class NativeOsLaneTests(unittest.TestCase):
             ci.native_os(env, 3)
             self.assertEqual(selector.call_args.args[0], ['checkout-python', 'scripts/ci/list_os_marked_tests.py', 'macos'])
             self.assertEqual(selector.call_args.kwargs['env'], env)
-            tests.assert_called_once_with(env, ['tests/a.py', 'tests/b.py'], 3, pytest_args=['-m', 'platforms and not integration'])
+            tests.assert_called_once_with(env, ['tests/a.py', 'tests/b.py'], 3, pytest_args=['-m', 'platforms and not integration'], file_timeout=None)
             installer.assert_not_called()
+
+    def test_native_os_gives_listed_slow_files_their_bound_with_the_platform_marker(self):
+        slow = 'tests/tools/test_search_filename_globs.py'
+        other = 'tests/tools/test_find_shell.py'
+        self.assertGreater(ci.FILE_TIMEOUTS[slow], 300)
+        calls = []
+
+        def fake(env, roots, workers, pytest_args=None, file_timeout=None):
+            calls.append((list(roots), pytest_args, file_timeout))
+
+        with (patch.object(ci.sys, 'platform', 'darwin'),
+              patch.object(ci.subprocess, 'check_output', return_value=f'{slow}\n{other}\n'),
+              patch.object(ci, 'python', return_value='python'),
+              patch.object(ci, 'python_tests', side_effect=fake)):
+            ci.native_os({}, 4)
+        marker = ['-m', 'platforms and not integration']
+        self.assertEqual(sorted(calls, key=lambda c: c[2] or 0),
+                         [([other], marker, None), ([slow], marker, ci.FILE_TIMEOUTS[slow])])
 
     def test_empty_or_failed_selector_never_dispatches_tests(self):
         for output in ('\n ', subprocess.CalledProcessError(1, ['selector'])):
@@ -41,7 +59,7 @@ class NativeOsLaneTests(unittest.TestCase):
         with patch.object(ci.sys, 'platform', 'win32'), patch.object(ci, 'python', return_value='checkout-python'), patch.object(ci.subprocess, 'check_output', return_value='tests/windows.py\n'), patch.object(ci, 'python_tests', side_effect=RuntimeError('test failure')) as tests, patch.object(ci, 'run') as installer:
             with self.assertRaisesRegex(RuntimeError, 'Native OS checks failed'):
                 ci.native_os(env, 2)
-            tests.assert_called_once_with(env, ['tests/windows.py'], 2, pytest_args=['-m', 'platforms and not integration'])
+            tests.assert_called_once_with(env, ['tests/windows.py'], 2, pytest_args=['-m', 'platforms and not integration'], file_timeout=None)
             calls = [call.args[0] for call in installer.call_args_list]
             self.assertEqual(len(calls), 6)
             for shell in ('powershell', 'pwsh'):
