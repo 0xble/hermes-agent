@@ -27,6 +27,7 @@ _TRANSIENT_MARKERS = (
     "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
 )
 _TRANSIENT_RETRY_LIMIT = 6
+_DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
 # A failed retirement is still a standing user request. Housekeeping re-runs it with the saved
 # decisions on a doubling backoff (2026-10-30: 28 topics sat "failed" after faults that had cleared
 # or been fixed, because only a new user request ever retried one). Exhausted retries stay failed.
@@ -259,6 +260,23 @@ async def _probe_deleted(bot, source, *, runner=None, read_only=False):
     return False
 
 
+async def _confirm_deleted(bot, source, runner):
+    if await _probe_deleted(bot, source, runner=runner):
+        return True
+    from hermes_platform.resolver import locate_command
+    if not locate_command("telegram").command:
+        return False
+    for delay in _DELETE_VERIFY_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            if await _probe_deleted(bot, source, runner=runner, read_only=True):
+                return True
+        except Exception as exc:
+            if _transient_delay(exc) is None:
+                raise
+    return False
+
+
 async def _cli_peer(bot, source):
     if source.chat_type != "dm":
         return str(source.chat_id)
@@ -436,7 +454,7 @@ async def advance(runner, source):
                     peer = await _cli_peer(bot, source)
                     await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
                               str(peer), str(source.thread_id))
-            if not await _probe_deleted(bot, source, runner=runner):
+            if not await _confirm_deleted(bot, source, runner):
                 raise RuntimeError("Telegram still accepts messages in the topic after deletion")
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
