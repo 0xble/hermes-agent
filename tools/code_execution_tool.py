@@ -838,6 +838,9 @@ def execute_code(
     from tools.environments.sandbox_scope import hosted_scope
     # A hosted agent's code runs only in its sandbox, never in a kernel on this host.
     if env_type != "local" or hosted_scope() is not None:
+        from agent.incognito import is_incognito
+        if is_incognito():  # a remote or hosted backend writes where the private interval cannot reach
+            return tool_error("Remote code execution is unavailable in incognito mode. Use the local backend.")
         return record_execution_backend("code", "remote", _execute_remote(
             code, task_id, enabled_tools, reset=bool(reset), session_id=session_id, turn_id=turn_id,
             conversation_id=conversation_id))
