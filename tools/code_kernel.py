@@ -897,13 +897,13 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     kernel.ensure_open()
     kernel.current_task = task_id
     kernel.current_caller = _current_caller(task_id)
-    from agent.incognito import is_incognito
-    from agent.incognito_private_dir import private_subdir_for_current_session
-    private_root = private_subdir_for_current_session("kernel")
-    if is_incognito() and private_root is None:
-        raise RuntimeError("Incognito code kernel has no bound private interval")
-    kernel.tmpdir = (tempfile.mkdtemp(prefix="hermes_kernel_", dir=str(private_root))
-                     if private_root is not None else tempfile.mkdtemp(prefix="hermes_kernel_"))
+    from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+    try:
+        parent = private_temp_parent("kernel")
+    except PrivateIntervalUnavailable:
+        raise RuntimeError("Incognito code kernel has no bound private interval") from None
+    kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_", dir=parent)
+    private_root = parent
     kernel.rpc_token = secrets.token_urlsafe(32)
     kernel.sentinel = "@@HERMES-KERNEL-" + secrets.token_urlsafe(16) + "@@"
     rpc_endpoint = _bind_rpc_socket(kernel)

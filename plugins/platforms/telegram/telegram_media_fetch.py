@@ -120,9 +120,7 @@ async def cache_replied_media(adapter: Any, msg: Any, event: Any) -> None:
             note += " [Any transcript quoted above is that replied-to voice note, not this message.]"
         adapter._attach_cached(event, cached, note, "[Telegram] Cached replied-to %s at %s", retype=not spoken)
         return
-    from plugins.platforms.telegram.private_ingress import PRIVATE_ATTACHMENT_NOTE
     failure_notes = {
-        "private": PRIVATE_ATTACHMENT_NOTE,
         "failed": "[Replied-to Telegram attachment could not be downloaded, not cached.]",
         "unreadable": "[Replied-to Telegram attachment could not be read, not cached.]",
     }

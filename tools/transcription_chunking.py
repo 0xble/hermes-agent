@@ -119,19 +119,16 @@ def transcribe_oversized(
     from tools.voice_mode_transcript import is_whisper_hallucination
 
     max_bytes, max_seconds = limit
-    from agent.incognito import is_incognito
-    from agent.incognito_private_dir import private_subdir_for_current_session
+    from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
 
-    private = is_incognito()
-    parent = private_subdir_for_current_session("stt-split") if private else None
-    if private and parent is None:
+    try:
+        parent = private_temp_parent("stt-split")
+    except PrivateIntervalUnavailable:
         return _error_result("Cannot split oversized audio: private interval is unresolved")
     ffmpeg = _find_ffmpeg_binary()
     if not ffmpeg:
         return _too_large(path, max_bytes, "ffmpeg was not found")
-    with TemporaryDirectory(
-        prefix="hermes-stt-split-", dir=str(parent) if parent is not None else None,
-        ignore_cleanup_errors=True) as work_dir:
+    with TemporaryDirectory(prefix="hermes-stt-split-", dir=parent, ignore_cleanup_errors=True) as work_dir:
         compact, error = _transcode_audio_for_stt(path, work_dir)
         if error or not compact:
             return _too_large(path, max_bytes, error or "re-encoding produced no file")

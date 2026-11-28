@@ -59,20 +59,14 @@ def _keep_private_copy(path: str) -> Optional[str]:
     document fallback) delete their file as soon as the send returns. Blocking: use ``to_thread``."""
     tmp_dir = None
     try:
-        from agent.incognito import is_incognito
-        from agent.incognito_private_dir import private_subdir_for_current_session
+        from agent.incognito_private_dir import private_temp_parent
 
-        private = is_incognito()
-        parent = private_subdir_for_current_session("telegram-flood") if private else None
-        if private and parent is None:
-            logger.warning("Could not keep a deferred Telegram copy: private interval is unresolved")
-            return None
-        tmp_dir = tempfile.mkdtemp(
-            prefix="hermes-tg-flood-", dir=str(parent) if parent is not None else None)
+        tmp_dir = tempfile.mkdtemp(prefix="hermes-tg-flood-", dir=private_temp_parent("telegram-flood"))
         kept = os.path.join(tmp_dir, os.path.basename(path))
         shutil.copy2(path, kept)
         return kept
     except OSError as exc:
+        # PrivateIntervalUnavailable is an OSError: a private turn with no interval keeps nothing.
         logger.warning("Could not keep a copy of %s for the deferred upload: %s", os.path.basename(path), exc)
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
