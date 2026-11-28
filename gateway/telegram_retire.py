@@ -27,12 +27,15 @@ _TRANSIENT_MARKERS = (
     "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
 )
 _TRANSIENT_RETRY_LIMIT = 6
+_DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
 # A failed retirement is still a standing user request. Housekeeping re-runs it with the saved
 # decisions on a doubling backoff (2026-10-30: 28 topics sat "failed" after faults that had cleared
 # or been fixed, because only a new user request ever retried one). Exhausted retries stay failed.
 _AUTO_RETRY_LIMIT = 5
 _AUTO_RETRY_BASE_SECONDS = 600
 _AUTO_RETRY_MAX_SECONDS = 6 * 3600
+# Four independent readbacks overlap without flooding Telegram or housekeeping.
+_RESUME_CONCURRENCY = 4
 
 
 def _transient_delay(exc) -> float | None:
@@ -259,6 +262,23 @@ async def _probe_deleted(bot, source, *, runner=None, read_only=False):
     return False
 
 
+async def _confirm_deleted(bot, source, runner):
+    if await _probe_deleted(bot, source, runner=runner):
+        return True
+    from hermes_platform.resolver import locate_command
+    if not locate_command("telegram").command:
+        return False
+    for delay in _DELETE_VERIFY_DELAYS:
+        await asyncio.sleep(delay)
+        try:
+            if await _probe_deleted(bot, source, runner=runner, read_only=True):
+                return True
+        except Exception as exc:
+            if _transient_delay(exc) is None:
+                raise
+    return False
+
+
 async def _cli_peer(bot, source):
     if source.chat_type != "dm":
         return str(source.chat_id)
@@ -436,7 +456,7 @@ async def advance(runner, source):
                     peer = await _cli_peer(bot, source)
                     await cli(runner, source, "telegram", "--agent", "--yes", "topic", "delete",
                               str(peer), str(source.thread_id))
-            if not await _probe_deleted(bot, source, runner=runner):
+            if not await _confirm_deleted(bot, source, runner):
                 raise RuntimeError("Telegram still accepts messages in the topic after deletion")
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
@@ -536,12 +556,19 @@ async def _auto_retry(runner, source, generation):
 async def resume_all(runner):
     if getattr(runner, "_session_db", None) is None:
         return
-    for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
+    # Four independent readbacks overlap without flooding Telegram or housekeeping.
+    semaphore = asyncio.Semaphore(_RESUME_CONCURRENCY)
+
+    async def resume_one(raw):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done"}:
-                source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
+            if state["phase"] in {"cancelled", "done"}:
+                return
+            source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
+            async with semaphore:
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)
         except Exception:
             logger.warning("Unable to resume one topic retirement", exc_info=True)
+
+    await asyncio.gather(*(resume_one(raw) for _, raw in await runner._session_db.list_meta_prefix(PREFIX)))

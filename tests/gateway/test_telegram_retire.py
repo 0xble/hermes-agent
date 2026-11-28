@@ -354,7 +354,8 @@ async def test_unresolved_delete_unknown_probe_never_retries_or_cancels(runtime)
 async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(runtime, monkeypatch):
     monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
     runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
-    lookup = AsyncMock(side_effect=[[{"id": 42}], [{"id": 42}], []])
+    monkeypatch.setattr(retire.asyncio, "sleep", AsyncMock())
+    lookup = AsyncMock(side_effect=[[{"id": 42}]] * 7 + [[]])
     monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     await retire.request(runtime, runtime.source)
     await retire.advance(runtime, runtime.source)
@@ -378,9 +379,32 @@ async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(r
     runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
     runtime._session_db.delete_telegram_topic_binding.assert_awaited_once_with(
         chat_id="100", thread_id="42", profile_name="default")
-    assert lookup.await_count == 3
+    assert lookup.await_count == 8  # 1 recovery + 1 initial + 5 backoff + 1 final confirmation
     assert lookup.await_args is not None
     assert lookup.await_args.args[-3:] == ("@HermesBot", "--id", "42")
+
+
+@pytest.mark.asyncio
+async def test_resume_all_runs_lagging_delete_readbacks_concurrently(runtime, monkeypatch):
+    """Housekeeping advances independent retirements together, not one readback backoff at a time."""
+    sources = [SessionSource(platform=Platform.TELEGRAM, chat_id="100", thread_id=str(thread_id),
+                             chat_type="dm", user_id="100") for thread_id in (42, 43)]
+    runtime._session_key_for_source = lambda source: f"topic-key-{source.thread_id}"
+    await retire.request(runtime, sources[0])
+    await retire.request(runtime, sources[1])
+    sleep_calls = []
+    both_backoffs_started = asyncio.Event()
+
+    async def fake_advance(_runner, source):
+        sleep_calls.append(source.thread_id)
+        if len(sleep_calls) == 2:
+            both_backoffs_started.set()
+        await both_backoffs_started.wait()
+
+    monkeypatch.setattr(retire, "advance", fake_advance)
+    await asyncio.wait_for(retire.resume_all(runtime), timeout=1)
+
+    assert sorted(sleep_calls) == ["42", "43"]
 
 
 async def _saved_unresolved_retirement(runtime):
@@ -712,3 +736,35 @@ async def test_a_retiring_topic_cannot_create_new_topics(runtime):
     await retire.request(runtime, runtime.source)
     with pytest.raises(TopicRequestError, match="retiring"):
         await create_topic_session(runtime, runtime.source, TopicSpec(name="Successor"))
+
+
+@pytest.mark.asyncio
+async def test_delete_readback_lag_confirms_inline_without_posting(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
+    adapter._bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
+    sleep = AsyncMock()
+    monkeypatch.setattr(retire.asyncio, "sleep", sleep)
+    lookup = AsyncMock(side_effect=[[{"id": 42}], [{"id": 42}], []])
+    monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
+
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+
+    assert (await retire.load(runner, source))["phase"] == "done"
+    assert adapter.send.await_count == 1
+    adapter._bot.send_message.assert_not_awaited()
+    assert lookup.await_count == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [2]
+
+
+@pytest.mark.asyncio
+async def test_bot_only_readback_is_one_send_probe(setup_retire):
+    runner, source, adapter, _ = setup_retire
+
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+
+    assert (await retire.load(runner, source))["phase"] == "done"
+    adapter._bot.send_message.assert_awaited_once_with(
+        chat_id=100, message_thread_id=42, text=retire.NOTICE)
