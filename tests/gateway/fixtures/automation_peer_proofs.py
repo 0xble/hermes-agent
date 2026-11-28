@@ -4,19 +4,15 @@ import functools
 import json
 from pathlib import Path
 import sys
-import time
 from unittest.mock import patch
 
 import websockets
 from websockets.asyncio.server import ServerConnection
 
 from tests.gateway.fixtures.automation_peer import probe
-from tests.gateway.test_authority_automation import _PROBE_TIMEOUT, _TEARDOWN_MARGIN
 
 
 async def prove(root, base, fault):
-    probe_restart = functools.partial(probe, root, base, 'restart-started',
-                                      deadline=time.monotonic() + _PROBE_TIMEOUT - _TEARDOWN_MARGIN)
     initial_reply = None
     injected = []
     buffered_markers = ('BUFFERED_AT_CLOSE_1', 'BUFFERED_AT_CLOSE_2')
@@ -55,7 +51,7 @@ async def prove(root, base, fault):
     with patch.object(websockets, 'serve', serve):
         if fault == 'replay':
             try:
-                await probe_restart()
+                await probe(root, base, 'restart-started')
             except AssertionError as exc:
                 if not str(exc).startswith('unexpected post-restart AUTOMATION_ACK sends:'):
                     raise
@@ -64,7 +60,7 @@ async def prove(root, base, fault):
             else:
                 raise AssertionError(f'Fixture accepted a replayed warm-up reply: {injected!r}')
         else:
-            await probe_restart()
+            await probe(root, base, 'restart-started')
             assert injected == list(buffered_markers), injected
             print('Both buffered frames were consumed after clean close; the relay drained.')
 
