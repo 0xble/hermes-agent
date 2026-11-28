@@ -772,6 +772,33 @@ def test_wake_carries_the_full_handoff_while_the_ping_keeps_a_preview(tmp_path, 
     assert first[:200] in ping and first[:201] not in ping and "Verified on staging" not in ping
 
 
+def test_a_huge_handoff_is_capped_after_the_guidance(tmp_path, monkeypatch):
+    """A wake carries at most WAKE_HANDOFF_LIMIT characters of handoff, points at the board for
+    the rest, and keeps its guidance ahead of the handoff so no body cap can cut it."""
+    from gateway.kanban_watchers_notifier import WAKE_HANDOFF_LIMIT
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "huge-wake.db"))
+    kb.init_db()
+    summary = "head line\n" + "y" * (WAKE_HANDOFF_LIMIT + 5000) + "TAIL"
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="huge", assignee="worker", session_id="agent:main:telegram:dm:chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                           chat_type="dm", delivery_mode="notify+wake")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary=summary)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    wake = _wake_text(adapter)
+    assert summary[:WAKE_HANDOFF_LIMIT] in wake and "TAIL" not in wake
+    assert f"hermes kanban show {tid}" in wake
+    assert wake.index("not a request to decompose") < wake.index("head line")
+    assert len(wake) < WAKE_HANDOFF_LIMIT + 2000
+
+
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     """A triage escalation wakes the origin so a decision gets made."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "triage-wake.db"))

@@ -6,7 +6,7 @@ docs of config.yaml.
 
 from hermes_cli.config_defaults_auxiliary import _aux
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
-from hermes_cli.config_defaults_runtime import DEFAULT_CRON_MAX_PARALLEL_JOBS
+from hermes_cli.config_defaults_runtime import DEFAULT_CRON_MAX_PARALLEL_JOBS, DEFAULT_KANBAN_MAX_IN_PROGRESS
 from hermes_cli.config_defaults_voice import VOICE_DEFAULTS
 from hermes_cli.config_defaults_sandbox import (
     DEFAULT_SANDBOX_IMAGE, DEFAULT_VERCEL_IMAGE, LEGACY_SANDBOX_IMAGE, LEGACY_SANDBOX_IMAGES, LEGACY_VERCEL_RUNTIME,
@@ -1981,10 +1981,10 @@ DEFAULT_CONFIG = {
         # Global concurrency cap (#33488): the HOST never has more than N tasks in 'running' at once —
         # counted across every active board and profile and across both the ready and review dispatch
         # lanes (workers share one machine, so the cap bounds the machine, not each board; OOF-30). At the
-        # cap, ready cards stay queued and are not charged. A missing or invalid value means 12
-        # (``kanban_db_dispatch.DEFAULT_MAX_IN_PROGRESS``); the memory-pressure guard still holds spawns
-        # back on a Linux host that runs short of memory.
-        "max_in_progress": 12,
+        # cap, ready cards stay queued and are not charged. A missing or invalid value means this
+        # default (12); the memory-pressure guard still holds spawns back on a Linux host that runs
+        # short of memory.
+        "max_in_progress": DEFAULT_KANBAN_MAX_IN_PROGRESS,
         # Per-profile cap: positive int = no single profile runs more than N workers even if the
         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
         # when fan-out would saturate one profile's model/API quota/browser pool.

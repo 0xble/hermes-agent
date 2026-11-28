@@ -1010,7 +1010,7 @@ def _host_prefix() -> str:
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Strip both; a provider without a model is rejected (a bare ``--provider`` re-resolves the
-    profile's model on another backend). A model alone may name a model alias: stored as its key and
+    profile's model on another backend). A model alone may name a model alias: stored as ``@<key>`` and
     expanded at dispatch (``card_launch_route``); an unknown ``@alias`` is refused here."""
     model, provider = (model or "").strip() or None, (provider or "").strip() or None
     if provider and not model:
@@ -2383,7 +2383,7 @@ def release_stale_claims(
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
-            error, owner_restart = reclaim_verdict(conn, row["id"], row["claim_lock"])
+            error, restart = reclaim_verdict(conn, row["id"], row["claim_lock"])
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2397,7 +2397,7 @@ def release_stale_claims(
             if cur.rowcount != 1:
                 continue
             run_id = _record_reclaim(
-                conn, row["id"], termination,
+                conn, row["id"], termination | restart,
                 error=error,
                 payload={
                     "stale_lock": row["claim_lock"],
@@ -2414,7 +2414,7 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (as ``enforce_max_runtime``): a run ended without a verdict counts
         # toward the breaker (a trip: ``blocked`` + ``gave_up``) unless its owner recorded a restart under it.
         _record_task_failure(
-            conn, row["id"], error, infrastructure=owner_restart,
+            conn, row["id"], error, infrastructure=bool(restart),
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},

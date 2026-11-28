@@ -324,7 +324,7 @@ def test_managed_worker_stop_frame_carries_shutdown_source(monkeypatch):
         it = iter(frames + [{'type': 'finish'}])
         monkeypatch.setattr(worker, 'read_frame', lambda stream: next(it))
         controls = worker.WorkerControls.__new__(worker.WorkerControls)
-        controls.agent, controls.stop_source = None, None
+        controls.agent, controls.stop_source, controls.owner_stop = None, None, False
         controls.stopped, controls.finish = threading.Event(), threading.Event()
         controls.lock, controls.clarifications = threading.Lock(), {}
         controls.read()
@@ -333,3 +333,35 @@ def test_managed_worker_stop_frame_carries_shutdown_source(monkeypatch):
     assert controls_after([{'type': 'stop', 'source': 'system'}]).stop_source == "system"
     user = controls_after([{'type': 'stop'}])
     assert user.stopped.is_set() and user.stop_source is None
+
+
+def test_only_the_owners_stop_control_marks_an_owner_stop(monkeypatch):
+    """A Kanban attempt is uncharged only for the owner's own Stop control: a user's Stop, a lost
+    channel (EOF) and a malformed frame all stop the turn without claiming the owner did it."""
+    import threading
+
+    from agent import managed_worker as worker
+
+    monkeypatch.setattr(worker, '_drain_background_delegations', lambda _seconds: None)
+
+    def controls_after(frames, end=None):
+        def read_frame(_stream, it=iter(frames)):
+            frame = next(it, None)
+            if frame is None:
+                raise end or EOFError()
+            return frame
+        monkeypatch.setattr(worker, 'read_frame', read_frame)
+        controls = worker.WorkerControls.__new__(worker.WorkerControls)
+        controls.agent, controls.stop_source, controls.owner_stop = None, None, False
+        controls.stopped, controls.finish = threading.Event(), threading.Event()
+        controls.lock, controls.clarifications = threading.Lock(), {}
+        controls.read()
+        return controls
+
+    assert controls_after([{'type': 'stop', 'source': 'system'}, {'type': 'finish'}]).owner_stop is True
+    assert controls_after([{'type': 'stop'}, {'type': 'finish'}]).owner_stop is False
+    assert controls_after([{'type': 'stop'}, {'type': 'stop', 'source': 'system'}, {'type': 'finish'}]).owner_stop is False
+    lost = controls_after([])
+    assert lost.stopped.is_set() and lost.owner_stop is False
+    malformed = controls_after([{'type': 'bogus'}])
+    assert malformed.stopped.is_set() and malformed.owner_stop is False

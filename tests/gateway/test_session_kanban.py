@@ -83,6 +83,67 @@ def test_alias_pinned_card_runs_the_aliases_route(tmp_path, monkeypatch):
     assert policy.model == 'claude-opus-5-5' and policy.config()['agent']['reasoning_effort'] == 'low'
 
 
+
+_PROFILE = {'model': {'default': 'loop-model', 'provider': 'custom', 'base_url': 'https://profile.invalid/v1',
+                      'api_key': 'profile-secret'}, 'platform_toolsets': {'cli': ['terminal', 'file']}}
+
+
+@pytest.mark.parametrize('entry, expect', [
+    ({'model': 'm-keyed', 'base_url': 'https://alias.invalid/v1', 'api_key': 'alias-secret'}, 'api_key'),
+    ({'model': 'm-env', 'base_url': 'https://alias.invalid/v1', 'key_env': 'ALIAS_KEY'}, 'key_env'),
+    ({'model': 'm-bare', 'base_url': 'https://alias.invalid/v1'}, None),
+], ids=['api_key', 'key_env', 'no-key'])
+def test_an_alias_owns_its_credential_and_never_carries_the_profile_key(tmp_path, monkeypatch, entry, expect):
+    """An alias with its own endpoint runs on its own key (literal or key_env pointer); the
+    profile's key never pairs with the alias's host, even on the same provider label."""
+    monkeypatch.setenv('ALIAS_KEY', 'env-secret')
+    aliases = {'model_aliases': {'Edge': entry}}
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda *a, **k: aliases)
+    from gateway.session_kanban import build_kanban_policy
+    _task, _workspace, connection, params = _claimed_card(tmp_path, monkeypatch, model_override='edge')
+    policy, private = build_kanban_policy(connection, params, {**_PROFILE, **aliases})
+    frozen = json.loads(policy.config_json)
+    assert policy.model == entry['model'] and frozen['model']['base_url'] == 'https://alias.invalid/v1'
+    assert 'profile-secret' not in policy.config_json and 'profile-secret' not in private.values()
+    if expect == 'api_key':
+        assert frozen['model']['api_key_from'] == ['model_aliases', 'Edge', 'api_key']
+        assert private[('model_aliases', 'Edge', 'api_key')] == 'alias-secret'
+    elif expect == 'key_env':
+        assert frozen['model']['key_env'] == 'ALIAS_KEY' and 'api_key_from' not in frozen['model']
+    else:
+        assert not {'api_key', 'api_key_from', 'key_env', 'api_key_env'} & {k for k, v in frozen['model'].items() if v}
+
+
+def test_an_alias_pin_that_no_longer_resolves_blocks_the_card(tmp_path, monkeypatch):
+    """The stored ``@`` keeps an alias pin an alias: once the owner's config drops it, dispatch
+    blocks the card with the reason instead of sending the name as a model id. A raw id stays raw
+    even when an alias of that name is added later."""
+    from hermes_state_runtime import RuntimeStoreError
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from gateway.session_kanban import build_kanban_policy
+    aliases = {'model_aliases': {'opus': {'model': 'claude-opus-5-5', 'provider': 'custom:claude-proxy'}}}
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda *a, **k: aliases)
+    task, workspace, connection, params = _claimed_card(tmp_path, monkeypatch, model_override='opus')
+    assert task.model_override == '@opus'
+    with pytest.raises(RuntimeStoreError, match='invalid_kanban_claim'):
+        build_kanban_policy(connection, params, dict(_PROFILE))
+    with connect_closing(board='owned') as conn:
+        blocked = kb.get_task(conn, task.id)
+    assert blocked.status == 'blocked' and blocked.block_kind == 'needs_input'
+
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda *a, **k: {})
+    with connect_closing(board='owned') as conn:
+        raw = kb.create_task(conn, title='raw pin', assignee='default', workspace_kind='dir',
+                             workspace_path=str(workspace), model_override='sonnet')
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, raw)
+    later = {'model_aliases': {'sonnet': {'model': 'claude-sonnet-5-5', 'provider': 'custom:claude-proxy'}}}
+    policy, _secrets = build_kanban_policy(connection, dict(params, task_id=raw, run_id=claimed.current_run_id,
+                                                            claim_lock=claimed.claim_lock), {**_PROFILE, **later})
+    assert claimed.model_override == 'sonnet' and policy.model == 'sonnet'
+
+
 @pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash'])
 def test_real_dispatcher_lifecycle(tmp_path, mode):
     import os

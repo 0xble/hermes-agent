@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.config_defaults_runtime import DEFAULT_KANBAN_MAX_IN_PROGRESS as DEFAULT_MAX_IN_PROGRESS
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -678,7 +679,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_owner_recovery import free_owner_restart, owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -721,6 +722,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
+            # The owner restarted under this run: its clock ran through the restart, not the card's work.
+            restart = free_owner_restart(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -736,6 +739,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "limit_seconds": limit,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    **({"owner_restart": True} if restart else {}),
                 }
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
@@ -749,7 +753,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
-                error=error,
+                error=error, infrastructure=restart,
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
@@ -1808,10 +1812,6 @@ def review_dispatch_enabled() -> bool:
 # inside the tick (``_memory_pressure_level``) holds spawns back when the host
 # runs short, because a static cap can't see other tenants. The guard fails
 # open: unreadable memory (non-Linux) reads "unknown" and restricts nothing.
-
-# The default host cap, chosen by the operator (2026-11-27); set
-# ``kanban.max_in_progress`` to raise or lower it.
-DEFAULT_MAX_IN_PROGRESS = 12
 
 
 def _system_memory_sample() -> dict:
