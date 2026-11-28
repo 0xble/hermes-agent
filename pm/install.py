@@ -189,6 +189,27 @@ def _identity(lockfile: Lockfile, name: str, target: str):
     return (target, tuple(a["sha256"] for a in artifacts))
 
 
+def _spawned_by_test() -> bool:
+    """A child a test spawned with a rebuilt environment, which drops the harness's bridge var.
+
+    Without this, a gateway or CLI started in a scratch test HOME acquired dependencies from the
+    network in the background, outlived the test, and failed its orphan and cleanup checks whenever
+    the index was slow. A process with a pytest ancestor is never a production process. The test
+    process itself (pytest imported) keeps the env and config policy, since the repo's runner counts
+    as a pytest ancestor there, and a test that sets the bridge var explicitly (for example to
+    ``0``) keeps its choice.
+    """
+    import sys
+
+    if "pytest" in sys.modules:
+        return False
+    try:
+        from hermes_state_guard import _has_pytest_ancestor
+    except ImportError:
+        return False
+    return _has_pytest_ancestor()
+
+
 def lazy_installs_allowed() -> bool:
     """Policy: may pm install things on demand right now?
 
@@ -200,11 +221,10 @@ def lazy_installs_allowed() -> bool:
     """
     import os
 
-    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
+    bridge = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower()
+    if bridge in ("1", "true", "yes"):
+        return False
+    if not bridge and _spawned_by_test():
         return False
     try:
         from hermes_cli.config import cfg_get, load_config_readonly, require_readable_config_before_write

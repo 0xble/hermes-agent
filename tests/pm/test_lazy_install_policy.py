@@ -32,6 +32,40 @@ def test_internal_disable_overrides_enabled_config(monkeypatch):
     assert not pm.lazy_installs_allowed()
 
 
+@pytest.mark.parametrize("bridge,spawned,expected", [
+    (None, True, False),   # a test-spawned child with a rebuilt env never acquires in the background
+    (None, False, True),   # outside any test, config decides ({} allows)
+    ("0", True, True),     # an explicit bridge value is the test's own choice
+    ("1", False, False),
+])
+def test_test_spawned_child_without_bridge_never_lazy_installs(monkeypatch, bridge, spawned, expected):
+    import hermes_state_guard
+    import pm.install
+
+    get_config_path().write_text("{}\n", encoding="utf-8")
+    if bridge is None:
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", bridge)
+    # Simulate a child process: no pytest module, and the ancestry answer under test.
+    monkeypatch.delitem(sys.modules, "pytest")
+    monkeypatch.setattr(hermes_state_guard, "_has_pytest_ancestor", lambda: spawned)
+
+    assert pm.install.lazy_installs_allowed() is expected
+
+
+def test_the_test_process_itself_keeps_config_policy(monkeypatch):
+    import hermes_state_guard
+    import pm.install
+
+    get_config_path().write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.setattr(hermes_state_guard, "_has_pytest_ancestor", lambda: True)
+
+    assert "pytest" in sys.modules
+    assert pm.install.lazy_installs_allowed() is True
+
+
 class _Missing:
     """Make importing ``target`` fail as if module ``name`` were not installed."""
 
