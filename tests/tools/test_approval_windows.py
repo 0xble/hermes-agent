@@ -222,7 +222,7 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
 
     @pytest.mark.parametrize("prefix, fragment, suffix, count", [
         ('echo "', "wmic shadowcopy ", 'list"; echo ok', 500),
-        ('echo "', "ssh -x ", 'cat"; echo ok', 500),
+        ('echo "', "ssh -x ", 'cat"; echo ok', 1000),
         ("", "; ssh -x", "", 750),
         ("", "\n ssh -x", "", 750),
     ], ids=["quoted-wmic", "quoted-ssh", "semicolon-ssh", "newline-ssh"])
@@ -233,17 +233,21 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
 
         def scan_cpu_time(repetitions):
             command = prefix + fragment * repetitions + suffix
-            start = time.thread_time()
-            for _ in range(scans):
-                assert not _is_dangerous(command)
-            return time.thread_time() - start
+            samples = []
+            for _ in range(3):
+                start = time.thread_time()
+                for _ in range(scans):
+                    assert not _is_dangerous(command)
+                samples.append(time.thread_time() - start)
+            return sorted(samples)[1]
 
         assert not _is_dangerous(prefix + fragment + suffix)  # warm up lazy initialization
         small = scan_cpu_time(count)
-        large = scan_cpu_time(4 * count)
-        # Thread CPU time excludes preemption. Four times the input should cost about 4x the
-        # work, not 16x as in a quadratic scan; allow headroom for cache and measurement noise.
-        assert large < 8 * small, f"{small=:.6f}s, {large=:.6f}s"
+        large = scan_cpu_time(8 * count)
+        # Thread CPU time excludes preemption. Eight times the input should cost about 8x the
+        # work, not 64x as in a quadratic scan; keep the bound below the quadratic ratio while
+        # allowing ordinary interpreter and cache noise.
+        assert large < 16 * small, f"{small=:.6f}s, {large=:.6f}s"
 
 
 class TestDriveLetterRoots:
