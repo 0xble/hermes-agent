@@ -25,6 +25,12 @@ async def _poll_run_terminal(client, url, headers):
         await asyncio.sleep(.02)
 
 
+# The turn reaches BLOCK_FIFO only after a real agent loop starts; on a loaded CI runner that
+# took longer than 10s. The wait returns as soon as the event is set, so a wider budget costs
+# nothing on a healthy run and stays inside the caller's 100s subprocess timeout.
+BLOCKED_WAIT_S = 30
+
+
 async def probe(peer):
     import aiohttp
     import websockets
@@ -106,7 +112,7 @@ async def probe(peer):
                             assert response.status == 202, await response.text()
                             return (await response.json())['run_id']
                     blocking = await create_run('BLOCK_FIFO')
-                    assert await asyncio.to_thread(peer.blocked.wait, 10)
+                    assert await asyncio.to_thread(peer.blocked.wait, BLOCKED_WAIT_S)
                     async with client.post(f'http://127.0.0.1:{api_port}/v1/runs/{blocking}/steer',
                             json={'input': 'SAFE_STEER'}, headers=headers) as response:
                         steered = await response.json()
@@ -122,7 +128,7 @@ async def probe(peer):
                 if os.environ.get('API_ADVANCED'):
                     await ws.send(json.dumps({'jsonrpc': '2.0', 'id': 3, 'method': 'prompt.submit', 'params': {'session_id': ref.session_id, 'input_id': 'ws-block', 'text': 'BLOCK_FIFO'}}))
                     await until(lambda f: f.get('id') == 3)
-                    assert await asyncio.to_thread(peer.blocked.wait, 10)
+                    assert await asyncio.to_thread(peer.blocked.wait, BLOCKED_WAIT_S)
                     retry_headers = {**headers, 'Idempotency-Key': 'durable-api-retry'}
                     follow = {'messages': [{'role': 'system', 'content': 'API_STABLE_SYSTEM'}, {'role': 'user', 'content': 'FIFO_SECOND'}]}
                     async def request_follow(stream=False):

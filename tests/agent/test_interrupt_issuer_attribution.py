@@ -130,9 +130,12 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
     prepared = SimpleNamespace(batch=batch, tids=[], future=concurrent.futures.Future())
     try:
         # Drive the REAL batch-timeout guard: a prepared terminal call whose worker never settles.
+        # Terminal declares a deadline floor of TERMINAL_TIMEOUT (180s) plus grace for a foreground
+        # call, which would otherwise hold this guard for about 185s; remove it so 0.05s applies.
         with (
             patch("agent.terminal_approval_batch.take_prepared_call", return_value=prepared),
             patch.object(te, "_resolve_sequential_tool_timeout", return_value=0.05),
+            patch("agent.tool_executor_deadline.declared_deadline_floor", return_value=None),
             patch.object(te, "_emit_terminal_post_tool_call"),
         ):
             te._run_sequential_tool_execution_middleware(
