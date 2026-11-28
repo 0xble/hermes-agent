@@ -11,6 +11,11 @@ TRANSIENT_PROVIDER_REASONS = frozenset({
 TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
+# A Kanban turn its profile owner stopped with its own Stop control (a gateway restart, shutdown or
+# profile retirement; ``gateway.session_kanban``): the host's reason, not the card's, so the
+# dispatcher re-queues it without spending the retry budget, up to a per-card streak
+# (``kanban_owner_recovery.OWNER_RESTART_LIMIT``). Outside the BSD sysexits range.
+KANBAN_OWNER_STOP_EXIT_CODE = 79
 
 
 def turn_exit_code(

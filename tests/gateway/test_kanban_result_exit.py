@@ -53,6 +53,20 @@ def test_managed_result_persists_exact_worker_exit(tmp_path, monkeypatch, result
     assert session_kanban.worker_exit_code(path, context | {"claim_lock": "foreign"}) == 1
 
 
+@pytest.mark.parametrize("owner_stopped, expected", [(True, 79), (False, 130)])
+def test_only_an_owner_stop_books_the_uncharged_exit(tmp_path, monkeypatch, owner_stopped, expected):
+    """An interrupted card turn exits KANBAN_OWNER_STOP_EXIT_CODE only when the owner's own Stop
+    control ended it; a user's Stop or a lost channel stays 130."""
+    from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE
+    assert KANBAN_OWNER_STOP_EXIT_CODE == 79
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    monkeypatch.setattr(session_kanban, "_run_task_turns", lambda *_args: {"interrupted": True})
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+
+    session_kanban.run_worker_turns(SimpleNamespace(), frame, [], owner_stopped=lambda: owner_stopped)
+    assert session_kanban.worker_exit_code(path, context) == expected
+
+
 def _credential_failures():
     from hermes_cli.auth import AuthError
     from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE

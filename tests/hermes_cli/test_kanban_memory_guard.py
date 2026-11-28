@@ -5,14 +5,10 @@ Two production incidents shared the same failure shape: no
 the dispatcher fanned out 26-31 concurrent workers, the host swap-thrashed,
 and the whole machine (dashboard included) became unreachable.
 
-Covers the two safeguards added in response:
-
-1. :func:`hermes_cli.kanban_db_dispatch.derive_default_max_in_progress` /
-   :func:`hermes_cli.kanban_db_dispatch.resolve_max_in_progress` — memory-derived
-   default global concurrency cap when the operator never set one.
-2. The live memory-pressure guard inside ``dispatch_once`` — critical
-   pressure spawns nothing; elevated pressure spawns at most one; unknown
-   imposes no restriction (fail-open).
+Covers the live memory-pressure guard inside ``dispatch_once``: critical
+pressure spawns nothing, elevated pressure spawns at most one, unknown imposes
+no restriction (fail-open). The host cap itself defaults to
+``DEFAULT_MAX_IN_PROGRESS`` (``test_kanban_host_cap.py``).
 """
 
 from __future__ import annotations
@@ -38,49 +34,6 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 GIB = 1024 * 1024  # KiB per GiB
-
-
-# ---------------------------------------------------------------------------
-# derive_default_max_in_progress / resolve_max_in_progress
-# ---------------------------------------------------------------------------
-
-
-def test_derived_cap_small_vm_floors_at_two():
-    # 1 GiB VM (the incident shape): 1024 // 512 = 2 workers.
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": 1 * GIB}) == 2
-    # Even tiny VMs keep a floor of 2 so boards still make progress.
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": GIB // 4}) == 2
-
-
-
-
-def test_derived_cap_fails_open_without_memtotal():
-    assert kbd.derive_default_max_in_progress({}) is None
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": 0}) is None
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": -5}) is None
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": True}) is None
-    assert kbd.derive_default_max_in_progress({"mem_total_kib": "1048576"}) is None
-
-
-def test_resolve_max_in_progress_explicit_config_wins(monkeypatch):
-    monkeypatch.setattr(
-        kbd, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
-    )
-    # Operator said 6 on a 1 GiB box — their call, even above the derived 2.
-    assert kbd.resolve_max_in_progress(6) == 6
-    assert kbd.resolve_max_in_progress(1) == 1
-
-
-def test_resolve_max_in_progress_derives_when_unset(monkeypatch):
-    monkeypatch.setattr(
-        kbd, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
-    )
-    assert kbd.resolve_max_in_progress(None) == 2
-
-
-def test_resolve_max_in_progress_unset_and_unknown_memory_is_uncapped(monkeypatch):
-    monkeypatch.setattr(kbd, "_system_memory_sample", dict)
-    assert kbd.resolve_max_in_progress(None) is None
 
 
 # ---------------------------------------------------------------------------

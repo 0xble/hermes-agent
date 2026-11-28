@@ -62,8 +62,7 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     Regression guard for the OOF-30 review finding: ``run_daemon`` only
     forwarded ``max_spawn`` — with no explicit ``--max`` (the shipped
     systemd shape) nothing capped the tick even though the gateway and
-    ``hermes kanban dispatch`` paths both resolved the memory-derived
-    default.
+    ``hermes kanban dispatch`` paths both resolved the default cap.
     """
     captured: dict = {}
     stop = threading.Event()
@@ -73,16 +72,15 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    # No explicit config → the derived default must flow through.
+    # No explicit config → the default host cap must flow through.
     monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
-    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
         stop.set()
 
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
-    assert captured.get("max_in_progress") == 3
+    assert captured.get("max_in_progress") == kbd.DEFAULT_MAX_IN_PROGRESS
 
 
 
@@ -104,6 +102,16 @@ def test_configured_max_in_progress_parsing(monkeypatch):
             cfgmod, "load_config_readonly", lambda c=config: c
         )
         assert kbd.configured_max_in_progress() == expected, config
+
+
+def test_an_unset_host_cap_defaults_to_12_on_every_host(monkeypatch):
+    """Unreadable memory (macOS, Windows) once left the host uncapped; the default is now 12
+    everywhere, and the config default says the same."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert kbd.resolve_max_in_progress(None) == kbd.DEFAULT_MAX_IN_PROGRESS == 12
+    assert DEFAULT_CONFIG["kanban"]["max_in_progress"] == 12
+    assert kbd.resolve_max_in_progress(3) == 3
 
 
 # ---------------------------------------------------------------------------

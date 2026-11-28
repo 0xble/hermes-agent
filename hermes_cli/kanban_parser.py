@@ -197,9 +197,10 @@ _SPECS = [
                   f"the dispatcher's kanban.failure_limit config (default "
                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
         _arg("--model", dest="model_override",
-             help="Pin the worker to this model (passed as -m <model>) without "
-                  "changing the profile's configured model. Combine with --provider "
-                  "when the model belongs to a different backend than the profile's default."),
+             help="Pin the worker to this model without changing the profile's configured "
+                  "model. A model alias (a model_aliases name, or @name) runs the alias's "
+                  "model, provider and reasoning effort; an unknown @name is refused. Combine "
+                  "a raw model id with --provider when it belongs to another backend."),
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
@@ -252,7 +253,7 @@ _SPECS = [
          help="Assign or reassign a task"),
     _cmd("set-model", [
         _TASK_ID,
-        _arg("model", nargs="?", help="Model to pin the worker to (or 'none' to clear the override)"),
+        _arg("model", nargs="?", help="Model or model alias to pin the worker to (or 'none' to clear the override)"),
         _arg("--provider",
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),

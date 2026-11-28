@@ -111,8 +111,8 @@ def _full_config() -> dict[str, Any]:
 
 def _alias_names(full_config: Mapping[str, Any]) -> list[str]:
     """The aliases ``/model`` resolves (``model_aliases`` plus ``model.aliases``), from the same loader."""
-    from hermes_cli.model_switch import _load_direct_aliases
-    return sorted(_load_direct_aliases(dict(full_config)))
+    from hermes_cli.model_alias_runtime import alias_names
+    return alias_names(full_config)
 
 
 def core_task_parameters() -> dict[str, dict[str, Any]]:
@@ -162,9 +162,8 @@ def _alias_route(index: int, task: Mapping[str, Any]) -> Optional[dict[str, Any]
     names = _alias_names(full)
     key = alias.strip().lower() if isinstance(alias, str) else ""
     if key not in names:
-        known = f"Use one of: {', '.join(names)}" if names else "No model aliases are configured"
-        raise DelegationRouteError(f"Task {index}: unknown model alias {alias!r}. {known} "
-                                   f"(model_aliases in config.yaml).")
+        from hermes_cli.model_alias_runtime import unknown_alias_message
+        raise DelegationRouteError(f"Task {index}: {unknown_alias_message(alias, names)}")
     entry = _alias_entry(full, key)
     chain = entry.get("fallback_providers") if isinstance(entry, Mapping) else None
     if isinstance(chain, list):

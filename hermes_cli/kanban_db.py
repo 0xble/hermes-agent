@@ -1009,14 +1009,14 @@ def _host_prefix() -> str:
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Strip both; a provider without a model is rejected (a bare ``--provider``
-    would re-resolve the profile's model against another backend — exactly
-    the mismatch the override exists to kill)."""
-    model = (model or "").strip() or None
-    provider = (provider or "").strip() or None
+    """Strip both; a provider without a model is rejected (a bare ``--provider`` re-resolves the
+    profile's model on another backend). A model alone may name a model alias: stored as ``@<key>`` and
+    expanded at dispatch (``card_launch_route``); an unknown ``@alias`` is refused here."""
+    model, provider = (model or "").strip() or None, (provider or "").strip() or None
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
-    return model, provider
+    from hermes_cli.model_alias_runtime import card_model_alias
+    return (card_model_alias(model) or model) if model and not provider else model, provider
 
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
@@ -2353,7 +2353,7 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_verdict
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2383,7 +2383,8 @@ def release_stale_claims(
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
-            retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            error, restart = reclaim_verdict(conn, row["id"], row["claim_lock"])
+            retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2396,7 +2397,7 @@ def release_stale_claims(
             if cur.rowcount != 1:
                 continue
             run_id = _record_reclaim(
-                conn, row["id"], termination,
+                conn, row["id"], termination | restart,
                 error=error,
                 payload={
                     "stale_lock": row["claim_lock"],
@@ -2410,11 +2411,10 @@ def release_stale_claims(
                 },
             )
             reclaimed += 1
-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
-        # the run ended without a verdict, so it counts toward the breaker and a
-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+        # Own txn, after the reclaim commit (as ``enforce_max_runtime``): a run ended without a verdict counts
+        # toward the breaker (a trip: ``blocked`` + ``gave_up``) unless its owner recorded a restart under it.
         _record_task_failure(
-            conn, row["id"], error,
+            conn, row["id"], error, infrastructure=bool(restart),
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},

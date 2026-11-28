@@ -21,11 +21,8 @@ _owners = {}
 
 async def _restore_local_session_for_cron(authority, sid, *, admission_gate):
     """Retry only when the live cache changed during restore, not on receipt conflicts."""
-    from gateway.session_local_recovery import _LiveSessionChanged, restore_local_session_async
-    try:
-        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
-    except _LiveSessionChanged:
-        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
+    from gateway.session_local_recovery import restore_local_session_settled
+    return await restore_local_session_settled(authority, sid, admission_gate=admission_gate)
 
 
 def bind_owner(authority):

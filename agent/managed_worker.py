@@ -247,6 +247,7 @@ class WorkerControls:
         self.agent = None
         self.stopped = threading.Event()
         self.stop_source = None
+        self.owner_stop = False  # the owner's own Stop control, never a lost or malformed channel
         self.finish = threading.Event()
         self.clarifications = {}
         self.lock = threading.Lock()
@@ -272,6 +273,7 @@ class WorkerControls:
                 frame = read_frame(sys.stdin.buffer)
                 if frame in ({'type': 'stop'}, {'type': 'stop', 'source': 'system'}):
                     # The owner's shutdown Stop names its source; a user's Stop carries none.
+                    self.owner_stop = self.owner_stop or (frame.get('source') == 'system' and not self.stopped.is_set())
                     self.stop(interrupt_source=frame.get('source'))
                     continue
                 if frame == {'type': 'finish'}:
@@ -485,7 +487,7 @@ def execute(frame, channel):
                       getattr(agent, 'session_completion_tokens', 0) or 0)
             # Most failed results name no provider or model; the owner's error card needs the agent's.
             result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
-                      **run_worker_turns(agent, frame, history)}
+                      **run_worker_turns(agent, frame, history, owner_stopped=lambda: controls.owner_stop)}
             turn_done.set()
             result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
             result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])

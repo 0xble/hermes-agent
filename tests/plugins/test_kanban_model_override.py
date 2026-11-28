@@ -110,6 +110,21 @@ def test_create_task_with_model_and_provider(conn):
     assert ev.payload["provider_override"] == "openrouter"
 
 
+def test_model_alias_pin_is_stored_as_its_key_and_an_unknown_alias_is_refused(conn, monkeypatch):
+    aliases = {"model_aliases": {"Opus": {"model": "claude-opus-5-5", "provider": "custom:claude-proxy"}}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda *a, **k: aliases)
+    tid = kb.create_task(conn, title="t", assignee="worker", model_override="@OPUS")
+    assert kb.get_task(conn, tid).model_override == "@opus"  # the @ keeps it an alias pin for good
+    with pytest.raises(ValueError, match=r"unknown model alias '@sonet'\. Use one of: opus"):
+        kb.create_task(conn, title="t2", assignee="worker", model_override="@sonet")
+    with pytest.raises(ValueError, match="unknown model alias"):
+        kb.set_model_override(conn, tid, "@sonet")
+    # A raw id pinned with its provider stays exactly as given, even when it spells an alias.
+    assert kb.set_model_override(conn, tid, "Opus", provider="openrouter")
+    task = kb.get_task(conn, tid)
+    assert (task.model_override, task.provider_override) == ("Opus", "openrouter")
+
+
 
 
 # ---------------------------------------------------------------------------

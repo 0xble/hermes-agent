@@ -580,11 +580,10 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 
     The dispatcher consults live system memory before spawning (OOF-30/
-    OOF-77: memory-derived default cap + pressure-based spawn restriction).
-    Left un-patched, dispatch tests would pass or fail based on how loaded
-    the CI runner happens to be. Defaulting the sample to ``{}`` makes the
-    derived cap ``None`` and the pressure level ``"unknown"`` — i.e. the
-    pre-guard behaviour every existing test was written against. Tests that
+    OOF-77: a pressure-based spawn restriction). Left un-patched, dispatch
+    tests would pass or fail based on how loaded the CI runner happens to be.
+    Defaulting the sample to ``{}`` makes the pressure level ``"unknown"``,
+    i.e. no restriction, which every existing test was written against. Tests that
     exercise the guard itself opt out with
     ``@pytest.mark.real_memory_guard`` or patch the seam directly.
     """
