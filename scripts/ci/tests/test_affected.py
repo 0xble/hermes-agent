@@ -114,3 +114,8 @@ def test_path_map_selects_node_ids_for_globbed_inputs(repo: Path, tmp_path_facto
     monkeypatch.setattr(affected, 'PATH_MAP_FILE', rules)
     _, tests, _ = change(repo, 'cases/alpha/case.yaml', 'x: 1\n')
     assert tests == ['tests/test_unrelated.py::test_case[alpha]']
+
+
+def test_prose_beside_ci_configuration_does_not_run_everything(repo: Path) -> None:
+    mode, tests, _ = change(repo, '.github/workflows/README.md', '# notes\n')
+    assert (mode, tests) == ('affected', [])

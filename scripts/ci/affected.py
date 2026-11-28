@@ -47,9 +47,12 @@ GENERIC_NAMES = {'__init__.py', '__main__.py', 'conftest.py', 'README.md', 'SKIL
                  'CLAUDE.md', 'config.yaml', 'settings.json', 'package.json', 'index.ts', 'index.js'}
 
 
+GIT_TIMEOUT_SECONDS = 120
+
+
 def git(root: Path, *args: str) -> str:
-    return subprocess.run(['git', '-C', str(root), *args], check=True,
-                          capture_output=True, text=True).stdout
+    return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True,
+                          text=True, timeout=GIT_TIMEOUT_SECONDS).stdout
 
 
 def is_test_file(path: str) -> bool:
@@ -149,89 +152,98 @@ def imports(path: str, source: str) -> set[str]:
     return found
 
 
-def select(root: Path, base: str) -> tuple[str, list[str], str]:
-    """Return (mode, tests, reason). mode is 'full' or 'affected'."""
+def changed_paths(root: Path, base: str) -> list[str]:
     diff = git(root, 'diff', '--name-only', '--no-renames', '-z', f'{base}...HEAD', '--')
-    changed = sorted({p for p in diff.split('\0') if p})
-    if not changed:
-        return 'affected', [], 'no changes against base'
+    return sorted({p for p in diff.split('\0') if p})
+
+
+def shared_setup_change(changed: list[str]) -> str | None:
+    """The first changed path that can alter how every test runs, if any."""
     patterns = full_suite_patterns()
     for path in changed:
+        if path.endswith('.md'):
+            continue  # prose beside CI configuration never changes how tests run
         if any(fnmatch.fnmatchcase(path, pat) for pat in patterns):
-            return 'full', [], f'shared setup changed: {path}'
+            return path
+    return None
 
-    roots = testpaths(root)
-    tracked = [p for p in git(root, 'ls-files', '-z', '--', '*.py').split('\0') if p]
+
+def load_sources(root: Path) -> dict[str, str]:
     sources: dict[str, str] = {}
-    for path in tracked:
+    for path in (p for p in git(root, 'ls-files', '-z', '--', '*.py').split('\0') if p):
         try:
             sources[path] = (root / path).read_text(encoding='utf-8', errors='replace')
         except OSError:
             continue
-    tests = sorted(p for p in sources if is_test_file(p) and under(p, roots))
+    return sources
 
+
+def import_graph(sources: dict[str, str], tests: list[str], changed: list[str]) -> dict[str, set[str]]:
+    """Map each file to the files that import it, including conftest scope."""
     # Module name -> files. Deleted modules keep their names so importers still match.
     by_name: dict[str, set[str]] = defaultdict(set)
     for path in [*sources, *(p for p in changed if p.endswith('.py') and p not in sources)]:
         for name in module_names(path):
             by_name[name].add(path)
-
     importers: dict[str, set[str]] = defaultdict(set)
     for path, source in sources.items():
         for name in imports(path, source):
-            parts = name.split('.')
             # "from a.b import c" may name module a.b.c or attribute c of a.b.
-            for target in by_name.get(name, ()) or by_name.get('.'.join(parts[:-1]), ()):
+            for target in by_name.get(name, ()) or by_name.get(name.rpartition('.')[0], ()):
                 if target != path:
                     importers[target].add(path)
     # A test depends on every conftest.py above it.
-    conftests = [p for p in sources if PurePosixPath(p).name == 'conftest.py']
-    for conftest in conftests:
+    for conftest in (p for p in sources if PurePosixPath(p).name == 'conftest.py'):
         folder = str(PurePosixPath(conftest).parent)
-        for test in tests:
-            if folder == '.' or test.startswith(folder + '/'):
-                importers[conftest].add(test)
+        importers[conftest].update(t for t in tests if folder == '.' or t.startswith(folder + '/'))
+    return importers
 
-    affected: set[str] = set()
-    queue = deque(p for p in changed if p.endswith('.py'))
-    seen = set(queue)
+
+def tests_reaching(starts: list[str], importers: dict[str, set[str]], tests: set[str]) -> set[str]:
+    """Tests among the starts or among their direct and transitive importers."""
+    seen = set(starts)
+    queue = deque(starts)
     while queue:
         current = queue.popleft()
-        if current in tests:
-            affected.add(current)
         for parent in importers.get(current, ()):
             if parent not in seen:
                 seen.add(parent)
                 queue.append(parent)
+    return seen & tests
 
-    # Tests that name a changed file (fixtures, data, CLIs run by path).
+
+def path_reference_pattern(changed: list[str]) -> re.Pattern[str]:
+    """Match a changed file's path, its last 2 parts, or a distinctive basename."""
     tokens = set()
     for path in changed:
-        tokens.add(path)
         pure = PurePosixPath(path)
+        tokens.add(path)
         if len(pure.parts) > 1:
             tokens.add('/'.join(pure.parts[-2:]))
         if len(pure.name) >= MIN_TEXT_TOKEN and pure.name not in GENERIC_NAMES:
             tokens.add(pure.name)
-    if tokens:
-        pattern = re.compile('|'.join(re.escape(t) for t in sorted(tokens, key=len, reverse=True)))
-        for test in tests:
-            if test not in affected and pattern.search(sources[test]):
-                affected.add(test)
-        # A helper module that names the file pulls in its importers too.
-        for path, source in sources.items():
-            if path not in tests and not is_test_file(path) and pattern.search(source):
-                stack = [path]
-                while stack:
-                    node = stack.pop()
-                    for parent in importers.get(node, ()):
-                        if parent in tests:
-                            affected.add(parent)
-                        elif parent not in seen:
-                            seen.add(parent)
-                            stack.append(parent)
+    return re.compile('|'.join(re.escape(t) for t in sorted(tokens, key=len, reverse=True)))
 
-    affected.update(mapped_targets(changed))
+
+def select(root: Path, base: str) -> tuple[str, list[str], str]:
+    """Return (mode, tests, reason). mode is 'full' or 'affected'."""
+    changed = changed_paths(root, base)
+    if not changed:
+        return 'affected', [], 'no changes against base'
+    if shared := shared_setup_change(changed):
+        return 'full', [], f'shared setup changed: {shared}'
+    sources = load_sources(root)
+    roots = testpaths(root)
+    tests = sorted(p for p in sources if is_test_file(p) and under(p, roots))
+    importers = import_graph(sources, tests, changed)
+    test_set = set(tests)
+    affected = tests_reaching([p for p in changed if p.endswith('.py')], importers, test_set)
+    # Files that name a changed file (fixtures, data, CLIs run by path), and
+    # the tests that import such a helper.
+    pattern = path_reference_pattern(changed)
+    naming = [path for path, source in sources.items() if pattern.search(source)]
+    affected |= tests_reaching(naming, importers, test_set)
+    affected |= mapped_targets(changed)
     return 'affected', sorted(affected), f'{len(changed)} changed files'
 
 
@@ -253,6 +265,8 @@ def choose(root: Path, base_ref: str | None = None) -> tuple[str, list[str], str
         return select(root, resolve_base(root, base_ref))
     except subprocess.CalledProcessError as exc:
         return 'full', [], f'git failed: {exc.stderr.strip()[:200]}'
+    except subprocess.TimeoutExpired:
+        return 'full', [], 'git timed out'
     except LookupError as exc:
         return 'full', [], str(exc)
 
