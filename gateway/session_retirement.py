@@ -28,7 +28,7 @@ def _pinned(authority, session_id, live):
     return (authority.sessions.get(session_id) is not live
             or live.source is None or live.source.platform not in _RETIRABLE
             or live.subscribers or live.event_stream.observers or live.rescan or live.settling
-            or live.detached or live.detaching or is_history_mount(live)
+            or live.detached or live.detaching or live.attaching or is_history_mount(live)
             or live.mutation_lock.locked() or live.claim_gate.locked()
             or (task is not None and not task.done() and task is not asyncio.current_task())
             or session_id in authority.executing or session_id in authority.pending_closes
@@ -43,15 +43,15 @@ def _reviewing(live):
 
 
 async def retire_idle(authority, session_id, live, target):
-    """Drop *live* when nothing pins it. Called with no await since the last check before it, and
-    with none inside: the FIFO read below and the removal are one step on the loop. Input committed
-    before that read shows as a queued row (or a worker as registered) and keeps the session; input
-    committing after it is followed by a loop-side ``_schedule``/``_publish_pending``, which
-    restores the conversation (``restore_retired``) before anything indexes it."""
+    """Drop *live* only when both durable work and loop-owned pins are absent."""
     if _pinned(authority, session_id, live):
         return False
     from gateway.session_viewer_close import _busy
     if await asyncio.to_thread(_busy, authority, session_id, target):
+        return False
+    # Scheduling that ran after the busy snapshot pinned this session via rescan.
+    # Scheduling that has not run yet can restore the session after retirement.
+    if _pinned(authority, session_id, live):
         return False
     del authority.sessions[session_id]
     authority.launch_sources.pop(session_id, None)  # a cache: re-read from the row on demand

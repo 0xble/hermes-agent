@@ -648,7 +648,6 @@ class AuthorityConnection:
             raise RuntimeStoreError('not_found')
 
     async def resume(self, ref, params):
-        from gateway.session_local_inventory import snapshot_info
         replay_from = self.replay_cursors.pop(ref.session_id, None)
         reconnect = ref.session_id in self.reconnects
         self.reconnects.discard(ref.session_id)
@@ -702,6 +701,17 @@ class AuthorityConnection:
         # reopens it (``reopen_local_session`` in the drain), so opening a finished chat
         # never re-lights DB-derived liveness with no new activity.
         await self._authorize_resume(ref, 'session:read')
+        assert ref is not None
+        # Pin the authorized object across the awaits below so idle retirement cannot drop it mid-resume.
+        live = self.authority.sessions[ref.session_id]
+        live.attaching += 1
+        try:
+            return await self._resume_pinned(ref, params, requested, replay_from, reconnect)
+        finally:
+            live.attaching -= 1
+
+    async def _resume_pinned(self, ref, params, requested, replay_from, reconnect):
+        from gateway.session_local_inventory import snapshot_info
         mounted = self.authority.sessions[ref.session_id].source
         # Only a local route has a stored creation policy to refresh; a platform lane's turns read the profile.
         if 'session:control' in self.actor.capabilities and getattr(mounted, 'platform', None) == Platform.LOCAL:
