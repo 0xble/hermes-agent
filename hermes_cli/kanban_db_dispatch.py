@@ -1846,7 +1846,7 @@ def review_dispatch_enabled() -> bool:
 # safeguards — a memory-DERIVED default cap when none is configured
 # (``resolve_max_in_progress``) and a live memory-PRESSURE guard inside the
 # tick (``_memory_pressure_level``) because a static cap can't see other
-# tenants. Both fail open: non-Linux / read error → no cap / "unknown".
+# tenants. Both fail open: unreadable memory → no cap / "unknown" pressure.
 
 # Assumed per-worker footprint for the derived cap; deliberately conservative
 # so the cap errs toward fewer workers on small VMs.
@@ -1859,25 +1859,24 @@ DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 
 def _system_memory_sample() -> dict:
-    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
-
-    Local import keeps ``kanban_db`` importable without the gateway package.
-    Module-level indirection is also the test seam — conftest patches this to
-    ``{}`` so results don't depend on the CI runner's live memory.
-    """
+    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown. Without /proc (macOS)
+    MemTotal comes from ``sysconf``, so the derived cap applies there too; available memory stays
+    unknown, so the pressure guard does not. The test seam: conftest patches this to ``{}``."""
     try:
         from gateway.lifecycle_ledger import sample_memory
-        return sample_memory() or {}
+        sample = sample_memory() or {}
     except Exception:
-        return {}
+        sample = {}
+    if "mem_total_kib" not in sample and hasattr(os, "sysconf"):
+        with contextlib.suppress(OSError, ValueError):
+            sample["mem_total_kib"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 1024
+    return sample
 
 
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
     """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
-    """
+    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``; ``None``
+    (no cap) when total memory is unknown (Windows)."""
     if sample is None:
         sample = _system_memory_sample()
     total_kib = sample.get("mem_total_kib")

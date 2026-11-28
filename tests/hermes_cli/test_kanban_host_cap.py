@@ -106,6 +106,22 @@ def test_configured_max_in_progress_parsing(monkeypatch):
         assert kbd.configured_max_in_progress() == expected, config
 
 
+@pytest.mark.real_memory_guard
+def test_host_without_proc_still_gets_the_memory_derived_cap(monkeypatch):
+    """macOS has no /proc: total memory comes from sysconf, so an unset cap still bounds the host."""
+    import os
+    import gateway.lifecycle_ledger as ledger
+
+    monkeypatch.setattr(ledger, "sample_memory", dict)
+    pages = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 16 * 1024 ** 3 // 4096}
+    monkeypatch.setattr(os, "sysconf", lambda name: pages[name])
+    assert kbd.resolve_max_in_progress(None) == kbd.DERIVED_MAX_IN_PROGRESS_CEILING
+    pages["SC_PHYS_PAGES"] = 1024 ** 3 // 4096
+    assert kbd.resolve_max_in_progress(None) == kbd.DERIVED_MAX_IN_PROGRESS_FLOOR
+    # Available memory stays unknown there, so the pressure guard never restricts the tick.
+    assert kbd._memory_pressure_level() == "unknown"
+
+
 # ---------------------------------------------------------------------------
 # 2. max_in_progress counts running work on ALL boards (P1b)
 # ---------------------------------------------------------------------------
