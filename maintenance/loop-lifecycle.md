@@ -117,8 +117,13 @@ profile-scoped `hermes_cli.goals_autonomy.autonomy_enabled` helper. When it is t
   reason, row kept. Clearing stays user-only through `/loop stop`, `/loop clear` or an approved
   control.
 
-The external `loop-lifecycle` plugin owns the `loop_set` tool. Its pause, resume and stop
-actions reach these controls through `apply_control`. Residual: the plugin's `set` refuses only
+**Patch identity:** `targeted-loop-edit-controls`.
+
+The external `loop-lifecycle` plugin owns `loop_set`. Targeted `revise` and `replace` use
+`apply_control` only with `loops.autonomy` enabled. They apply without a quote or approval
+card and store a schedule receipt in the same transaction. Local loop controls and user-only
+clear are unchanged. `tests/hermes_cli/test_session_controls_remote_edit.py` verifies this path.
+The plugin also uses `apply_control` for pause, resume and stop. Residual: its `set` refuses only
 an active or paused loop, so after the agent finishes a loop, a new `set` starts a fresh tick
 budget.
 

@@ -69,6 +69,52 @@ PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
 
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
+# Plugins use this capability marker to distinguish targeted edits from local revisions.
+SUPPORTS_LOOP_EDIT_CONTROLS = True
+
+_LOOP_EDIT_KEYS = {
+    "revise": frozenset({"prompt", "interval_seconds", "self_paced", "times", "until"}),
+    "replace": frozenset({"prompt", "interval_seconds", "times", "until"}),
+}
+_LOOP_EDIT_ACTIONS = frozenset(_LOOP_EDIT_KEYS)
+
+
+def _is_loop_edit(kind: str, action: str) -> bool:
+    return kind == "loop" and action in _LOOP_EDIT_ACTIONS
+
+
+def _check_loop_edit_payload(action: str, payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    payload = dict(payload or {})
+    if set(payload) - _LOOP_EDIT_KEYS[action]:
+        raise ValueError("unsupported_loop_field")
+    normalized: dict[str, Any] = {}
+    for key in ("prompt", "until"):
+        if key in payload and payload[key] is not None:
+            if not isinstance(payload[key], str):
+                raise ValueError(f"invalid_loop_{key}")
+            normalized[key] = payload[key].strip()
+    for key, floor in (("interval_seconds", 1), ("times", 0)):
+        if key in payload and payload[key] is not None:
+            value = payload[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+                raise ValueError(f"invalid_loop_{key}")
+            normalized[key] = value
+    if payload.get("self_paced") is not None:
+        if not isinstance(payload["self_paced"], bool):
+            raise ValueError("invalid_loop_self_paced")
+        if payload["self_paced"]:
+            if normalized.get("interval_seconds") is not None:
+                raise ValueError("invalid_loop_cadence")
+            normalized["self_paced"] = True
+    if action == "replace" and not normalized.get("prompt"):
+        raise ValueError("replacement_prompt_required")
+    if action == "replace":
+        if "interval_seconds" not in payload:
+            raise ValueError("interval_required")
+        if "times" not in normalized and not normalized.get("until"):
+            raise ValueError("end_condition_required")
+    return normalized
+
 
 def replacement_contract(payload: Optional[dict[str, Any]]) -> dict[str, str]:
     """Explicit replacement contract edits. Omitted fields retain their current values."""
@@ -100,6 +146,8 @@ def _check_payload(kind: str, action: str, payload: Optional[dict[str, Any]]) ->
         if max_turns is not None:
             normalized["max_turns"] = max_turns
         return normalized
+    if _is_loop_edit(kind, action):
+        return _check_loop_edit_payload(action, payload)
     return payload
 
 
@@ -514,6 +562,36 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
         return {"result": result, "state": getattr(manager, "state", None),
                 "continuation_prompt": continuation_prompt}
+    if _is_loop_edit(kind, action):
+        from hermes_cli.loops import LoopManager, load_loop
+        manager = LoopManager(target_sid, cursor=cursor)
+        text = reason or "session-control"
+        with _approved_authority(authority):
+            if action == "revise":
+                result = manager.revise(
+                    reason=text, actor="agent", prompt=payload.get("prompt"),
+                    interval_seconds=payload.get("interval_seconds"),
+                    self_paced=bool(payload.get("self_paced")), times=payload.get("times"),
+                    until=payload.get("until"))
+            else:
+                result = manager.replace(
+                    prompt=str(payload.get("prompt") or ""),
+                    interval_seconds=payload.get("interval_seconds"),
+                    times=int(payload.get("times") or 0), until=str(payload.get("until") or ""),
+                    reason=text, user_quote="")
+        state = load_loop(target_sid, cursor=cursor)
+        receipt: dict[str, Any] = {"result": result, "state": state}
+        if result.get("ok") and state is not None:
+            # Bind the receipt to the committed schedule without enqueueing an extra wake.
+            # The loop scheduler reads next_due_at from the stored row.
+            receipt["loop_schedule"] = {
+                "instance": state.created_at, "version": state.version,
+                "next_due_at": state.next_due_at, "cadence": state.cadence_label(),
+            }
+            verb = "revised" if action == "revise" else "replaced"
+            prompt = " ".join(state.prompt.split())[:300]
+            receipt["notice"] = f"Loop {verb} autonomously without approval ({state.cadence_label()}): {prompt}"
+        return receipt
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
@@ -600,7 +678,10 @@ def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional
             state = LoopState.from_json(raw) if raw else None
             prompt = str(getattr(state, "prompt", "") or "")
             cadence = state.cadence_label() if state is not None else ""
-            return f"loop: {prompt or '(none)'}{f' ({cadence})' if cadence else ''}"
+            before = f"loop: {prompt or '(none)'}{f' ({cadence})' if cadence else ''}"
+            if _is_loop_edit(kind, action) and payload.get("prompt"):
+                return f"{before} -> {payload['prompt']}"
+            return before
     except (TypeError, ValueError, AttributeError):
         logger.debug("could not describe session-control target", exc_info=True)
     return ""
@@ -944,7 +1025,7 @@ def _definition_key(kind: str, session_id: str) -> str:
 
 
 def _bind_control_result(record: dict[str, Any], result: dict[str, Any], cursor) -> None:
-    for key in ("outcome", "wait_seconds", "waiting_until", "notice"):
+    for key in ("outcome", "wait_seconds", "waiting_until", "notice", "loop_schedule"):
         if key in result:
             record[key] = result[key]
     if result.get("continuation_prompt"):
@@ -1044,6 +1125,8 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     if _lifecycle_autonomy(kind):
         return apply_control(kind, action, target_sid, requester_sid=requester_sid,
                              reason=reason, payload=payload)
+    if _is_loop_edit(kind, action):
+        return _loop_edit_needs_autonomy()
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
     from hermes_cli.goal_notices import lifecycle_cards_hidden
@@ -1081,6 +1164,16 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     return db._execute_write(create)
 
 
+def _loop_edit_needs_autonomy() -> dict[str, Any]:
+    # There is no approval card or quote path for loop edits: a change to another session's
+    # cadence or prompt is an agent control that exists only under loops.autonomy.
+    return {"ok": False, "error_code": "autonomy_required",
+            "error": "revising or replacing a loop through session controls requires loops.autonomy"}
+
+
+
+
+
 def _is_cross_session_goal_change(kind: str, action: str, target_sid: str, requester_sid: str) -> bool:
     """Goal objective changes requested for another session are session-authorized, not user-gated."""
     return kind == "goal" and action in {"clear", "replace"} and target_sid != requester_sid
@@ -1098,6 +1191,12 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
+    if _is_loop_edit(kind, action):
+        if not autonomous:
+            return _loop_edit_needs_autonomy()
+        if not isinstance(reason, str) or not reason.strip():
+            return {"ok": False, "error_code": "reason_required", "error": f"loop {action} requires a reason"}
+        reason, user_quote = reason.strip(), ""
     if autonomous and kind == "goal" and action == "clear":
         if not isinstance(reason, str) or not reason.strip():
             return {"ok": False, "error_code": "reason_required",
@@ -1523,6 +1622,8 @@ CONTROLS = {
     ("loop", "pause"): _pause_loop,
     ("loop", "resume"): _resume_loop,
     ("loop", "stop"): _stop_loop,
+    ("loop", "revise"): None,
+    ("loop", "replace"): None,
     ("goal", "replace"): None,
 }
 
@@ -1533,6 +1634,7 @@ __all__ = [
     "continuation_is_current",
     "expire_request",
     "fail_request",
+    "SUPPORTS_LOOP_EDIT_CONTROLS",
     "mark_outbox",
     "pending_outbox",
     "quote_matches_control",
