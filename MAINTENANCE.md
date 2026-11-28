@@ -307,7 +307,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 - **Patch identity:** `release-launcher-stability`.
 - **Behavior:** Recovered commands from immutable releases use the install-bound runtime when the release has no local convenience launcher.
-- **Source surfaces:** `hermes_cli/_launchers.py` and `tests/hermes_cli/test_source_launcher_publication.py`.
+- **Source surfaces:** `hermes_cli/_launchers.py`, `hermes_cli/chat_launch.py` (Windows looks for `hermes.exe` itself, since `installation_command` returns only an extensionless launcher Windows never publishes), `tests/hermes_cli/test_source_launcher_publication.py` and `tests/hermes_cli/test_chat_launch.py`.
 - **Retirement:** Remove when immutable release recovery persists only stable install-bound commands.
 - **Rollback:** Revert the commit carrying `Fork-Patch: release-launcher-stability`.
 

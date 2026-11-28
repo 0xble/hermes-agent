@@ -15,16 +15,17 @@ def hermes_command(args=()) -> list[str]:
     bootstrap. It needs no extra environment (no ``PYTHONPATH``); the child serves the profile
     named by the inherited ``HERMES_HOME``. The first item is always a file a child process can
     start without a shell."""
-    from hermes_cli._launchers import installation_command, runtime_command
+    from hermes_cli._launchers import installation_command, resolve_store_python, runtime_command
     from hermes_cli.main import PROJECT_ROOT
-    command = installation_command(PROJECT_ROOT, args)
-    launcher = Path(command[0])
-    if os.name != "nt" or launcher.name != "hermes":
-        return command
-    # Windows publishes ``hermes.exe``, or ``hermes.cmd`` when it could not make one. Neither is
-    # the extensionless path, and a batch file is not startable without a shell.
-    exe = launcher.with_name("hermes.exe")
-    return [str(exe), *command[1:]] if exe.is_file() else runtime_command(PROJECT_ROOT, args)
+    if os.name != "nt":
+        return installation_command(PROJECT_ROOT, args)
+    # Windows publishes ``hermes.exe``, or ``hermes.cmd`` when it could not make one, never the
+    # extensionless launcher ``installation_command`` requires, and a batch file is not startable
+    # without a shell. Look for the executable launcher directly.
+    exe = Path(PROJECT_ROOT) / ".hermes" / "bin" / "hermes.exe"
+    if exe.is_file() and resolve_store_python(PROJECT_ROOT) is not None:
+        return [str(exe), *args]
+    return runtime_command(PROJECT_ROOT, args)
 
 
 # A canonical local session is keyed ``local-`` + 64 hex; main's epilogue printed 22-char stored ids.
