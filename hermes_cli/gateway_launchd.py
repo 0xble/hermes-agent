@@ -1072,6 +1072,10 @@ def _launchd_stop_locked():
     set_intent(_gw().get_hermes_home(), stopped=True)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
+    # Decide before bootout whether launchd runs this home's gateway (directly or under a wrapper):
+    # only then does bootout SIGTERM it. A loaded-but-parked job beside a detached owner does not.
+    supervised = _launchctl_supervised_pid(get_launchd_label())
+    launchd_owned = {supervised} | _gw()._gateway_descendants_of(supervised) if supervised else set()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
     booted_out = False
     try:
@@ -1086,9 +1090,15 @@ def _launchd_stop_locked():
         if not (_launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(e.returncode)):
             raise
     if booted_out:
-        # bootout SIGTERMed the gateway, which now drains (notify, then cron and delegation waits)
-        # and launchd SIGKILLs it at ExitTimeOut anyway. A 5s CLI SIGKILL cut that drain short, so
-        # interrupted turns were never marked for resume and the next boot paid unclean recovery.
+        # A SIGTERMed gateway drains (notify, then cron and delegation waits) and launchd SIGKILLs a
+        # job it owns at ExitTimeOut anyway. A 5s CLI SIGKILL cut that drain short, so interrupted
+        # turns were never marked for resume and the next boot paid unclean recovery.
+        from gateway.status import get_running_pid, terminate_pid
+        pid = get_running_pid()
+        if pid is not None and pid not in launchd_owned:
+            # bootout signalled nothing this home runs: give the detached owner the same SIGTERM.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                terminate_pid(pid, force=False)
         budget = _launchd_old_gateway_exit_budget()
         _gw()._wait_for_gateway_exit(timeout=budget + 5.0, force_after=budget)
     else:
