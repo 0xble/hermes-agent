@@ -137,10 +137,13 @@ def _waiting_on_resume(entry: dict[str, Any]) -> bool:
     return waiting_on_resume(entry)
 
 
-def _release_unstarted_child(batch: _Batch, child: Any) -> None:
-    """Teardown for a child whose run never started (``_run_single_child``'s finally never runs for it)."""
-    from tools.delegate_tool_resumable import release_unstarted
+def _release_unstarted_child(batch: _Batch, child: Any, entry: Optional[dict[str, Any]] = None) -> None:
+    """Teardown for a child whose run never started (``_run_single_child``'s finally never runs for it); *entry*,
+    its fabricated result, settles its queued resumable row (``record_queued``)."""
+    from tools.delegate_tool_resumable import release_unstarted, settle_unstarted
     release_unstarted(child)
+    if entry is not None:
+        settle_unstarted(child, batch.parent_agent, entry)
     _detach_child(batch.parent_agent, child)
     _close_child(child, "Failed to close a subagent that never started")
 
@@ -152,8 +155,9 @@ def _run_gated(batch: _Batch, gate: Any, honor_parent_interrupt: bool, i: int, t
     entry = gate.run(child, lambda: batch.run_child(i, task, child), parent=parent)
     if entry is not None:
         return entry
-    _release_unstarted_child(batch, child)
-    return _fabricated_entry(i, "interrupted", "Stopped while waiting for the batch's shared prompt cache", child)
+    entry = _fabricated_entry(i, "interrupted", "Stopped while waiting for the batch's shared prompt cache", child)
+    _release_unstarted_child(batch, child, entry)
+    return entry
 
 def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interrupt: bool) -> None:
     """Run the batch's children in parallel, appending entries to ``results`` (sorted by task_index on return, one
@@ -226,6 +230,17 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
                 _release_unstarted_child(batch, _child_by_index.get(idx))
     results.sort(key=lambda r: r["task_index"])  # match input order
 
+def _settle_unrecorded(unit: _Batch, results: list) -> list:
+    """Settle the queued resumable row (``record_queued``) of each child that never recorded a run of its own, with
+    its result entry; returns the entries (stamped when the row became resumable)."""
+    from tools.delegate_tool_resumable import settle_unstarted
+    by_index = {entry.get("task_index"): entry for entry in results}
+    for i, _, child in unit.children:
+        if i in by_index:
+            with _quiet("queued subagent record settle failed", exc_info=True):
+                settle_unstarted(child, unit.parent_agent, by_index[i])
+    return results
+
 def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
     """Run the batch's built children, join, finalize (hooks + cost rollup), return the combined dict. Shared by the
     sync path and the background runner; a background runner receives a per-group unit (a subset of the call's
@@ -240,6 +255,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         _record_finished_child(batch, results[-1], honor_parent_interrupt)
     else:
         _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
+    if not honor_parent_interrupt:  # a queued child that failed before it recorded its run leaves no queued row
+        _settle_unrecorded(batch, results)
 
     children_by_index = {i: child for i, _, child in batch.children}
     for entry in results:
@@ -454,8 +471,9 @@ def _units_of(batch: _Batch) -> list[_Batch]:
         members.setdefault(key, []).append((i, t, c))
     return [replace(batch, children=ch, group=(key[1] if key[0] == "g" else None)) for key, ch in members.items()]
 
-def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> None:
-    """Release children, live writers, manifests, and metrics for a unit that will not run."""
+def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> list:
+    """Release children, live writers, manifests, and metrics for a unit that will not run; returns each child's
+    entry (a queued child the gateway's restart stopped carries its automatic-resume promise)."""
     from tools.delegation_live_log import update_manifest_statuses
 
     for i, _, child in unit.children:
@@ -466,8 +484,10 @@ def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> None:
             with _quiet("Live transcript finalize failed", exc_info=True):
                 unit.live_writers[i].finalize(outcome)
     results = [{"task_index": i, **outcome} for i, _, _ in unit.children]
+    _settle_unrecorded(unit, results)
     update_manifest_statuses(unit.live_deleg_id, results)
     finish_delegation_unit(unit.task_list, results, background=True)
+    return results
 
 
 def batch_route_chain(child_agents: list) -> list[tuple[str, str, str]]:
@@ -516,7 +536,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
             _signal_child_stop(c, reason)
 
     def _cancel_queued(reason: str = "Queued delegation cancelled"):
-        _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
+        return _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
 
     from agent.shared_primary_cooldown import route_from_agent, route_from_record
     # Children can run on different routes (model-map options), so every child's primary and
@@ -526,7 +546,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
                for entry in (getattr(child, "_fallback_chain", None) or []) if isinstance(entry, dict)]
     route_chain = list(dict.fromkeys(routes))
 
-    return dispatch_async_delegation_batch(
+    dispatch = dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
         goals=[t["goal"] for t in unit.task_list], context=effective_context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
@@ -544,6 +564,11 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         route_chain=route_chain,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
+    if dispatch.get("accepted") is True and dispatch.get("status") == "queued":
+        with _quiet("queued subagent records failed", exc_info=True):  # waiting for a slot: a restart must not lose them
+            from tools.delegate_tool_resumable import record_queued
+            record_queued(child_agents, unit.parent_agent)
+    return dispatch
 
 
 def _restore_parent_cancellation(unit: _Batch) -> None:

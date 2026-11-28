@@ -86,6 +86,13 @@ def recover_abandoned_delegations() -> int:
                     continue
             if last_state in ("queued", "admitted") and not cron_execution_id:
                 error = f"Work was {last_state}; it was never started."
+                waiting: dict[str, Any] = {}
+                if continuable := continuable_of(conn, delegation_id):  # its queued children (``record_queued``)
+                    from tools.delegate_tool_auto_resume import boot_notice
+                    notice, promised = boot_notice(conn, continuable, recovered_records)
+                    error += notice
+                    if len(promised) >= len(task.get("task_indexes") or task.get("goals") or [0]):
+                        waiting = {"waiting_to_resume": promised}  # the scheduler reports each child: no wake
                 event = {
                     "type": "async_delegation", "delegation_id": delegation_id,
                     "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -95,15 +102,16 @@ def recover_abandoned_delegations() -> int:
                     "role": task.get("role"), "model": task.get("model"),
                     "is_batch": bool(task.get("is_batch")), "status": "interrupted",
                     "summary": None, "error": error, "exit_reason": "interrupted",
-                    "dispatched_at": dispatched_at, "completed_at": now,
+                    "dispatched_at": dispatched_at, "completed_at": now, **waiting,
                     **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
                 }
                 result = {"status": "interrupted", "summary": None, "error": error,
-                          "exit_reason": "interrupted"}
+                          "exit_reason": "interrupted", **waiting}
                 conn.execute("""UPDATE async_delegations SET state='interrupted', completed_at=?,
-                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                       updated_at=?, event_json=?, result_json=?, delivery_state=?
                        WHERE delegation_id=? AND state=?""",
-                    (now, now, json.dumps(event), json.dumps(result), delegation_id, last_state))
+                    (now, now, json.dumps(event), json.dumps(result), "delivered" if waiting else "pending",
+                     delegation_id, last_state))
                 recovered += 1
                 continue
             error = ("Cron execution record missing; outcome unknown."

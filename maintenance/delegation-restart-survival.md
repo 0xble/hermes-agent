@@ -87,6 +87,13 @@ result/transcript evidence for conservative recovery through the durable retry e
   one records `retry_reason='stopped by user'` and settles any already-owed terminal
   report once. The accepted restart-cut completion/continuation owns the one parent
   notice and requires explicit resume, not an automatic rerun or a second wake.
+- A background unit still queued for an async pool slot never reaches `record_start`, so
+  `record_queued` gives each of its children a `running` row marked `never_started` when
+  the unit is queued. A queued unit the shutdown cancels settles those rows like a run's own
+  stop (`settle_unstarted`: promised, so the unit completes silently); a dead owner's rows
+  are recovered on boot and the queued ledger row is silent when every child is promised.
+  Continuing a `never_started` row runs the original goal afresh (new workspace and
+  isolation worktree), since it has no transcript.
 - An unspent cut dispatch claim re-arms quietly after the normal grace window.
   Unresumed cuts expire at the existing 24h lineage deadline and settle `reported`
   without another parent wake; normal retention then prunes the row and orphaned
@@ -113,4 +120,4 @@ state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.
 
-Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`, `tests/tools/test_async_delegation_restart_cut.py`, `tests/tools/test_delegate_resumable.py`.
+Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`, `tests/tools/test_async_delegation_restart_cut.py`, `tests/tools/test_delegate_resumable.py`, `tests/tools/test_delegate_auto_resume_queued.py`.
