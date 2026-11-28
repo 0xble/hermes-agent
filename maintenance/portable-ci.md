@@ -157,6 +157,15 @@ rmdir "$ci_scratch/mnt" "$ci_scratch"
 
 Draft PR pushes compute the selection once (`--nonempty-shards 10`) and start only the hosted shards that have selected files, which matters under the account's concurrent hosted-job cap. Marking a PR ready, and every push after that, runs the full gate on the exact head. `qualification` cannot pass on a draft, so quick never stands in for the full gate before merge, and a test quick missed is caught there. `--select-only` prints the selection without running it.
 
+## Pre-merge macOS for fork sync and macOS changes
+
+The hosted PR gate is Linux. A ready PR also runs `Native OS (macos-26)` (`bin/ci nightly-native` at the exact head) when `scripts/ci/macos_scope.py` says it needs one:
+- fork-sync candidates (`sync/controller-*`)
+- diffs that touch macOS-specific paths, macOS-marked or darwin-branching Python, CI configuration, or dependencies
+- any diff the script cannot read (it fails closed)
+
+`qualification` requires that job whenever it was requested. Other PRs keep Linux pre-merge plus the nightly macOS run. This replaces the fork-sync controller's local macOS gate, so hermes-agent tests no longer run on the Mac.
+
 ## portable-ci-home-sweep
 
 Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this
