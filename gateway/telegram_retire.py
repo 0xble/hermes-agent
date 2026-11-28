@@ -34,6 +34,8 @@ _DELETE_VERIFY_DELAYS = (2, 5, 10, 20, 30)
 _AUTO_RETRY_LIMIT = 5
 _AUTO_RETRY_BASE_SECONDS = 600
 _AUTO_RETRY_MAX_SECONDS = 6 * 3600
+# Four independent readbacks overlap without flooding Telegram or housekeeping.
+_RESUME_CONCURRENCY = 4
 
 
 def _transient_delay(exc) -> float | None:
@@ -554,12 +556,19 @@ async def _auto_retry(runner, source, generation):
 async def resume_all(runner):
     if getattr(runner, "_session_db", None) is None:
         return
-    for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
+    # Four independent readbacks overlap without flooding Telegram or housekeeping.
+    semaphore = asyncio.Semaphore(_RESUME_CONCURRENCY)
+
+    async def resume_one(raw):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done"}:
-                source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
+            if state["phase"] in {"cancelled", "done"}:
+                return
+            source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
+            async with semaphore:
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)
         except Exception:
             logger.warning("Unable to resume one topic retirement", exc_info=True)
+
+    await asyncio.gather(*(resume_one(raw) for _, raw in await runner._session_db.list_meta_prefix(PREFIX)))

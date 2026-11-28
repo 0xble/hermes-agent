@@ -379,9 +379,32 @@ async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(r
     runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
     runtime._session_db.delete_telegram_topic_binding.assert_awaited_once_with(
         chat_id="100", thread_id="42", profile_name="default")
-    assert lookup.await_count == 8  # recovery probe, 6 backoff readbacks, then the confirming one
+    assert lookup.await_count == 8  # 1 recovery + 1 initial + 5 backoff + 1 final confirmation
     assert lookup.await_args is not None
     assert lookup.await_args.args[-3:] == ("@HermesBot", "--id", "42")
+
+
+@pytest.mark.asyncio
+async def test_resume_all_runs_lagging_delete_readbacks_concurrently(runtime, monkeypatch):
+    """Housekeeping advances independent retirements together, not one readback backoff at a time."""
+    sources = [SessionSource(platform=Platform.TELEGRAM, chat_id="100", thread_id=str(thread_id),
+                             chat_type="dm", user_id="100") for thread_id in (42, 43)]
+    runtime._session_key_for_source = lambda source: f"topic-key-{source.thread_id}"
+    await retire.request(runtime, sources[0])
+    await retire.request(runtime, sources[1])
+    sleep_calls = []
+    both_backoffs_started = asyncio.Event()
+
+    async def fake_advance(_runner, source):
+        sleep_calls.append(source.thread_id)
+        if len(sleep_calls) == 2:
+            both_backoffs_started.set()
+        await both_backoffs_started.wait()
+
+    monkeypatch.setattr(retire, "advance", fake_advance)
+    await asyncio.wait_for(retire.resume_all(runtime), timeout=1)
+
+    assert sorted(sleep_calls) == ["42", "43"]
 
 
 async def _saved_unresolved_retirement(runtime):
