@@ -47,7 +47,7 @@ def completion_criteria(state) -> list[str]:
 
 
 def record_hard_limit_breach(state, reason: str) -> None:
-    from hermes_cli.goals_authority import _evidence_is_negated
+    from hermes_cli.goals.authority import _evidence_is_negated
 
     breached = re.search(
         r"(?i)\b(?:constraints?|hard[- ]limits?)\s+(?:(?:was|were|has been|have been)\s+)?"
@@ -145,7 +145,7 @@ def _existing_removal_requirements(state):
 
 
 def current_removal_quote(session_id, quote, *, requirements=(), cursor=None):
-    from hermes_cli.goals_authority import _bound_removal_instruction_units
+    from hermes_cli.goals.authority import _bound_removal_instruction_units
     from hermes_cli.session_controls import _read_current_user_quote, _normalize
 
     checked = _read_current_user_quote(session_id, quote, cursor=cursor)
@@ -163,7 +163,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
                     max_turns=None, user_quote="", kind="revise"):
     """Validate the entire delta before changing the staged snapshot."""
     from hermes_cli.goals import GoalContract, contract_items
-    from hermes_cli.goals_authority import (
+    from hermes_cli.goals.authority import (
         _normalize_authority_value, _bound_removal_instruction_units,
     )
     from hermes_cli.session_controls import _CURRENT_AUTHORITY

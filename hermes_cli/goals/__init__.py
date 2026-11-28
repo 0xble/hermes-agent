@@ -383,11 +383,6 @@ def format_goal_authoring_warning(findings: list[GoalAuthoringFinding]) -> str:
 # ``goals.min_continuation_gap_seconds`` remains the configured lower bound between
 # automatic continuations. The no-progress ladder adds its own escalating waits on top.
 DEFAULT_MIN_CONTINUATION_GAP_SECONDS = 15 * 60
-# A continuation turn that ends without a usable response never reaches the post-turn judge. The
-# goal re-arms as a short timed wait (the automatic-continuation floor still applies) and pauses
-# after this many consecutive empty continuations.
-CONTINUATION_RETRY_SECONDS = 60
-CONTINUATION_MAX_EMPTY = 3
 _MIN_CONTINUATION_GAP_REASON = "minimum gap between autonomous goal continuations"
 
 # Stable opening used by every standing-goal continuation prompt. Consumers that need to
@@ -1967,16 +1962,6 @@ def _evidence_for_turn(evidence: Optional[list[dict[str, Any]]], previous_turn_a
     return rows
 
 
-def _judge_response_window(text: str) -> str:
-    """Head plus tail of a long response: the summary leads and the evidence section usually closes."""
-    text = text or ""
-    head, tail = _JUDGE_RESPONSE_SNIPPET_CHARS, _JUDGE_RESPONSE_TAIL_CHARS
-    if len(text) <= head + tail:
-        return text
-    omitted = len(text) - head - tail
-    return f"{text[:head]}\n… [{omitted} chars omitted] …\n{text[-tail:]}"
-
-
 def extract_citations(text: str) -> list[str]:
     """Exact identifiers a response cites: backtick spans, quoted strings, URLs, SHAs and long ids.
 
@@ -2694,7 +2679,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
 # Goal authority and recorded-user/evidence helpers live in a topical sibling.
 # The imports keep the facade patch seam used by CLI, gateway, loops and tests.
 _REVISION_EVIDENCE_MIN_CHARS = 12
-from hermes_cli.goals_authority import (
+from hermes_cli.goals.authority import (
     _AUTHORITY_PRESERVE_RE, _REPLACEMENT_ACTION_RE, _REPLACEMENT_BUDGET_TARGET_RE,
     _REPLACEMENT_GATE_TARGET_RE, _REPLACEMENT_NEGATION_RE, _REMOVAL_VERBS,
     _REVISION_QUOTE_MIN_CHARS, _REVISION_SOURCE_MAX_CHARS, _REPLY_QUOTE_RE,
@@ -2706,7 +2691,7 @@ from hermes_cli.goals_authority import (
     _normalize_authority_value, _removal_authority_text, _removal_instruction_units,
     _replacement_action_is_authorized, _replacement_goal_is_negated, _requirement_diff,
     _typed_user_message_records_since, _typed_user_message_text, _unit_is_non_directive,
-    user_messages_since,
+    _judge_response_window, user_messages_since,
 )
 
 
@@ -3155,49 +3140,6 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             reason, waiting_until=time.time() + seconds,
             waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
         )
-
-    @snapshot_control
-    def rearm_after_empty_continuation(
-        self, *, expected_instance: Optional[float] = None, turn_started_at: Optional[float] = None,
-        retry_seconds: int = CONTINUATION_RETRY_SECONDS, max_empty: int = CONTINUATION_MAX_EMPTY,
-    ) -> Optional[str]:
-        """A continuation turn ended with no usable response, so no post-turn judge will queue the
-        next one. Park the goal on a short timed wait so the idle watcher retries it once.
-
-        One atomic mutation fences the goal instance, a wait someone else already armed, and an
-        evaluation that finished after this turn started. After ``max_empty`` consecutive empty
-        continuations the goal pauses instead. Returns ``"rearmed"``, ``"paused"`` or ``None``.
-        """
-        def _apply(state):
-            if state is None or state.status != "active" or state.waiting_since:
-                return None
-            if expected_instance is not None and state.created_at != expected_instance:
-                return None
-            if turn_started_at is not None and state.last_turn_at > turn_started_at:
-                return None  # a newer turn was already judged; nothing is stranded
-            failures = state.consecutive_continuation_failures + 1
-            if failures >= max_empty:
-                state.consecutive_continuation_failures = failures
-                state.clear_wait()
-                state.status = "paused"
-                state.paused_reason = f"continuation turn produced no response {failures} times in a row"
-                state.paused_by = "system"
-                state.consecutive_no_progress = 0
-                state.backoff_level = 0
-                return "paused"
-            state.consecutive_continuation_failures = failures
-            state.clear_wait(preserve_notice_key=True)
-            now = time.time()
-            # This is a transport recovery, not a normal successful automatic chain. Let the
-            # short retry delay be the watcher gate; a successful retry re-establishes the normal
-            # continuation floor when it is admitted.
-            state.last_automatic_continuation_at = 0.0
-            state.waiting_until = now + retry_seconds
-            state.waiting_seconds = retry_seconds
-            state.waiting_reason = "continuation turn produced no response"
-            state.waiting_since = now
-            return "rearmed"
-        return self._mutate_current(_apply)
 
     @snapshot_control
     def stop_waiting(self) -> bool:

@@ -7,7 +7,15 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.lifecycle_snapshot import snapshot_control
+
 logger = logging.getLogger(__name__)
+
+# A continuation turn that ends without a usable response never reaches the post-turn judge. The
+# goal re-arms as a short timed wait (the automatic-continuation floor still applies) and pauses
+# after this many consecutive empty continuations.
+CONTINUATION_RETRY_SECONDS = 60
+CONTINUATION_MAX_EMPTY = 3
 
 
 def _paused_by_contract_verdict(state) -> bool:
@@ -323,5 +331,48 @@ class GoalRevisionsMixin:
         self._save()
         return {"ok": True, "error_code": "", "error": "", "state": state,
                 "previous_goal": previous["goal"], "revision": revision, "version": 1}
+
+    @snapshot_control
+    def rearm_after_empty_continuation(
+        self, *, expected_instance: Optional[float] = None, turn_started_at: Optional[float] = None,
+        retry_seconds: int = CONTINUATION_RETRY_SECONDS, max_empty: int = CONTINUATION_MAX_EMPTY,
+    ) -> Optional[str]:
+        """A continuation turn ended with no usable response, so no post-turn judge will queue the
+        next one. Park the goal on a short timed wait so the idle watcher retries it once.
+
+        One atomic mutation fences the goal instance, a wait someone else already armed, and an
+        evaluation that finished after this turn started. After ``max_empty`` consecutive empty
+        continuations the goal pauses instead. Returns ``"rearmed"``, ``"paused"`` or ``None``.
+        """
+        def _apply(state):
+            if state is None or state.status != "active" or state.waiting_since:
+                return None
+            if expected_instance is not None and state.created_at != expected_instance:
+                return None
+            if turn_started_at is not None and state.last_turn_at > turn_started_at:
+                return None  # a newer turn was already judged; nothing is stranded
+            failures = state.consecutive_continuation_failures + 1
+            if failures >= max_empty:
+                state.consecutive_continuation_failures = failures
+                state.clear_wait()
+                state.status = "paused"
+                state.paused_reason = f"continuation turn produced no response {failures} times in a row"
+                state.paused_by = "system"
+                state.consecutive_no_progress = 0
+                state.backoff_level = 0
+                return "paused"
+            state.consecutive_continuation_failures = failures
+            state.clear_wait(preserve_notice_key=True)
+            now = time.time()
+            # This is a transport recovery, not a normal successful automatic chain. Let the
+            # short retry delay be the watcher gate; a successful retry re-establishes the normal
+            # continuation floor when it is admitted.
+            state.last_automatic_continuation_at = 0.0
+            state.waiting_until = now + retry_seconds
+            state.waiting_seconds = retry_seconds
+            state.waiting_reason = "continuation turn produced no response"
+            state.waiting_since = now
+            return "rearmed"
+        return self._mutate_current(_apply)
 
     # --- /subgoal user controls ---------------------------------------

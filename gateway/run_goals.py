@@ -1028,6 +1028,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
         return await self._run_in_executor_with_context(_rearm)
 
+    async def _maybe_rearm_failed_goal_continuation(
+        self, *, event: Any, retry_scheduled: bool, successful: bool, final_text: str,
+        agent_result: Any, session_entry: Any, invalidation_epoch: Optional[int],
+    ) -> None:
+        if event is None or retry_scheduled or successful or final_text.strip():
+            return
+        if not is_goal_continuation_event(event):
+            return
+        try:
+            await self._rearm_failed_goal_continuation(
+                event=event, agent_result=agent_result, session_entry=session_entry,
+                invalidation_epoch=invalidation_epoch,
+            )
+        except Exception:
+            logger.debug("failed goal continuation re-arm", exc_info=True)
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -1074,19 +1090,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        # A continuation with no usable final response never reaches the normal evaluator. Re-arm
-        # only this stamped goal turn; identity/CAS checks in GoalManager make late settlement,
-        # replacement, and user preemption no-ops.
-        if (event is not None and is_goal_continuation_event(event)
-                and not retry_scheduled
-                and (not successful or not final_text.strip())):
-            try:
-                await self._rearm_failed_goal_continuation(
-                    event=event, agent_result=agent_result, session_entry=session_entry,
-                    invalidation_epoch=invalidation_epoch,
-                )
-            except Exception:
-                logger.debug("failed goal continuation re-arm", exc_info=True)
+        # Empty continuation turns bypass the evaluator; re-arm only this stamped goal turn.
+        await self._maybe_rearm_failed_goal_continuation(
+            event=event, retry_scheduled=retry_scheduled, successful=successful,
+            final_text=final_text, agent_result=agent_result, session_entry=session_entry,
+            invalidation_epoch=invalidation_epoch,
+        )
         if exhausted_synthetic:
             from gateway.platforms.event import turn_origin_for_event
             origin = turn_origin_for_event(event)
