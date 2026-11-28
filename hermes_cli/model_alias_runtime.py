@@ -42,6 +42,57 @@ def alias_name(value: Any, config: Mapping[str, Any] | None = None) -> str | Non
     return key if key in _load_direct_aliases(dict(config or {})) else None
 
 
+def alias_names(config: Mapping[str, Any] | None) -> list[str]:
+    """The aliases ``/model`` resolves (``model_aliases`` plus ``model.aliases``), from the same loader."""
+    from hermes_cli.model_switch import _load_direct_aliases
+    return sorted(_load_direct_aliases(dict(config or {})))
+
+
+def unknown_alias_message(value: Any, names: list[str]) -> str:
+    known = f"Use one of: {', '.join(names)}" if names else "No model aliases are configured"
+    return f"unknown model alias {value!r}. {known} (model_aliases in config.yaml)."
+
+
+def card_model_alias(value: str, config: Mapping[str, Any] | None = None) -> str | None:
+    """The stored form of a Kanban card's model pin when it names an alias (``@<key>``), else None.
+
+    A configured alias name (case-insensitive) or ``@name`` is an alias. The stored ``@`` marks the
+    pin as an alias for good: dispatch resolves it or blocks the card, and a raw id is never read as
+    an alias added later. An unconfigured ``@name`` is refused here.
+    """
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+    names = alias_names(config)
+    key = value.strip().lower()
+    if key.removeprefix("@") in names:
+        return "@" + key.removeprefix("@")
+    if key.startswith("@"):
+        raise ModelAliasError(unknown_alias_message(value, names))
+    return None
+
+
+def card_launch_route(model: str | None, provider: str | None, reasoning: str | None,
+                      config: Mapping[str, Any]) -> tuple[dict[str, str], AliasRoute | None]:
+    """Session create fields for a card's pin, resolved from the owner's current config, and the
+    alias route when the card pinned one.
+
+    A card pinned to ``@<alias>`` (no ``provider_override``) runs the alias's live model, provider,
+    endpoint and default reasoning effort; the card's own effort wins. An alias the config no longer
+    defines raises ``ModelAliasError``. A raw id passes through as given.
+    """
+    fields = {"model": model, "provider": provider, "reasoning": reasoning}
+    route = None
+    if model and not provider and model.startswith("@"):
+        if model[1:] not in alias_names(config):
+            raise ModelAliasError(unknown_alias_message(model, alias_names(config)))
+        route = resolve_model_alias(model[1:], config, required=True)
+        fields.update(model=route.model, provider=route.provider, base_url=route.base_url)
+        if not reasoning and isinstance(route.reasoning_effort, str):
+            fields["reasoning"] = route.reasoning_effort
+    return {name: value for name, value in fields.items() if value}, route
+
+
 def resolve_model_alias(value: Any, config: Mapping[str, Any] | None = None, *, required: bool = False) -> AliasRoute:
     """Resolve from the request's current config snapshot without expanding saved config."""
     cfg = dict(config or {})

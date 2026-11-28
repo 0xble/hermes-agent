@@ -206,10 +206,48 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
     return ""
 
 
-def reclaim_error(conn, task_id, claim_lock) -> str:
-    """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
-    note = owner_attempt_note(conn, task_id)
-    return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
+# Consecutive owner restarts a card is re-queued for free; the next one is charged as a failure, so a
+# card whose attempts keep taking its owner down still reaches its retry budget.
+OWNER_RESTART_LIMIT = 3
+
+
+def owner_restart_streak(conn, task_id) -> int:
+    """The card's trailing closed runs re-queued for an owner restart (``owner_restart`` in the run
+    metadata); any other closed run ends the streak."""
+    rows = conn.execute("SELECT metadata FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+                        "ORDER BY id DESC LIMIT ?", (task_id, OWNER_RESTART_LIMIT)).fetchall()
+    streak = 0
+    for row in rows:
+        try:
+            marked = json.loads(row["metadata"] or "{}").get("owner_restart") is True
+        except (ValueError, TypeError, AttributeError):
+            marked = False
+        if not marked:
+            break
+        streak += 1
+    return streak
+
+
+def free_owner_restart(conn, task_id, lost=None) -> bool:
+    """True when the current run ended for its owner's restart and the card has a free restart left.
+
+    The evidence is the owner's own ``worker_lost`` with ``restart`` (``session_kanban.record_worker_loss``).
+    Within ``OWNER_RESTART_LIMIT`` consecutive restarts the attempt is re-queued without charging the
+    card's retry budget; past it, the restart is charged like any failure.
+    """
+    if lost is None:
+        lost = _latest_run_event(conn, task_id, "worker_lost")
+    return bool(lost.get("restart")) and owner_restart_streak(conn, task_id) < OWNER_RESTART_LIMIT
+
+
+def reclaim_verdict(conn, task_id, claim_lock) -> tuple[str, dict]:
+    """A stale-lock reclaim's ``(run error, run metadata extra)``: the error names how the attempt
+    ended when the owner recorded it, and a free owner restart is marked ``owner_restart`` (not
+    charged, and counted toward the card's restart streak)."""
+    lost = _latest_run_event(conn, task_id, "worker_lost")
+    note = owner_attempt_note(conn, task_id, lost)
+    extra = {"owner_restart": True} if free_owner_restart(conn, task_id, lost) else {}
+    return f"stale_lock={claim_lock}" + (f" [{note}]" if note else ""), extra
 
 
 def apply_attempt_note(conn, task_id, pid, dead) -> None:
@@ -218,14 +256,29 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
     turn never finished, so it books as a crash and charges the breaker, and the
-    protocol-violation streak (which reads the persisted payload) does not count it.
+    protocol-violation streak (which reads the persisted payload) does not count it. A loss the
+    owner recorded as its own restart, or an owner-stop exit, books as a re-queue instead with no
+    charge, until the card's restart streak reaches ``OWNER_RESTART_LIMIT``.
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
-    note = owner_attempt_note(conn, task_id, lost)
-    if not note:
-        return
-    dead.event_payload["attempt_note"] = note
-    if lost:
+    restart = dead.owner_restart or (bool(lost.get("restart")) and not (dead.rate_limited or dead.terminal_provider))
+    note = owner_attempt_note(conn, task_id, lost) or ("owner restarted" if restart else "")
+    if restart and owner_restart_streak(conn, task_id) < OWNER_RESTART_LIMIT:
+        # The owner stopped under this attempt (its turn never settled): re-queue, never charge.
+        dead.owner_restart, dead.protocol_violation, dead.event_kind = True, False, "reclaimed"
+        dead.event_payload.pop("protocol_violation", None)
+        dead.event_payload.update(owner_restart=True, exit_kind=dead.kind, **({"worker_lost": lost} if lost else {}))
+    elif restart:
+        # Past the free streak: this restart is charged as a crash.
+        dead.owner_restart, dead.protocol_violation, dead.event_kind = False, False, "crashed"
+        dead.event_payload.pop("protocol_violation", None)
+        dead.event_payload.pop("owner_restart", None)
+        dead.event_payload.update(owner_restart_limit=OWNER_RESTART_LIMIT, exit_kind=dead.kind)
+        from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
+        _head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
+        dead.error_text = (f"pid {pid} ended in its owner's restart {OWNER_RESTART_LIMIT + 1} times in a row; "
+                           f"charged as a failure{sep}{output}")
+    elif lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
             from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR
@@ -236,6 +289,9 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
             # Keep the worker's last output that _classify_dead_worker appended.
             dead.error_text = (f"pid {pid} exited cleanly after its managed worker was lost."
                                + dead.error_text.removeprefix(_PROTOCOL_VIOLATION_ERROR))
+    if not note:
+        return
+    dead.event_payload["attempt_note"] = note
     # Before the worker's own output: the stored error is capped, and the output may be long.
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)

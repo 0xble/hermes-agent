@@ -168,6 +168,10 @@ def settle_recovered_unattended(db, epoch) -> int:
             continue
         if defer_detached(db, row):
             continue
+        if 'kanban_card_v1' in (row.get('payload') or {}):
+            # Before the settle: the card's submitter exits on it, and the dispatcher then books the run.
+            from gateway.session_kanban import record_card_restart
+            record_card_restart(db, row['target_session_id'])
         try:
             notice = interrupted_notice(row)
             resolve_unknown_session_input(

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.config_defaults_runtime import DEFAULT_KANBAN_MAX_IN_PROGRESS as DEFAULT_MAX_IN_PROGRESS
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -273,7 +274,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
-    return ("nonzero_exit", code)
+    from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE
+    return ("owner_restart" if code == KANBAN_OWNER_STOP_EXIT_CODE else "nonzero_exit", code)
 
 
 _EXIT_TRAILER_RE = re.compile(
@@ -677,7 +679,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_owner_recovery import free_owner_restart, owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in rows:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -720,6 +722,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=True):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
+            # The owner restarted under this run: its clock ran through the restart, not the card's work.
+            restart = free_owner_restart(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -735,6 +739,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "limit_seconds": limit,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    **({"owner_restart": True} if restart else {}),
                 }
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
@@ -748,7 +753,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         if cur.rowcount == 1:
             _record_task_failure(
                 conn, tid,
-                error=error,
+                error=error, infrastructure=restart,
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
@@ -1002,54 +1007,6 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
-_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-
-
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
-
-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
-    (``_default_spawn``), so when it exits without a terminal board call the
-    reason is usually sitting there: the model's own explanation of why it could
-    not comply (#88603), or the rendered provider error (#46593). The reap used to
-    discard it in favour of a canned message on every retry. Trims the CLI exit
-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
-    on a missing/empty log.
-
-    ``board`` must come from the dispatching tick: ambient current-board resolution
-    is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_exit_summary_marker())
-    if cut != -1:
-        raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
-
-
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1064,12 +1021,14 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_restart: bool = False
+    """The profile owner stopped or restarted under the attempt: re-queued, never charged."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        return "rate_limited" if self.rate_limited else "reclaimed" if self.owner_restart else "crashed"
 
 
 def _classify_dead_worker(
@@ -1135,6 +1094,12 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_restart":
+        return _DeadWorker(
+            kind, code, f"pid {pid} ended when its profile owner stopped or restarted — requeued without "
+            "counting a failure", "reclaimed", {"pid": pid, "claimer": claimer, "exit_code": code, "owner_restart": True},
+            owner_restart=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -1247,7 +1212,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
-            else:
+            elif not dead.owner_restart:  # the host's restart, not the card's: never charged
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
@@ -1842,20 +1807,11 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
-# Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
-# safeguards — a memory-DERIVED default cap when none is configured
-# (``resolve_max_in_progress``) and a live memory-PRESSURE guard inside the
-# tick (``_memory_pressure_level``) because a static cap can't see other
-# tenants. Both fail open: non-Linux / read error → no cap / "unknown".
-
-# Assumed per-worker footprint for the derived cap; deliberately conservative
-# so the cap errs toward fewer workers on small VMs.
-MEMORY_GUARD_MB_PER_WORKER = 512
-
-# Derived default bounds: never below 2 (smallest VM must still progress),
-# never above 8 (more fan-out must be explicit in config).
-DERIVED_MAX_IN_PROGRESS_FLOOR = 2
-DERIVED_MAX_IN_PROGRESS_CEILING = 8
+# Host concurrency: ``kanban.max_in_progress`` caps running cards on this host
+# (``DEFAULT_MAX_IN_PROGRESS`` when unset), and a live memory-PRESSURE guard
+# inside the tick (``_memory_pressure_level``) holds spawns back when the host
+# runs short, because a static cap can't see other tenants. The guard fails
+# open: unreadable memory (non-Linux) reads "unknown" and restricts nothing.
 
 
 def _system_memory_sample() -> dict:
@@ -1872,36 +1828,19 @@ def _system_memory_sample() -> dict:
         return {}
 
 
-def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
-    """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+def resolve_max_in_progress(configured: Optional[int]) -> int:
+    """Effective host concurrency cap: explicit config wins, else
+    ``DEFAULT_MAX_IN_PROGRESS``. Every dispatch entry point routes through this
+    so they agree.
     """
-    if sample is None:
-        sample = _system_memory_sample()
-    total_kib = sample.get("mem_total_kib")
-    if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
-        return None
-    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
-    return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
-
-
-def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
-    """Effective global concurrency cap: explicit config wins, else the
-    memory-derived default. All config-parsing callers route through this so
-    both paths agree.
-    """
-    if configured is not None:
-        return configured
-    return derive_default_max_in_progress()
+    return configured if configured is not None else DEFAULT_MAX_IN_PROGRESS
 
 
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
     Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
+    positive integer wins, anything else falls through to the default cap.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -1921,7 +1860,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
-    host-level budget — the memory-derived cap bounds the machine, not the
+    host-level budget — the cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
     """
     try:
@@ -1938,7 +1877,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
-    this a derived cap of N gets multiplied by the number of active boards.
+    this a cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
     """
@@ -2228,7 +2167,7 @@ def _tick_spawn_budget(
     spawns), not a per-tick budget — a per-tick reading would grow concurrency
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
-    cap by N — exactly the fan-out the memory-derived default exists to prevent.
+    cap by N — exactly the fan-out the host cap exists to prevent.
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -2931,3 +2870,4 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli.kanban_worker_log import _worker_final_output

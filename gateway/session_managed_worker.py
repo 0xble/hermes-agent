@@ -573,20 +573,30 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
-def _record_lost_attempt(authority, policy, exc, reason, scope):
+def _record_lost_attempt(authority, policy, exc, reason, scope, *, owner_stop=False):
     """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
     A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
-    without it the card's run learns nothing from its own loss. A deliberate Stop or a
-    superseded generation is not a loss. Tracked, so retirement joins the write.
+    without it the card's run learns nothing from its own loss. A user's Stop or a superseded
+    generation is not a loss. ``owner_stop``: this owner Stopped the worker for its own restart or
+    shutdown (``worker.stop_cause``), so the loss is recorded as the owner's restart: the host's
+    reason, not the card's. A loss the owner did not cause is charged, even during a drain.
+    Tracked, so retirement joins the write.
     """
-    if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
-            or reason in ('managed_worker_stopped', 'stale_generation')):
+    if (not getattr(policy, 'kanban_json', None) or reason == 'stale_generation' or (not owner_stop and (
+            isinstance(exc, asyncio.CancelledError) or reason == 'managed_worker_stopped'))):
         return None
     from gateway.session_kanban import record_worker_loss
     from gateway.session_runtime_workers import track_mutation
-    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
+    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason, restart=owner_stop,
                                                                pid=(scope or {}).get('pid'), bound=scope is not None)))
+
+
+async def _note_before_settle(recording):
+    """Let a lost attempt's board note (``recording``) land before its admission settles, at most
+    ``LOSS_RECORD_WAIT_S`` (the write carries on, tracked)."""
+    if recording is not None:
+        await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
 
 
 async def _settle_lost(authority, row, scope, recording):
@@ -600,8 +610,7 @@ async def _settle_lost(authority, row, scope, recording):
     from gateway.session_worker_reservation import lose_admission_worker
     from gateway.session_runtime_workers import tracked_write
     try:
-        if recording is not None:
-            await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
+        await _note_before_settle(recording)
     finally:
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
 
@@ -786,11 +795,15 @@ async def execute_managed(authority, ref, row, policy):
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
-                # this settles like an ordinary interrupted turn (the finally kills the child).
+                # this settles like an ordinary interrupted turn (the finally kills the child). A
+                # card stopped by this owner's own restart is noted first, so it is not charged.
+                await _note_before_settle(_record_lost_attempt(authority, policy, exc, reason, scope,
+                                                               owner_stop=bool(worker.stop_cause)))
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
-        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
+        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope,
+                                                                       owner_stop=bool(worker.stop_cause)))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
             live.controls.snapshot(ref.session_id, None)

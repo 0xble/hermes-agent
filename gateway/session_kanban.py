@@ -49,12 +49,17 @@ def build_kanban_policy(connection, params, config):
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
-    params_policy = {'source': 'cli', 'cwd': cwd}
-    for name, value in (('model', task.model_override), ('provider', task.provider_override), ('reasoning', task.reasoning_effort)):
-        if value:
-            params_policy[name] = value
+    from hermes_cli.model_alias_runtime import ModelAliasError, card_launch_route
+    try:
+        launch, alias = card_launch_route(task.model_override, task.provider_override, task.reasoning_effort, config)
+    except ModelAliasError as exc:
+        _block_unresolved_alias(path, task, str(exc))
+        raise RuntimeStoreError('invalid_kanban_claim', field='model_override', detail=str(exc)) from exc
+    params_policy = {'source': 'cli', 'cwd': cwd, **launch}
     private = {}
     policy = build_policy(params_policy, config, private_secrets=private)
+    if alias is not None and (alias.base_url or alias.api_key):
+        policy = _pin_alias_credential(policy, private, task.model_override[1:], config)
     if policy.model is None:
         from gateway.run import _resolve_gateway_model
         policy = replace(policy, model=_resolve_gateway_model(policy.config()))
@@ -68,6 +73,43 @@ def build_kanban_policy(connection, params, config):
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
                    request_json=json.dumps(request, sort_keys=True), kanban_json=json.dumps(context)), private
+
+
+def _block_unresolved_alias(path, task, reason):
+    """A card pinned to an alias its owner no longer defines cannot run as intended: block it for the
+    operator instead of running another model or burning its retries."""
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli import kanban_db as kb
+    with connect_closing(path) as conn:
+        kb.block_task(conn, task.id, reason=f'model pin cannot run: {reason}', kind='needs_input',
+                      expected_run_id=task.current_run_id)
+
+
+def _pin_alias_credential(policy, private, name, config):
+    """An alias with its own endpoint or key owns the route's credential: the profile's key, key
+    pointers and endpoint pins never pair with the alias's host. The alias's literal key rides the
+    private config secrets at its own path (``api_key_from``, as a committed ``/model`` pick does);
+    a ``key_env`` pointer is re-read each turn."""
+    from gateway.session_route_identity import ROUTE_BOUND_KEYS
+    frozen = json.loads(policy.config_json)
+    model = frozen.setdefault('model', {})
+    for key in set(ROUTE_BOUND_KEYS) - {'provider', 'base_url'}:
+        model.pop(key, None)
+        private.pop(('model', key), None)
+    model_section = config.get('model')
+    sections = ((('model_aliases',), config.get('model_aliases')),
+                (('model', 'aliases'), model_section.get('aliases') if isinstance(model_section, dict) else None))
+    # model_aliases wins over model.aliases, as in the alias loader.
+    entry = next(((path, written, value) for path, entries in sections if isinstance(entries, dict)
+                  for written, value in entries.items()
+                  if str(written).strip().lower() == name and isinstance(value, dict)), None)
+    if entry and entry[2].get('api_key'):
+        source = (*entry[0], entry[1], 'api_key')
+        private[source] = entry[2]['api_key']
+        model.update(api_key=None, api_key_from=list(source))
+    elif entry and entry[2].get('key_env'):
+        model['key_env'] = str(entry[2]['key_env']).strip()
+    return replace(policy, config_json=json.dumps(frozen))
 
 
 async def run_task(connection, params):
@@ -225,14 +267,16 @@ def _watch_submitter(db, run_id):
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
 
 
-def run_worker_turns(agent, frame, history):
+def run_worker_turns(agent, frame, history, owner_stopped=lambda: False):
+    """``owner_stopped``: whether the owner's own Stop control (its restart, shutdown or profile
+    retirement) ended the turn, so a card's interrupted attempt is not charged to the card."""
     from gateway.session_managed_worker import worker_turn_scope
     from gateway.session_surface import arm_surface_turn
     with worker_turn_scope(frame):
         # The agent consumes explicit one-turn attributes, not the ContextVar: arm them exactly as
         # the in-process runner does (voice route marker + surface note on the user message).
         arm_surface_turn(agent)
-        return _run_worker_turns(agent, frame, history)
+        return _run_worker_turns(agent, frame, history, owner_stopped)
 
 
 @contextlib.contextmanager
@@ -265,7 +309,7 @@ def _worker_workspace(frame):
         clear_session_vars(tokens)
 
 
-def _run_worker_turns(agent, frame, history):
+def _run_worker_turns(agent, frame, history, owner_stopped=lambda: False):
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
     if context is None:
         from gateway.session_display import worker_display_kwargs
@@ -279,6 +323,9 @@ def _run_worker_turns(agent, frame, history):
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
+        if code == 130 and owner_stopped():
+            from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE
+            code = KANBAN_OWNER_STOP_EXIT_CODE
         if isinstance(result, dict):
             # Redact before the tail cut: a cut through a PEM header or a token prefix
             # leaves a body the redactor no longer recognises.
@@ -316,11 +363,14 @@ def _record_worker_result(context, code, last_output):
                  'last_output': last_output}, run_id=context['run_id'])
 
 
-def record_worker_loss(policy, reason, *, pid=None, bound=False):
+def record_worker_loss(policy, reason, *, pid=None, bound=False, restart=False):
     """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
-    Never raises: the caller's own loss handling must not depend on the board write.
+    ``restart``: the owner lost the attempt by stopping or restarting, so the dispatcher re-queues
+    it without charging the card (``kanban_owner_recovery.owner_restart_lost``); a loss already
+    recorded for the run keeps its verdict. Never raises: the caller's own loss handling must not
+    depend on the board write.
     """
     try:
         context = json.loads(policy.kanban_json or 'null')
@@ -334,13 +384,32 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
                                (context['task_id'],)).fetchone()
             if row is None or row[0] != 'running' or row[1] != run_id:
                 return
+            if restart and conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_lost'",
+                                        (context['task_id'], run_id)).fetchone():
+                return
             kb._append_event(conn, context['task_id'], 'worker_lost',
                              {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
+                              'run_id': run_id, 'pid': pid, 'bound': bool(bound),
+                              **({'restart': True} if restart else {})},
                              run_id=run_id)
     except Exception:
         import logging
         logging.getLogger(__name__).exception('kanban worker_lost record failed')
+
+
+def record_card_restart(db, session_id):
+    """Boot recovery settled a card attempt this owner lost by restarting (its turn was still in
+    flight): mark the run so the dispatcher re-queues it without charging the card."""
+    try:
+        from hermes_state_local import local_receipt
+        from gateway.session_policy import restore_policy
+        saved = local_receipt(db, session_id)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('kanban restart record failed')
+        return
+    if saved:
+        record_worker_loss(restore_policy(saved['policy']), 'owner restarted', restart=True)
 
 
 def _bound_worker_matches(conn, context):

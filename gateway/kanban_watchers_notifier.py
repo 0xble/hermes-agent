@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import sqlite3
 from functools import partial
 from pathlib import Path
 import weakref
@@ -339,7 +340,8 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
+                "summaries": _run_summaries(self.kb, conn, events)}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -384,6 +386,18 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     ).collect()
 
 
+def _run_summaries(kb: Any, conn: Any, events: list) -> dict:
+    """``{run_id: full summary}`` for the claimed handoff events, read while the board is open.
+    Best-effort: a failed read leaves the wake with the event's first-line summary."""
+    try:
+        runs = [kb.get_run(conn, ev.run_id) for ev in events
+                if ev.kind in ("completed", "review_requested") and ev.run_id is not None]
+    except sqlite3.Error as exc:
+        logger.debug("kanban notifier: run summaries unavailable (%s); waking with the event summary", exc)
+        return {}
+    return {run.id: run.summary for run in runs if run is not None and run.summary}
+
+
 # --- Per-event message formatting: kind -> (msg, wake_handoff, wake_review_detail) ---
 # ``None`` for handoff / review_detail leaves the accumulated wake value untouched.
 
@@ -408,15 +422,36 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+# Longest handoff a wake carries. Comfortably inside the API server's self-post body cap, so the
+# wake (whose guidance precedes the handoff) always arrives whole; the rest is on the board.
+WAKE_HANDOFF_LIMIT = 16_000
+
+
+def _full_handoff(ev, n, fallback: str) -> str:
+    """The woken session's handoff: the run's full summary (``_run_summaries``), else *fallback*,
+    capped at ``WAKE_HANDOFF_LIMIT`` with a pointer to the board for the rest.
+
+    The event payload keeps only the summary's first line (400 chars) so board events and the
+    dashboard stream stay small; the chat ping shows a preview. A first-line wake sent the
+    creator back to the board for the result it was woken for.
+    """
+    text = n.summaries.get(ev.run_id) or fallback
+    if len(text) <= WAKE_HANDOFF_LIMIT:
+        return text
+    return text[:WAKE_HANDOFF_LIMIT] + "\n" + t(
+        "gateway.kanban.wake.handoff_truncated", limit=WAKE_HANDOFF_LIMIT, task_id=n.task_id)
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
-    wake_handoff = None
+    wake_handoff = preview = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        preview = _first_line(str(payload_summary), 200)
+        wake_handoff = _full_handoff(ev, n, str(payload_summary))
     elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
-    handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+        preview, wake_handoff = _first_line(n.task.result, 160), _full_handoff(ev, n, n.task.result)
+    handoff = f"\n{preview}" if preview is not None else ""
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
@@ -429,7 +464,7 @@ def _fmt_review_requested(ev, n) -> tuple:
     if summary:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
+        wake_handoff = _full_handoff(ev, n, summary)
     return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
@@ -522,6 +557,7 @@ class _KanbanNotification:
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
+        self.summaries = d.get("summaries") or {}
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
@@ -612,13 +648,15 @@ class _KanbanNotification:
             task_id=sub["task_id"], status=_status, title=self.title,
             assignee=task.assignee if task else "", board=self.board_slug,
         )
-        # Label as an automatic notification and carry the handoff so the
-        # creator inspects the board instead of re-decomposing.
-        if self.wake_handoff:
-            synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
+        # Label as an automatic notification and carry the handoff so the creator inspects the
+        # board instead of re-decomposing. The guidance precedes the (long) handoff, so no body cap
+        # downstream can cut it.
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
-        self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+        synth += "\n\n" + t("gateway.kanban.wake.guidance")
+        if self.wake_handoff:
+            synth += "\n\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
+        self.synth = synth
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
