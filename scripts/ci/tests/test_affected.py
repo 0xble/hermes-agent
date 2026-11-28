@@ -119,3 +119,30 @@ def test_path_map_selects_node_ids_for_globbed_inputs(repo: Path, tmp_path_facto
 def test_prose_beside_ci_configuration_does_not_run_everything(repo: Path) -> None:
     mode, tests, _ = change(repo, '.github/workflows/README.md', '# notes\n')
     assert (mode, tests) == ('affected', [])
+
+
+def test_conftest_fixture_imports_count_even_when_deferred(repo: Path) -> None:
+    git(repo, 'switch', '-q', 'main')
+    (repo / 'tests/conftest.py').write_text('def fixture():\n    from pkg import core\n', encoding='utf-8')
+    git(repo, 'commit', '-qam', 'fixture')
+    git(repo, 'switch', '-qC', 'change')
+    _, tests, _ = change(repo, 'pkg/core.py', 'VALUE = 3\n')
+    assert 'tests/test_unrelated.py' in tests
+
+
+def test_pytest_plugins_and_module_constant_imports_count(repo: Path) -> None:
+    git(repo, 'switch', '-q', 'main')
+    (repo / 'tests/test_plugin_user.py').write_text('pytest_plugins = ["pkg.other"]\n', encoding='utf-8')
+    (repo / 'tests/test_dynamic.py').write_text(
+        'import importlib\nTARGET = "pkg.other"\ndef test_x():\n    importlib.import_module(TARGET)\n', encoding='utf-8')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'plugins')
+    git(repo, 'switch', '-qC', 'change')
+    _, tests, _ = change(repo, 'pkg/other.py', 'X = 4\n')
+    assert {'tests/test_plugin_user.py', 'tests/test_dynamic.py'} <= set(tests)
+
+
+@pytest.mark.parametrize('path', ['rust/tool/Cargo.toml', 'tools/web/package.json'])
+def test_nested_dependency_manifests_run_everything(repo: Path, path: str) -> None:
+    mode, _, _ = change(repo, path, '# changed\n')
+    assert mode == 'full'

@@ -104,7 +104,8 @@ def quick_files(base: str | None, index: int, count: int) -> list[str]:
     print(f'quick: {mode} ({reason})', file=sys.stderr, flush=True)
     if mode == 'full':
         return universe
-    chosen = set(tests)
+    # A path-map rule may name a pytest node; its file runs whole here.
+    chosen = {test.split('::', 1)[0] for test in tests}
     return [path for path in universe if path in chosen]
 
 
