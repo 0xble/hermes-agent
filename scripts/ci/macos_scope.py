@@ -23,8 +23,9 @@ MACOS_PATH = re.compile(
     r'|\.(swift|m|mm|plist|entitlements|xcconfig)$')
 # Shared setup can change any platform's behavior.
 SHARED_SETUP = re.compile(
-    r'^(\.github/|bin/ci|scripts/ci/|ci/|pyproject\.toml$|uv\.lock$|package(-lock)?\.json$'
-    r'|pnpm-lock\.yaml$|conftest\.py$|.*/conftest\.py$)')
+    r'^(\.github/|bin/ci|scripts/ci/|ci/)'
+    r'|(^|/)(conftest\.py|pyproject\.toml|uv\.lock|poetry\.lock|requirements[^/]*\.txt|package(-lock)?\.json'
+    r'|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc|bun\.lockb?|Cargo\.(toml|lock)|go\.(mod|sum))$')
 # Python that marks macOS tests or branches on the platform.
 MACOS_SOURCE = re.compile(
     r'platforms\([^)]*["\'](macos|posix)["\']'
