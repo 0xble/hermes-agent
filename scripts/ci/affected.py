@@ -29,9 +29,10 @@ from pathlib import Path, PurePosixPath
 FULL_SUITE_PATTERNS = (
     'conftest.py', '*/conftest.py',
     'pyproject.toml', '*/pyproject.toml', 'setup.cfg', 'setup.py', 'tox.ini', 'pytest.ini', '.pytest.ini',
-    'uv.lock', '*/uv.lock', 'poetry.lock', 'requirements*.txt', '*/requirements*.txt',
+    'uv.lock', '*/uv.lock', 'poetry.lock', '*/poetry.lock', 'requirements*.txt', '*/requirements*.txt',
     'package.json', '*/package.json', 'package-lock.json', '*/package-lock.json',
-    'pnpm-lock.yaml', '*/pnpm-lock.yaml', 'bun.lock', '*/bun.lock', 'bun.lockb',
+    'pnpm-lock.yaml', '*/pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', '*/.npmrc',
+    'bun.lock', '*/bun.lock', 'bun.lockb', '*/bun.lockb',
     'Cargo.toml', '*/Cargo.toml', 'Cargo.lock', '*/Cargo.lock', 'go.mod', '*/go.mod', 'go.sum', '*/go.sum',
     '.python-version', '.tool-versions', 'mise.toml', '.mise.toml',
     '.github/workflows/*', '.github/actions/*', '.github/known-flakes*', 'bin/ci', 'bin/ci-*', 'scripts/ci/*', 'ci/*', '.mergify.yml',
@@ -120,7 +121,7 @@ def walk(tree: ast.AST, lazy: bool):
         node = stack.pop()
         yield node
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.If) and 'TYPE_CHECKING' in ast.unparse(child.test):
+            if isinstance(child, ast.If) and ast.unparse(child.test) in ('TYPE_CHECKING', 'typing.TYPE_CHECKING'):
                 stack.extend(child.orelse)  # annotation-only imports never run
                 continue
             if lazy or not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
@@ -223,9 +224,13 @@ def import_graph(sources: dict[str, str], tests: list[str], changed: list[str]) 
     for path, source in sources.items():
         for name in imports(path, source):
             # "from a.b import c" may name module a.b.c or attribute c of a.b.
-            for target in by_name.get(name, ()) or by_name.get(name.rpartition('.')[0], ()):
-                if target != path:
-                    importers[target].add(path)
+            targets = set(by_name.get(name, ()) or by_name.get(name.rpartition('.')[0], ()))
+            # Importing a.b.c also runs the package initializers a and a.b.
+            parts = name.split('.')
+            for depth in range(1, len(parts)):
+                targets.update(t for t in by_name.get('.'.join(parts[:depth]), ()) if t.endswith('__init__.py'))
+            for target in targets - {path}:
+                importers[target].add(path)
     # A test depends on every conftest.py above it.
     for conftest in (p for p in sources if PurePosixPath(p).name == 'conftest.py'):
         folder = str(PurePosixPath(conftest).parent)
