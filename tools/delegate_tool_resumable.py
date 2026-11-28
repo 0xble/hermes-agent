@@ -78,9 +78,11 @@ def classify(entry: dict[str, Any], stop_cause: Optional[str]) -> tuple[str, Opt
 # ── storage ────────────────────────────────────────────────────────────────
 def _db_path_for(parent_agent: Any = None) -> Optional[Path]:
     """The profile store the parent's children write their transcripts to (else this scope's ``state.db``);
-    None in a managed worker, which owns no ledger."""
+    None in a managed worker, which owns no ledger, and for a private parent: its helpers leave no durable record."""
     from agent.runtime_session_store import is_worker_process
-    if is_worker_process():
+    from agent.incognito import is_incognito
+    if is_worker_process() or getattr(parent_agent, "incognito", False) is True or is_incognito(
+            getattr(parent_agent, "session_id", None)):
         return None
     path = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
     if isinstance(path, (str, Path)):
