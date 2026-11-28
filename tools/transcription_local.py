@@ -314,7 +314,12 @@ def _transcribe_local_command(
             from tools.transcription_whisper_cpp import ensure_whisper_cpp_models, whisper_cpp_command
             if command_template == whisper_cpp_command():
                 ensure_whisper_cpp_models(normalized_model)
-        with tempfile.TemporaryDirectory(prefix="hermes-local-stt-") as output_dir:
+        from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+        try:
+            local_parent = private_temp_parent("stt-local")
+        except PrivateIntervalUnavailable:
+            return _error_result("Local STT cannot run: private interval is unresolved")
+        with tempfile.TemporaryDirectory(prefix="hermes-local-stt-", dir=local_parent) as output_dir:
             prepared_input, prep_error = _prepare_local_audio(file_path, output_dir)
             if prep_error:
                 return _error_result(prep_error)

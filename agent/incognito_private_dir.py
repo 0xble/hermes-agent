@@ -13,9 +13,13 @@ import secrets
 import shutil
 import sys
 import threading
+import time
 from typing import Mapping
 
 PRIVATE_DIR_PREFIX = "hermes-incognito-"
+# An interval is assembled under this name, then renamed to PRIVATE_DIR_PREFIX + token.
+PENDING_DIR_PREFIX = ".hermes-incognito-pending-"
+_PENDING_MAX_AGE_SECONDS = 300.0
 logger = logging.getLogger(__name__)
 _lock = threading.RLock()
 _session_dirs: dict[str, Path] = {}
@@ -99,6 +103,15 @@ def sweep_private_dirs(*, skip_live_owners: bool = False) -> int:
         except OSError:
             continue
         for path in entries:
+            if path.name.startswith(PENDING_DIR_PREFIX):
+                # A crash between mkdir and rename leaves an empty-but-for-marker shell.
+                try:
+                    stale = time.time() - path.lstat().st_mtime > _PENDING_MAX_AGE_SECONDS
+                except OSError:
+                    continue
+                if stale:
+                    _remove(path)
+                continue
             if path.name.startswith(PRIVATE_DIR_PREFIX) or path.name == "unattributed":
                 if skip_live_owners and path.name != "unattributed":
                     owner = _owner_pid(path)
@@ -117,20 +130,33 @@ def sweep_private_dirs(*, skip_live_owners: bool = False) -> int:
 
 
 def _new_dir() -> Path:
+    """Create an interval whose owner marker is visible from its first appearance.
+
+    The directory is built under a name the sweeps never match, marked, and only then
+    renamed into place, so a concurrent ``skip_live_owners`` sweep can never see a live
+    interval without its marker and remove it.
+    """
     root = _configured_root()
     root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{PRIVATE_DIR_PREFIX}{secrets.token_hex(16)}"
-    path.mkdir(mode=0o700)
+    token = secrets.token_hex(16)
+    staging = root / f"{PENDING_DIR_PREFIX}{token}"
+    staging.mkdir(mode=0o700)
     try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
-    owner = path / ".owner"
-    owner.write_text(f"{os.getpid()}\n", encoding="ascii")
-    try:
-        os.chmod(owner, 0o600)
-    except OSError:
-        pass
+        try:
+            os.chmod(staging, 0o700)
+        except OSError:
+            pass
+        owner = staging / ".owner"
+        owner.write_text(f"{os.getpid()}\n", encoding="ascii")
+        try:
+            os.chmod(owner, 0o600)
+        except OSError:
+            pass
+        path = root / f"{PRIVATE_DIR_PREFIX}{token}"
+        os.rename(staging, path)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return path
 
 
@@ -187,6 +213,31 @@ def private_subdir_for_current_session(relative: str = "") -> Path | None:
     path = root / relative if relative else root
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+class PrivateIntervalUnavailable(OSError):
+    """An incognito turn needs scratch space but no private interval is bound to it.
+
+    An ``OSError`` so best-effort temp-file handlers already treat it as "could not write"
+    and fail closed instead of falling back to the shared OS temp directory.
+    """
+
+
+def private_temp_parent(relative: str) -> str | None:
+    """The single fail-closed rule for temp files that may hold conversation content.
+
+    Pass the result as ``dir=`` to ``tempfile``. Returns ``None`` for a public turn (the
+    ordinary temp location is kept), the interval subdirectory for a bound private turn,
+    and raises :class:`PrivateIntervalUnavailable` for a private turn with no bound
+    interval. Callers must never substitute the public temp directory for that error.
+    """
+    from agent.incognito import is_incognito
+    if not is_incognito():
+        return None
+    parent = private_subdir_for_current_session(relative)
+    if parent is None:
+        raise PrivateIntervalUnavailable("no private interval is bound to this incognito turn")
+    return str(parent)
 
 
 def bind_private_session(session_id: str | None, path: Path | None) -> None:
