@@ -1106,6 +1106,7 @@ class ToolRegistry:
             from agent.incognito import is_incognito
             if is_incognito(kwargs.get("session_id")):
                 return tool_error("This plugin tool is unavailable in incognito mode.")
+        dispatch_sid = kwargs.get("session_id")
         from tools.arg_validation import check_tool_args, flag_unknown_args
         refusal, unknown, valid = check_tool_args(entry, args)
         if refusal is not None:
@@ -1115,11 +1116,15 @@ class ToolRegistry:
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
             # plugin handler is not broken by every field the dispatcher injects (#68318).
             kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            from contextlib import nullcontext
+            from agent.incognito import incognito_scope, is_incognito as _private
+            # Only a private dispatch is scoped, so handler storage resolves to its interval; public calls are untouched.
+            with (incognito_scope(True, session_id=dispatch_sid) if _private(dispatch_sid) else nullcontext()):
+                if entry.is_async:
+                    from model_tools import _run_async
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
             return flag_unknown_args(self._normalize_handler_result(name, result), name, unknown, valid)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
