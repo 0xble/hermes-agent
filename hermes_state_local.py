@@ -1,4 +1,5 @@
 """Private local creation receipts in the canonical runtime transaction owner."""
+import hashlib
 import json
 import sqlite3
 import threading
@@ -8,6 +9,38 @@ from collections import OrderedDict
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
 POLICY_PREFIX = 'gateway.local_policy.v1:'
+# A receipt's frozen ``policy.config_json`` is the whole profile config (~50 KB), and most sessions
+# freeze a config identical to the last one's. It is stored once under its SHA-256 and the receipt
+# carries ``policy.config_ref``; decode_receipt restores ``config_json``, so readers never see a ref.
+CONFIG_PREFIX = 'gateway.local_policy_config.v1:'
+
+
+def encode_receipt(conn, receipt):
+    """The stored form of *receipt*: its frozen config moves to a shared content-addressed row."""
+    policy = receipt.get('policy')
+    config = policy.get('config_json') if isinstance(policy, dict) else None
+    if not isinstance(config, str):
+        return _json(receipt)
+    digest = hashlib.sha256(config.encode('utf-8')).hexdigest()
+    conn.execute('INSERT OR IGNORE INTO state_meta(key,value) VALUES(?,?)', (CONFIG_PREFIX + digest, config))
+    stored = {key: value for key, value in policy.items() if key != 'config_json'}
+    stored['config_ref'] = digest
+    return _json({**receipt, 'policy': stored})
+
+
+def decode_receipt(conn, raw):
+    """*raw* stored receipt with its frozen ``config_json`` restored. Inline receipts (written before
+    the shared form) pass through. A ref whose config row is gone refuses as ``storage_unavailable``."""
+    receipt = json.loads(raw)
+    policy = receipt.get('policy') if isinstance(receipt, dict) else None
+    if not isinstance(policy, dict) or 'config_ref' not in policy:
+        return receipt
+    row = conn.execute('SELECT value FROM state_meta WHERE key=?', (CONFIG_PREFIX + str(policy['config_ref']),)).fetchone()
+    if row is None:
+        raise RuntimeStoreError('storage_unavailable')
+    restored = {key: value for key, value in policy.items() if key != 'config_ref'}
+    restored['config_json'] = row[0]
+    return {**receipt, 'policy': restored}
 API_BINDING_PREFIX = 'gateway.api.binding.v1.'
 API_DECLARED_PREFIX = 'gateway.api.conversation.v1.'
 
@@ -34,7 +67,7 @@ def commit_local_session(db, *, epoch, receipt):
         old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
         if old is not None:
             try:
-                saved = json.loads(old[0])
+                saved = decode_receipt(conn, old[0])
                 same = all(saved[k] == receipt[k] for k in (
                     'profile_id', 'principal_id', 'request_id', 'session_id', 'route'))
                 same = same and same_create_retry(saved['policy'], receipt['policy']['request_json'], request)
@@ -75,7 +108,7 @@ def commit_local_session(db, *, epoch, receipt):
              _json(entry['origin']), started))
         conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
                      (route, _json(entry), started))
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encode_receipt(conn, receipt)))
         if on_create is not None:
             on_create.publish()  # before the row is visible, so no reader lazy-loads around it
         return receipt
@@ -408,15 +441,15 @@ def annotate_local_lineages(sessions, heads):
 def local_receipt(db, session_id):
     with db._read_ctx() as conn:
         row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
-    if row is None:
+        if row is None:
+            raise RuntimeStoreError('storage_unavailable')
+        try:
+            value = decode_receipt(conn, row[0])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeStoreError('storage_unavailable') from exc
+    if not isinstance(value, dict):
         raise RuntimeStoreError('storage_unavailable')
-    try:
-        value = json.loads(row[0])
-        if not isinstance(value, dict):
-            raise ValueError('invalid receipt')
-        return value
-    except (TypeError, ValueError) as exc:
-        raise RuntimeStoreError('storage_unavailable') from exc
+    return value
 
 
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
