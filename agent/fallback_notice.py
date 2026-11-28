@@ -8,9 +8,14 @@ while the turn runs. The error handler that classified the failure records the p
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
+import time
+from urllib.parse import urlsplit
 
 from agent.error_classifier import FailoverReason
+from hermes_cli.route_identity import normalize_route_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,10 @@ def fallback_reason_text(reason: FailoverReason | None) -> str:
     """Return a concise operator-facing explanation for a fallback switch."""
     label = _FALLBACK_REASON_LABELS.get(reason)
     return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
+
+
+def _fallback_reason_text(reason):
+    return fallback_reason_text(reason)
 
 
 def record_fallback_trigger(agent, reason: FailoverReason | None, error_text: str) -> None:
@@ -136,3 +145,83 @@ def announce_fallback_switch(agent, notice: str) -> None:
 
 
 FALLBACK_STATUS_KIND = "fallback"
+
+def resolved_route(agent) -> tuple[str, str, str]:
+    """Resolved model, endpoint and wire; the caller must also compare backend identity."""
+    endpoint = normalize_route_base_url(str(getattr(agent, "base_url", "") or ""))
+    try:
+        parsed = urlsplit(endpoint)
+        if "@" in parsed.netloc:
+            endpoint = endpoint.replace(parsed.netloc, parsed.netloc.rsplit("@", 1)[-1], 1)
+    except ValueError:
+        pass  # An unparseable endpoint must not manufacture equivalence.
+    return (
+        str(getattr(agent, "model", "") or ""),
+        endpoint,
+        str(getattr(agent, "api_mode", "") or ""),
+    )
+
+def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds):
+    """Silence identical alias retries, never distinct first-class credential surfaces."""
+    from agent.backend_identity import BackendIdentity, distinct_credential_surface
+    from agent.chat_completion_helpers import (
+        _buffer_fallback_notice, _rate_limit_fallback_notice,
+    )
+    from agent.redact import redact_sensitive_text
+    from agent.fallback_route_recovery_uncooled import note_fallback_activated
+    from agent.turn_failure_routes import note_route_left
+
+    # Reached only once a fallback is bound, so both record a switch that really happened.
+    note_route_left(agent, old_provider, old_model)
+    note_fallback_activated(agent)
+    new_route = resolved_route(agent)
+    same_route = (all(old_route) and old_route == new_route
+                  and not distinct_credential_surface(BackendIdentity.build(provider=old_provider),
+                                                      BackendIdentity.build(provider=agent.provider)))
+    agent._provider_fallback_silent_retry = same_route and (
+        not getattr(agent, "_provider_fallback_active", False)
+        or getattr(agent, "_provider_fallback_silent_retry", False))
+    logger.info("Fallback resolved routes: %s -> %s (silent retry=%s)",
+                redact_sensitive_text(str(old_route), force=True, redact_url_credentials=True),
+                redact_sensitive_text(str(new_route), force=True, redact_url_credentials=True), same_route)
+    # A custom label-only alias is another bounded attempt, not a backend switch.
+    if same_route:
+        return
+    fb_model, fb_provider = agent.model, agent.provider
+    use_generic, notice = _rate_limit_fallback_notice(
+        agent, reason, shared_adoption, old_model, fb_model, fb_provider)
+    if use_generic:
+        notice = (
+            f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+            f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
+        if cooldown_seconds is not None:
+            remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
+            notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
+    if notice:
+        _buffer_fallback_notice(agent, notice)
+
+def finish_fallback_restore(agent, was_active, held_shared_record, previous_model, previous_provider):
+    """End the episode, retaining silence only for its pending successful-primary receipt."""
+    from agent.notice_style import ContextNotice
+    from agent.turn_failure_routes import reset_routes_left
+
+    reset_routes_left(agent)
+    silent_retry = bool(getattr(agent, "_provider_fallback_silent_retry", False))
+    try:
+        from agent.spare_guards import release_fallback_route
+        release_fallback_route(agent)
+    except Exception:
+        logger.debug("Spare lease release during primary restore failed", exc_info=True)
+    agent._provider_fallback_active = False
+    agent._provider_fallback_silent_retry = False
+    agent._provider_fallback_route = None
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if held_shared_record and isinstance(record, dict):
+        # Local receipt metadata, never written to the shared cooldown file. A silent retry
+        # still waits for primary success; clearing the episode must not announce its recovery.
+        agent._shared_primary_cooldown_record = {**record, "_silent_retry": silent_retry}
+    if was_active and not held_shared_record and not silent_retry:
+        # Notification surfaces are best-effort and must not undo a successful restore.
+        with contextlib.suppress(Exception):
+            agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+                f"fallback {previous_model} via {previous_provider} is no longer active."))

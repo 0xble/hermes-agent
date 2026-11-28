@@ -492,6 +492,14 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
     return cleaned or None
 
 
+def sanitize_reasoning_override(override: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Canonical /reasoning session pick, or None for an invalid config."""
+    if not isinstance(override, dict):
+        return None
+    from hermes_constants import parse_reasoning_effort
+    return parse_reasoning_effort(override)
+
+
 @dataclass
 class SessionEntry:
     """Routing-index entry: maps a session key to its current session ID and metadata."""
