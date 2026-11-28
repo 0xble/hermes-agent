@@ -1,7 +1,7 @@
 # Kanban card dispatch hardening
 
 Fork patch identity: `kanban-card-dispatch`.
-Contract tests: `tests/hermes_cli/test_kanban_host_cap.py`, `tests/hermes_cli/test_kanban_managed_worker_loss.py`.
+Contract tests: `tests/hermes_cli/test_kanban_host_cap.py`, `tests/hermes_cli/test_kanban_managed_worker_loss.py`, `tests/gateway/test_kanban_notifier.py`.
 
 ## Required behavior
 
@@ -19,6 +19,10 @@ Contract tests: `tests/hermes_cli/test_kanban_host_cap.py`, `tests/hermes_cli/te
   sweep and the TTL reclaim both honor it. The first loss recorded for a run keeps its verdict, so
   a real crash before a restart is still charged. A user's Stop, a worker crash, a timeout, and
   rate-limit, billing or terminal provider exits keep their existing accounting.
+- A `completed` or `review_requested` wake carries the run's full summary (the task result for
+  legacy rows). The event payload keeps its 400-character first line, which keeps board events
+  and the dashboard stream small, and the chat ping keeps its one-line preview. The wake is
+  session input with no transport limit.
 
 ## Scope and retirement
 

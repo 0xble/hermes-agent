@@ -339,7 +339,8 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
+                "summaries": _run_summaries(self.kb, conn, events)}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -384,6 +385,13 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     ).collect()
 
 
+def _run_summaries(kb: Any, conn: Any, events: list) -> dict:
+    """``{run_id: full summary}`` for the claimed handoff events, read while the board is open."""
+    runs = (kb.get_run(conn, ev.run_id) for ev in events
+            if ev.kind in ("completed", "review_requested") and ev.run_id is not None)
+    return {run.id: run.summary for run in runs if run is not None and run.summary}
+
+
 # --- Per-event message formatting: kind -> (msg, wake_handoff, wake_review_detail) ---
 # ``None`` for handoff / review_detail leaves the accumulated wake value untouched.
 
@@ -408,15 +416,26 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+def _full_handoff(ev, n, fallback: str) -> str:
+    """The woken session's handoff: the run's full summary (``_run_summaries``), else *fallback*.
+
+    The event payload keeps only the summary's first line (400 chars) so board events and the
+    dashboard stream stay small; the chat ping shows a preview, but the wake turn is session
+    input with no transport limit, and a truncated handoff sends the creator back to the board.
+    """
+    return n.summaries.get(ev.run_id) or fallback
+
+
 def _fmt_completed(ev, n) -> tuple:
     # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
-    wake_handoff = None
+    wake_handoff = preview = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        preview = _first_line(str(payload_summary), 200)
+        wake_handoff = _full_handoff(ev, n, str(payload_summary))
     elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
-    handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+        preview, wake_handoff = _first_line(n.task.result, 160), _full_handoff(ev, n, n.task.result)
+    handoff = f"\n{preview}" if preview is not None else ""
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
@@ -429,7 +448,7 @@ def _fmt_review_requested(ev, n) -> tuple:
     if summary:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
+        wake_handoff = _full_handoff(ev, n, summary)
     return t("gateway.kanban.ping.review_requested", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
@@ -522,6 +541,7 @@ class _KanbanNotification:
         self.sub_fail_counts = sub_fail_counts
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
+        self.summaries = d.get("summaries") or {}
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
