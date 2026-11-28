@@ -213,14 +213,14 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal']}}
     monkeypatch.setattr('gateway.run._load_gateway_config', lambda: config)
     calls = []
-    def create_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None):
+    async def create_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None):
         # Another process reclaims the task while the owner session is being created.
         with closing(connect(board='owned')) as conn:
             kb.block_task(conn, task_id, reason='replace claim', expected_run_id=old.current_run_id)
             kb.unblock_task(conn, task_id)
             kb.claim_task(conn, task_id)
         return SimpleNamespace(session_id='owner-session', profile_id=str(tmp_path))
-    monkeypatch.setattr('gateway.session_local.create_local_session', create_local_session)
+    monkeypatch.setattr('gateway.session_local.create_local_session_async', create_local_session)
     async def submit(actor, submission, **kwargs):
         calls.append(('submit', submission))
     async def resume(ref, params):
@@ -236,3 +236,53 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+def test_card_admission_commits_and_restores_off_the_loop(monkeypatch):
+    """Every card admission creates a session: its commit (state.db writer) and its store restore
+    (session-store lock) must not run on the gateway loop, where they froze every adapter."""
+    import asyncio
+    import threading
+    from gateway.session_local import create_local_session_async
+    threads = {}
+
+    def stage(authority, actor, params, **kwargs):
+        return {'session_id': 'card-session'}
+
+    def commit(db, *, epoch, receipt):
+        threads['commit'] = threading.get_ident()
+
+    async def restore(authority, sid, *, admission_gate=True):  # the async restore runs its store work off-loop
+        threads['restored'] = sid
+        return SimpleNamespace(session_id=sid)
+
+    monkeypatch.setattr('gateway.session_local.stage_local_session', stage)
+    monkeypatch.setattr('hermes_state_local.commit_local_session', commit)
+    monkeypatch.setattr('gateway.session_local_recovery.restore_local_session_async', restore)
+    monkeypatch.setattr('gateway.session_runtime_workers.persist_work_count', lambda authority: None)
+    authority = SimpleNamespace(db=object(), epoch=1)
+
+    async def admit():
+        threads['loop'] = threading.get_ident()
+        return await create_local_session_async(authority, object(), {'request_id': 'card'})
+
+    ref = asyncio.run(admit())
+    assert ref.session_id == 'card-session'
+    assert threads['commit'] != threads['loop'] and threads['restored'] == 'card-session'
+
+
+def test_settled_restore_rereads_once_after_a_live_cache_race(monkeypatch):
+    """A concurrent retry of the same card restores the same session: the loser re-reads once."""
+    import asyncio
+    from gateway.session_local_recovery import _LiveSessionChanged, restore_local_session_settled
+    calls = []
+
+    async def restore(authority, sid, *, admission_gate=True):
+        calls.append(sid)
+        if len(calls) == 1:
+            raise _LiveSessionChanged('admission_conflict')
+        return SimpleNamespace(session_id=sid)
+
+    monkeypatch.setattr('gateway.session_local_recovery.restore_local_session_async', restore)
+    assert asyncio.run(restore_local_session_settled(object(), 'card-session')).session_id == 'card-session'
+    assert calls == ['card-session', 'card-session']

@@ -311,6 +311,17 @@ async def restore_local_session_async(authority, sid, *, admission_gate=True):
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
 
+async def restore_local_session_settled(authority, sid, *, admission_gate=True):
+    """``restore_local_session_async``, re-read once when a concurrent restore changed the live cache.
+
+    Only the live-cache race retries, never a receipt conflict.
+    """
+    try:
+        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
+    except _LiveSessionChanged:
+        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
+
+
 def transcript_target(authority, ref):
     """The current physical transcript of logical *ref* (a local receipt's entry, else the tip)."""
     live = authority.sessions[ref.session_id]

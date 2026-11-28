@@ -23,6 +23,11 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
   topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
   profile's handles (primed off the loop at startup and on hot-add).
+- Kanban card admission (`gateway/session_kanban.py::run_task`) creates its session through
+  `session_local.create_local_session_async`: the creation commit runs through `tracked_write`, and the
+  session-store restore through `restore_local_session_settled`, the async restore re-read once on a
+  live-cache race and shared with cron. The loop guard named both sites 10 times each in the 2026-11-27
+  Kanban test (`tests/gateway/test_session_kanban.py`).
 - Detached process-result routing (`gateway/session_detached.py::follow_detached_pin`) resolves
   store entries, logical owners, session rows and cold mounts through `asyncio.to_thread`.
   The live route is checked after the worker returns. This preserves completion delivery after
