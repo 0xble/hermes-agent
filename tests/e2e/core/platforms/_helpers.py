@@ -96,7 +96,10 @@ class Director:
                 self.turns[token] = self.turns.get(token, 0) + 1
             queue = self.scripts.get(token)
             if queue:
-                return queue.pop(0)
+                response = queue.pop(0)
+                # Conditional wire responses let content tests refuse success when
+                # the gateway has not actually forwarded an attachment/tool result.
+                return response(body) if callable(response) else response
         return Text(f"reply to {token}")
 
 

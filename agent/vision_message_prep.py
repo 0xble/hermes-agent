@@ -75,7 +75,13 @@ class VisionMessagePrepMixin:
             return "", None
         mime = header[len("data:"):].split(";", 1)[0].strip() if header.startswith("data:") else ""
         suffix = _DATA_URL_SUFFIXES.get(mime if mime.startswith("image/") else "image/jpeg", ".jpg")
-        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
+        from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+        try:
+            parent = private_temp_parent("vision-data-url")
+        except PrivateIntervalUnavailable:
+            logger.warning("Refusing to stage a data-URL image: private interval is unresolved")
+            return "", None
+        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False, dir=parent)
         try:
             with tmp:
                 tmp.write(base64.b64decode(data))

@@ -194,6 +194,8 @@ class TelegramStandin(StandinServer):
                     data = await part.read()
                     params[part.name] = {"filename": part.filename, "size": len(data),
                                          "sha256": hashlib.sha256(data).hexdigest()}
+                    if part.name == "photo":
+                        params[part.name]["sha256"] = hashlib.sha256(data).hexdigest()
                 else:
                     params[part.name] = decode_value(await part.text())
         elif request.can_read_body:
@@ -335,6 +337,14 @@ class TelegramStandin(StandinServer):
         return self._bot_message(p, caption=p.get("caption", ""), _kind="document",
                                  document={"file_id": "out-doc", "file_unique_id": "od"})
 
+    def _m_sendAudio(self, p: dict[str, Any]) -> dict[str, Any]:
+        return self._bot_message(p, caption=p.get("caption", ""), _kind="audio",
+                                 audio={"file_id": "out-audio", "file_unique_id": "oa"})
+
+    def _m_sendVoice(self, p: dict[str, Any]) -> dict[str, Any]:
+        return self._bot_message(p, caption=p.get("caption", ""), _kind="voice",
+                                 voice={"file_id": "out-voice", "file_unique_id": "ov"})
+
     def _m_editMessageText(self, p: dict[str, Any]) -> dict[str, Any]:
         text = _check_rich(p) if p.get("rich_message") else _check_text(p)
         chat_id, mid = str(p["chat_id"]), str(p["message_id"])
@@ -396,6 +406,29 @@ class TelegramStandin(StandinServer):
         chat = {"id": int(user_id), "type": "private", "first_name": "Tester"}
         fields: dict[str, Any] = {"document": {"file_id": fid, "file_unique_id": f"u-{fid}", "file_name": filename,
                                                "mime_type": mime, "file_size": len(data)}}
+        if caption:
+            fields["caption"] = caption
+        return self._inbound(chat, user_id, **fields)
+
+    def dm_photo(self, user_id: int, data: bytes, caption: str = "") -> dict[str, Any]:
+        """Queue a native Telegram photo with one photo-size variant."""
+        fid = f"photo-{len(self.files) + 1}"
+        self.files[fid] = data
+        self.file_paths[fid] = f"photos/{fid}.jpg"
+        chat = {"id": int(user_id), "type": "private", "first_name": "Tester"}
+        fields: dict[str, Any] = {"photo": [{"file_id": fid, "file_unique_id": f"u-{fid}",
+                                               "file_size": len(data), "width": 32, "height": 32}]}
+        if caption:
+            fields["caption"] = caption
+        return self._inbound(chat, user_id, **fields)
+
+    def dm_voice(self, user_id: int, data: bytes, caption: str = "") -> dict[str, Any]:
+        fid = f"voice-{len(self.files) + 1}"
+        self.files[fid] = data
+        self.file_paths[fid] = f"voice/{fid}.ogg"
+        chat = {"id": int(user_id), "type": "private", "first_name": "Tester"}
+        fields: dict[str, Any] = {"voice": {"file_id": fid, "file_unique_id": f"u-{fid}",
+                                             "file_size": len(data), "duration": 1, "mime_type": "audio/ogg"}}
         if caption:
             fields["caption"] = caption
         return self._inbound(chat, user_id, **fields)

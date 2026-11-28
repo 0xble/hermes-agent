@@ -266,7 +266,9 @@ def _write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
         with open(output_path, "wb") as f:
             f.write(wav_bytes)
         return output_path
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    from agent.incognito_private_dir import private_temp_parent
+    # A private turn with no bound interval raises OSError: nothing is staged in public temp.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=private_temp_parent("tts-wav")) as tmp:
         tmp.write(wav_bytes)
         wav_path = tmp.name
     try:

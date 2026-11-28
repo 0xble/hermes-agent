@@ -141,7 +141,37 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
         (entry["host_path"], entry["container_path"])
         for entry in (*iter_skills_files(container_base=container_base),
                       *iter_cache_files(container_base=container_base))]
-    return files
+    # Private interval files are disposable, session-scoped state.  Never upload them to
+    # a remote durable home: remote stores outlive the interval and have no cleanup hook.
+    from agent.incognito import is_incognito
+
+    private = is_incognito()
+    private_prefix = None
+    private_root = None
+    try:
+        from agent.incognito_private_dir import PRIVATE_DIR_PREFIX, _configured_root
+        private_prefix = PRIVATE_DIR_PREFIX
+        private_root = _configured_root().expanduser().resolve()
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        if private:
+            # Do not continue with an incomplete allowlist while a private turn is active.
+            return []
+
+    if private_root is None:
+        return files
+
+    filtered: list[tuple[str, str]] = []
+    for host_path, remote_path in files:
+        try:
+            resolved = Path(host_path).expanduser().resolve()
+            relative = resolved.relative_to(private_root)
+            if relative.parts and private_prefix and (
+                relative.parts[0].startswith(private_prefix) or relative.parts[0] == "unattributed"):
+                continue
+        except (OSError, ValueError):
+            pass
+        filtered.append((host_path, remote_path))
+    return filtered
 
 
 def _resolve_host_path_str(host_path: str) -> str:

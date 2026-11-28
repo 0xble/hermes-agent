@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import inspect
@@ -25,6 +25,17 @@ _TRANSITIONING: set[str] = set()
 
 def transition_pending(session_key: str | None) -> bool:
     return session_key in _TRANSITIONING
+
+
+def private_lane_scope(session_key: str | None):
+    """Re-enter a registered private lane for work that may have lost its ingress scope.
+
+    Queued drains start outside ingress, so their task never inherited the scope. A public or
+    unknown key returns a no-op context: it never converts public work into private work.
+    """
+    if isinstance(session_key, str) and is_registered(session_key):
+        return incognito_scope(True, session_key)
+    return nullcontext()
 
 
 @contextmanager

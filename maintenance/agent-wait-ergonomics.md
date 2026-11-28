@@ -22,3 +22,5 @@ Authoritative regressions: `tests/tools/test_wait_polling_ergonomics.py`, alongs
 Retire when a released upstream version passes those boundaries. Revert the owning patch to roll back; observation state is ephemeral and there is no database migration. `semaphore status` belongs to dotfiles' CLI source, not this fork patch.
 
 Contract tests: `tests/tools/test_wait_polling_ergonomics.py`.
+
+Contract tests: `tests/tools/test_wait_polling_ergonomics.py`.

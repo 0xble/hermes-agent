@@ -64,6 +64,18 @@ def test_private_interval_is_volatile_and_restart_keeps_only_prefix(tmp_path, me
     register_session(key, False)
 
 
+def test_entering_private_interval_retires_both_kernel_owner_identities(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("tools.code_kernel.shutdown_kernels_for_owners",
+                        lambda *owners: calls.append(owners))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="kernel-boundary", thread_id="1")
+    entry = store.get_or_create_session(source)
+    store.set_incognito(entry.session_key, True)
+    assert calls[0] == (entry.session_key, entry.session_id)
+    store.set_incognito(entry.session_key, False)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("private", [False, True])
 async def test_async_ingress_scopes_real_store_without_blocking_gateway_loop(tmp_path, private):

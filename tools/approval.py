@@ -13,7 +13,6 @@ call time; sibling-defined names are imported from their defining module.
 
 from dataclasses import dataclass
 import hashlib
-import importlib
 import logging
 import os
 import threading
@@ -379,12 +378,11 @@ def clear_session(session_key: str) -> None:
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
-    for module, shutdown in (("tools.code_kernel", "shutdown_kernels_for_owner"),
-                             ("tools.code_kernel_remote", "shutdown_remote_kernels_for_owner")):
-        try:
-            getattr(importlib.import_module(module), shutdown)(session_key)
-        except Exception:
-            pass
+    try:
+        from tools.code_kernel import shutdown_kernels_for_owners
+        shutdown_kernels_for_owners(session_key)
+    except Exception:
+        pass
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:

@@ -386,7 +386,10 @@ def _generate_command_tts(
         output.unlink()
     timeout = _get_command_tts_timeout(config)
     output_format = _get_command_tts_output_format(config, str(output))
-    with tempfile.TemporaryDirectory() as tmpdir:
+    from agent.incognito_private_dir import private_temp_parent
+    # Raises PrivateIntervalUnavailable (an OSError) for a private turn with no bound interval.
+    temp_parent = private_temp_parent("tts-command")
+    with tempfile.TemporaryDirectory(dir=temp_parent) as tmpdir:
         text_path = Path(tmpdir) / "input.txt"
         text_path.write_text(text, encoding="utf-8")
         # The command writes to a Hermes-named file, never the caller's ``output_path``: that path

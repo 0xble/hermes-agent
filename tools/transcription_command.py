@@ -112,7 +112,10 @@ def _transcribe_command_stt(
     language = (language_override or config.get("language")
                 or _resolve_stt_language(provider_name, stt_config) or DEFAULT_COMMAND_STT_LANGUAGE)
     try:
-        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-") as tmpdir:
+        from agent.incognito_private_dir import private_temp_parent
+        # A private turn with no bound interval raises OSError, handled below: fail closed.
+        temp_parent = private_temp_parent("stt-command")
+        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-", dir=temp_parent) as tmpdir:
             input_path, normalize_error = _normalize_command_stt_input(audio, tmpdir, provider_name, config)
             if normalize_error:
                 return fail(normalize_error)

@@ -1164,7 +1164,12 @@ class GatewaySessionCommandsMixin:
         if redact:
             from hermes_cli.session_export_md import redact_session_data
             export_data = redact_session_data(export_data)
-        temp_dir = tempfile.mkdtemp(prefix="hermes_save_")
+        from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="hermes_save_", dir=private_temp_parent("save"))
+        except PrivateIntervalUnavailable as e:
+            # The export is the whole private transcript: never stage it in the shared temp dir.
+            return t("gateway.save.failed", error=e)
         temp_path = os.path.join(temp_dir, filename)
         try:
             # Off-loop: render + write scale with transcript size (multi-MB) and would stall the loop.

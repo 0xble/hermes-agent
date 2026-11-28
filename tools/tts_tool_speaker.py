@@ -48,7 +48,8 @@ def _play_via_tempfile(audio_iter: Iterable[bytes], stop_evt: threading.Event, s
     tmp = tmp_path = None
     try:
         import wave
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        from agent.incognito_private_dir import private_temp_parent
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=private_temp_parent("tts-speaker"))
         tmp_path = tmp.name
         with wave.open(tmp, "wb") as wf:
             wf.setnchannels(1)
@@ -129,7 +130,8 @@ class _SyncSentencePipeline:
             return None
         tmp_path = None
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            from agent.incognito_private_dir import private_temp_parent
+            fd, tmp_path = tempfile.mkstemp(suffix=".mp3", dir=private_temp_parent("tts-speaker"))
             os.close(fd)
             raw = _origin().text_to_speech_tool(text=cleaned, output_path=tmp_path)
             written = _first_written_artifact(raw, tmp_path)

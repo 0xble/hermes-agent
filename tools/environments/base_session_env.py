@@ -185,7 +185,8 @@ def _wrap_command_script(
     passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
     relay_parent_address: str = "",
     pipe_marker: str = "",
-    persist_env: bool = True, seed_snaps: Iterable[str] = ()) -> str:
+    persist_env: bool = True, seed_snaps: Iterable[str] = (),
+    private_scratch: str = "") -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``persist_env=False`` skips the re-dump, so every command starts from the login-time
     snapshot and exports from one command never reach the next (the CWD marker still runs).
@@ -216,6 +217,13 @@ def _wrap_command_script(
     elif snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
+    if private_scratch:
+        # The sourced snapshot carries the public TMPDIR; a private turn re-asserts its own
+        # (*private_scratch* is the shell-quoted interval scratch directory) after it.
+        parts.append(
+            f"mkdir -p -- {private_scratch} || exit 126\n"
+            f"export TMPDIR={private_scratch} TMP={private_scratch} "
+            f"TEMP={private_scratch} HERMES_SCRATCH_DIR={private_scratch}")
     if relay_parent_address:
         parts.append(relay_parent_export_line(relay_parent_address))
     parts += [

@@ -532,9 +532,15 @@ class GatewayVoiceMixin:
                 return
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
-            audio_path = build_auto_tts_output_path(event.source.platform)
-            raw = await asyncio.to_thread(text_to_speech_tool, text=tts_text,
-                                          output_path=audio_path)
+            # A private lane's scope may be gone by the time this post-handler block runs (inline
+            # callers, drains started outside ingress). Re-enter it from the routing key so the
+            # spoken copy of a private reply is staged in its interval, never in public temp. A
+            # private turn with no bound interval raises here and sends no voice reply.
+            from gateway.incognito import private_lane_scope
+            with private_lane_scope(self._session_key_for_source(event.source)):
+                audio_path = build_auto_tts_output_path(event.source.platform)
+                raw = await asyncio.to_thread(text_to_speech_tool, text=tts_text,
+                                              output_path=audio_path)
             try:
                 result = json.loads(raw)
             except (json.JSONDecodeError, TypeError):

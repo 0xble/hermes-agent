@@ -99,6 +99,37 @@ class TestResolveShellInitFiles:
         assert resolved == []
 
 
+def test_incognito_command_reasserts_private_tmpdir_after_public_snapshot(tmp_path, monkeypatch):
+    """A shell snapshot from a public turn must not put private scratch writes in public cache."""
+    from agent import incognito_private_dir
+    from agent.incognito import incognito_scope, register_session
+
+    home = tmp_path / "home"
+    public_tmp = home / "cache" / "scratch"
+    private_root = tmp_path / "private"
+    public_tmp.mkdir(parents=True)
+    monkeypatch.setattr(incognito_private_dir, "_configured_root", lambda: private_root)
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    session_id = "shell-snapshot-private"
+    register_session(session_id)
+    private = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), env={
+            "HERMES_HOME": str(home), "TMPDIR": str(public_tmp)})
+        with incognito_scope(True, session_id=session_id):
+            private = incognito_private_dir.private_dir_for_session(session_id, create=True)
+            result = env.execute('printf canary > "$TMPDIR/canary.txt"; printf %s "$TMPDIR"')
+        assert result["returncode"] == 0
+        assert private is not None
+        assert result["output"].strip() == str(private / "cache" / "scratch")
+        assert (private / "cache" / "scratch" / "canary.txt").read_text() == "canary"
+        assert not (public_tmp / "canary.txt").exists()
+    finally:
+        incognito_private_dir.discard_private_dir(session_id)
+        register_session(session_id, False)
+        assert private is None or not private.exists()
+
+
 class TestPrependShellInit:
     def test_empty_list_returns_command_unchanged(self):
         assert _prepend_shell_init("echo hi", []) == "echo hi"

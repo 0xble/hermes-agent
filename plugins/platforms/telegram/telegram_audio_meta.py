@@ -102,7 +102,10 @@ def fit_thumbnail_jpeg(path: str, *, seek: Optional[int] = None, prefix: str = "
         return None
     out = None
     try:
-        fd, out = tempfile.mkstemp(suffix=".jpg", prefix=prefix)
+        # Lazy: a plugin->core import is counted by the boundary lint. A private turn with no
+        # bound interval raises OSError here, inside the best-effort boundary: no thumbnail.
+        from agent.incognito_private_dir import private_temp_parent
+        fd, out = tempfile.mkstemp(suffix=".jpg", prefix=prefix, dir=private_temp_parent("telegram-thumb"))
         os.close(fd)
         seek_args = ["-ss", str(seek)] if seek is not None else []
         ok = subprocess.run(

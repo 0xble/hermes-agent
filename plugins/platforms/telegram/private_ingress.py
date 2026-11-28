@@ -11,12 +11,6 @@ from .callback_routing import matching_picker_state, picker_callback
 
 logger = logging.getLogger(__name__)
 
-PRIVATE_ATTACHMENT_NOTE = (
-    "[Attachment not downloaded: Telegram media requires a disk cache, which is unavailable in incognito. "
-    "Your text or caption is still available.]"
-)
-
-
 def _routing_event(adapter, update):
     query = getattr(update, "callback_query", None)
     if not isinstance(getattr(query, "data", None), str):
@@ -170,15 +164,3 @@ def private_application_class(base):
                     return await super().process_update(update)
 
     return PrivateTelegramApplication
-
-
-def refuse_private_attachment(event) -> bool:
-    """Keep captions functional without creating implicit private files or media cache entries."""
-    if not is_incognito():
-        return False
-    event.text = f"{event.text}\n\n{PRIVATE_ATTACHMENT_NOTE}" if event.text else PRIVATE_ATTACHMENT_NOTE
-    event.media_urls = []
-    event.media_types = []
-    event.media_text_inlined = []
-    event.message_type = MessageType.TEXT
-    return True

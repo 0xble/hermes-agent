@@ -12,6 +12,7 @@ per-gateway signed bearer the WS upgrade uses; stdlib ``urllib`` in a thread exe
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import email.message
 import email.utils
 import http.client
@@ -264,7 +265,10 @@ class RelayMediaClient:
                     if not ext:
                         mime = (resp.headers.get("Content-Type") or "").split(";")[0]
                         ext = mimetypes.guess_extension(mime) or ".bin"
-                    fd, tmp_path = tempfile.mkstemp(prefix="relay_media_", suffix=ext)
+                    from agent.incognito_private_dir import private_temp_parent
+                    # Raises OSError (caught below: download fails closed) for an unbound private turn.
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix="relay_media_", suffix=ext, dir=private_temp_parent("relay-media"))
                     with os.fdopen(fd, "wb") as fh:
                         fh.write(data)
                     return tmp_path, name
@@ -272,7 +276,8 @@ class RelayMediaClient:
                 logger.warning("relay media download failed for %s: %s", url, exc)
                 return None
 
-        return await asyncio.get_running_loop().run_in_executor(None, _get)
+        # run_in_executor drops contextvars: carry the turn's incognito scope into the worker thread.
+        return await asyncio.get_running_loop().run_in_executor(None, contextvars.copy_context().run, _get)
 
 
 def _content_disposition_filename(header: str) -> str:

@@ -4189,9 +4189,9 @@ def _shrink_data_url(url: str, *, max_dimension: int, resize_fn: Any) -> tuple:
         mime = _data_url_mime(header)
         import base64 as _b64
         raw = _b64.b64decode(data)
-        tmp = tempfile.NamedTemporaryFile(
-            prefix="hermes_shrink_", suffix=_IMAGE_SUFFIX_BY_MIME.get(mime, ".jpg"), delete=False
-        )
+        from agent.incognito_private_dir import private_temp_parent  # no interval: OSError, handled below
+        tmp = tempfile.NamedTemporaryFile(prefix="hermes_shrink_", suffix=_IMAGE_SUFFIX_BY_MIME.get(mime, ".jpg"),
+                                          delete=False, dir=private_temp_parent("image-shrink"))
         try:
             tmp.write(raw)
             tmp.close()
