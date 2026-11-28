@@ -1,7 +1,10 @@
 """Versioned loop revisions; authority policy is unchanged by snapshot/CAS settlement.
 
-With ``loops.autonomy`` on, the agent may revise any field or replace its loop without a user
-quote. The min-interval and self-paced floors and the ``loops.max_ticks`` backstop still apply.
+An agent may revise operational fields or replace a loop it created, with a reason, without a
+user quote. A user-set stop condition, a user-created or legacy loop's activating change, and
+removal of a user-created loop still need a verbatim quote. With ``loops.autonomy`` on, those
+quote requirements lift too. The min-interval and self-paced floors and the ``loops.max_ticks``
+backstop still apply.
 """
 
 from __future__ import annotations
@@ -11,6 +14,89 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from hermes_cli.loops import LoopState
+
+
+
+def _quote_authorizes_delta(quote: str, changed: list[str], before: dict[str, Any],
+                            after: dict[str, Any]) -> bool:
+    """Require field-specific evidence for every loop delta in an authenticated quote.
+
+    ``check_user_quote`` authenticates the source and freshness. This predicate only binds those
+    words to the requested deltas. Directionless verbs such as ``change`` are lifecycle actions,
+    not evidence for any particular field. Replacement additionally needs an explicit replacement
+    verb; it may not use a stop/removal phrase as a shortcut.
+    """
+    import re
+
+    words = set(re.findall(r"[a-z0-9']+", str(quote or '').casefold()))
+    if not words:
+        return False
+    action_words = {"change", "update", "switch", "replace", "redefine", "revise", "reword", "rewrite",
+                    "modify", "set", "make", "use", "keep", "slow", "slower", "faster",
+                    "speed", "speedup", "increase", "decrease", "reduce", "remove", "drop",
+                    "delete", "clear", "stop", "end", "cancel", "extend", "raise", "lower"}
+    if not words & action_words:
+        return False
+
+    field_evidence = {
+        "prompt": {"prompt", "wording", "instruction", "task", "objective", "reword", "rewrite"},
+        "times": {"times", "runs", "run", "budget", "cap", "limit", "retries", "retry",
+                  "forever", "unlimited"},
+        "cadence": {"interval", "cadence", "polling", "frequency", "rate", "often", "frequent",
+                     "slow", "slower", "fast", "faster", "speed", "speedup", "minute", "minutes",
+                     "hour", "hours", "paced", "pace"},
+        "until": {"condition", "stopping", "until", "finish", "finished", "done", "when", "after"},
+    }
+
+    fields = [field for field in changed if field != "replace"]
+    if "replace" in changed:
+        # ``replace`` is an operation, not evidence for prompt, cadence, budget, or stop condition.
+        # In particular, stop/end must never authorize a replacement or condition removal.
+        if not words & {"replace", "redefine"}:
+            return False
+    checks: list[bool] = []
+    for field in fields:
+        if field == "until":
+            old = str(before.get("until") or "").strip()
+            new = str(after.get("until") or "").strip()
+            if old and not new:
+                # Lifecycle verbs (stop/end/cancel) and generic timing words (when/after/done)
+                # never remove ``until``: "Cancel the loop when done" cancels the loop. Removal
+                # needs a removal verb plus a noun naming the stop condition itself.
+                removal_words = {"remove", "drop", "delete"}
+                condition_nouns = {"condition", "stopping", "until"}
+                checks.append(bool(words & removal_words) and bool(words & condition_nouns))
+            else:
+                checks.append(bool(words & field_evidence["until"]))
+        elif field in {"interval_seconds", "mode", "current_delay"}:
+            checks.append(bool(words & field_evidence["cadence"]))
+        elif field in field_evidence:
+            checks.append(bool(words & field_evidence[field]))
+        else:
+            checks.append(False)
+    if not fields:
+        return "replace" in changed
+    return all(checks)
+
+
+def _loop_revision_needs_quote(state, changed, caller, *, autonomous, faster, raising_times):
+    from hermes_cli.lifecycle_authority import user_stop_condition
+    from hermes_cli.lifecycle_policy import decision, A
+
+    operations = ["revise"]
+    if "prompt" in changed:
+        operations.append("outcome")
+    if faster:
+        operations.append("cadence_faster")
+    if raising_times:
+        operations.append("budget")
+    required = any(decision("loop", operation, state, actor=caller.actor,
+                            autonomous=autonomous) != A for operation in operations)
+    if "until" in changed:
+        required |= decision("loop", "stop_when", state, actor=caller.actor,
+                             autonomous=autonomous,
+                             owner="user" if user_stop_condition(state) else "agent") != A
+    return required
 
 
 class LoopRevisionsMixin:
@@ -26,13 +112,11 @@ class LoopRevisionsMixin:
         }
 
     def _revision_quote(self, state: LoopState, user_quote: str,
-                        user_messages: Optional[list[str]], *, required: bool) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
+                        user_messages: Optional[list[str]], *, required: bool, stop_condition: str = "",
+                        changed: Optional[list[str]] = None, before: Optional[dict[str, Any]] = None,
+                        after: Optional[dict[str, Any]] = None) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
         """Validate a verbatim user quote using the goal lifecycle's shared source rules."""
-        from hermes_cli.goals import (
-            _REVISION_QUOTE_MIN_CHARS,
-            _REVISION_SOURCE_MAX_CHARS,
-            user_messages_since,
-        )
+        from hermes_cli.goals import _REVISION_QUOTE_MIN_CHARS
 
         quote = " ".join((user_quote or "").split())
         if required and not quote:
@@ -48,24 +132,22 @@ class LoopRevisionsMixin:
             return None, "user_quote_too_short", {
                 "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"
             }
-        pool = user_messages if user_messages is not None else user_messages_since(
-            self.session_id, state.created_at
-        )
-        sources = [" ".join(message.split()) for message in pool if quote in " ".join(message.split())]
-        if not sources:
-            return None, "user_quote_not_found", {
-                "error": "user_quote does not match any user message sent since the loop was set"
+        # Compatibility user_messages input is never authority. Authenticate the
+        # current transcript, including a receipt-bound relay of Brian's words.
+        from hermes_cli.session_controls import check_user_quote
+        checked = check_user_quote(self.session_id, quote, cursor=self._cursor,
+                                   stop_condition=stop_condition)
+        if isinstance(checked, str):
+            return None, checked, {"error": "user_quote has no current authenticated source"}
+        if changed and not _quote_authorizes_delta(checked.message, changed, before or {}, after or {}):
+            return None, "user_quote_qualified", {
+                "error": "user_quote does not authorize every requested loop change"
             }
-        source = next((message for message in sources if len(message) <= _REVISION_SOURCE_MAX_CHARS), "")
-        if not source:
-            return None, "user_message_too_long", {
-                "error": (
-                    f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too long to "
-                    "judge whether it authorizes this change; ask the user to state the change in a short "
-                    "message and quote that"
-                )
-            }
-        return quote, None, {"user_message": source}
+        return checked[0], None, {
+            "user_message": checked[1],
+            "source_session_id": checked.source_session_id,
+            **({"relay_receipt": checked.relay_receipt} if checked.relay_receipt else {}),
+        }
 
     def revise(
         self,
@@ -102,6 +184,11 @@ class LoopRevisionsMixin:
     ) -> dict[str, Any]:
         """Apply a versioned, authority-checked edit to the existing loop."""
         from hermes_cli.goals_autonomy import loop_autonomy_enabled
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent or user"}
         from hermes_cli.loops import min_interval_seconds, self_paced_floor_seconds
         state = self._state
         version = state.version if state is not None else 1
@@ -161,31 +248,33 @@ class LoopRevisionsMixin:
                 error_code="no_change", error="the revision changes nothing",
             )
 
-        current_effective_delay = (
-            state.interval_seconds if state.mode == "interval"
-            else (state.current_delay or float(self_paced_floor_seconds()))
-        )
         new_effective_delay = (
             after["interval_seconds"] if after["mode"] == "interval"
             else float(self_paced_floor_seconds())
         )
-        # Switching to self-paced starts at the floor, so it is faster whenever the floor is below the
-        # current delay; it gets the same authority check as any other cadence change.
+        current_effective_delay = (
+            state.interval_seconds if state.mode == "interval"
+            else (state.current_delay or float(self_paced_floor_seconds()))
+        )
+        # Switching to self-paced starts at the floor, so it is faster whenever the floor is
+        # below the current delay. Cadence, wording and run-count edits of an agent-created
+        # loop are operational judgment. A user stop condition is a commitment. Legacy and
+        # user-created loops keep the full authority check. loops.autonomy still lifts quotes.
         faster = new_effective_delay < current_effective_delay
         raising_times = (
             "times" in changed
             and state.times > 0
             and (after["times"] == 0 or after["times"] > state.times)
         )
-        needs_authority = (
-            ("prompt" in changed)
-            or ("until" in changed)
-            or faster
-            or raising_times
+        autonomous = caller is LifecycleAuthority.AUTONOMY
+        needs_authority = _loop_revision_needs_quote(
+            state, changed, caller, autonomous=autonomous, faster=faster,
+            raising_times=raising_times,
         )
-        autonomous = actor == "agent" and loop_autonomy_enabled()
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority and not autonomous
+            state, user_quote, user_messages, required=needs_authority,
+            stop_condition=after["until"] if "until" in changed else "",
+            changed=changed, before=before, after=after,
         )
         if quote_error:
             return self._revision_result(
@@ -203,8 +292,15 @@ class LoopRevisionsMixin:
             "before": {key: before[key] for key in changed},
             "after": {key: after[key] for key in changed},
         }
+        revision["lifecycle_authority"] = caller.value
         if autonomous:
             revision["authority"] = "autonomy"
+        if quote_detail:
+            revision["quote_source_session_id"] = quote_detail["source_session_id"]
+            if quote_detail.get("relay_receipt"):
+                revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if "until" in changed and (quote or caller.actor == "user"):
+            state.stop_condition_owner = "user"
         if clamped_from is not None:
             revision["clamped"] = {
                 "interval_seconds": clamped_from,
@@ -235,12 +331,13 @@ class LoopRevisionsMixin:
         self,
         *,
         prompt: str,
+        actor: str = "agent",
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
         route: Optional[dict[str, str]] = None,
         reason: str,
-        user_quote: str,
+        user_quote: str = "",
         user_messages: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route.
@@ -248,22 +345,28 @@ class LoopRevisionsMixin:
         Commit only against the durable snapshot this replacement read.
         """
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
-        return mutate_loop_snapshot(self, "_replace", prompt=prompt, interval_seconds=interval_seconds, times=times, until=until, route=route, reason=reason, user_quote=user_quote, user_messages=user_messages)
+        return mutate_loop_snapshot(self, "_replace", prompt=prompt, actor=actor, interval_seconds=interval_seconds, times=times, until=until, route=route, reason=reason, user_quote=user_quote, user_messages=user_messages)
 
     def _replace(
         self,
         *,
         prompt: str,
+        actor: str = "agent",
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
         route: Optional[dict[str, str]] = None,
         reason: str,
-        user_quote: str,
+        user_quote: str = "",
         user_messages: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route."""
         from hermes_cli.goals_autonomy import loop_autonomy_enabled
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent or user"}
         from hermes_cli.loops import max_ticks_default, min_interval_seconds, self_paced_floor_seconds
         state = self._state
         version = state.version if state is not None else 1
@@ -284,27 +387,18 @@ class LoopRevisionsMixin:
                 ok=False, revision=None, version=state.version,
                 error_code="no_change", error="replacement prompt is empty",
             )
-        autonomous = loop_autonomy_enabled()
-        quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=not autonomous
-        )
-        if quote_error:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
-            )
-        now = max(time.time(), state.created_at + 1e-6)
+        from hermes_cli.lifecycle_authority import user_stop_condition
+        from hermes_cli.lifecycle_policy import decision, A
+        autonomous = caller is LifecycleAuthority.AUTONOMY
+        needs_authority = decision("loop", "replace", state, actor=caller.actor,
+                                   autonomous=autonomous) != A
+        if state.until != (until or "").strip():
+            needs_authority |= decision("loop", "stop_when", state, actor=caller.actor,
+                autonomous=autonomous, owner="user" if user_stop_condition(state) else "agent") != A
         self_paced = interval_seconds is None
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         new_times = max(0, int(times or 0))
         new_until = (until or "").strip()
-        # Without the user's words a replacement is the same loop under new orders, so the
-        # tick budget keeps counting and the cadence floor still holds from the last tick. The
-        # requested run count means that many more runs.
-        carry = not quote
-        carried_ticks = state.ticks_fired if carry else 0
-        if carry and new_times:
-            new_times += carried_ticks
         old_snapshot = {
             "prompt": state.prompt,
             "mode": state.mode,
@@ -321,11 +415,35 @@ class LoopRevisionsMixin:
             "current_delay": float(self_paced_floor_seconds()) if self_paced else interval,
             "times": new_times,
             "until": new_until,
-            "ticks_fired": carried_ticks,
+            "ticks_fired": 0,
         }
+        changed = [key for key in old_snapshot if key != "ticks_fired" and new_snapshot[key] != old_snapshot[key]]
+        quote_changed = ["replace", *changed]
+        quote, quote_error, quote_detail = self._revision_quote(
+            state, user_quote, user_messages, required=needs_authority,
+            stop_condition=new_until if "until" in changed else "",
+            changed=quote_changed,
+            before=old_snapshot,
+            after=new_snapshot,
+        )
+        if quote_error:
+            return self._revision_result(
+                ok=False, revision=None, version=state.version,
+                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
+            )
+        now = max(time.time(), state.created_at + 1e-6)
+        # Without the user's words a replacement is the same loop under new orders, so the
+        # tick budget keeps counting and the cadence floor still holds from the last tick. The
+        # requested run count means that many more runs.
+        carry = not quote
+        carried_ticks = state.ticks_fired if carry else 0
+        if carry and new_times:
+            new_times += carried_ticks
+        new_snapshot["times"] = new_times
+        new_snapshot["ticks_fired"] = carried_ticks
         revision = {
             "at": now,
-            "actor": "agent",
+            "actor": caller.actor,
             "reason": reason,
             "user_quote": quote or "",
             "user_message": (quote_detail or {}).get("user_message", "") if quote else "",
@@ -333,8 +451,15 @@ class LoopRevisionsMixin:
             "before": old_snapshot,
             "after": new_snapshot,
         }
+        revision["lifecycle_authority"] = caller.value
         if autonomous:
             revision["authority"] = "autonomy"
+        if quote_detail:
+            revision["quote_source_session_id"] = quote_detail["source_session_id"]
+            if quote_detail.get("relay_receipt"):
+                revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if state.until != new_until and (quote or caller.actor == "user"):
+            state.stop_condition_owner = "user"
         old_route = dict(state.route)
         # A replaced paused loop stays paused with its reason. Only /loop resume, or an autonomous
         # resume of the agent's own pause, re-arms it.

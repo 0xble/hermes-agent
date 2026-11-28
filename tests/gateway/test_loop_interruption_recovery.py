@@ -571,7 +571,8 @@ _LOOP_NON_CONTROL_API = frozenset({
     "state", "refresh", "is_active", "has_loop", "status_line", "is_due",
     "fire_tick", "complete_tick", "abandon_tick", "recover_tick",
 })
-_REPLACE_REQUEST = "please replace the loop with replacement work now"
+_REPLACE_REQUEST = ("Please replace the loop prompt, set the interval to 1 minute, run it 2 times, "
+                    "and set the stop condition to replacement work")
 
 
 def _public_loop_controls():
@@ -599,6 +600,15 @@ async def _session_reset(runner, source, sid):
     await runner._handle_reset_command(MessageEvent(text="/new", source=source))
 
 
+def _replace_with_current_quote(sid):
+    """Persist the typed request. A bare user_messages list is not authority."""
+    from tests.hermes_cli.test_loop_revise import _record_quote
+    _record_quote(sid, _REPLACE_REQUEST)
+    return _accepted(loops.LoopManager(sid).replace(
+        prompt="replacement work", interval_seconds=60, times=2, reason="user asked to replace it",
+        user_quote=_REPLACE_REQUEST, user_messages=[_REPLACE_REQUEST]))
+
+
 def _pause_then_resume_elsewhere(sid):
     loops.LoopManager(sid).pause()
     loops.LoopManager(sid).resume()
@@ -609,9 +619,7 @@ def _pause_then_resume_elsewhere(sid):
 LOOP_CONTROLS = {
     "set": lambda runner, source, sid: loops.LoopManager(sid).set(
         "replacement work", interval_seconds=60, times=2, route=_route(source)),
-    "replace": lambda runner, source, sid: _accepted(loops.LoopManager(sid).replace(
-        prompt="replacement work", interval_seconds=60, times=2, reason="user asked to replace it",
-        user_quote="replace the loop with replacement work", user_messages=[_REPLACE_REQUEST])),
+    "replace": lambda runner, source, sid: _replace_with_current_quote(sid),
     "revise": lambda runner, source, sid: _accepted(loops.LoopManager(sid).revise(
         reason="slow the cadence", interval_seconds=120)),
     "pause": lambda runner, source, sid: loops.LoopManager(sid).pause(),

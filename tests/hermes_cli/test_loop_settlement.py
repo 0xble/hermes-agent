@@ -20,9 +20,14 @@ def test_judge_cannot_settle_over_a_newer_loop(hermes_home, monkeypatch, verdict
         if change == "revise":
             assert writer.revise(reason="Less polling", interval_seconds=600)["ok"]
         elif change == "replace":
+            from tests.hermes_cli.test_loop_revise import _record_quote
             source = "Watch the new deployment instead"
-            assert writer.replace(prompt=source, reason="User changed task", user_quote=source,
-                                  user_messages=[source], interval_seconds=600)["ok"]
+            quote = ("Please replace the loop prompt, set the interval to 10 minutes, "
+                     "and set the stop condition to the new deployment")
+            _record_quote(manager.session_id, quote)
+            assert writer.replace(prompt=source, reason="User changed task", user_quote=quote,
+                                  user_messages=[quote], interval_seconds=600,
+                                  until="the new deployment")["ok"]
         elif change == "pause":
             writer.pause()
         else:
@@ -209,6 +214,8 @@ def test_loop_cas_validates_entry_and_noop_commit(hermes_home, monkeypatch, oper
         result = manager.complete_tick("[LOOP_COMPLETE]")
     elif operation == "replace":
         source = "Watch the new deployment instead"
+        from tests.hermes_cli.test_loop_revise import _record_quote
+        _record_quote(manager.session_id, source)
         result = manager.replace(prompt=source, reason="New task", user_quote=source, user_messages=[source])
     else:
         result = manager.revise(reason="Fewer checks", times=0 if operation == "noop" else 3)

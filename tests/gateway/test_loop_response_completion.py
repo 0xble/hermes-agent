@@ -53,9 +53,17 @@ async def test_final_marker_cannot_override_newer_controls(loop_env, change):
     writer = loops.LoopManager(manager.session_id)
 
     def replace():
-        quote = "Watch the new deployment instead"
-        assert writer.replace(prompt=quote, interval_seconds=600, reason="new task", user_quote=quote,
-                              user_messages=[quote])["ok"]
+        prompt = "Watch the new deployment"
+        quote = ("Please replace the loop prompt, set the interval to 10 minutes, run it 5 times, "
+                 "and set the stop condition to ready")
+        # Replace needs the user's quote in the current authenticated transcript.
+        from hermes_cli import goals
+        db = goals._get_session_db()
+        db.create_session(session_id=manager.session_id, source="cli", model="test")
+        db.append_message(manager.session_id, "user", quote)
+        result = writer.replace(prompt=prompt, interval_seconds=600, reason="new task", user_quote=quote,
+                                user_messages=[quote])
+        assert result["ok"], result
 
     def resume():
         writer.pause()
