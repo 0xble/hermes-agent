@@ -32,6 +32,7 @@ __all__ = [
     "DiskFull",
     "ExportTooLarge",
     "FenceStale",
+    "GatewayOwnerRestartError",
     "HandoffUnsettled",
     "HeldRowRewritten",
     "MalformedSchema",
@@ -378,6 +379,10 @@ class HandoffUnsettled(AuthorityRefusal):
         super().__init__(reason)
 
 
+class GatewayOwnerRestartError(RuntimeError):
+    """The worker could not reconnect before its owner-transition deadline."""
+
+    phase = "owner_transition"
 class RetiredSessionError(AuthorityRefusal):
     """The addressed session id is permanently retired and cannot be created again; ``reason`` is the code the refusing operation answers (``session_deleted`` for an exclusive create, ``not_found`` for a plain create)."""
 

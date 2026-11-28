@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 
-from hermes_state_errors import is_malformed_db_error
+from storage_errors import is_malformed_db_error
 
 logger = logging.getLogger("hermes_state")
 
