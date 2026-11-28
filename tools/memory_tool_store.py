@@ -245,8 +245,7 @@ class MemoryStore:
             path = self._path_for(target)
             from hermes_constants import mkdir_under_hermes_home
 
-            if not self.read_only:
-                mkdir_under_hermes_home(path.parent)
+            mkdir_under_hermes_home(path.parent)
             # Deduplicate (order-preserving, first occurrence wins).
             entries = list(dict.fromkeys(self._read_file(path)))
             self._set_entries(target, entries)

@@ -7,14 +7,15 @@ import logging
 import re
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any, Optional
 
-from hermes_cli.goals_authority import (
+from hermes_cli.goals import (
     _REPLY_QUOTE_RE,
     _REVISION_QUOTE_MIN_CHARS,
     _REVISION_SOURCE_MAX_CHARS,
+    _get_session_db,
     _is_user_typed,
 )
 
@@ -128,7 +129,7 @@ def resolve_target(target: str) -> str:
     if not raw:
         raise ValueError("unknown_target")
     db = _db()
-    if db is None or not db.sessions.get(raw):
+    if db is None or not db.get_session(raw):
         raise ValueError("unknown_target")
     return raw
 
@@ -230,11 +231,13 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:
         return "user_quote_too_short"
+    db = _db()
+    if db is None:
+        return "user_quote_not_found"
     try:
         # Only what the conversation currently says: a rewound (/undo) instruction never authorizes.
-        rows = _read_lifecycle(
-            cursor, lambda read: read.user_messages(requester_session_id, current_only=True), [],
-        )
+        rows = db.messages_by_role(requester_session_id, "user", since=0.0, limit=500, cursor=cursor,
+                                   current_only=True)
     except Exception:
         logger.debug("current user quote lookup failed", exc_info=True)
         return "user_quote_not_found"
@@ -326,22 +329,27 @@ def _quote_names_target(quote: str, target_sid: str, *, cursor=None) -> bool:
     lowered = _normalize(quote).lower()
     if _bounded_in(target_sid.lower(), lowered):
         return True
-    def matches(read) -> bool:
-        title = _normalize(read.title(target_sid)).lower()
-        if len(title) < 3 or not _bounded_in(title, lowered):
-            return False
-        # Use the same Unicode folding for every title, including ambiguous longer titles.
-        for raw_title in read.other_titles(target_sid):
-            other = _normalize(raw_title).lower()
-            if other and _bounded_in(other, lowered) and title in other:
-                return False
-        return True
-
+    title = _normalize(_session_title(target_sid, cursor=cursor)).lower()
+    if len(title) < 3 or not _bounded_in(title, lowered):
+        return False
+    # Every other titled session is compared in Python with the same folding as the target: a SQL
+    # lower() prefilter folds only ASCII, so "CAFÉ search" would escape the ambiguity check.
+    sql = "SELECT id, title FROM sessions WHERE id != ? AND title IS NOT NULL AND title != ''"
+    params = (target_sid,)
     try:
-        return _read_lifecycle(cursor, matches, False)
+        if cursor is not None:
+            rows = cursor.execute(sql, params).fetchall()
+        else:
+            db = _db()
+            rows = db._read_all(sql, params) if db is not None else []
     except Exception:
         logger.debug("session title disambiguation failed", exc_info=True)
         return False
+    for row in rows:
+        other = _normalize(row[1] if not hasattr(row, "keys") else row["title"]).lower()
+        if other and _bounded_in(other, lowered) and title in other:
+            return False
+    return True
 
 
 # A direct instruction has a fixed shape: optional courtesy words, the action verb, a noun phrase
@@ -470,7 +478,7 @@ def _load_record(request_id: str) -> Optional[dict[str, Any]]:
     db = _db()
     if db is None:
         return None
-    raw = db.state_meta.get(_record_key(request_id))
+    raw = db.get_meta(_record_key(request_id))
     if not raw:
         return None
     try:
@@ -480,12 +488,10 @@ def _load_record(request_id: str) -> Optional[dict[str, Any]]:
 
 
 def _save_record(record: dict[str, Any], *, cursor=None) -> None:
-    key = _record_key(record["id"])
-    value = json.dumps(record, ensure_ascii=False)
-    if cursor is not None:
-        cursor.set(key, value)
-    else:
-        _db().state_meta.set(key, value)
+    db = _db()
+    if db is None:
+        raise RuntimeError("session database unavailable")
+    db.set_meta(_record_key(record["id"]), json.dumps(record, ensure_ascii=False), cursor=cursor)
 
 
 def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
@@ -566,16 +572,15 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     return receipt
 
 
-def _read_lifecycle(cursor, read, default):
-    if cursor is not None:
-        return read(cursor)
-    db = _db()
-    return db.state_meta.read_lifecycle(read) if db is not None else default
-
-
 def _session_title(session_id: str, *, cursor=None) -> str:
+    db = _db()
+    if db is None:
+        return ""
     try:
-        return _read_lifecycle(cursor, lambda read: read.title(session_id), None) or ""
+        if cursor is not None:
+            row = cursor.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return str(row[0] or "") if row else ""
+        return str(db.get_session_title(session_id) or "")
     except Exception:
         return ""
 
@@ -650,9 +655,25 @@ def _wake_session_matches(stamped_sid: str, session_id: str, *, cursor=None) -> 
     """
     if not session_id or stamped_sid == session_id:
         return True
-    return _read_lifecycle(
-        cursor, lambda read: read.has_compression_ancestor(session_id, stamped_sid), False,
-    )
+    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+
+    db = _db() if cursor is None else None
+    if cursor is None and db is None:
+        return False
+    with (db._read_ctx() if cursor is None else nullcontext(cursor)) as conn:
+        row = conn.execute(
+            f"""WITH RECURSIVE lineage(id, depth) AS (
+                SELECT ?, 0
+                UNION ALL
+                SELECT c.parent_session_id, lineage.depth + 1
+                FROM lineage JOIN sessions c ON c.id = lineage.id
+                WHERE lineage.depth < 64
+                  AND {_COMPRESSION_CHILD_SQL.format(a='c')}
+                  {_non_continuation_child_sql('c.', 'c.parent_session_id')}
+            ) SELECT 1 FROM lineage WHERE id = ? AND depth > 0 LIMIT 1""",
+            (session_id, stamped_sid),
+        ).fetchone()
+    return row is not None
 
 
 def compression_successor(session_id: str, *, cursor=None) -> Optional[str]:
@@ -663,7 +684,25 @@ def compression_successor(session_id: str, *, cursor=None) -> Optional[str]:
     one candidate child, a cycle, or a lineage deeper than the walk bound fails closed (None)."""
     if not session_id:
         return None
-    return _read_lifecycle(cursor, lambda read: read.compression_successor(session_id), None)
+    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+
+    db = _db() if cursor is None else None
+    if cursor is None and db is None:
+        return None
+    sql = (f"SELECT c.id FROM sessions c WHERE c.parent_session_id = ?\n"
+           f"  AND {_COMPRESSION_CHILD_SQL.format(a='c')}\n"
+           f"{_non_continuation_child_sql('c.', 'c.parent_session_id')} LIMIT 2")
+    current, seen = session_id, {session_id}
+    with (db._read_ctx() if cursor is None else nullcontext(cursor)) as conn:
+        for _ in range(64):
+            rows = conn.execute(sql, (current,)).fetchall()
+            if not rows:
+                return current if current != session_id else None
+            if len(rows) > 1 or rows[0][0] in seen:
+                return None
+            current = rows[0][0]
+            seen.add(current)
+    return None
 
 
 def migrated_successor(kind: str, session_id: str, stored: Any = ...) -> Optional[str]:
@@ -678,12 +717,12 @@ def migrated_successor(kind: str, session_id: str, stored: Any = ...) -> Optiona
         if db is None:
             return None
         if stored is ...:
-            raw = db.state_meta.get(_definition_key(kind, session_id))
+            raw = db.get_meta(_definition_key(kind, session_id))
             stored = json.loads(raw) if raw else None
         if isinstance(stored, dict) and stored.get("status") != "cleared":
             return None
         successor = compression_successor(session_id)
-        if not successor or not db.state_meta.get(_definition_key(kind, successor)):
+        if not successor or not db.get_meta(_definition_key(kind, successor)):
             return None
         return successor
     except Exception:
@@ -727,7 +766,7 @@ def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=
     try:
         db = _db() if cursor is None else None
         raw = _meta_value(cursor, _definition_key("goal", target_sid)) if cursor is not None else (
-            db.state_meta.get(_definition_key("goal", target_sid)) if db is not None else None
+            db.get_meta(_definition_key("goal", target_sid)) if db is not None else None
         )
         definition = json.loads(raw) if raw else None
         if not session_id and cursor is None:
@@ -800,7 +839,7 @@ def _loop_wake_matches(metadata: dict[str, Any], sid: str, *, cursor=None, requi
         if cursor is None and db is None:
             return not require_stored
         raw = _meta_value(cursor, _definition_key("loop", sid)) if cursor is not None else (
-            db.state_meta.get(_definition_key("loop", sid))
+            db.get_meta(_definition_key("loop", sid))
         )
         stored = json.loads(raw) if raw else None
     except Exception:
@@ -897,7 +936,8 @@ def refresh_goal_continuation(event: Any, session_id: str) -> Optional[str]:
 
 
 def _meta_value(cursor, key: str) -> Optional[str]:
-    return cursor.get(key)
+    row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
 
 def _definition_key(kind: str, session_id: str) -> str:
     return f"{'goal' if kind == 'goal' else 'loop'}:{session_id}"
@@ -948,8 +988,8 @@ _APPROVABLE_SOURCES = frozenset({"telegram"})
 
 def _session_source(session_id: str) -> str:
     db = _db()
-    row = db.sessions.get(session_id) if db is not None else None
-    return str((row.source if row is not None else "") or "").strip().lower()
+    row = db.get_session(session_id) if db is not None else None
+    return str((row or {}).get("source") or "").strip().lower()
 
 
 def _has_approval_surface(session_id: str) -> bool:
@@ -960,11 +1000,11 @@ def _has_gateway_route(session_id: str) -> bool:
     db = _db()
     if db is None:
         return False
-    row = db.sessions.get(session_id)
+    row = db.get_session(session_id)
     if not row:
         return False
-    source = str(row.source or "").strip().lower()
-    chat_id = row.chat_id
+    source = str(row.get("source") or "").strip().lower()
+    chat_id = row.get("chat_id")
     if not source or chat_id in (None, ""):
         return False
     try:
@@ -1038,7 +1078,7 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
         _save_record(record, cursor=conn)
         return record
 
-    return db.state_meta.write_lifecycle(create)
+    return db._execute_write(create)
 
 
 def _is_cross_session_goal_change(kind: str, action: str, target_sid: str, requester_sid: str) -> bool:
@@ -1087,7 +1127,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                 _governing_sentence(*quote_check), payload,
             )
 
-    def commit(conn, authority: dict[str, Any]) -> dict[str, Any]:
+    def commit(conn, authority: dict[str, Any], savepoint: str) -> dict[str, Any]:
         """Apply and record one immediate control while holding the SessionDB write lock."""
         if kind == "goal" and action == "replace":
             failure = _goal_replace_failure(target_sid, cursor=conn)
@@ -1095,18 +1135,19 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                 return failure
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         affected_before = _affected_text(kind, action, raw, payload)
+        conn.execute(f"SAVEPOINT {savepoint}")
+        result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
+                                authority=authority, cursor=conn)
+        manager_result = result.get("result")
         code = ""
         error = ""
         details = {}
-        with conn.savepoint() as rollback:
-            result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
-                                    authority=authority, cursor=conn)
-            manager_result = result.get("result")
-            if isinstance(manager_result, dict) and not manager_result.get("ok", True):
-                code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
-                error = manager_result.get("error") or code
-                details = {key: manager_result[key] for key in ("missing_requirements",) if key in manager_result}
-                rollback()
+        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+            code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
+            error = manager_result.get("error") or code
+            details = {key: manager_result[key] for key in ("missing_requirements",) if key in manager_result}
+            conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
         now = _now()
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                              authority=authority, status="failed" if code else "applied", now=now,
@@ -1133,10 +1174,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                 ):
                     quote, message = checked
                     authority = {"via": "quote", "quote": quote, "message": message}
-            return commit(conn, authority)
+            return commit(conn, authority, "session_control_autonomy")
 
         try:
-            return _db().state_meta.write_lifecycle(apply_autonomous)
+            return _db()._execute_write(apply_autonomous)
         except Exception as exc:
             logger.warning("autonomous %s control failed", kind, exc_info=True)
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
@@ -1147,8 +1188,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if cross_session_goal_change and not quote_matches:
         authority = {"via": "session", "session_id": str(requester_sid)}
         try:
-            return _db().state_meta.write_lifecycle(
-                lambda conn: commit(conn, authority))
+            return _db()._execute_write(
+                lambda conn: commit(conn, authority, "session_control_session"))
         except Exception as exc:
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
@@ -1185,10 +1226,11 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                                       cursor=conn):
             return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
-        return commit(conn, {"via": "quote", "quote": quote, "message": message})
+        return commit(conn, {"via": "quote", "quote": quote, "message": message},
+                      "session_control_quote")
 
     try:
-        outcome = _db().state_meta.write_lifecycle(apply)
+        outcome = _db()._execute_write(apply)
     except Exception as exc:
         return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
     if _REFUSED in outcome:
@@ -1243,22 +1285,25 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
             return record
 
         # Roll back even a partially saved manager action before persisting a failure receipt.
+        conn.execute("SAVEPOINT session_control_apply")
         try:
-            with conn.savepoint():
-                result = _manager_apply(kind, action, record["target_session_id"],
-                                        reason=record.get("reason") or "session-control",
-                                        payload=record.get("payload"), authority=record["authority"], cursor=conn)
-                manager_result = result.get("result")
-                if isinstance(manager_result, dict) and not manager_result.get("ok", True):
-                    raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
-                _bind_control_result(record, result, conn)
-                record["status"], record["error"] = "applied", None
+            result = _manager_apply(kind, action, record["target_session_id"],
+                                    reason=record.get("reason") or "session-control",
+                                    payload=record.get("payload"), authority=record["authority"], cursor=conn)
+            manager_result = result.get("result")
+            if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+                raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
+            _bind_control_result(record, result, conn)
+            record["status"], record["error"] = "applied", None
         except Exception as exc:
+            conn.execute("ROLLBACK TO session_control_apply")
             record["status"], record["error"] = "failed", str(exc)
+        finally:
+            conn.execute("RELEASE session_control_apply")
         _save_record(record, cursor=conn)
         return record
 
-    record = db.state_meta.write_lifecycle(resolve)
+    record = db._execute_write(resolve)
     if record is not None and record.get("status") == "failed":
         # Not persisted: the explanation is for the card that tapped approve, which renders it as-is.
         record["error_reason"] = control_error_reason(record.get("error"), kind=record.get("kind"))
@@ -1293,51 +1338,54 @@ def continuation_is_current(request_id: str) -> bool:
             _save_record(record, cursor=conn)
         return bool(valid)
 
-    return db.state_meta.write_lifecycle(validate)
-
-def _update_control_record(request_id: str, mutate) -> Optional[dict[str, Any]]:
-    """Update only the current approval/outbox record under the profile writer."""
-    db = _db()
-    if db is None or not request_id:
-        return None
-
-    def decide(raw):
-        try:
-            record = json.loads(raw) if raw else None
-        except (TypeError, ValueError):
-            return raw
-        if not isinstance(record, dict) or not mutate(record):
-            return raw
-        return json.dumps(record, ensure_ascii=False)
-
-    changed, saved = db.state_meta.update(_record_key(request_id), decide)
-    return json.loads(saved) if changed else None
-
+    return db._execute_write(validate)
 
 def fail_request(request_id: str, error: str) -> Optional[dict[str, Any]]:
-    """Settle a pending approval as failed so an unroutable target can notify its requester."""
-    now = _now()
+    """CAS a pending request to failed so an unroutable target can notify its requester."""
+    db = _db()
+    if db is None:
+        return None
+    key, now = _record_key(request_id), _now()
 
-    def fail(record):
+    def _fail(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
         if record.get("status") != "pending":
-            return False
-        record.update(status="failed", error=error, resolved_at=now)
-        return True
+            return None
+        record["status"], record["error"], record["resolved_at"] = "failed", error, now
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
 
-    return _update_control_record(request_id, fail)
+    return db._execute_write(_fail)
 
 
 def expire_request(request_id: str) -> Optional[dict[str, Any]]:
-    """Expire a still-pending request once its deadline has passed."""
-    now = _now()
+    """Compare-and-set one pending request to expired inside its write transaction."""
+    db = _db()
+    if db is None:
+        return None
+    key, now = _record_key(request_id), _now()
 
-    def expire(record):
+    def _expire(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
         if record.get("status") != "pending" or float(record.get("expires_at") or 0) > now:
-            return False
-        record.update(status="expired", resolved_at=now)
-        return True
+            return None
+        record["status"], record["resolved_at"] = "expired", now
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
 
-    return _update_control_record(request_id, expire)
+    return db._execute_write(_expire)
 
 
 def pending_outbox() -> list[dict[str, Any]]:
@@ -1346,12 +1394,10 @@ def pending_outbox() -> list[dict[str, Any]]:
         return []
     out = []
     now = _now()
-    for entry in db.state_meta.list_prefix(_CONTROL_PREFIX):
+    for _key, raw in db.list_meta_prefix(_CONTROL_PREFIX):
         try:
-            record = json.loads(entry.value)
+            record = json.loads(raw)
         except (TypeError, ValueError):
-            continue
-        if not isinstance(record, dict):
             continue
         if (record.get("status") in {"applied", "denied", "failed", "expired"}
                 and not record.get("outbox_done")
@@ -1368,13 +1414,24 @@ def pending_outbox() -> list[dict[str, Any]]:
 
 def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[dict[str, Any]]:
     """Atomically set an outbox delivery flag, preserving concurrent flags."""
-    def mark(record):
-        if record.get(flag) == value:
-            return False
-        record[flag] = value
-        return True
+    db = _db()
+    if db is None:
+        return None
+    key = _record_key(request_id)
 
-    return _update_control_record(request_id, mark)
+    def _mark(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        record[flag] = value
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
+
+    return db._execute_write(_mark)
 
 
 def _pause_goal(sid, reason, payload, authority, cursor=None):

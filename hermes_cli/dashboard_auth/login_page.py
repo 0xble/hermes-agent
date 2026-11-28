@@ -3,8 +3,8 @@
 Providers come from the registry; an OAuth provider renders an anchor to
 ``/auth/login?provider=<name>``, a ``supports_password`` provider renders a
 credential form wired by :data:`_PASSWORD_FORM_SCRIPT`. Styling mirrors the
-``@nous-research/ui`` design system; Oswald and Mona Sans load from Google
-Fonts and fall back to the system sans when it is unreachable.
+``@nous-research/ui`` design system; fonts load from the SPA's ``/fonts/``
+mount, which the gate allowlists pre-auth.
 
 The ``class="provider-btn"`` anchor is test-stable: the suite extracts its
 href to walk the OAuth flow.
@@ -24,10 +24,37 @@ _LOGIN_HTML_TEMPLATE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in — Hermes Agent</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@200..900&amp;family=Oswald:wght@200..700&amp;display=swap">
 <style>
+  /* Brand fonts shipped by @nous-research/ui — same files the SPA loads. */
+  @font-face {{
+    font-family: 'Collapse';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
+  }}
+  @font-face {{
+    font-family: 'Collapse';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/fonts/Collapse-Bold.woff2') format('woff2');
+  }}
+  @font-face {{
+    font-family: 'Rules Compressed';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/RulesCompressed-Regular.woff2') format('woff2');
+  }}
+  @font-face {{
+    font-family: 'Rules Compressed';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
+  }}
+
   :root {{
     --background-base: #170d02;
     --background: #170d02;
@@ -45,7 +72,7 @@ _LOGIN_HTML_TEMPLATE = """\
     min-height: 100%;
     background: var(--background-base);
     color: var(--foreground);
-    font-family: 'Mona Sans', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
@@ -96,7 +123,7 @@ _LOGIN_HTML_TEMPLATE = """\
   .brand {{
     text-align: center;
     margin-bottom: 1.75rem;
-    font-family: 'Oswald', system-ui, sans-serif;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600;
     font-size: 1.05rem;
     letter-spacing: 0.32em;
@@ -128,7 +155,7 @@ _LOGIN_HTML_TEMPLATE = """\
 
   h1 {{
     margin: 0 0 0.4rem;
-    font-family: 'Oswald', system-ui, sans-serif;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600;
     font-size: 1.85rem;
     letter-spacing: 0.05em;
@@ -157,7 +184,7 @@ _LOGIN_HTML_TEMPLATE = """\
     text-align: center;
     background: var(--midground);
     color: var(--background-base);
-    font-family: 'Mona Sans', system-ui, sans-serif;
+    font-family: 'Collapse', sans-serif;
     font-weight: 700;
     font-size: 0.78rem;
     letter-spacing: 0.2em;
@@ -191,7 +218,7 @@ _LOGIN_HTML_TEMPLATE = """\
     text-align: left;
   }}
   .form-title {{
-    font-family: 'Oswald', system-ui, sans-serif;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600;
     font-size: 0.72rem;
     letter-spacing: 0.18em;
@@ -216,7 +243,7 @@ _LOGIN_HTML_TEMPLATE = """\
     color: var(--foreground);
     border: 1px solid var(--hairline-strong);
     border-radius: 0;
-    font-family: 'Mona Sans', system-ui, sans-serif;
+    font-family: 'Collapse', sans-serif;
     font-size: 0.95rem;
   }}
   .field-input:focus-visible {{
@@ -284,10 +311,21 @@ _EMPTY_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign-in unavailable — Hermes Agent</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@200..900&amp;family=Oswald:wght@200..700&amp;display=swap">
 <style>
+  @font-face {
+    font-family: 'Collapse';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/Collapse-Regular.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'Rules Compressed';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('/fonts/RulesCompressed-Medium.woff2') format('woff2');
+  }
   :root {
     --background-base: #170d02;
     --midground: #ffac02;
@@ -299,7 +337,7 @@ _EMPTY_HTML = """\
     margin: 0; padding: 0; min-height: 100%;
     background: var(--background-base);
     color: var(--foreground);
-    font-family: 'Mona Sans', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px; line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
@@ -319,7 +357,7 @@ _EMPTY_HTML = """\
   }
   h1 {
     margin: 0 0 1rem;
-    font-family: 'Oswald', system-ui, sans-serif;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600; font-size: 1.5rem;
     letter-spacing: 0.05em; text-transform: uppercase;
     color: var(--midground);
@@ -360,9 +398,6 @@ _TOKEN_MODE_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Token-gated dashboard — Hermes Agent</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@200..900&amp;family=Oswald:wght@200..700&amp;display=swap">
 <style>
   :root {
     --background-base: #170d02;
@@ -375,7 +410,7 @@ _TOKEN_MODE_HTML = """\
     margin: 0; padding: 0; min-height: 100%;
     background: var(--background-base);
     color: var(--foreground);
-    font-family: 'Mona Sans', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: 'Collapse', system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     font-size: 16px; line-height: 1.5;
     -webkit-font-smoothing: antialiased;
   }
@@ -395,7 +430,7 @@ _TOKEN_MODE_HTML = """\
   }
   h1 {
     margin: 0 0 1rem;
-    font-family: 'Oswald', system-ui, sans-serif;
+    font-family: 'Rules Compressed', 'Collapse', sans-serif;
     font-weight: 600; font-size: 1.5rem;
     letter-spacing: 0.05em; text-transform: uppercase;
     color: var(--midground);
@@ -527,7 +562,8 @@ def render_login_html(*, next_path: str = "", prefix: str = "") -> str:
         password_script=_PASSWORD_FORM_SCRIPT if needs_password_script else "",
     )
     # Inject the reverse-proxy prefix so the password-login JS can read
-    # it from the <main> element's data attribute.  ``str.replace`` after ``str.format``
+    # it from the <main> element's data attribute, and rewrite the font
+    # URLs to stay inside the mount.  ``str.replace`` after ``str.format``
     # avoids interfering with the CSS ``{{ }}`` doubling in the template.
     return _apply_proxy_prefix(html_out, prefix)
 
@@ -535,15 +571,21 @@ def render_login_html(*, next_path: str = "", prefix: str = "") -> str:
 def _apply_proxy_prefix(html_out: str, prefix: str) -> str:
     """Rewrite a rendered login-family page for a reverse-proxy sub-path.
 
-    A no-op when *prefix* is empty (bare-root deploys are byte-for-byte
-    unaffected): ``<main>`` gains ``data-prefix`` so the password-login JS (a
-    plain string, never ``str.format``-aware) can prepend the prefix to its
-    fetch target and post-login landing. The fonts are absolute Google Fonts
-    URLs and need no rewrite.
+    Two rewrites, both no-ops when *prefix* is empty (bare-root deploys are
+    byte-for-byte unaffected):
+
+    * ``<main>`` gains ``data-prefix`` so the password-login JS (a plain
+      string, never ``str.format``-aware) can prepend the prefix to its
+      fetch target and post-login landing.
+    * ``@font-face`` ``url('/fonts/...')`` becomes ``url('<prefix>/fonts/...')``
+      so the fonts load from the mount instead of the origin root (404
+      behind a prefix-stripping proxy).
     """
     if not prefix:
         return html_out
-    return html_out.replace("<main>", f'<main data-prefix="{prefix}">', 1)
+    html_out = html_out.replace("<main>", f'<main data-prefix="{prefix}">', 1)
+    html_out = html_out.replace("url('/fonts/", f"url('{prefix}/fonts/")
+    return html_out
 
 
 def render_native_provider_choice_html(
@@ -554,7 +596,7 @@ def render_native_provider_choice_html(
 
     Every link re-enters ``/auth/native/authorize`` with the SAME desktop PKCE inputs plus an
     explicit ``provider``, so the choice never leaves the validated native flow. ``prefix``
-    (from ``X-Forwarded-Prefix``) marks the page so it works behind
+    (from ``X-Forwarded-Prefix``) rewrites the template's font URLs so the page works behind
     a reverse-proxy sub-path; the buttons' ``authorize_path`` is already prefixed by the caller.
     """
     common = {"code_challenge": code_challenge, "code_challenge_method": code_challenge_method,

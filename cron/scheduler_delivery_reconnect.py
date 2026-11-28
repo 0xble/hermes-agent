@@ -24,12 +24,8 @@ def queue_for_live_reconnect(
     try:
         from gateway.delivery_ledger import (
             compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
-        from cron.scheduler_delivery_standalone import _PRE_SEND_LIVE_REJECTIONS
-        # Retryable = reconnect-only, or a pre-send rejection the adapter itself marked retryable
-        # (``SendResult.retryable``): the same wording with retryable=False is a permanent fatal.
-        retryable_live_rejection = is_reconnect_only(t.live_error) or (
-            t.live_retryable is True and t.live_error in _PRE_SEND_LIVE_REJECTIONS)
-        if not retryable_live_rejection or not ledger_enabled():
+        if not (is_reconnect_only(t.live_error)
+                or (t.live_retryable is True and t.live_error in _PRE_SEND_LIVE_REJECTIONS)) or not ledger_enabled():
             return
         session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
         job_ref = f"job:{t.job.get('id', '?')}"

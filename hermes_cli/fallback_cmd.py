@@ -14,27 +14,22 @@ from hermes_cli.fallback_config import get_fallback_chain
 # Normalized fallback chain (merges legacy ``fallback_model``); always a fresh copy.
 _read_chain = get_fallback_chain
 
-
 _MISSING_ACTIVE_PROVIDER = object()
-
 
 def _identity(entry: dict[str, Any]):
     """BackendIdentity for a ``{provider, model, base_url?}`` entry."""
     from agent.backend_identity import BackendIdentity
     return BackendIdentity.build(provider=entry.get("provider"), model=entry.get("model"), base_url=entry.get("base_url"))
 
-
 def _write_chain(config: dict[str, Any], chain: list[dict[str, Any]]) -> None:
     """Persist the chain to ``fallback_providers``; drop the legacy key so there is one source of truth."""
     config["fallback_providers"] = chain
     config.pop("fallback_model", None)
 
-
 def _format_entry(entry: dict[str, Any]) -> str:
     """One-line human-readable rendering of a fallback entry."""
     base = entry.get("base_url")
     return f"{entry.get('model', '?')}  (via {entry.get('provider', '?')}){f'  [{base}]' if base else ''}"
-
 
 def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[dict[str, Any]]:
     """Pull the ``{provider, model, base_url?, api_mode?}`` dict from a ``config["model"]`` snapshot."""
@@ -48,7 +43,6 @@ def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[dict[str, Any]]
     entry.update({key: value for key in ("base_url", "api_mode") if (value := (model_cfg.get(key) or "").strip())})
     return entry
 
-
 def _snapshot_auth_active_provider() -> Any:
     """Return the current ``active_provider`` in auth.json."""
     from hermes_cli.auth import _auth_store_lock, _load_auth_store
@@ -56,7 +50,6 @@ def _snapshot_auth_active_provider() -> Any:
     with _auth_store_lock():
         store = _load_auth_store()
         return store.get("active_provider", _MISSING_ACTIVE_PROVIDER)
-
 
 def _restore_auth_active_provider(value: Any) -> None:
     """Write back a previously snapshotted ``active_provider`` value."""
@@ -70,7 +63,6 @@ def _restore_auth_active_provider(value: Any) -> None:
             store["active_provider"] = value
         _save_auth_store(store)
 
-
 def _restore_model_cfg(model_before: Any) -> None:
     """Restore ``config["model"]`` to a previously-captured snapshot."""
     from hermes_cli.config import load_config, save_config
@@ -79,7 +71,6 @@ def _restore_model_cfg(model_before: Any) -> None:
     if model_before is not None:
         cfg["model"] = copy.deepcopy(model_before)
     save_config(cfg)
-
 
 def _restore_primary_route(model_before: Any, active_provider_before: Any) -> None:
     """Attempt both halves of temporary picker-route restoration."""
@@ -96,15 +87,12 @@ def _restore_primary_route(model_before: Any, active_provider_before: Any) -> No
         details = "; ".join(str(exc) for exc in errors)
         raise RuntimeError(f"Could not fully restore the primary route: {details}") from errors[0]
 
-
 def _entries(n: int) -> str:
     return f"{n} {'entry' if n == 1 else 'entries'}"
-
 
 def _print_chain(heading: str, chain: list[dict[str, Any]]) -> None:
     print(f"  {heading} ({_entries(len(chain))}):")
     print("".join(f"    {i}. {_format_entry(entry)}\n" for i, entry in enumerate(chain, 1)))
-
 
 def _load_chain(empty_message: str):
     """Load config + chain; print ``empty_message`` block and return ``(config, None)`` when empty."""
@@ -115,7 +103,6 @@ def _load_chain(empty_message: str):
         print(f"\n{empty_message}\n")
     return config, chain or None
 
-
 def _describe_primary(config: dict[str, Any]) -> Optional[str]:
     """One-line description of the primary model for display purposes."""
     model_cfg = config.get("model")
@@ -124,7 +111,6 @@ def _describe_primary(config: dict[str, Any]) -> Optional[str]:
         model = (model_cfg.get("default") or model_cfg.get("model") or "?").strip() or "?"
         return f"{model}  (via {provider})"
     return model_cfg.strip() or None if isinstance(model_cfg, str) else None
-
 
 def cmd_fallback_list(args) -> None:
     """Print the current fallback chain."""
@@ -138,7 +124,6 @@ def cmd_fallback_list(args) -> None:
     _print_chain("Fallback chain", chain)
     print("  Tried in order when the primary fails (rate-limit, 5xx, connection errors).")
     print("  Docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers\n")
-
 
 def cmd_fallback_add(args) -> None:
     """Launch the same picker as `hermes model`, then append the selection to the chain."""
@@ -195,7 +180,6 @@ def cmd_fallback_add(args) -> None:
     print(f"  Chain is now {_entries(len(chain))} long.\n")
     print("  Run `hermes fallback list` to view, or `hermes fallback remove` to delete.")
 
-
 def cmd_fallback_remove(args) -> None:
     """Pick an entry from the chain and remove it."""
     from hermes_cli.config import save_config
@@ -214,7 +198,6 @@ def cmd_fallback_remove(args) -> None:
     save_config(config)
     print(f"\n  Removed fallback: {_format_entry(removed)}")
     print(f"  Chain is now {_entries(len(chain))} long.\n" if chain else "  Fallback chain is now empty.\n")
-
 
 def cmd_fallback_clear(args) -> None:
     """Remove all fallback entries (with confirmation)."""
@@ -235,7 +218,6 @@ def cmd_fallback_clear(args) -> None:
     _write_chain(config, [])
     save_config(config)
     print("\n  Fallback chain cleared.\n")
-
 
 def cmd_fallback_status(args) -> None:
     """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
@@ -263,7 +245,6 @@ def cmd_fallback_status(args) -> None:
             f"backoff {record.get('backoff_count', 0)})"
         )
     print()
-
 
 def cmd_fallback_cooldowns_clear(args) -> None:
     """Clear shared primary cooldowns: ``--all``, or one exact ``provider/model`` or model.
@@ -294,14 +275,12 @@ def cmd_fallback_cooldowns_clear(args) -> None:
             print(f"  Cleared: {record.get('model', '?')} via {record.get('provider', '?')}")
     print("\n  Running agents retry the primary at their next turn start.\n")
 
-
 def cmd_fallback_cooldowns(args) -> None:
     """Dispatch ``hermes fallback cooldowns [clear]``; listing is the default."""
     if getattr(args, "cooldowns_command", None) == "clear":
         cmd_fallback_cooldowns_clear(args)
     else:
         cmd_fallback_status(args)
-
 
 def cmd_fallback(args) -> None:
 
@@ -312,7 +291,6 @@ def cmd_fallback(args) -> None:
         print("Use one of: list, add, remove, clear, status, cooldowns, check")
         raise SystemExit(2)
     handler(args)
-
 
 _SUBCOMMANDS = {
     **dict.fromkeys((None, "", "list", "ls"), cmd_fallback_list), "add": cmd_fallback_add,

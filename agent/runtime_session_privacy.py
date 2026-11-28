@@ -2,7 +2,6 @@
 from contextlib import contextmanager
 import json
 
-
 def open_public_outbox(store):
     from agent.runtime_session_store import WorkerPersistenceError
     from gateway.status import _try_acquire_file_lock
@@ -26,7 +25,6 @@ def open_public_outbox(store):
             raise
         return owner
 
-
 def _require_public(scope, journal=None, operation=None, payload=None):
     from agent.runtime_session_store import WorkerPersistenceError
     from hermes_state_runtime import RuntimeStoreError
@@ -44,7 +42,6 @@ def _require_public(scope, journal=None, operation=None, payload=None):
     except RuntimeStoreError as exc:
         raise WorkerPersistenceError(exc.reason) from None
 
-
 @contextmanager
 def journal_admission(scope, journal=None, *, operation=None, payload=None):
     # Never hold this gate over RPC: owner writers acquire DB lock, then shared gate.
@@ -52,7 +49,6 @@ def journal_admission(scope, journal=None, *, operation=None, payload=None):
     with persistence_admission():
         _require_public(scope, journal, operation, payload)
         yield
-
 
 def private_convenience(scope):
     """Only the normal transcript/usage no-op surfaces suppress local privacy refusal."""
@@ -65,12 +61,10 @@ def private_convenience(scope):
         raise
     return False
 
-
 def authoritative_privacy_denial(exc):
     from agent.runtime_session_store import WorkerPersistenceError
     from hermes_state_runtime import RuntimeStoreError
     return isinstance(exc, (WorkerPersistenceError, RuntimeStoreError)) and str(exc) == 'privacy_denied'
-
 
 def discard_refused_entry(store, entry):
     # The owner explicitly refused BEFORE commit. This is not an ambiguous transport
@@ -79,7 +73,6 @@ def discard_refused_entry(store, entry):
     store._save(candidate, skip_privacy=True)
     store.journal = candidate
     store.failure = None
-
 
 def queue_entry(store, operation, payload, *, best_effort):
     from agent.runtime_session_store import WorkerPersistenceError

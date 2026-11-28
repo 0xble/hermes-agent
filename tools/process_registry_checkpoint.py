@@ -20,10 +20,7 @@ class ProcessCheckpointMixin:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(
-        self, extra_entries: Optional[list[dict[str, Any]]] = None, *,
-        required: bool = False, deadline: Optional[float] = None,
-    ):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, *, required: bool = False):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
         from tools.process_registry_ssh import binding_record
@@ -31,7 +28,7 @@ class ProcessCheckpointMixin:
 
         # A hosted caller only changes its own agent's records, which are never persisted here, so
         # it has no host change to write: it neither takes the lock nor rewrites this host's file.
-        if hosted_scope() is not None or (deadline is not None and time.monotonic() >= deadline):
+        if hosted_scope() is not None:
             return
         from agent.runtime_session_store import is_worker_process
         # Every interpreter on the home writes this file; ``hermes update --force`` sweeps only what
@@ -76,13 +73,8 @@ class ProcessCheckpointMixin:
             # Every interpreter of the profile (owner, each managed worker) rewrites this file from
             # its own table; a worker's output-log handoff is its only path to the next one, so a
             # writer keeps the handoffs it does not track (read-merge-write under one file lock).
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            with _FileLock(path.with_name(path.name + ".lock"), **({"timeout": remaining} if remaining is not None else {})):
-                if deadline is not None and time.monotonic() >= deadline:
-                    return
+            with _FileLock(path.with_name(path.name + ".lock")):
                 entries.extend(self._foreign_handoffs(path, known))
-                if deadline is not None and time.monotonic() >= deadline:
-                    return
                 atomic_json_write(path, entries)
         except Exception as e:
             if required:

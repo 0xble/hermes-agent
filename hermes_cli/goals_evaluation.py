@@ -29,7 +29,7 @@ def _read_goal(session_id: str, db: SessionDB) -> GoalState | None:
     try:
         if goal_autonomy_enabled():
             return load_goal(session_id, db=db)
-        raw = db.state_meta.get(_meta_key(session_id))
+        raw = db.get_meta(_meta_key(session_id))
         return GoalState.from_json(raw) if raw else None
     except Exception as exc:
         raise GoalEvaluationPersistenceError from exc
@@ -56,8 +56,8 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
     from hermes_cli.goals import GoalState, _meta_key
 
     def commit(cursor):
-        raw = cursor.get(_meta_key(session_id))
-        if not raw or GoalState.from_json(raw).to_json() != expected:
+        row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+        if not row or not row[0] or GoalState.from_json(row[0]).to_json() != expected:
             raise GoalEvaluationConflict
         if precondition is not None:
             precondition(cursor)
@@ -65,10 +65,10 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
         validate_peer_completion(state)
         if state.to_json() != expected:
             state.mutation_id = uuid.uuid4().hex
-            cursor.set(_meta_key(session_id), state.to_json())
+            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
 
     try:
-        db.state_meta.write_lifecycle(commit)
+        db._execute_write(commit)
     except GoalEvaluationConflict:
         raise
     except Exception as exc:

@@ -488,9 +488,6 @@ def batch_route_chain(child_agents: list) -> list[tuple[str, str, str]]:
 
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
-    from urllib.parse import urlsplit
-
-    from agent.shared_primary_cooldown import route_from_agent, route_from_record
     from tools.async_delegation import dispatch_async_delegation_batch
     unit_id = unit_id or _new_delegation_id()
     child_agents = [c for (_, _, c) in unit.children]
@@ -521,22 +518,13 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     def _cancel_queued(reason: str = "Queued delegation cancelled"):
         _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
 
+    from agent.shared_primary_cooldown import route_from_agent, route_from_record
     # Children can run on different routes (model-map options), so every child's primary and
     # fallbacks belong in the chain; otherwise the retry misses a sibling's recovering route.
     routes = [route_from_agent(child) for child in child_agents]
     routes += [route_from_record(entry) for child in child_agents
                for entry in (getattr(child, "_fallback_chain", None) or []) if isinstance(entry, dict)]
-    # Configured URLs can carry userinfo or query credentials. Keep those routes
-    # out of the delegation ledger and rely on provider hints for their backoff.
-    route_chain = []
-    for provider, url, model in dict.fromkeys(routes):
-        try:
-            endpoint = urlsplit(url)
-        except ValueError:
-            continue
-        if not url or (endpoint.scheme in {"http", "https"} and endpoint.hostname
-                       and endpoint.username is None and not endpoint.query):
-            route_chain.append((provider, url, model))
+    route_chain = list(dict.fromkeys(routes))
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
@@ -591,8 +579,6 @@ def _dispatch_background(batch: _Batch) -> str:
         oneshot_session=getattr(batch.parent_agent, "_oneshot_session", None) is True,  # agent_is_oneshot's pin
     )
     if wake_sid is None:  # (a detached-only continue checked this before building its child)
-        if batch.detached_only:
-            return _refuse_detached_only(batch, "this session cannot receive detached completions")
         if rejection := _reject_inline_recovery(batch):
             return rejection
         logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")

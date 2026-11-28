@@ -189,10 +189,6 @@ class TurnContext:
         if self._card_recorder is not None:
             self._card_recorder(message_id)
 
-    def track_cleanup_id(self, message_id: str) -> None:
-        """Keep a temporary progress card in this turn's cleanup list."""
-        self._cleanup_msg_ids.append(message_id)
-
     @property
     def _status_adapter(self) -> Any:
         """The adapter that answers the turn NOW. A reconnect replaces the platform's adapter while a
@@ -210,6 +206,7 @@ class TurnContext:
     def bind_status_adapter(self, resolve: Callable[[], Any]) -> None:
         """Pin the adapter that answers the turn now, and keep *resolve* to re-ask at every send."""
         self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
+
     def bind_agent_lifetime(self, agent: Any) -> None:
         """Keep only drain fences on the agent, never the entire turn context. A soft machine-turn
         preemption aimed at an earlier turn is dropped here, before this turn can run the agent."""

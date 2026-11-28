@@ -884,19 +884,6 @@ class GatewayConfigLoadersMixin:
         return value
 
     @classmethod
-    def _load_restart_delegation_timeout(cls) -> float:
-        """Live background-delegation wait cap for in-band restart in seconds."""
-        from gateway.run import _load_gateway_config
-        env_raw = os.getenv("HERMES_RESTART_DELEGATION_TIMEOUT")
-        raw = env_raw if env_raw is not None and str(env_raw).strip() != "" else cfg_get(
-            _load_gateway_config(), "gateway", "restart_delegation_timeout", default=None,
-        )
-        value = parse_restart_delegation_timeout(raw)
-        if raw is not None and str(raw).strip() != "":
-            cls._warn_unparsable_timeout("gateway.restart_delegation_timeout", raw, DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT)
-        return value
-
-    @classmethod
     def _load_cron_drain_timeout(cls) -> float:
         """The cron and api_server (/v1) floor under the stop()/drain wait.
 

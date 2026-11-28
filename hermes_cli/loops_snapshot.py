@@ -35,9 +35,12 @@ def _read_loop(session_id: str, db: Any, cursor: Any = None) -> LoopState | None
     try:
         if cursor is not None:
             # A cursor owner holds the write lock; a separate SessionDB read would deadlock.
-            raw = cursor.get(_meta_key(session_id))
+            row = cursor.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)
+            ).fetchone()
+            raw = row[0] if row else None
         else:
-            raw = db.state_meta.get(_meta_key(session_id))
+            raw = db.get_meta(_meta_key(session_id))
         return LoopState.from_json(raw) if raw else None
     except Exception as exc:
         if cursor is not None:

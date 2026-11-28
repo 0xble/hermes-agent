@@ -376,14 +376,13 @@ def _typed_user_message_records_since(session_id: Optional[str], since: float = 
                                       limit: int = 500) -> list[dict[str, Any]]:
     """Newest-first active typed user rows; withdrawn and summarized-away rows cannot authorize."""
     db = _facade()._get_session_db()
-    if not session_id or db is None:
+    reader = getattr(db, "get_messages", None) if db is not None else None
+    if not session_id or reader is None:
         return []
     try:
-        # Active-only reads preserve carried compaction copies and exclude rewound rows.
-        rows = [
-            dict(row.as_wire_row(), compressed_summary=row.compressed_summary)
-            for row in db.messages.read_transcript(session_id)
-        ]
+        # Replay's active-only accessor preserves carried compaction copies, but never revives
+        # rewind/Undo rows or soft-archived originals. Select typed input before applying its limit.
+        rows = reader(session_id, include_inactive=False, include_compacted=False)
     except Exception as exc:  # health: allow BLE001 -- malformed or unavailable session rows must fail closed for authority
         logger.debug("goal revise: user message read failed: %s", exc)
         return []

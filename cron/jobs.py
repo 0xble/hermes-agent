@@ -2075,7 +2075,6 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
-    "priority": _normalize_priority,
     "wrap_response": normalize_wrap_response,
     "priority": _normalize_priority,
 }
@@ -2096,7 +2095,6 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
-    "priority": _normalize_priority,
     "wrap_response": normalize_wrap_response,
     "priority": _normalize_priority,
 }

@@ -94,10 +94,9 @@ class GatewayHomeShutdownNoticeMixin:
         )
 
     async def _notify_home_channels_of_shutdown(
-        self, shutdown_message, notified: set, delivered: set, *, skip_reason: Optional[str],
-        private_topic_parents: Optional[set] = None,
+        self, msg: str, notified: set, delivered: set, *, skip_reason: Optional[str]
     ) -> None:
-        """Send ``shutdown_message(adapter)`` to EVERY served profile's home channel through that profile's OWN bot.
+        """Send ``msg`` to EVERY served profile's home channel through that profile's OWN bot.
 
         ``notified`` holds the targets the active-session pass already handled; ``delivered`` the subset
         that really got the notice (a home among them is owed "online" like one this pass reaches). ``self.adapters`` and
@@ -106,7 +105,6 @@ class GatewayHomeShutdownNoticeMixin:
         (_handle_fatal) that pops the adapter -> "dictionary changed size during iteration".
         """
         from gateway.run import _async_profile_runtime_scope
-        from gateway.config import Platform
         from gateway.run_shutdown import _delivery_target_key
         from gateway.warning_notifications import present_notification
 
@@ -115,7 +113,6 @@ class GatewayHomeShutdownNoticeMixin:
         if skip_reason is not None:
             logger.info("Home-channel shutdown broadcast suppressed: %s", skip_reason)
             return
-        private_topic_parents = private_topic_parents or set()
         profile_adapters = getattr(self, "_profile_adapters", None) or {}
         for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
             home = platform_cfg.home_channel
@@ -124,13 +121,8 @@ class GatewayHomeShutdownNoticeMixin:
             adapter = (self.adapters if profile is None else profile_adapters.get(profile) or {}).get(platform)
             if adapter is None or not self._notice_allowed(platform, "home channel", platform_cfg):
                 continue
-            _, delivery_profile = self._owning_profile(adapter, platform)
-            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=delivery_profile)
-            # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
-            if dedup_key in notified or (
-                platform == Platform.TELEGRAM and home.thread_id is None
-                and (id(adapter), str(home.chat_id)) in private_topic_parents
-            ):
+            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
+            if dedup_key in notified:
                 continue
             try:
                 metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
@@ -143,8 +135,7 @@ class GatewayHomeShutdownNoticeMixin:
             async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata,
                                  dedup_key=dedup_key):
                 if await self._send_shutdown_notice(
-                    adapter, str(home.chat_id), shutdown_message(adapter), "home channel", platform.value,
-                    **({"metadata": metadata} if metadata else {}),
+                    adapter, str(home.chat_id), msg, "home channel", platform.value, metadata=metadata,
                 ):
                     notified.add(dedup_key)
                     self._home_shutdown_notice = HOME_NOTICE_SENT

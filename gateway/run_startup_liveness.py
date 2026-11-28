@@ -17,9 +17,7 @@ def start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
 
     See #69089.
     """
-    from gateway.shutdown_watchdog import (
-        _arm_loop_floor_timer, session_store_lock_snapshot, start_loop_liveness_watchdog,
-    )
+    from gateway.shutdown_watchdog import _arm_loop_floor_timer, session_store_lock_snapshot, start_loop_liveness_watchdog
     from gateway.run import _load_gateway_config
     from hermes_state_loop_guard import install_from_config
     install_from_config(_load_gateway_config())  # gateway.sessiondb_loop_guard (debug, default off)

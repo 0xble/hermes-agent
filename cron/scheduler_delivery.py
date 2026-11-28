@@ -16,7 +16,6 @@ import logging
 import os
 import time
 import threading
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -66,6 +65,10 @@ _HOME_TARGET_PRIORITY = (
 _LEGACY_HOME_TARGET_ENV_VARS = {"QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL"}
 
 
+
+
+
+
 def _fresh_thread_overrides_origin_topic(pconfig) -> bool:
     """``platforms.<p>.extra.cron_fresh_thread_per_run: true``: a continuable job created inside a
     topic/thread opens a fresh thread per run instead of delivering back to its origin topic
@@ -84,6 +87,24 @@ def _origin_thread_is(job: dict, thread_id) -> bool:
     return origin_thread is not None and str(origin_thread) == str(thread_id)
 
 
+def _resolve_origin(job: dict) -> Optional[dict]:
+    """Extract origin info from a job. Non-dict origins (provenance strings, hand-edited
+    jobs.json) are treated as missing — otherwise every fire crashed on ``origin.get``.
+
+    Without this guard, a job tagged with e.g. ``"combined-digest-replaces-x-and-y"`` crashed every fire
+    attempt with ``'str' object has no attribute 'get'`` — ``mark_job_run`` recorded the failure, but the
+    next tick re-loaded the same poisoned origin and crashed identically until the field was patched
+    manually (#18722).
+    """
+    origin = job.get("origin")
+    if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+        # Jobs stamped before non-push origins stopped being captured (#69304): the api_server
+        # adapter's send() is a stub, so honouring this origin fails every fire with
+        # last_status=ok. Treat it as missing so deliver=origin takes the home-channel fallback.
+        if str(origin["platform"]).lower() in _NON_PUSH_ORIGIN_PLATFORMS:
+            return None
+        return origin
+    return None
 
 
 
@@ -620,21 +641,6 @@ def _delivery_lane_value(job: dict, *, for_failure: bool = False):
     return job.get("deliver", "local")
 
 
-def _snapshot_delivery_job(job: Mapping[str, Any]) -> dict[str, Any]:
-    """Capture the fields used by normal target resolution so mid-run edits do not affect hooks."""
-    snapshot: dict[str, Any] = {
-        "id": str(job["id"]),
-        "name": str(job.get("name") or job["id"]),
-    }
-    if "deliver" in job:
-        deliver = job["deliver"]
-        snapshot["deliver"] = list(deliver) if isinstance(deliver, (list, tuple)) else deliver
-    if "origin" in job:
-        origin = job["origin"]
-        snapshot["origin"] = dict(origin) if isinstance(origin, Mapping) else origin
-    return snapshot
-
-
 def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> list[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
@@ -777,7 +783,6 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
               if receipt["status"] in ("queued", "claimed")} or None
     values = {key: value for key, value in {
         "last_delivery_unverified": new_value, "last_delivery_queued": queued,
-        "last_delivery_formatting_degraded": list(job.get("_formatting_degraded_targets") or []) or None,
         "last_delivery_reached_none": job.pop("_delivery_reached_none", None) or None,
         "last_delivery_formatting_degraded": list(job.get("_formatting_degraded_targets") or []) or None,
     }.items() if (job.get(key) or None) != value}
@@ -819,8 +824,6 @@ class _TargetDelivery:
     live_adapter_ready: bool = False
     force_document: bool = False  # [[as_document]]: images go unrecompressed
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
-    live_delivered_text: bool = False
-    live_delivered_copy_count: int = 0
     # The adapter's SendResult.retryable verdict for live_error (carried by DeliverySendError on the
     # exception arm, read off the SendResult on the unconfirmed arm). The string alone is ambiguous —
     # Telegram's "Not connected" is retryable while the bot client rebuilds, permanent when the fatal
@@ -1039,8 +1042,6 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    import contextvars as _cv, functools as _ft  # chunk ids tagged at send end, in THIS profile
-    record_ids = _ft.partial(_cv.copy_context().run, record_cron_delivery, t.platform_name, t.chat_id, text_to_send)
     flood_waited = 0.0
     reconnect_waited = 0.0
     reconnect_attempt = 0
@@ -1512,38 +1513,20 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        # A partial split send: replies to the chunks that landed are framed as a past report too.
-        record_cron_delivery(t.platform_name, t.chat_id, content.strip(), result or {})
-        # A partial send's head is on screen at this target, so the run did reach someone; so may
-        # a send whose answer was lost (explicit ``uncertain``, or no result at all: timeout, raise).
-        reached_target = (
-            partial or delivered_text or delivered_copy_count > 0
-            or (t.standalone_in_flight and (result is None or result.get("delivery") == "uncertain")))
+        # A timeout or an exception after request dispatch is ambiguous. The send implementation
+        # marks the target in flight, so treat it as reached and never replay it. Preserve any
+        # chunk receipts before returning so replies to landed chunks retain cron framing.
+        record_cron_delivery(t.platform_name, t.chat_id, content.strip(), result)
         if t.standalone_in_flight:
-            # The failed payload may be on screen (in full or in part, e.g. a timeout or lost answer):
-            # queueing it would let the redelivery sweep post it twice. Possible loss over certain
-            # duplication, so surface the window loudly. Payloads never attempted are still queued.
-            logger.warning(
-                "Job '%s': NOT queueing the in-flight payload for %s for post-reconnect redelivery — "
-                "the standalone send may have delivered it; a replay could duplicate it",
-                job["id"], t.where)
-            pending_copies = (copy_blocks or [])[delivered_copy_count + int(is_copy_block):]
-            pending_media = [] if payload_media else media_files
-            if pending_copies or pending_media:
-                reconnect.queue_for_live_reconnect(
-                    t, "", pending_media, delivery_errors, copy_blocks=pending_copies,
-                )
-            return reached_target
-        # A satellite profile's worker has no platform token, so standalone cannot stand in for a
-        # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        reconnect.queue_for_live_reconnect(
-            t,
-            "" if delivered_text else content,
-            media_files,
-            delivery_errors,
-            copy_blocks=(copy_blocks or [])[delivered_copy_count:],
-        )
-        return reached_target
+            logger.warning("Job '%s': not queueing ambiguous standalone failure for %s", job["id"], t.where)
+            return True
+        # A definite pre-send failure may be safely handed back to the live reconnect ledger.
+        remaining_copy_blocks = (copy_blocks or [])[delivered_copy_count + (1 if err is not None and last_is_copy_block else 0):]
+        if (content and not delivered_text) or remaining_copy_blocks or (media_files and last_is_copy_block):
+            _queue_for_live_reconnect(
+                t, "" if copy_blocks or delivered_text else content, media_files, delivery_errors,
+                copy_blocks=remaining_copy_blocks)
+        return False
     _mark_formatting_degraded(t)
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
@@ -1678,6 +1661,29 @@ def _uses_external_delivery_queue(job: dict, adapters, targets: list, external_e
         and external_execution == str(job.get("execution_id") or "")
         and any(target["platform"] not in (BOT_CHAT_PLATFORM, ROOM_PLATFORM) for target in targets)
     )
+
+
+def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
+    """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
+    origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
+    an error string."""
+    deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
+    if deliver_value == "local":
+        return None
+    if deliver_value == "origin":
+        logger.info(
+            # deliver=origin with no resolvable origin and no configured home channels: treat as local
+            # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
+            # so failing here would make every CLI `deliver=origin` (or auto-detect) job emit a spurious "no
+            # delivery target resolved" error on every run (#43014). The output is still persisted in
+            # last_output for `cron list`/resume.
+            "Job '%s': deliver=origin but no origin or home channels — "
+            "skipping delivery (output saved in last_output)",
+            job.get("name", job.get("id", "?")))
+        return None
+    msg = f"no delivery target resolved for deliver={deliver_value}"
+    logger.warning("Job '%s': %s", job["id"], msg)
+    return msg
 
 
 def _should_wrap_cron_response(job: dict, user_cfg: Any) -> bool:

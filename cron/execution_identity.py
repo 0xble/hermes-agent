@@ -25,23 +25,14 @@ class CronExecution:
     profile: str
 
 
-@dataclass(frozen=True)
-class _BoundCronExecution:
-    execution: CronExecution
-    delivery_job: dict[str, Any]
-
-
-_CURRENT: ContextVar[Optional[_BoundCronExecution]] = ContextVar(
-    "hermes_cron_execution", default=None,
-)
+_CURRENT: ContextVar[Optional[CronExecution]] = ContextVar("hermes_cron_execution", default=None)
 
 
 def enter_cron_execution(job: Mapping[str, Any], execution_id: str, record: Mapping[str, Any]) -> Token:
     """Bind this fire's identity from *record*, the ledger row of the running transition."""
-    from cron.scheduler_delivery import _snapshot_delivery_job
     from hermes_cli.profiles import current_profile_name
 
-    execution = CronExecution(
+    return _CURRENT.set(CronExecution(
         job_id=str(job["id"]),
         job_name=str(job.get("name") or job["id"]),
         execution_id=str(execution_id),
@@ -49,8 +40,7 @@ def enter_cron_execution(job: Mapping[str, Any], execution_id: str, record: Mapp
         scheduled_instant=record.get("scheduled_instant"),
         started_at=record.get("started_at"),
         profile=current_profile_name("default") or "default",
-    )
-    return _CURRENT.set(_BoundCronExecution(execution, _snapshot_delivery_job(job)))
+    ))
 
 
 def exit_cron_execution(token: Optional[Token]) -> None:
@@ -58,19 +48,7 @@ def exit_cron_execution(token: Optional[Token]) -> None:
         _CURRENT.reset(token)
 
 
-def _current_bound() -> Optional[_BoundCronExecution]:
+def current_cron_execution() -> Optional[CronExecution]:
     from agent.delegation_context import is_delegated_child_context
 
     return None if is_delegated_child_context() else _CURRENT.get()
-
-
-def current_cron_execution() -> Optional[CronExecution]:
-    bound = _current_bound()
-    return bound.execution if bound is not None else None
-
-
-def _current_cron_execution_job() -> Optional[dict[str, Any]]:
-    """Delivery-relevant snapshot of the firing job bound in this context, or ``None`` outside a
-    cron run or inside a delegated child."""
-    bound = _current_bound()
-    return bound.delivery_job if bound is not None else None

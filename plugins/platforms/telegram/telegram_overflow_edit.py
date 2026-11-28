@@ -34,21 +34,18 @@ async def edit_overflow_split(
     if len(chunks) <= 1:
         chunks = [content]  # defensive: a single chunk just edits normally
     first_chunk = chunks[0]
-    from gateway.reply_latency import record_transport_reply
-    confirmed_at = None
     try:
         if finalize:
             await adapter._edit_markdown_or_plain(
                 chat_id, message_id, separate_chunk_indicator_from_fence(adapter.format_message(first_chunk)), _strip_mdv2(first_chunk),
                 "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
         else:
-            await adapter._edit_preview(chat_id, message_id, first_chunk)
+            await adapter._edit_text(chat_id, message_id, first_chunk)
     except Exception as e:
         if "not modified" not in str(e).lower():  # identical first chunk still sends continuations
             logger.error("[%s] Overflow split: first-chunk edit failed: %s", adapter.name, _redact_telegram_error_text(e), exc_info=True)
             return SendResult(success=False, error=_redact_telegram_error_text(e))
     if finalize:
-        confirmed_at = record_transport_reply(first_chunk, chat_id=chat_id, thread_id=adapter._metadata_thread_id(metadata))
         await adapter._record_sent_text(chat_id, message_id, quotable_text(first_chunk))
     # Continuations call adapter._bot.send_message directly to skip adapter.send's pre-chunking.
     continuation_ids: list[str] = []
@@ -80,12 +77,10 @@ async def edit_overflow_split(
                 continuation_message_ids=tuple(continuation_ids))
         new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
         if finalize and new_id != prev_id:
-            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             await adapter._record_sent_text(chat_id, new_id, quotable_text(chunk))
         continuation_ids.append(new_id)
         delivered_chunks.append(chunk)
         prev_id = new_id
     last_id = continuation_ids[-1] if continuation_ids else message_id
     logger.debug("[%s] Overflow split delivered %d chunks; last_id=%s", adapter.name, 1 + len(continuation_ids), last_id)
-    return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
-                      raw_response={"reply_latency_confirmed_at": confirmed_at} if confirmed_at is not None else None)
+    return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids))

@@ -23,7 +23,6 @@ _CARD_DESTINATION_REFUSALS = {
 }
 
 
-
 class TaskCardProgressMixin:
     # ── Slack-native task cards (progress-queue drain) ──────────────────────────────────────
 

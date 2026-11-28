@@ -28,8 +28,8 @@ async def _fetch_file_once(source: Any, attempt: int, local_root: str | None) ->
         from plugins.platforms.telegram.telegram_media_fetch import local_bot_api_path
         host_path = await asyncio.to_thread(
             local_bot_api_path, getattr(file_obj, "file_path", None), local_root)
-        if host_path is not None:  # unmapped server path: fall through to PTB's own download
-            return file_obj, await asyncio.to_thread(host_path.read_bytes)
+        assert host_path is not None
+        return file_obj, await asyncio.to_thread(host_path.read_bytes)
 
     try:
         downloaded = await file_obj.download_as_bytearray(**_timeouts(attempt))

@@ -32,7 +32,6 @@ class ProcessRegistry:
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
         self._finish_exited(session, exit_code())
 
-
     def get(self, session_id: str):
         """Resolve a handle and refresh its original backend only."""
         return self._refresh_detached_session(self._lookup_session(session_id))

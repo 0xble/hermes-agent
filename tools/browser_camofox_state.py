@@ -13,11 +13,9 @@ from typing import Dict, Optional
 
 from hermes_constants import get_hermes_home
 
-
 def get_camofox_state_dir() -> Path:
     """Return the profile-scoped root directory for Camofox persistence."""
     return get_hermes_home() / "browser_auth" / "camofox"
-
 
 def get_camofox_identity(task_id: Optional[str] = None) -> dict[str, str]:
     """Stable Hermes-managed Camofox identity: userId is profile-scoped, session key is
@@ -27,7 +25,6 @@ def get_camofox_identity(task_id: Optional[str] = None) -> dict[str, str]:
     session_digest = uuid.uuid5(uuid.NAMESPACE_URL, f"camofox-session:{scope_root}:{task_id or 'default'}").hex[:16]
     return {"user_id": f"hermes_{user_digest}", "session_key": f"task_{session_digest}"}
 
-
 # Default operator aliases for the personal profile. Company profiles (LPG, Meridian) MUST
 # narrow this through ``browser.camofox.accounts``: a shared agent that advertises another
 # owner's alias invites a cross-company login, which the migration contract forbids.
@@ -36,7 +33,6 @@ CAMOFOX_ACCOUNT_ALIASES = ("brianle", "lpg", "meridian")
 # ``personal`` was the legacy Chrome-era alias. The replacement is a hard cutover to
 # ``brianle`` with no compatibility alias, so config cannot reintroduce it.
 _REFUSED_ACCOUNT_ALIASES = frozenset({"personal"})
-
 
 def get_camofox_account_aliases() -> tuple:
     """Operator-facing Camofox aliases for the ACTIVE profile.
@@ -61,7 +57,6 @@ def get_camofox_account_aliases() -> tuple:
             continue
         aliases.append(alias)
     return tuple(aliases) or CAMOFOX_ACCOUNT_ALIASES
-
 
 def get_camofox_account_identity(account: str, task_id: Optional[str] = None) -> Dict[str, str]:
     """Return a stable identity for one named operator account.

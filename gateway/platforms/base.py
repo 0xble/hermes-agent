@@ -3,7 +3,6 @@
 
 import asyncio
 import contextlib
-import contextvars
 import inspect
 import ipaddress
 import logging
@@ -1660,34 +1659,6 @@ class ExecApprovalPrompt:
     @property
     def choices(self) -> list[str]:
         return [choice for _, choice, _ in self.actions]
-
-
-# Outbound class of the sends made in the current context. Unlabelled sends are finals, which a
-# platform's volume budget never sheds. Non-final notices and progress bubbles are labelled at their
-# call sites so a platform near a quota can spend its remaining volume on answers.
-OUTBOUND_FINAL = "final"
-# ``SendResult.error`` for a notice or progress send a platform's volume budget dropped on purpose:
-# final, so no retry, plain-text fallback or delivery-failure notice may spend the budget again.
-SEND_SHED_BY_BUDGET = "daily_budget_shed"
-OUTBOUND_NOTICE = "notice"
-OUTBOUND_PROGRESS = "progress"
-OUTBOUND_TOOL_PROGRESS = "tool_progress"
-_OUTBOUND_CLASS: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
-    "gateway_outbound_class", default=None)
-
-
-@contextlib.contextmanager
-def outbound_class(kind: str):
-    """Label sends and edits as notices, tool progress, or expendable cosmetic progress."""
-    token = _OUTBOUND_CLASS.set(kind)
-    try:
-        yield
-    finally:
-        _OUTBOUND_CLASS.reset(token)
-
-
-def current_outbound_class() -> Optional[str]:
-    return _OUTBOUND_CLASS.get()
 
 
 # The task currently running a platform's serial update consumer (PTB's update fetcher awaits each
