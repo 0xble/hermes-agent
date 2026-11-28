@@ -1239,6 +1239,7 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                      reload_callback: Callable[[], Any] | None = None,
                      before_flip: Callable[[], Any] | None = None,
                      operation: str = "promote", force_reload: bool = False,
+                     expected_current: Path | None = None,
                      deadline: float | None = None) -> dict[str, str | None]:
     """Persist the exact pointers, layout and plist bytes before any live mutation.
 
@@ -1255,6 +1256,8 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     if operation not in {"promote", "rollback", "restore"}:
         raise ValueError(f"unsupported activation operation: {operation}")
     pending = _read_txn(paths)
+    if expected_current is not None and pending is not None:
+        raise RuntimeError("another release transaction owns activation")
     if pending is not None:
         if pending["operation"] == "first-migration" and pending.get("candidate") is None:
             if source is not None and str(Path(source).resolve()) != pending["source"]:
@@ -1273,6 +1276,8 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                 return result
             pending = None
     old = _pointer_value(paths.current)
+    if expected_current is not None and old != str(expected_current):
+        raise RuntimeError("release activation no longer matches the expected current release")
     if old == str(candidate) and not force_reload:
         return {"current": old, "previous": _pointer_value(paths.previous)}
     from hermes_cli.immutable_release_preflight import activation_preflight
@@ -1608,9 +1613,19 @@ def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> Non
 
 def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | None = None,
              reload_callback: Callable[[], Any] | None = None,
+             expected_release: tuple[str, str] | None = None,
              deadline: float | None = None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     pending = _read_txn(paths)
+    if expected_release is not None:
+        live_sha, previous_sha = expected_release
+        expected_current, expected_previous = (paths.releases.resolve() / sha for sha in (live_sha, previous_sha))
+        if (pending is not None or read_pointer(paths.current) != expected_current
+                or read_pointer(paths.previous) != expected_previous):
+            raise RuntimeError("rollback no longer matches the expected release pair")
+        return activate_release(paths.home, expected_previous, plist_path=plist_path, plist_body=plist_body,
+                                reload_callback=reload_callback, operation="rollback",
+                                expected_current=expected_current, deadline=deadline)
     if pending is not None:
         operation = pending["operation"]
         result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)

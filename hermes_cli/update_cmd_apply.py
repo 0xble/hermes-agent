@@ -3,6 +3,88 @@
 from __future__ import annotations
 
 
+def _update_preflight_handled(args, project_root, resolve_update_branch) -> bool:
+    """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
+    import json
+    import sys
+
+    from hermes_cli.config import is_managed, managed_error
+    from hermes_cli.update_channel import handle_metadata_args
+    from hermes_cli.update_cmd_common import _record_stop
+
+    if getattr(args, "expect_release", None) is not None:
+        incompatible = ("check", "plan", "list_venv_holders", "set_channel",
+                        "install_id", "channel", "replace_candidate", "allow_drop_main", "no_backup")
+        branch = bool(getattr(args, "branch", None))
+        rollback = bool(getattr(args, "rollback", False))
+        if branch == rollback or any(getattr(args, flag, False) for flag in incompatible):
+            print("✗ --expect-release requires either --branch or --rollback without overrides.")
+            _record_stop("commit_point_refused", without_receipt="refused")
+            raise SystemExit(2)
+    if handle_metadata_args(args, project_root):
+        sys.exit(0)
+    if is_managed():
+        managed_error("update Hermes Agent")
+        if not any(getattr(args, flag, False) for flag in ("plan", "check", "list_venv_holders")):
+            _record_stop("managed_install", without_receipt="refused")  # an update attempt: a metrics row only
+        return True
+
+    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
+    # docker/nix/apt refusal gates: on an image/package-managed install the
+    # plan itself reports "not updatable in place" plus the right mechanism.
+    if getattr(args, "plan", False):
+        # Read-only plan phase (#91277 Phase 2): inventory every running Hermes runtime across profiles, its
+        # supervisor, and its running code version — without mutating anything. Safe on a live fleet.
+        from hermes_cli.update_inventory import (
+            collect_runtime_inventory,
+            print_update_plan,
+        )
+
+        print_update_plan(collect_runtime_inventory())
+        return True
+
+    if getattr(args, "list_venv_holders", False):
+        # Read-only twin of the Windows venv-holder refusal (#117246): same scan and classifiers,
+        # machine-readable, exit 3 when holders remain so automation can stop those PIDs and retry.
+        import json
+
+        from hermes_cli.update_cmd_windows import VENV_HOLDERS_EXIT, list_venv_holders
+
+        holders = list_venv_holders()
+        print(json.dumps(holders, indent=2))
+        if holders:
+            sys.exit(VENV_HOLDERS_EXIT)
+        return True
+
+    # Image/package-managed admission gate (#91277 Phase 3): baked provenance marker first (fail-closed
+    # on malformed), then docker/nix/apt heuristics; one shared decision for every mutation surface, so
+    # --check never reports git state for an image-managed install. Prints the real update command,
+    # records a `refused` receipt and exits 2 (refused-by-contract, distinct from exit 1 errors).
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
+    )
+
+    refusal = evaluate_update_admission(project_root)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
+
+    if getattr(args, "check", False):
+        # --check honors --branch so its answer matches what update would pull.
+        branch = resolve_update_branch(args)
+        from hermes_cli.update_cmd import _cmd_update_check
+
+        _cmd_update_check(
+            branch=branch,
+            branch_explicit=bool(getattr(args, "branch", None)),
+            **({"channel": args.channel} if getattr(args, "channel", None) else {}),
+        )
+        return True
+    return False
+
+
 def _run_immutable_rollback(args, gateway_mode: bool) -> None:
     """Recover or apply a rollback and verify its acknowledged fleet."""
     from hermes_cli.update_cmd import (
@@ -15,13 +97,15 @@ def _run_immutable_rollback(args, gateway_mode: bool) -> None:
     begin_update_receipt()
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
+    pin = getattr(args, "expect_release", None)
     # Finish an interrupted rollback without deriving A from pointers already
     # swapped toward A. Otherwise a second --rollback would undo itself.
     pending_path = paths.home / "release-txn.json"
-    pending_operation = (json.loads(pending_path.read_text(encoding="utf-8-sig"))["operation"]
-                         if pending_path.exists() else None)
+    pending_operation = None
+    if pin is None and pending_path.exists():
+        pending_operation = json.loads(pending_path.read_text(encoding="utf-8-sig"))["operation"]
     before = read_pointer(paths.current)
-    recovered = _finish_pending_release_transaction(home)
+    recovered = _finish_pending_release_transaction(home) if pin is None else None
     if pending_operation in {"rollback", "first-migration-rollback"} and recovered is not None:
         result = recovered
         before = Path(recovered["previous"]) if recovered.get("previous") else before
@@ -31,6 +115,9 @@ def _run_immutable_rollback(args, gateway_mode: bool) -> None:
         from hermes_cli import gateway, gateway_launchd
         plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
         previous = read_pointer(paths.previous)
+        if pin is not None and previous != paths.releases.resolve() / pin[1]:
+            from hermes_cli.update_cmd_candidate import refuse_release_pin
+            refuse_release_pin(f"expected rollback release {pin[1]}, found {previous.name if previous else 'no release'}")
         source_layout = previous is not None and previous.parent != paths.releases.resolve()
         plist_body = None
         if plist and plist.exists() and not source_layout and previous is not None:
@@ -38,7 +125,8 @@ def _run_immutable_rollback(args, gateway_mode: bool) -> None:
         callback = (lambda: gateway_launchd._reload_installed_launchd_plist(
             plist, use_planned_handover=False)) if plist and plist.exists() else None
         result = rollback(home, plist_path=plist if plist and plist.exists() else None,
-                          plist_body=plist_body, reload_callback=callback)
+                          plist_body=plist_body, reload_callback=callback,
+                          **({"expected_release": pin} if pin is not None else {}))
     if result.get("reload_pending"):
         if _await_release_acknowledgement(home):
             result = _finish_pending_release_transaction(home) or {key: value for key, value in result.items()
@@ -94,6 +182,16 @@ def _prepare_update_attempt(args, gateway_mode: bool):
         git_operation_in_progress,
     )
     _commit.begin_update_attempt()  # nothing an earlier update in this process armed is ours (O5)
+    pin = getattr(args, "expect_release", None)
+    if pin is not None:
+        if getattr(args, "post_swap", None):
+            # The child claims the original receipt before checking the pin.
+            # Recovering a different pending activation here would bypass it.
+            return _resolve_update_options(args, gateway_mode)
+        from hermes_cli.update_cmd_candidate import refuse_release_pin, require_pinned_live_release
+        require_pinned_live_release(get_hermes_home(), pin[0])
+        if not getattr(args, "rollback", False) and not (_m().PROJECT_ROOT / ".git").exists():
+            refuse_release_pin("the owning Git checkout is unavailable")
     from hermes_cli.update_proxy_env import prefer_dotenv_proxy_env
     prefer_dotenv_proxy_env()  # the .env loaded at import beats a system proxy the Desktop injected
     # A user's active Git operation owns the checkout, including its index.
@@ -265,8 +363,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
     _record_pre_update_backup_outcome(args, pre_update_snapshot_id)
     _record_snapshot_stage(args, pre_update_snapshot_id)
+    pin = getattr(args, "expect_release", None)
+    if pin is not None and not pre_update_snapshot_id:
+        from hermes_cli.update_cmd_candidate import refuse_release_pin
+        refuse_release_pin("a successful pre-update quick snapshot is required")
     from hermes_cli.update_stage import publish_stage
-    publish_stage("Downloading updates")  # a failed backup never stops the update
+    publish_stage("Downloading updates")
 
     _windows_gateway_resume = _pause_gateways_for_update(opts)
     if _windows_gateway_resume:
@@ -292,6 +394,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         stop=lambda: _m()._resume_windows_gateways_after_update(_windows_gateway_resume))
     branch = completion_request["branch"]
 
+    if pin is not None and (use_zip_update or not _immutable_release_enabled()):
+        from hermes_cli.update_cmd_candidate import refuse_release_pin
+        refuse_release_pin("the immutable Git update path is unavailable")
     if use_zip_update:
         try:
             _update_via_zip(

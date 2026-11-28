@@ -18,6 +18,37 @@ def candidate_sha(value: str) -> str:
     return value.lower()
 
 
+def parse_release_pin(value: str) -> tuple[str, str]:
+    live, separator, candidate = value.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError("expected LIVE_SHA:CANDIDATE_SHA")
+    pair = candidate_sha(live), candidate_sha(candidate)
+    if pair[0] == pair[1]:
+        raise argparse.ArgumentTypeError("live and candidate release SHAs must differ")
+    return pair
+
+
+def refuse_release_pin(detail: str) -> None:
+    from hermes_cli import update_receipt
+    if not update_receipt.has_active_update_receipt():
+        update_receipt.begin_update_receipt()
+    update_receipt.record_step("release_pin", False, detail)
+    _record_stop("commit_point_refused")
+    print(f"✗ Pinned release update refused: {detail}")
+    raise SystemExit(2)
+
+
+def require_pinned_live_release(home: Path, expected_live: str) -> None:
+    from hermes_cli.immutable_releases import ReleasePaths, resolved_release
+    paths = ReleasePaths.for_home(home)
+    pending = paths.home / "release-txn.json"
+    if pending.exists() or pending.is_symlink():
+        refuse_release_pin("an earlier release transaction still owns activation")
+    live = resolved_release(home)
+    if live is None or live.name != expected_live:
+        refuse_release_pin(f"expected live {expected_live}, found {live.name if live else 'no ready release'}")
+
+
 def carried_candidate(source: Path, sha: str) -> str:
     """Unwrap our target-first, candidate-second merges, never arbitrary user merges."""
     from hermes_cli.update_cmd import _git_run
@@ -207,6 +238,20 @@ def select_update_candidate(source: Path, home: Path, target: str,
 def select_update_target(source: Path, home: Path, live: Path | None, fetched: str, branch: str,
                          args) -> tuple[str, str | None]:
     """Return the revision to stage and the source branch its release stamp records."""
+    pin = getattr(args, "expect_release", None)
+    if pin is not None:
+        from hermes_cli import update_cmd, update_receipt
+        expected_live, expected_candidate = pin
+        if live is None or live.name != expected_live:
+            refuse_release_pin(f"expected live {expected_live}, found {live.name if live else 'no release'}")
+        if fetched != expected_candidate:
+            refuse_release_pin(f"expected candidate {expected_candidate}, fetched {fetched}")
+        result = update_cmd._git_run(
+            ["git"], ["merge-base", "--is-ancestor", expected_live, fetched], cwd=source)
+        if result.returncode != 0:
+            refuse_release_pin(f"cannot prove candidate {fetched} preserves live ancestry from {expected_live}")
+        update_receipt.record_step("release_pin", True, f"live={expected_live} candidate={fetched}")
+        return fetched, branch
     selected = select_update_candidate(
         source, home, fetched, getattr(args, "replace_candidate", None), target_branch=branch)
     return selected, branch if selected == fetched else candidate_branch(home, live, source=source)

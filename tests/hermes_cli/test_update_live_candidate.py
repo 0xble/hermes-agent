@@ -82,9 +82,8 @@ def installed(tmp_path, monkeypatch):
     build_update_parser(parser.add_subparsers(), cmd_update=main.cmd_update)
     with update_receipt.update_receipt_scope():
         update_receipt.begin_update_receipt()
-        receipt = update_receipt._current.get()
         yield SimpleNamespace(source=source, home=home, base=base, live=live,
-                              target=target, parser=parser, handed=handed, receipt=receipt)
+                              target=target, parser=parser, handed=handed)
 
 
 def apply(installed, *flags):
@@ -97,6 +96,103 @@ def apply(installed, *flags):
     active = releases.read_pointer(releases.ReleasePaths.for_home(installed.home).current)
     assert active is not None
     return active
+
+
+@pytest.mark.parametrize("change", ["live", "fetch", "ancestry"])
+def test_pinned_update_refuses_changed_or_divergent_release_before_staging(installed, change):
+    expected_live = installed.base if change == "live" else installed.live
+    expected_candidate = installed.base if change == "fetch" else installed.target
+    with pytest.raises(SystemExit) as stopped:
+        apply(installed, "--branch", "main", "--expect-release", f"{expected_live}:{expected_candidate}")
+    assert stopped.value.code == 2
+    assert installed.handed == []
+    assert releases.read_pointer(installed.home / "current").name == installed.live
+    assert not (installed.home / "releases" / installed.target).exists()
+    assert not (installed.home / "release-txn.json").exists()
+    assert update_receipt._current.get().data["stop_class"] == "commit_point_refused"
+
+
+def test_pinned_update_stages_exact_descendant_and_forwards_pin(installed):
+    git(installed.source, "merge", "--no-edit", "candidate")
+    git(installed.source, "fetch", ".", "main")
+    candidate = git(installed.source, "rev-parse", "HEAD")
+    pin = f"{installed.live}:{candidate}"
+    active = apply(installed, "--branch", "main", "--expect-release", pin)
+    assert active.name == candidate
+    assert len(installed.handed) == 1
+    assert installed.handed[0] == active
+    args = installed.parser.parse_args(["update", "--branch", "main", "--expect-release", pin])
+    child = installed.parser.parse_args(
+        ["update", "--post-swap", "handoff.json", *update_cmd._post_swap_argv_tail(args)])
+    assert child.expect_release == (installed.live, candidate)
+
+
+def test_pinned_update_does_not_recover_an_unrelated_transaction(installed):
+    pending = installed.home / "release-txn.json"
+    pending.write_text("{}")
+    pin = f"{installed.live}:{installed.target}"
+    args = installed.parser.parse_args(["update", "--branch", "main", "--expect-release", pin])
+    with pytest.raises(SystemExit) as stopped:
+        update_cmd._prepare_update_attempt(args, gateway_mode=False)
+    assert stopped.value.code == 2
+    assert pending.read_text() == "{}"
+    assert releases.read_pointer(installed.home / "current").name == installed.live
+
+
+def test_pinned_update_refuses_missing_snapshot_before_fetch(installed, monkeypatch):
+    monkeypatch.setattr(update_cmd, "_prepare_update_attempt",
+                        lambda *_: SimpleNamespace(gw_input_fn=None, assume_yes=True))
+    monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda _: None)
+    monkeypatch.setattr(main, "_run_pre_update_backup", lambda _: None)
+    pin = f"{installed.live}:{installed.target}"
+    args = installed.parser.parse_args(["update", "--branch", "main", "--expect-release", pin])
+    with pytest.raises(SystemExit) as stopped:
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+    assert stopped.value.code == 2
+    assert releases.read_pointer(installed.home / "current").name == installed.live
+    assert update_receipt._current.get().data["stop_class"] == "commit_point_refused"
+
+
+def test_pinned_handoff_refuses_another_staged_release(installed):
+    active = releases.read_pointer(installed.home / "current")
+    pin = f"{installed.live}:{installed.target}"
+    args = installed.parser.parse_args(["update", "--branch", "main", "--expect-release", pin])
+    with pytest.raises(SystemExit) as stopped:
+        update_cmd._execute_post_swap(
+            {"swap": "immutable", "release": str(active), "candidate_sha": active.name},
+            args, gateway_mode=False)
+    assert stopped.value.code == 2
+    assert update_receipt._current.get().data["stop_class"] == "commit_point_refused"
+
+
+def test_pinned_rollback_matches_both_pointers_and_refuses_a_repeat(installed):
+    prior = installed.live
+    change_live(installed, installed.target)
+    paths = releases.ReleasePaths.for_home(installed.home)
+    for pair in ((installed.target, installed.base), (installed.base, prior)):
+        with pytest.raises(RuntimeError, match="expected release pair"):
+            releases.rollback(installed.home, expected_release=pair)
+        assert releases.read_pointer(paths.current).name == installed.target
+        assert releases.read_pointer(paths.previous).name == prior
+        assert not (paths.home / "release-txn.json").exists()
+    pin = (installed.target, prior)
+    releases.rollback(installed.home, expected_release=pin)
+    assert releases.read_pointer(paths.current).name == prior
+    assert releases.read_pointer(paths.previous).name == installed.target
+    with pytest.raises(RuntimeError, match="expected release pair"):
+        releases.rollback(installed.home, expected_release=pin)
+    assert releases.read_pointer(paths.current).name == prior
+
+
+@pytest.mark.parametrize("flags", [[], ["--branch", "main", "--rollback"],
+                                   ["--branch", "main", "--set-channel", "stable"],
+                                   ["--branch", "main", "--no-backup"]])
+def test_pinned_update_rejects_non_update_paths(installed, flags):
+    pin = f"{installed.live}:{installed.target}"
+    args = installed.parser.parse_args(["update", "--expect-release", pin, *flags])
+    with pytest.raises(SystemExit) as stopped:
+        main._update_preflight_handled(args)
+    assert stopped.value.code == 2
 
 
 def test_fetch_update_carries_live_candidate_into_activated_tree(installed, capsys):
