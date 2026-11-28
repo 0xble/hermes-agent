@@ -1239,3 +1239,18 @@ warm main's nightly. The first main nightly seeds its own entries.
 
 Rollback by reverting this cache change. Retire it when the owning CI bootstrap
 provides equivalent pinned, verified, outage-independent warm archive inputs.
+
+## Held media after a busy /stop or /new
+
+The `fork-ci-reliability` identity also covers one product change in
+`gateway/run_inbound.py`: `_hm_busy_slash_or_photo` calls `_hm_drop_held_input`
+when `/stop`, `/new` or `/reset` passes the slash-access gate while a turn runs.
+A turn admitted to the session FIFO behind another runs outside the adapter's
+session guard, so neither the adapter's busy discard nor the runner's idle
+dispatch dropped a photo the adapter was still buffering, and it ran as a turn
+after the command. Hosted, this failed
+`test_contact_card_reaches_model_and_stop_drops_buffered_photo` with
+`assert ['none'] == []`. The change is upstream commit
+`cc28398bad563051ded348fb068bab051e1dbdc3`, taken ahead of a sync;
+`tests/gateway/test_busy_stop_drops_held_media.py` is the fork's seam test.
+Retire the fork copy when a sync brings that upstream commit in.
