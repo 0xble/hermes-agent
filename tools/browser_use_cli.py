@@ -331,6 +331,14 @@ def _find_cli() -> Optional[list[str]]:
     return [sys.executable, "-m", "browser_harness.run"]
 
 
+def browser_exec_available() -> bool:
+    """True when browser-harness is importable, without launching a browser."""
+    return _find_cli() is not None
+
+
+SCREENSHOTS_DETACHED = " Screenshots are not attached to this tool's results."
+
+
 def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
     """Stable per-task scratch dir that persists across browser_exec calls"""
     if os.environ.get("BH_AGENT_WORKSPACE"):

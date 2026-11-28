@@ -37,6 +37,16 @@ _warned = False
 _NO_WRITER_REPLACEMENT = "the store's own write verbs (the SQLite backend's writer helpers have no public replacement)"
 _NO_READ_POOL_REPLACEMENT = "the store's own read verbs (the SQLite backend's read pool has no public replacement)"
 
+# Compatibility hook retained for fork test fixtures; the guard itself lives with the
+# upstream StoreHolder so every persistence entry point shares the same boundary.
+def _ensure_test_isolation(db_path):
+    from persistence.sqlite._holder import _ensure_test_isolation as _guard
+    return _guard(db_path)
+
+# Historical import-time probe used by legacy tests when temporarily replacing the
+# deprecated default. It is intentionally path-only and performs no filesystem I/O.
+_IMPORT_DEFAULT_DB_PATH = None
+
 # Each carried name with the replacement its deprecation warning names.
 _REPLACEMENTS = {
     "SessionDB": "persistence_assembly.open_persistence(profile_scope()), or open_persistence_reader(...) for read_only",

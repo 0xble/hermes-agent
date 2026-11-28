@@ -11,6 +11,13 @@ import warnings as _warnings
 import hermes_state as _hermes_state
 
 
+def close_all_under(directory):
+    """Close all moved SQLite holders under *directory*."""
+    from persistence.sqlite._registry import close_all_under as _close_all_under
+    return _close_all_under(directory)
+
+
+
 def acquire(db_path=None):
     """A ``hermes_state.SessionDB`` on the store of ``db_path`` (a ``state.db``), or of the current profile."""
     first_warning = getattr(_hermes_state, "_first_warning", None)
