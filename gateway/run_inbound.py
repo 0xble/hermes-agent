@@ -78,6 +78,10 @@ def _is_restore_control_event(event: MessageEvent) -> bool:
 # ``RelayMediaClient.download`` temp-file prefix: the rest of such a basename is random, not a name.
 _RELAY_MEDIA_PREFIX = "relay_media_"
 _UNKNOWN_ATTACHMENT_NAME = "(original filename unknown)"
+# Media a person sends that cuts a machine-origin turn in queue mode, like typed text does.
+_PREEMPTING_MEDIA_TYPES = frozenset({
+    MessageType.VOICE, MessageType.AUDIO, MessageType.PHOTO, MessageType.VIDEO, MessageType.DOCUMENT,
+})
 
 
 def discord_triggering_note(message_id: Any) -> str:
@@ -1181,11 +1185,17 @@ class GatewayInboundMixin(
         adapter = self._delivery_adapter_for(source)
         if self._draining or adapter is None or running_agent is None:
             return False
-        if (running_agent is _AGENT_PENDING_SENTINEL
+        # A voice note, photo or file is the person speaking as much as typed text is, so it cuts a
+        # machine turn the same way; behind the person's own turn media keeps main's busy handling.
+        # An authorized bot's attachment is not the person speaking, so it never preempts.
+        media_preempts = (event.message_type in _PREEMPTING_MEDIA_TYPES and mode == "queue"
+                          and not superseded and not getattr(source, "is_bot", False)
+                          and self._human_preempts_autonomous_turn(event, state))
+        if (running_agent is _AGENT_PENDING_SENTINEL or media_preempts
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
             if self._human_preempts_autonomous_turn(event, state):
-                if mode == "queue" and event.message_type == MessageType.TEXT:
+                if mode == "queue" and (event.message_type == MessageType.TEXT or media_preempts):
                     # Keep the user message as a durable FIFO row and cut the machine turn
                     # cooperatively; admission never awaits publication or the interrupt.
                     from gateway.run_turn_pending_preemption import schedule_authority_machine_preemption
@@ -1196,7 +1206,7 @@ class GatewayInboundMixin(
                             self._current_session_run_generation(_quick_key), running_agent,
                         )
                 else:
-                    # Steer mode and media keep queue semantics: saved as a queued row, say so.
+                    # Steer mode keeps queue semantics: saved as a queued row, say so.
                     queued = self._BusySteerOutcome(
                         effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
                         steered=False, redirected=False)
