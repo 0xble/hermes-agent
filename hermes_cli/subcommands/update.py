@@ -8,6 +8,7 @@ from typing import Callable
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     """Attach the ``update`` subcommand to ``subparsers``."""
     from hermes_cli.release_channels import validate_name
+    from hermes_cli.update_cmd_candidate import candidate_sha, expect_sha
     update_parser = subparsers.add_parser(
         "update", help="Update Hermes Agent to the latest version",
         description="Pull the latest changes from git and reinstall dependencies")
@@ -59,10 +60,14 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes).")
     update_parser.add_argument(
+        "--expect-sha", default=None, metavar="SHA",
+        type=expect_sha,
+        help="With --branch, refuse unless the fetched branch resolves to this exact lowercase "
+            "40-hex commit SHA. Checked after the fetch and before anything changes.")
+    update_parser.add_argument(
         "--allow-drop-main", action="store_true", default=False,
         help="Allow an intentional rollback that would drop commits already live and on origin/main; record the override in the update receipt.",
     )
-    from hermes_cli.update_cmd_candidate import candidate_sha
     update_parser.add_argument(
         "--replace-candidate", default=None, metavar="SHA", type=candidate_sha,
         help="Explicitly replace this exact live candidate instead of carrying it into the update target.")

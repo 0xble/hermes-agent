@@ -1570,6 +1570,12 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     fetched = _git_run(git_cmd, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"], check=True).stdout.strip()
     if not re.fullmatch(r"[0-9a-fA-F]{40}", fetched):
         raise RuntimeError("fetch did not resolve to a complete commit SHA")
+    pinned = getattr(args, "expect_sha", None) if getattr(args, "branch", None) else None
+    if pinned and fetched.lower() != pinned:
+        # Before the pointer reads, the candidate selection and stage_release: nothing is staged.
+        _record_stop("head_moved")
+        raise RuntimeError(f"fetched {fetched[:10]} is not the pinned commit {pinned[:10]} (--expect-sha); "
+                           "nothing was staged")
     current = read_pointer(paths.current)
     if current is not None and current.parent != paths.releases.resolve():
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
@@ -1646,7 +1652,10 @@ def _post_swap_argv_tail(args) -> list[str]:
     tail = [flag for attr, flag in _POST_SWAP_FORWARDED_FLAGS if getattr(args, attr, False)]
     # Selection-only flags stay behind: the child runs the target's parser, which may predate them.
     branch = getattr(args, "branch", None)
-    return tail + (["--branch", str(branch)] if branch else [])
+    tail = tail + (["--branch", str(branch)] if branch else [])
+    # The pin is a safety claim about the target, so it crosses even though other selection flags do not.
+    pin = getattr(args, "expect_sha", None)
+    return tail + (["--expect-sha", str(pin)] if branch and pin else [])
 
 
 def _post_swap_payload(

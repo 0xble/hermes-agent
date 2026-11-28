@@ -124,3 +124,41 @@ def test_main_drop_refusal_uses_exit_two_and_closed_stop_class(tmp_path, monkeyp
     path = tmp_path / "home" / "logs" / "update_receipts" / "latest.json"
     assert path.is_file()
     assert '"stop_class": "main_drop"' in path.read_text(encoding="utf-8")
+
+
+def _update_parser():
+    parser = argparse.ArgumentParser()
+    build_update_parser(parser.add_subparsers(), cmd_update=lambda args: None)
+    return parser
+
+
+def test_expect_sha_parses_only_an_exact_lowercase_commit(capsys):
+    parser = _update_parser()
+    assert parser.parse_args(["update", "--branch", "x", "--expect-sha", "a" * 40]).expect_sha == "a" * 40
+    assert parser.parse_args(["update"]).expect_sha is None
+    for bad in ("A" * 40, "a" * 39, "a" * 41, "abc123", "main", "g" * 40, ""):
+        with pytest.raises(SystemExit) as refused:
+            parser.parse_args(["update", "--branch", "x", "--expect-sha", bad])
+        assert refused.value.code == 2
+    assert "40-hex" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("other", [{}, {"check": True}, {"plan": True}, {"rollback": True}])
+def test_expect_sha_without_a_fetching_branch_update_is_refused(capsys, other):
+    from hermes_cli import main as hermes_main
+
+    args = SimpleNamespace(branch=None if not other else "x", expect_sha="a" * 40, **other)
+    with pytest.raises(SystemExit) as refused:
+        hermes_main._update_preflight_handled(args)
+    assert refused.value.code == 2
+    assert "--expect-sha" in capsys.readouterr().out
+
+
+def test_post_swap_argv_keeps_the_pin_with_its_branch_only():
+    base = dict(gateway=False, no_backup=False, backup=False, yes=False, keep_stash=False,
+                switch_branch=False, force=False, force_venv=False, no_gateway_restart=False)
+    pinned = SimpleNamespace(**base, branch="release", expect_sha="b" * 40)
+    assert update_cmd._post_swap_argv_tail(pinned) == ["--branch", "release", "--expect-sha", "b" * 40]
+    assert update_cmd._post_swap_argv_tail(SimpleNamespace(**base, branch="release", expect_sha=None)) == [
+        "--branch", "release"]
+    assert update_cmd._post_swap_argv_tail(SimpleNamespace(**base, branch=None, expect_sha=None)) == []

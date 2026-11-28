@@ -1459,3 +1459,21 @@ Contract tests: `tests/gateway/test_admission_canary.py`, `tests/hermes_cli/test
   `tests/gateway/test_turn_executor_reuse.py`.
 - Upstream-origin (`gateway/turn_thread_reset.py` came with the turn-executor reuse change).
   Retire when upstream guards the reset against partially imported modules.
+
+## Branch update pinned to an approved commit
+
+- Fork patch identity: `update-lifecycle`.
+- `hermes update --branch <name>` followed a branch, so a force-push or advance between an approval
+  check of `origin/<name>` and the updater's own fetch installed an unapproved head. The optional
+  `--expect-sha <40 lowercase hex>` (requires `--branch`) is compared with the fetched
+  `origin/<name>` right after the fetch and before the checkout is prepared: a mismatch exits 1,
+  records stop class `head_moved`, resumes paused gateways and leaves the tree, stash, release link
+  and restart markers untouched. The immutable-release path compares the fetched commit before
+  `stage_release`. The ZIP fallback refuses the flag, and `_post_swap_argv_tail` forwards it.
+- A pinned run skips the fork upstream sync and the in-place parked-branch merge, either of which
+  would move HEAD past the pin. Without the flag nothing changes.
+- Guards: `test_a_branch_pin_*`, `test_a_pinned_branch_*` in
+  `tests/hermes_cli/test_update_target_identity.py` and `test_update_live_candidate.py`,
+  `test_expect_sha_*` and `test_post_swap_argv_keeps_the_pin_*` in `test_update_main_guard.py`,
+  and `test_update_via_zip_refuses_a_pinned_commit_*` in `test_update_zip_fallback_guards.py`.
+- Fork-origin: the `request_update` approval flow is fork-only. Retire with that flow.

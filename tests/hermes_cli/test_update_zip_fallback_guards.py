@@ -379,3 +379,15 @@ def test_zip_overlay_allows_ignored_preserved_entries(tmp_path, monkeypatch):
         _porcelain_run("!! venv/\n!! node_modules/\n!! .env\n"),
     )
     assert update_cmd._zip_overlay_block_reason(tmp_path) is None
+
+
+def test_update_via_zip_refuses_a_pinned_commit_before_anything_changes(tmp_path, monkeypatch, capsys):
+    """The archive is fetched by name; nothing resolves it to the pinned commit, so it must not run."""
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    with patch("urllib.request.urlretrieve") as download:
+        with pytest.raises(SystemExit) as exc_info:
+            update_cmd._update_via_zip(SimpleNamespace(branch="main", expect_sha="a" * 40))
+    assert exc_info.value.code == 1
+    download.assert_not_called()
+    out = capsys.readouterr().out
+    assert "--expect-sha is not supported" in out and "ZIP" in out

@@ -351,6 +351,12 @@ hermes update --branch release-candidate
 hermes update --check --branch experimental   # preview behindness only
 ```
 
+To install exactly the commit you reviewed, add `--expect-sha <40-hex>`. The updater fetches the branch and compares it with the pin before it stashes, switches or moves anything. If a force-push or new commit moved the branch in between, it exits 1 with stop reason `head_moved` and changes nothing. The flag requires `--branch` and has no effect without it; the Windows ZIP fallback refuses it because it cannot verify a commit.
+
+```bash
+hermes update --branch release-candidate --expect-sha 0123456789abcdef0123456789abcdef01234567
+```
+
 If your local checkout is on a different branch, Hermes auto-stashes any uncommitted work, switches HEAD to the target branch, and then pulls. Branches that don't exist locally are auto-tracked from `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches that don't exist anywhere fail cleanly — your stashed changes are restored before exit so you're never stranded in a weird state. The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
 
 ### Checkout parked on a feature branch
