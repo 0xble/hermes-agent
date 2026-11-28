@@ -28,7 +28,7 @@ from pathlib import Path, PurePosixPath
 # Paths whose change can alter how every test runs.
 FULL_SUITE_PATTERNS = (
     'conftest.py', '*/conftest.py',
-    'pyproject.toml', 'setup.cfg', 'setup.py', 'tox.ini', 'pytest.ini', '.pytest.ini',
+    'pyproject.toml', '*/pyproject.toml', 'setup.cfg', 'setup.py', 'tox.ini', 'pytest.ini', '.pytest.ini',
     'uv.lock', '*/uv.lock', 'poetry.lock', 'requirements*.txt', '*/requirements*.txt',
     'package.json', '*/package.json', 'package-lock.json', '*/package-lock.json',
     'pnpm-lock.yaml', '*/pnpm-lock.yaml', 'bun.lock', '*/bun.lock', 'bun.lockb',
@@ -157,10 +157,10 @@ def from_import_names(node: ast.ImportFrom, package: list[str]) -> set[str]:
 
 
 def dynamic_import_names(node: ast.Call, strings: dict[str, list[str]]) -> list[str]:
-    """importlib.import_module(...) and __import__(...) with a literal or a module constant."""
+    """import_module, __import__ and pytest.importorskip with a literal or a module constant."""
     fn = node.func
     name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', '')
-    if name not in ('import_module', '__import__') or not node.args:
+    if name not in ('import_module', '__import__', 'importorskip') or not node.args:
         return []
     arg = node.args[0]
     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):

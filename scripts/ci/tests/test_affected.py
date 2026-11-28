@@ -146,3 +146,14 @@ def test_pytest_plugins_and_module_constant_imports_count(repo: Path) -> None:
 def test_nested_dependency_manifests_run_everything(repo: Path, path: str) -> None:
     mode, _, _ = change(repo, path, '# changed\n')
     assert mode == 'full'
+
+
+def test_importorskip_counts_as_an_import(repo: Path) -> None:
+    git(repo, 'switch', '-q', 'main')
+    (repo / 'tests/test_optional.py').write_text(
+        'import pytest\nother = pytest.importorskip("pkg.other")\n', encoding='utf-8')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'optional')
+    git(repo, 'switch', '-qC', 'change')
+    _, tests, _ = change(repo, 'pkg/other.py', 'X = 5\n')
+    assert 'tests/test_optional.py' in tests
