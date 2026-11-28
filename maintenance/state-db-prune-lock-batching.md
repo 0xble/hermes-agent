@@ -133,14 +133,24 @@ Wall/CPU separation distinguishes elapsed time from CPU work by this thread,
 not the specific reason for a gap. These measurements do not establish an I/O,
 GIL, scheduling or index bottleneck, and do not claim a latency improvement.
 
+## Nightly Pass Start and Cut-Off
+
+The state.db maintenance chore used to run every 60 housekeeping ticks, so a nightly pass began at a random minute inside the window. On the live store in late November 2026 the passes started at 05:11, 05:18, 05:24, 05:47 and 05:53, pruned about 20 sessions a minute until 06:00, and returned without stamping anything. Some nights the tick never landed in the window. The 30-day backlog kept growing while `last_auto_prune` stayed at 2026-11-17.
+
+- The chore is checked every 5 ticks, so a pass starts within minutes of the window opening. Outside the window each check is a cached config read.
+- The pass runs on its own thread (`_StateDbMaintenancePass`), registered with `process_ownership` as a writer, so a pass that uses the whole window never holds the tick that drains deliveries and writes heartbeats. A tick that finds the previous pass running skips it.
+- Shutdown stops a running pass: the pass's cancel signal (`hermes_state_prune_budget.prune_cancel`) is the housekeeping stop event itself, so it fires the moment shutdown sets that event, whatever the housekeeping loop is doing. The prune budget checks it like its deadline between transactions and in its SQLite progress handler, and VACUUM and the completion stamp check it too. A stopped pass is partial like one the window cut off, so a restart or standby handover inside the window waits for at most one transaction, not the rest of the window.
+- A pass the window cuts off stamps `last_auto_prune_partial`, logs how many sessions it pruned, and leaves the 24-hour throttle unspent, so the next window resumes the backlog. A completed pass stamps `last_auto_prune` as before.
+- `ProfileOwnership.start_writer` drops finished writers, so a recurring writer thread does not grow its list.
+
 ## Source surfaces
 
-`gateway/run.py`, `gateway/session_prune.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_cli/maintenance_window.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/web_routers/sessions.py`, `hermes_state_prune_pacing.py`, `hermes_state_mutation_retirement.py`, `hermes_state_local.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compaction_prepare.py`, `hermes_state_coverage.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
+`gateway/run.py`, `gateway/runtime_ownership.py`, `gateway/session_prune.py`, `hermes_state_prune_budget.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_cli/maintenance_window.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/web_routers/sessions.py`, `hermes_state_prune_pacing.py`, `hermes_state_mutation_retirement.py`, `hermes_state_local.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compaction_prepare.py`, `hermes_state_coverage.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
 
 ## Focused regression
 
 ```text
-scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
+scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_state/test_auto_prune_window_close.py tests/gateway/test_background_housekeeping_chore.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
 ```
 
 ## Retirement

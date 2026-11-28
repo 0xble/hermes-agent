@@ -4580,6 +4580,39 @@ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
         logger.debug("%s error: %s", label, exc)
 
 
+class _StateDbMaintenancePass:
+    """The state.db maintenance chore on its own thread, so a pass that uses the whole deletion
+    window never holds the housekeeping tick. A tick that finds the previous pass running skips it.
+
+    *cancel* is the housekeeping stop event: the moment shutdown sets it, a running prune stops
+    between (or inside) transactions as its window deadline would, whatever the housekeeping loop
+    is doing, so ownership release never waits out the window. The pass records itself as partial
+    and the next window resumes it."""
+
+    def __init__(self, label: str, fn, cancel: threading.Event) -> None:
+        self.label, self.fn = label, fn
+        self.thread: Optional[threading.Thread] = None
+        self._stop = cancel
+
+    def __call__(self) -> None:
+        if self.thread is not None and self.thread.is_alive():
+            return
+        from gateway.runtime_ownership import process_ownership
+        self.thread = threading.Thread(target=self._run, daemon=True, name=f"housekeeping: {self.label}")
+        # A registered writer: the profile lock stays held while a pass may still write.
+        process_ownership.start_writer(self.thread)
+
+    def _run(self) -> None:
+        from hermes_state_prune_budget import prune_cancel
+        with prune_cancel(self._stop):
+            _housekeeping_chore(self.label, self.fn)
+
+    def stop(self, timeout: Optional[float] = None) -> None:
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+
 def _housekeeping_channel_directory(adapters, loop) -> None:
     from gateway.channel_directory import build_channel_directory
     if loop is not None:
@@ -4840,15 +4873,21 @@ def _start_gateway_housekeeping(
         # The ticker's own guards keep its loop alive; this is the outer layer for a thread that has
         # already ended (#111010). Runs every tick so the outage is bounded by one housekeeping interval.
         chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead, False))
+    # Every 5 ticks so a nightly pass starts as maintenance.deletion_window opens: on the hourly
+    # cadence it began at a random minute, pruned only until the window closed and skipped some
+    # nights entirely. Outside the window each check is a cached config read. Its own thread: a
+    # pass can run the whole window, and the tick must keep draining deliveries and heartbeats.
+    state_db_maintenance = _StateDbMaintenancePass("state.db maintenance tick", profile_scoped_chore(
+        runner,
+        # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
+        lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
+            _housekeeping_state_db_maintenance(_launch),
+    ), stop_event)
     chores += [
         # Per served profile: each has its own skills tree, curator state, Nous login and state.db.
         (60, "Curator tick", profile_scoped_chore(runner, lambda: _housekeeping_curator(idle_fence)), False),
-        (60, "state.db maintenance tick", profile_scoped_chore(
-            runner,
-            # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
-            lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
-                _housekeeping_state_db_maintenance(_launch),
-        ), watch_delivery_queue),  # Bootstrap maintenance follows the first delivery watch window.
+        # Bootstrap maintenance follows the first delivery watch window.
+        (5, "state.db maintenance tick", state_db_maintenance, watch_delivery_queue),
         # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
@@ -4895,6 +4934,8 @@ def _start_gateway_housekeeping(
             break
         for label, fn in deferred_after_watch:
             _housekeeping_chore(label, fn)
+    # A running pass stops at its next transaction boundary and resumes in the next window.
+    state_db_maintenance.stop()
     logger.info("Gateway housekeeping stopped (idle-task runs settled: %s)", idle_fence.close())
 
 

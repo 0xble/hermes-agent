@@ -244,6 +244,8 @@ class ProfileOwnership:
     def start_writer(self, thread: threading.Thread) -> None:
         """Register before starting so partial startup cannot forget a live writer."""
         with self._mutex:
+            # Only a live writer holds the lock in close(); a recurring writer must not grow the list.
+            self._writers = [writer for writer in self._writers if writer.is_alive()]
             self._writers.append(thread)
             thread.start()
 
