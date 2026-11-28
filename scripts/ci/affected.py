@@ -9,7 +9,8 @@ whole suite. The quick lane is fast feedback only: the full suite still runs
 once before merge, so a selection miss is caught there.
 
 Usage: affected.py [--base REF] [--json]
-Prints one test path per line, or ALL when the whole suite must run.
+Prints one test path or pytest node id per line, or ALL when the whole suite
+must run.
 """
 from __future__ import annotations
 
@@ -34,8 +35,12 @@ FULL_SUITE_PATTERNS = (
     '.github/workflows/*', '.github/actions/*', '.github/known-flakes*', 'bin/ci', 'bin/ci-*', 'scripts/ci/*', 'ci/*', '.mergify.yml',
     'sitecustomize.py', '*/sitecustomize.py',
 )
-# Optional per-repo glob list kept beside this script.
-EXTRA_FULL_SUITE_FILE = Path(__file__).with_name('full-suite-paths')
+# Optional per-repo files kept beside this script.
+EXTRA_FULL_SUITE_FILE = Path(__file__).with_name('full-suite-paths')  # one glob per line
+# One rule per line: a regex matched against each changed path, then the tests
+# or pytest node ids it selects; targets may use \1-style groups. For tests
+# that discover inputs by globbing, which neither imports nor path names reveal.
+PATH_MAP_FILE = Path(__file__).with_name('affected-map')
 MIN_TEXT_TOKEN = 8  # shorter basenames match too much prose to be a signal
 # Basenames shared by many files say nothing about which one a test reads.
 GENERIC_NAMES = {'__init__.py', '__main__.py', 'conftest.py', 'README.md', 'SKILL.md', 'AGENTS.md',
@@ -71,6 +76,21 @@ def full_suite_patterns() -> tuple[str, ...]:
         return FULL_SUITE_PATTERNS
     lines = [ln.strip() for ln in extra.read_text(encoding='utf-8').splitlines()]
     return FULL_SUITE_PATTERNS + tuple(ln for ln in lines if ln and not ln.startswith('#'))
+
+
+def mapped_targets(changed: list[str]) -> set[str]:
+    if not PATH_MAP_FILE.is_file():
+        return set()
+    targets: set[str] = set()
+    for line in PATH_MAP_FILE.read_text(encoding='utf-8').splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        pattern, *outputs = line.split()
+        regex = re.compile(pattern)
+        for path in changed:
+            if match := regex.match(path):
+                targets.update(match.expand(output) for output in outputs)
+    return targets
 
 
 def module_names(path: str) -> list[str]:
@@ -211,6 +231,7 @@ def select(root: Path, base: str) -> tuple[str, list[str], str]:
                             seen.add(parent)
                             stack.append(parent)
 
+    affected.update(mapped_targets(changed))
     return 'affected', sorted(affected), f'{len(changed)} changed files'
 
 
