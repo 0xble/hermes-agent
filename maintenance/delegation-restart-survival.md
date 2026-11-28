@@ -76,6 +76,9 @@ result/transcript evidence for conservative recovery through the durable retry e
   claimed legacy recovery (`retry_state='none'`) only for the stopping session's
   selectors; CLI `/stop` passes its own `parent_session_id`.
   CLI exits are labeled as CLI exits, not gateway shutdowns.
+  The gateway shutdown sweep (`gateway/run_shutdown.py`) calls `interrupt_all(..., resumable=True)`,
+  so every child it stops is marked `gateway_shutdown` before it unwinds and keeps a resumable
+  `AUTO_ON_BOOT` record; without the flag a cleanly unwound child reads as a user stop.
   `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
   continuation path, but recovery authority is based on positive evidence of a user
   stop, not on a restart token. Legacy phase-specific gateway-shutdown reasons and
@@ -110,4 +113,4 @@ state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.
 
-Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`, `tests/tools/test_async_delegation_restart_cut.py`.
+Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`, `tests/tools/test_async_delegation_restart_cut.py`, `tests/tools/test_delegate_resumable.py`.
