@@ -12,8 +12,6 @@ from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
 import hermes_state
-
-import hermes_state
 from hermes_constants import get_hermes_home
 from gateway import run as gateway_run
 from gateway.run_pending_recovery import recover_pending_shutdown_flush

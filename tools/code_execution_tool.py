@@ -782,9 +782,6 @@ def execute_code(
     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
     isolation jail: default `project` mode runs in the session's cwd with the project venv.
     ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
-    from agent.incognito import is_incognito
-    if is_incognito():
-        return tool_error("File-backed Python kernels are unavailable in incognito mode. Use foreground terminal instead.")
     # Fail closed under a terminal-policy refusal scope: the routed profile's terminal
     # policy is unresolved, so refuse rather than inherit the launch process's ambient policy.
     try:

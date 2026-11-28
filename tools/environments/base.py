@@ -579,6 +579,11 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         from agent.incognito import is_incognito
         chain = self._shell_state_snapshot_paths()
         seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
+        private_scratch = ""
+        if self.uses_host_filesystem:
+            from agent.incognito_private_dir import private_path_for_current_session
+            if (private := private_path_for_current_session()) is not None:
+                private_scratch = self._quote_shell_path(str(private / "cache" / "scratch"))
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
@@ -586,7 +591,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             relay_parent_address=in_process_child_relay_parent_address(),
             persist_env=self._persist_env and not is_incognito(),
             pipe_marker=self._pipe_marker,
-            seed_snaps=seeds,
+            seed_snaps=seeds, private_scratch=private_scratch,
             **self._snapshot_script_kwargs(cwd, chain[0] if chain else None))
 
     @staticmethod

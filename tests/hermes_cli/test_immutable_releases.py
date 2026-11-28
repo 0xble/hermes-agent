@@ -10,7 +10,6 @@ import stat
 import subprocess
 import sys
 import types
-import types
 import threading
 from pathlib import Path
 
