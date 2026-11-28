@@ -26,7 +26,10 @@ SHARED_SETUP = re.compile(
     r'^(\.github/|bin/ci|scripts/ci/|ci/|pyproject\.toml$|uv\.lock$|package(-lock)?\.json$'
     r'|pnpm-lock\.yaml$|conftest\.py$|.*/conftest\.py$)')
 # Python that marks macOS tests or branches on the platform.
-MACOS_SOURCE = re.compile(r'platforms\([^)]*["\'](macos|posix)["\']|sys\.platform\s*==\s*["\']darwin|platform\.system\(\)\s*==\s*["\']Darwin')
+MACOS_SOURCE = re.compile(
+    r'platforms\([^)]*["\'](macos|posix)["\']'
+    r'|sys\.platform\s*[!=]=\s*["\']darwin|sys\.platform\.startswith\(\s*["\']darwin'
+    r'|platform\.system\(\)\s*[!=]=\s*["\']Darwin|platform\.mac_ver\(|\bIS_MACOS\b|\bis_macos\b')
 GIT_TIMEOUT_SECONDS = 120
 
 

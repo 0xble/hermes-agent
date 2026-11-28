@@ -46,6 +46,8 @@ def test_fork_sync_candidates_always_run(repo: Path) -> None:
     ('gateway/platforms/macos_keychain.py', 'X = 1\n'),
     ('tools/launchd_helper.py', 'X = 1\n'),
     ('agent/core.py', 'import sys\nIS_MAC = sys.platform == "darwin"\n'),
+    ('agent/core.py', 'import platform\nif platform.system() != "Darwin":\n    pass\n'),
+    ('agent/core.py', 'import sys\nMAC = sys.platform.startswith("darwin")\n'),
     ('tests/test_tray.py', '@pytest.mark.platforms("macos")\ndef test_tray():\n    pass\n'),
     ('.github/workflows/gate.yml', 'name: gate\n'),
     ('uv.lock', 'version = 1\n'),
