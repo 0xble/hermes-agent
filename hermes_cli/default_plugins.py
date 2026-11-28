@@ -123,7 +123,8 @@ def fetch_policy(home: Path) -> str:
     ``"unreadable"`` for *home* (managed overlay applied). Nothing is fetched unless allowed, but an
     unreadable config keeps the home owed, so a repaired file is picked up. Read without binding the
     profile: a whole-profile bind at boot would freeze the launch environment before boot sets it up."""
-    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower() in ("1", "true", "yes"):
+    from pm.install import lazy_installs_env_disabled
+    if lazy_installs_env_disabled():
         return "denied"
     from gateway.config_loader import read_yaml_layers
     try:
@@ -251,6 +252,9 @@ def spawn_install(home: Optional[Path] = None) -> bool:
     from hermes_cli._subprocess_compat import IS_WINDOWS
     from pm.environments import dependency_home_root
     from pm.paths import install_root
+    from pm.install import lazy_installs_env_disabled
+    if lazy_installs_env_disabled():
+        return False  # every home the child would scan is denied by the same environment
     root = Path(dependency_home_root())
     if home is not None and fetch_policy(home) == "denied":
         return False

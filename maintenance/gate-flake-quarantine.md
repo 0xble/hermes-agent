@@ -27,6 +27,12 @@ Not quarantined because the failures were real regressions or had a quick repair
 
 Each entry names the exact pytest node ID, including any parameter ID, the owner task UUID, the reason with its run evidence, and an exclusive UTC expiry date. Remove the entry in the PR that fixes the flake. An expired entry counts as unknown, so the lane pauses again rather than extending it silently.
 
+## Test-spawned children never lazy-install
+
+A child process that a test spawns with a rebuilt environment loses `HERMES_DISABLE_LAZY_INSTALLS`, the harness's bridge var. A gateway or CLI started that way in a scratch HOME acquired dependencies from the network in the background, outlived the test, and failed its orphan and cleanup checks whenever the package index was slow. On 2026-11-28 from about 10:30 UTC that failed Python shards 5 and 8 on every PR. Symptoms included orphan `uv lock`/`uv sync --frozen`/`pm-runtime/generations` processes, and `test_mcp_device_flow` hitting `Directory not empty` on `tools/.staging-*`.
+
+`pm.install.lazy_installs_allowed()` therefore refuses when the bridge var is unset and the process has a pytest ancestor (`hermes_state_guard._has_pytest_ancestor`) but has not imported pytest itself. The test process keeps the env and config policy, since the repo's runner counts as a pytest ancestor there. An explicit bridge value, such as `0`, stays the test's choice. Production processes never have a pytest ancestor.
+
 ## Verification and retirement
 
 Run active quarantined files on every nightly with `scripts/run_tests.sh --file-retries 0`. A withdrawn implementation retires its selector with an explicit coverage disposition. A maintained implementation leaves quarantine only after its race has a deterministic fix and exact-SHA evidence passes.
