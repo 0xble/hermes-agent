@@ -343,6 +343,9 @@ def test_only_the_owners_stop_control_marks_an_owner_stop(monkeypatch):
     from agent import managed_worker as worker
 
     monkeypatch.setattr(worker, '_drain_background_delegations', lambda _seconds: None)
+    # A lost channel hard-exits the worker's process group; here that group is the test runner.
+    died = []
+    monkeypatch.setattr(worker, '_die_with_owner', lambda *a, **k: died.append(True))
 
     def controls_after(frames, end=None):
         def read_frame(_stream, it=iter(frames)):
@@ -362,6 +365,6 @@ def test_only_the_owners_stop_control_marks_an_owner_stop(monkeypatch):
     assert controls_after([{'type': 'stop'}, {'type': 'finish'}]).owner_stop is False
     assert controls_after([{'type': 'stop'}, {'type': 'stop', 'source': 'system'}, {'type': 'finish'}]).owner_stop is False
     lost = controls_after([])
-    assert lost.stopped.is_set() and lost.owner_stop is False
+    assert lost.stopped.is_set() and lost.owner_stop is False and died == [True]
     malformed = controls_after([{'type': 'bogus'}])
     assert malformed.stopped.is_set() and malformed.owner_stop is False
