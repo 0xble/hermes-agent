@@ -568,6 +568,8 @@ def _reset_foreground_exit_fence():
     yield
     if (base := sys.modules.get("tools.environments.base")) is not None:
         base._exit_fenced = False
+    if (registry := sys.modules.get("tools.delegate_tool_registry")) is not None:
+        registry._shutdown_stop_cause = None  # a gateway-shutdown test raises the child stop-cause fence
 
 
 @pytest.fixture(autouse=True)
