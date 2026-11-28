@@ -90,6 +90,24 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
     return buckets
 
 
+def quick_files(base: str | None, index: int, count: int) -> list[str]:
+    """Python/e2e files the change can affect, within shard I/N when given.
+
+    The universe is the same partition the full shards run, so quick never
+    selects a file the full gate would not, and a full fallback (shared setup
+    changed, or no merge base) runs exactly that shard.
+    """
+    from scripts.ci import affected
+    buckets = shard_files(ROOT, count or 1)
+    universe = buckets[index - 1] if count else [path for bucket in buckets for path in bucket]
+    mode, tests, reason = affected.choose(ROOT, base)
+    print(f'quick: {mode} ({reason})', file=sys.stderr, flush=True)
+    if mode == 'full':
+        return universe
+    chosen = set(tests)
+    return [path for path in universe if path in chosen]
+
+
 def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> None:
     buckets = shard_files(ROOT, count)
     files = buckets[index - 1]
@@ -1214,12 +1232,32 @@ def require_case_sensitive_tmpdir(parent: Path) -> None:
             )
 
 
+def quick(args: argparse.Namespace, shard_index: int, shard_count: int) -> int:
+    """Fast PR feedback: only the tests a change can affect. Not a merge gate."""
+    files = quick_files(args.expected_sha, shard_index, shard_count)
+    if args.select_only:
+        print('\n'.join(files))
+        return 0
+    if not files:
+        print('QUICK: PASS (no affected Python/e2e files)')
+        return 0
+    STATE.mkdir(exist_ok=True)
+    with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
+        env = resolve_local_toolchain(environment(home))
+        setup(env)
+        print(f'Quick: {len(files)} Python/e2e files', flush=True)
+        passed = aggregate([('python-quick', lambda: python_files(env, files, args.workers))])
+    print(f'QUICK: {"PASS" if passed else "FAIL"}. The full gate still runs before merge.')
+    return 0 if passed else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
-    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly')
+    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native', 'quick'))
+    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly; for quick, the base ref (default origin/main)')
+    parser.add_argument('--select-only', action='store_true', help='quick: print the selected files and exit without running them')
     parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES, 'node-gate', 'nightly-only-e2e'), action='append', help='Select exact-SHA lanes or partial check lanes')
-    parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, gate/nightly only)')
+    parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, gate/nightly/quick only)')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
     parser.add_argument('--node-workers', type=int, default=2)
     args = parser.parse_args()
@@ -1229,13 +1267,17 @@ def main() -> int:
         parser.error('--lane is only valid for check/gate/nightly')
     shard_index = shard_count = 0
     if args.shard:
-        if args.command not in ('gate', 'nightly') or args.lane:
-            parser.error('--shard requires gate/nightly without --lane')
+        if args.command not in ('gate', 'nightly', 'quick') or args.lane:
+            parser.error('--shard requires gate/nightly/quick without --lane')
         match = re.fullmatch(r'([1-9][0-9]*)/([1-9][0-9]*)', args.shard)
         if not match or int(match[1]) > int(match[2]):
             parser.error('--shard must be I/N with 1 <= I <= N')
         shard_index, shard_count = map(int, match.groups())
     exact = args.command in ('gate', 'nightly', 'nightly-native')
+    if args.select_only and args.command != 'quick':
+        parser.error('--select-only is only valid for quick')
+    if args.command == 'quick':
+        return quick(args, shard_index, shard_count)
     if exact != bool(args.expected_sha):
         parser.error('gate/nightly require a positional full SHA; other commands do not accept one')
     if args.command == 'preflight':

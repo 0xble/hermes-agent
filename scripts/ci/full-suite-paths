@@ -1,0 +1,5 @@
+# Globs (fnmatch, repository-relative) whose change runs the whole suite in
+# the quick lane, on top of the shared-setup list in affected.py.
+scripts/run_tests*
+tests/_fixtures/*
+pm/lock.json

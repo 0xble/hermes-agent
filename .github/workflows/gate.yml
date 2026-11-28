@@ -1,6 +1,11 @@
 name: Repository gate
+# Draft pushes run the quick lane: only the Python/e2e files the change can
+# affect (scripts/ci/affected.py), inside the same 10-shard partition. Marking a
+# PR ready, and every push after that, runs the full gate once on the exact
+# head; qualification passes only there, so nothing merges on quick alone.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
 concurrency:
@@ -100,9 +105,29 @@ jobs:
       - name: Assert checked-out PR head
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+      - name: Select affected tests for draft feedback
+        id: select
+        shell: bash
+        env:
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [[ "$DRAFT_PR" != true ]]; then
+            echo 'profile=gate' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'profile=quick' >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
+            echo 'No comparison history; quick falls back to the whole shard.'
+          python3 bin/ci quick origin/main --select-only --shard "$SHARD/10" > "$RUNNER_TEMP/quick-files.txt"
+          count=$(grep -c . "$RUNNER_TEMP/quick-files.txt" || true)
+          echo "Quick shard $SHARD/10: $count files"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
       - name: Cache pinned Linux tool archives
+        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         uses: ./.github/actions/cache-linux-tools
       - name: Install pinned Linux toolchain and platform libraries
+        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         shell: bash
         run: |
           apt-get update
@@ -112,9 +137,11 @@ jobs:
           uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Verify tmux for e2e coverage
+        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         shell: bash
         run: tmux -V
       - name: Exact-SHA Python shard
+        if: steps.select.outputs.profile == 'gate'
         shell: bash
         env:
           HERMES_E2E_REQUIRE_TUI: "1"
@@ -122,6 +149,15 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+      - name: Quick Python shard (draft feedback)
+        if: steps.select.outputs.profile == 'quick' && steps.select.outputs.count != '0'
+        shell: bash
+        env:
+          HERMES_E2E_REQUIRE_TUI: "1"
+        run: |
+          useradd --uid 1001 --create-home --shell /bin/bash ci
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
+          runuser -u ci -- env HOME="$HOME" ./bin/ci quick origin/main --shard '${{ matrix.shard }}/10'
   prompt-surface:
     name: Prompt surface diff
     uses: ./.github/workflows/prompt-surface-diff.yml
@@ -141,12 +177,11 @@ jobs:
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          if results and all(result == 'success' for result in results.values()):
+          draft = os.environ.get('DRAFT_PR') == 'true'
+          if not draft and results and all(result == 'success' for result in results.values()):
               sys.exit(0)
-          not_run = [name for name, result in results.items() if result != 'success']
-          only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
-          draft_skip = os.environ.get('DRAFT_PR') == 'true' and only_skipped
-          message = 'draft: gate not run' if draft_skip else 'gate not qualified'
+          # A draft ran the quick lane, never the full gate, so it cannot qualify.
+          message = 'draft: quick feedback only; mark ready to run the full gate' if draft else 'gate not qualified'
           print(message, file=sys.stderr)
           sys.exit(1)
           PY
