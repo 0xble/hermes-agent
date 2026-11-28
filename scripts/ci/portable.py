@@ -1234,6 +1234,11 @@ def require_case_sensitive_tmpdir(parent: Path) -> None:
 
 def quick(args: argparse.Namespace, shard_index: int, shard_count: int) -> int:
     """Fast PR feedback: only the tests a change can affect. Not a merge gate."""
+    if args.nonempty_shards:
+        chosen = set(quick_files(args.expected_sha, 0, 0))
+        buckets = shard_files(ROOT, args.nonempty_shards)
+        print(json.dumps([index for index, bucket in enumerate(buckets, 1) if chosen & set(bucket)]))
+        return 0
     files = quick_files(args.expected_sha, shard_index, shard_count)
     if args.select_only:
         print('\n'.join(files))
@@ -1256,6 +1261,7 @@ def main() -> int:
     parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native', 'quick'))
     parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly; for quick, the base ref (default origin/main)')
     parser.add_argument('--select-only', action='store_true', help='quick: print the selected files and exit without running them')
+    parser.add_argument('--nonempty-shards', type=int, metavar='N', help='quick: print a JSON list of the 1-indexed shards of N that have selected files')
     parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES, 'node-gate', 'nightly-only-e2e'), action='append', help='Select exact-SHA lanes or partial check lanes')
     parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, gate/nightly/quick only)')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
@@ -1274,8 +1280,8 @@ def main() -> int:
             parser.error('--shard must be I/N with 1 <= I <= N')
         shard_index, shard_count = map(int, match.groups())
     exact = args.command in ('gate', 'nightly', 'nightly-native')
-    if args.select_only and args.command != 'quick':
-        parser.error('--select-only is only valid for quick')
+    if (args.select_only or args.nonempty_shards) and args.command != 'quick':
+        parser.error('--select-only and --nonempty-shards are only valid for quick')
     if args.command == 'quick':
         return quick(args, shard_index, shard_count)
     if exact != bool(args.expected_sha):

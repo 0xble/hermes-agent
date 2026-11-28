@@ -1,8 +1,9 @@
 name: Repository gate
 # Draft pushes run the quick lane: only the Python/e2e files the change can
-# affect (scripts/ci/affected.py), inside the same 10-shard partition. Marking a
-# PR ready, and every push after that, runs the full gate once on the exact
-# head; qualification passes only there, so nothing merges on quick alone.
+# affect (scripts/ci/affected.py), inside the same 10-shard partition, and only
+# the shards that have any. Marking a PR ready, and every push after that, runs
+# the full gate once on the exact head; qualification passes only there, so
+# nothing merges on quick alone.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -78,13 +79,44 @@ jobs:
           runuser -u ci -- env HOME="$HOME" ./bin/ci setup
           bash ci/prepare-electron-sandbox.sh
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
+  select:
+    name: Select Python shards
+    runs-on: ubuntu-latest
+    outputs:
+      profile: ${{ steps.pick.outputs.profile }}
+      shards: ${{ steps.pick.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Pick the full matrix, or the quick shards with affected files
+        id: pick
+        env:
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [[ "$DRAFT_PR" != true ]]; then
+            echo 'profile=gate' >> "$GITHUB_OUTPUT"
+            echo 'shards=[1,2,3,4,5,6,7,8,9,10]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
+            echo 'No comparison history; quick falls back to every shard.'
+          shards=$(python3 bin/ci quick origin/main --nonempty-shards 10)
+          echo "Quick shards: $shards"
+          echo 'profile=quick' >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)
+    needs: select
+    if: needs.select.outputs.shards != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: ${{ fromJSON(needs.select.outputs.shards) }}
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
       options: --init
@@ -105,29 +137,9 @@ jobs:
       - name: Assert checked-out PR head
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
-      - name: Select affected tests for draft feedback
-        id: select
-        shell: bash
-        env:
-          DRAFT_PR: ${{ github.event.pull_request.draft }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          if [[ "$DRAFT_PR" != true ]]; then
-            echo 'profile=gate' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo 'profile=quick' >> "$GITHUB_OUTPUT"
-          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
-            echo 'No comparison history; quick falls back to the whole shard.'
-          python3 bin/ci quick origin/main --select-only --shard "$SHARD/10" > "$RUNNER_TEMP/quick-files.txt"
-          count=$(grep -c . "$RUNNER_TEMP/quick-files.txt" || true)
-          echo "Quick shard $SHARD/10: $count files"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
       - name: Cache pinned Linux tool archives
-        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         uses: ./.github/actions/cache-linux-tools
       - name: Install pinned Linux toolchain and platform libraries
-        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         shell: bash
         run: |
           apt-get update
@@ -137,11 +149,10 @@ jobs:
           uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Verify tmux for e2e coverage
-        if: steps.select.outputs.profile == 'gate' || steps.select.outputs.count != '0'
         shell: bash
         run: tmux -V
       - name: Exact-SHA Python shard
-        if: steps.select.outputs.profile == 'gate'
+        if: needs.select.outputs.profile == 'gate'
         shell: bash
         env:
           HERMES_E2E_REQUIRE_TUI: "1"
@@ -149,8 +160,14 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+      - name: Fetch comparison history for quick
+        if: needs.select.outputs.profile == 'quick'
+        shell: bash
+        run: |
+          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
+            echo 'No comparison history; quick falls back to the whole shard.'
       - name: Quick Python shard (draft feedback)
-        if: steps.select.outputs.profile == 'quick' && steps.select.outputs.count != '0'
+        if: needs.select.outputs.profile == 'quick'
         shell: bash
         env:
           HERMES_E2E_REQUIRE_TUI: "1"
@@ -165,7 +182,7 @@ jobs:
       contents: read
   qualification:
     if: always()
-    needs: [linux, python-shard, prompt-surface, repository-guards]
+    needs: [linux, select, python-shard, prompt-surface, repository-guards]
     runs-on: ubuntu-latest
     steps:
       - name: Require every gate job

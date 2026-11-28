@@ -155,7 +155,7 @@ rmdir "$ci_scratch/mnt" "$ci_scratch"
 
 `./bin/ci quick [base] [--shard I/N]` runs only the Python/e2e files a change can affect, compared with its merge base against `origin/main` (or `base`). `scripts/ci/affected.py` selects changed test files, every test that imports a changed module directly or through other modules, tests under a `conftest.py` that does, and tests that name a changed file's path. A production module's function-local imports and `TYPE_CHECKING` imports are not followed, because they do not run at import time. Changes to shared setup (any `conftest.py`, pytest or dependency configuration, lock files, CI configuration, and the globs in `scripts/ci/full-suite-paths`) select the whole partition, as do a shallow clone or a missing merge base. Selection stays inside the same shard partition the full gate runs.
 
-Draft PR pushes run quick on each hosted shard, and a shard with nothing selected exits before installing the toolchain. Marking a PR ready, and every push after that, runs the full gate on the exact head. `qualification` cannot pass on a draft, so quick never stands in for the full gate before merge, and a test quick missed is caught there. `--select-only` prints the selection without running it.
+Draft PR pushes compute the selection once (`--nonempty-shards 10`) and start only the hosted shards that have selected files, which matters under the account's concurrent hosted-job cap. Marking a PR ready, and every push after that, runs the full gate on the exact head. `qualification` cannot pass on a draft, so quick never stands in for the full gate before merge, and a test quick missed is caught there. `--select-only` prints the selection without running it.
 
 ## portable-ci-home-sweep
 
