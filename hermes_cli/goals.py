@@ -383,6 +383,11 @@ def format_goal_authoring_warning(findings: list[GoalAuthoringFinding]) -> str:
 # ``goals.min_continuation_gap_seconds`` remains the configured lower bound between
 # automatic continuations. The no-progress ladder adds its own escalating waits on top.
 DEFAULT_MIN_CONTINUATION_GAP_SECONDS = 15 * 60
+# A continuation turn that ends without a usable response never reaches the post-turn judge. The
+# goal re-arms as a short timed wait (the automatic-continuation floor still applies) and pauses
+# after this many consecutive empty continuations.
+CONTINUATION_RETRY_SECONDS = 60
+CONTINUATION_MAX_EMPTY = 3
 _MIN_CONTINUATION_GAP_REASON = "minimum gap between autonomous goal continuations"
 
 # Stable opening used by every standing-goal continuation prompt. Consumers that need to
@@ -1043,6 +1048,10 @@ class GoalState:
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
+    # Consecutive gateway continuations that ended without a usable final response. This is
+    # separate from judge transport failures because the model/provider may have returned cleanly
+    # while the gateway lost the turn's final response.
+    consecutive_continuation_failures: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: list[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -1101,10 +1110,10 @@ class GoalState:
     def from_json(cls, raw: str) -> GoalState:
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in (
+        ints: dict[str, int] = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures",
-            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
-        floats = {k: float(data.get(k) or 0.0) for k in (
+            "consecutive_continuation_failures", "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
+        floats: dict[str, float] = {k: float(data.get(k) or 0.0) for k in (
             "created_at", "last_turn_at", "waiting_until", "waiting_since",
             "last_automatic_continuation_at")}
         return cls(
@@ -3043,6 +3052,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         state.paused_by = ""
         state.consecutive_no_progress = 0
         state.backoff_level = 0
+        state.consecutive_continuation_failures = 0
         state.clear_wait()
         if reset_budget:
             state.turns_used = 0
@@ -3145,6 +3155,49 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             reason, waiting_until=time.time() + seconds,
             waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
         )
+
+    @snapshot_control
+    def rearm_after_empty_continuation(
+        self, *, expected_instance: Optional[float] = None, turn_started_at: Optional[float] = None,
+        retry_seconds: int = CONTINUATION_RETRY_SECONDS, max_empty: int = CONTINUATION_MAX_EMPTY,
+    ) -> Optional[str]:
+        """A continuation turn ended with no usable response, so no post-turn judge will queue the
+        next one. Park the goal on a short timed wait so the idle watcher retries it once.
+
+        One atomic mutation fences the goal instance, a wait someone else already armed, and an
+        evaluation that finished after this turn started. After ``max_empty`` consecutive empty
+        continuations the goal pauses instead. Returns ``"rearmed"``, ``"paused"`` or ``None``.
+        """
+        def _apply(state):
+            if state is None or state.status != "active" or state.waiting_since:
+                return None
+            if expected_instance is not None and state.created_at != expected_instance:
+                return None
+            if turn_started_at is not None and state.last_turn_at > turn_started_at:
+                return None  # a newer turn was already judged; nothing is stranded
+            failures = state.consecutive_continuation_failures + 1
+            if failures >= max_empty:
+                state.consecutive_continuation_failures = failures
+                state.clear_wait()
+                state.status = "paused"
+                state.paused_reason = f"continuation turn produced no response {failures} times in a row"
+                state.paused_by = "system"
+                state.consecutive_no_progress = 0
+                state.backoff_level = 0
+                return "paused"
+            state.consecutive_continuation_failures = failures
+            state.clear_wait(preserve_notice_key=True)
+            now = time.time()
+            # This is a transport recovery, not a normal successful automatic chain. Let the
+            # short retry delay be the watcher gate; a successful retry re-establishes the normal
+            # continuation floor when it is admitted.
+            state.last_automatic_continuation_at = 0.0
+            state.waiting_until = now + retry_seconds
+            state.waiting_seconds = retry_seconds
+            state.waiting_reason = "continuation turn produced no response"
+            state.waiting_since = now
+            return "rearmed"
+        return self._mutate_current(_apply)
 
     @snapshot_control
     def stop_waiting(self) -> bool:
@@ -3544,6 +3597,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         state = self._state
         if not self.is_active():
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        assert state is not None
 
         # A real break in silence resets the no-progress ladder. Discover the current
         # turn's evidence before any wait or gate return so an actionable result can reset it
@@ -3668,6 +3722,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         # Judge failure counters are diagnostics only; neither kind pauses a goal.
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
+        state.consecutive_continuation_failures = 0  # a judged turn ends the empty-continuation streak
 
         # Automatic no-progress waits already provide the sole pacing ladder. Fresh evidence
         # bypasses it by resetting backoff_level above; the hard floor still applies to the

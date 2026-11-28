@@ -305,6 +305,7 @@ class GoalRevisionsMixin:
         # Per-objective judge bookkeeping restarts with the new objective.
         state.consecutive_parse_failures = 0
         state.consecutive_transport_failures = 0
+        state.consecutive_continuation_failures = 0
         state.consecutive_no_progress = 0
         state.backoff_level = 0
         state.last_progress_fingerprint = None
