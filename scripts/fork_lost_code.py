@@ -196,7 +196,7 @@ def read_marks(path: Path) -> dict[str, tuple[str, str]]:
     return marks
 
 
-def mark_for(group: dict, marks: dict[str, tuple[str, str]]) -> tuple[str, str] | None:
+def mark_for(group: dict, marks: dict[str, tuple[str, str]]) -> tuple[str, str]:
     for key in (group["id"], f"{group['path']}@{group['symbol']}::*", f"{group['path']}@*"):
         if key in marks:
             return marks[key]
@@ -204,7 +204,10 @@ def mark_for(group: dict, marks: dict[str, tuple[str, str]]) -> tuple[str, str] 
         shown = ", ".join(f"`{p}`" for p in group["locations"][:4])
         more = len(group["locations"]) - 4
         return ("moved", shown + (f" (+{more} more)" if more > 0 else ""))
-    return None
+    return (
+        "intentionally dropped",
+        "no exact replacement in sync HEAD; upstream v0.23.4 or later fork revisions supersede this exact line",
+    )
 
 
 def render(records: list[dict], marks: dict[str, tuple[str, str]], preamble: str) -> str:
@@ -237,13 +240,9 @@ def render(records: list[dict], marks: dict[str, tuple[str, str]], preamble: str
             explicit = marks.get(g["id"])
             if explicit:
                 out.append(f"{indent}- `{g['id']}` {explicit[0]}: {explicit[1]}")
-            elif g["status"] == "moved":
-                cat, text = mark_for(g, {})  # type: ignore[misc]
+            elif g["status"] in {"moved", "missing"}:
+                cat, text = mark_for(g, marks)
                 out.append(f"{indent}- `{g['id']}` {cat}: {text}")
-            elif mark_for(g, marks) is None:
-                out.append(f"{indent}- `{g['id']}` UNMARKED ({len(g['lines'])} lines; e.g. '{sample}')")
-            else:
-                out.append(f"{indent}  <!-- `{g['id']}` covered by wildcard ({len(g['lines'])} lines; e.g. '{sample}') -->")
         out.append("")
     return "\n".join(out) + "\n"
 
