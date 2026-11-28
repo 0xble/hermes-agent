@@ -1523,8 +1523,6 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
-        from gateway.run_checkins import install_visible_observer
-        install_visible_observer(self, adapter)
         adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):

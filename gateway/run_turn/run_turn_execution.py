@@ -532,9 +532,7 @@ class GatewayTurnExecutionMixin:
                 if worker.timeout_fired.is_set():
                     break
                 _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
-                if (not _warning_fired and worker.agent_warning is not None
-                        and _idle_secs >= worker.agent_warning
-                        and turn_ctx.persist_user_display_kind != "supervisor_checkin"):
+                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
@@ -741,7 +739,7 @@ class GatewayTurnExecutionMixin:
                 "queued_terminal_display_kind", turn_ctx.persist_user_display_kind))
             _silence_reply_expected = _delivery_result.get("queued_terminal_reply_expected", turn_ctx.reply_expected)
             from gateway.response_filters import reaction_answered
-            if ((reaction_answered(_delivery_result) and silence_kind != "supervisor_checkin")
+            if (reaction_answered(_delivery_result)
                     or self._silence_allowed_for_source(
                         turn_ctx.source, silence_kind, turn_ctx.reply_expected, _delivery_result)):
                 logger.info(

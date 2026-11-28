@@ -162,13 +162,10 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   restore (`restore_local_session_async`) and admission reads. Still on the loop and named by
   the guard: `session_detached.name` (`lookup_by_session_key`), `session_viewer_close._physical_target`
   (`local_receipt`) and `/discard` (`peek_session_id`).
-- The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
-  session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
-  the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live
-  gateway held 36,898 routed sessions; a per-entry realpath made each pass ~150k GIL-releasing
-  lstat calls, and a 150 s Python stack sample showed 39 s of loop time in that scan, in
-  unbroken runs up to 5.1 s (`ws write slow (loop stalled >10s)` under heavier load). Proof:
-  `tests/gateway/test_checkin_poll_loop_budget.py`.
+- `_standalone_runtime_home` memoizes the resolved parent per DB path. On 2026-11-14 the live
+  gateway held 36,898 routed sessions, and the supervisor check-in poll's per-entry realpath made
+  each pass ~150k GIL-releasing lstat calls (39 s of loop time in a 150 s stack sample). That poll
+  was [retired](supervisor-checkins.md) on 2026-11-27. The memo stays for the other origin restores.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.

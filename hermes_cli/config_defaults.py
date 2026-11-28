@@ -1447,12 +1447,6 @@ DEFAULT_CONFIG = {
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
     },
-    "checkins": {
-        "enabled": True,
-        "only_roots": [],  # Exact compression-root session ids. Empty preserves profile-wide supervision.
-        "first_after_seconds": 1200,  # Both durations have a 300-second floor.
-        "interval_seconds": 1800,
-    },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
     # while replies stop changing.
@@ -1856,7 +1850,6 @@ DEFAULT_CONFIG = {
 
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
-        "review": {"excluded_threads": []},  # Topic thread IDs that never receive opted-in reviewed reports.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by default: policy-denied
         # in cron context to prevent unattended scheduling loops. Jobs created this way are user-owned in the same flat
         # jobs table. Interactive toolsets (messaging/clarify) stay denied in cron regardless.

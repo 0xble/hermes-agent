@@ -249,8 +249,6 @@ class GatewayTurnProgressMixin:
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
-        if ctx.persist_user_display_kind == "supervisor_checkin":
-            return
         from gateway.warning_notifications import render_notification
         status = kwargs.get("status")
         try:
@@ -1026,10 +1024,8 @@ class GatewayTurnProgressMixin:
             self._publish_execution("notification.clear", {"key": str(key)})
 
     def _status_live(self) -> bool:
-        """Engine chrome cannot precede a supervisor's roster-validated final."""
-        ctx = self._ctx
-        return (ctx.persist_user_display_kind != "supervisor_checkin"
-                and bool(ctx._status_adapter) and ctx._run_still_current())
+        """Status adapter present and this run is still the current generation."""
+        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         from gateway.bot_peer_notices import automatic_notices_allowed

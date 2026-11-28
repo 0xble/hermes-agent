@@ -1346,8 +1346,6 @@ def _deliver_via_live_adapter(
                 route_thread_id if route_thread_id is not None else "-",
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
-            if delivered_message_id is not None:
-                job.setdefault("_last_delivery_message_ids", []).append(str(delivered_message_id))
             _seed_live_delivery_sessions(t, delivered_message_id)
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
@@ -1505,8 +1503,6 @@ def _deliver_standalone(
             delivered_copy_count += 1
         elif payload_content:
             delivered_text = True
-        if isinstance(result, dict) and result.get("message_id") is not None:
-            job.setdefault("_last_delivery_message_ids", []).append(str(result["message_id"]))
         combined_warnings.extend((result.get("warnings") if isinstance(result, dict) else None) or [])
     if err is None and result is None:
         err = f"standalone send skipped (empty text and no media) for {t.where}"
@@ -1708,11 +1704,6 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
-    if (not for_failure and isinstance(job.get("review"), dict)
-            and str(job.get("deliver", "local")).strip().lower() == "local"):
-        from cron.scheduler_review import _deliver_reviewed_result
-
-        return _deliver_reviewed_result(job, content, adapters, loop)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     job.pop("_formatting_degraded_targets", None)
@@ -1756,7 +1747,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response and not job.get("_review_mirror_session"):
+    if wrap_response:
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"

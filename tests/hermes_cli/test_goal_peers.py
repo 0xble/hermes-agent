@@ -6,7 +6,6 @@ import pytest
 
 from gateway.session_context import scoped_current_session_id
 from hermes_cli import goals
-from hermes_cli.checkins import CheckinConfig, CheckinManager, outstanding_work
 from hermes_cli.goal_command import dispatch_goal_command
 from hermes_state import SessionDB
 
@@ -21,7 +20,6 @@ def parent(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("parent", source="telegram")
     monkeypatch.setattr(goals, "_get_session_db", lambda: db)
-    monkeypatch.setattr("tools.async_delegation.supervisor_inventory", lambda _: [])
     mgr = goals.GoalManager("parent")
     mgr.set("Deliver the verified peer artifact")
     with scoped_current_session_id("parent"):
@@ -31,6 +29,12 @@ def parent(tmp_path, monkeypatch):
 
 def command(mgr, text):
     return dispatch_goal_command(mgr, text, authorize_gate=lambda: None)
+
+
+def pending_refs(sid):
+    """References an active goal still awaits; a paused, cleared or absent goal awaits none."""
+    goal = goals.load_goal(sid)
+    return {row["ref"] for row in goal.pending_peers} if goal is not None and goal.status == "active" else set()
 
 
 def register(mgr, peer=PEER, ref="existing-work"):
@@ -43,10 +47,7 @@ def test_peer_only_handoff_survives_idle_and_unverified_result(parent):
     instance = mgr.state.created_at
     result = command(mgr, f'peer wait {instance} hermes:default/peer existing-work "artifact readback"')
     assert not result.error, result.output
-    work = outstanding_work(db, "parent")
-    assert len(work) == 1 and work[0]["kind"] == "peer"
-    checkin = CheckinManager(db, "parent", CheckinConfig())
-    assert checkin.reconcile(work, now=100).due_at == 1300
+    assert pending_refs("parent") == {"existing-work"}
     # Neither idle nor a peer's prose is parent tool proof.
     db.create_session("peer", source="telegram")
     db.append_message("peer", "assistant", "artifact readback verified")
@@ -54,7 +55,7 @@ def test_peer_only_handoff_survives_idle_and_unverified_result(parent):
     rejected = command(mgr, f'peer resolve {instance} hermes:default/peer existing-work "artifact readback verified"')
     assert rejected.error
     assert db.get_meta("goal:parent") == before
-    assert outstanding_work(db, "parent")[0]["status"] == "awaiting parent verification"
+    assert pending_refs("parent") == {"existing-work"}
 
 
 def test_resolve_only_exact_ref_with_recorded_parent_proof(parent):
@@ -181,7 +182,7 @@ def test_compression_migrates_dependencies_but_not_fork_authority(parent):
     db.end_session("parent", "compression")
     db.create_session("tip", source="telegram", parent_session_id="parent")
     assert goals.migrate_goal_to_session("parent", "tip", reason="compression")
-    assert {row["id"] for row in outstanding_work(db, "tip")} == {"existing-work", "second-work"}
+    assert pending_refs("tip") == {"existing-work", "second-work"}
     tip = goals.GoalManager("tip")
     db.append_message("tip", "tool", PROOF, tool_name="terminal")
     with scoped_current_session_id("tip"):
@@ -189,7 +190,7 @@ def test_compression_migrates_dependencies_but_not_fork_authority(parent):
         assert len(goals.load_goal("tip").pending_peers) == 1
         assert tip.resolve_peer("hermes:other/second", "second-work", PROOF, expected_instance=instance)["ok"]
     assert goals.load_goal("tip").pending_peers == []
-    assert not outstanding_work(db, "tip")
+    assert not pending_refs("tip")
     assert not mgr.resolve_peer(PEER, "existing-work", PROOF, expected_instance=instance)["ok"]
     db.create_session("fork", source="telegram", parent_session_id="tip")
     assert goals.load_goal("fork") is None
@@ -221,16 +222,14 @@ def test_pending_work_blocks_all_completion_routes(parent, monkeypatch, route):
     assert db.get_meta("goal:parent") == before
 
 
-def test_final_resolution_allows_completion_and_disarms(parent):
+def test_final_resolution_allows_completion(parent):
     mgr, db = parent
     register(mgr)
-    checkin = CheckinManager(db, "parent", CheckinConfig())
-    checkin.reconcile(outstanding_work(db, "parent"), now=100)
     db.append_message("parent", "tool", PROOF, tool_name="terminal")
     assert mgr.resolve_peer(PEER, "existing-work", PROOF, expected_instance=mgr.state.created_at)["ok"]
     mgr.mark_done("verified by parent")
     assert goals.load_goal("parent").status == "done"
-    assert checkin.reconcile(outstanding_work(db, "parent")) is None
+    assert not pending_refs("parent")
 
 
 def test_native_controls_preserve_refs_and_refuse_agent_clear(parent, monkeypatch):
@@ -253,11 +252,11 @@ def test_explicit_user_clear_retains_existing_semantics(parent):
     mgr, db = parent
     register(mgr)
     mgr.pause("user-paused")
-    assert not outstanding_work(db, "parent")
+    assert not pending_refs("parent")
     mgr.resume()
-    assert outstanding_work(db, "parent")
+    assert pending_refs("parent")
     mgr.clear()
-    assert not outstanding_work(db, "parent")
+    assert not pending_refs("parent")
     assert json.loads(db.get_meta("goal:parent"))["status"] == "cleared"
 
 

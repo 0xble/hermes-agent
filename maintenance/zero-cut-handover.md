@@ -20,12 +20,11 @@ The original design below is historical, not an activation receipt. In particula
 cooperative polling settlement failure retains the token lock and reports failure,
 rather than releasing it through the ordinary disconnect timeout path.
 
-External drain is engaged before stopping cron reviews or polling. Keep that order:
+External drain is engaged before stopping cron polling. Keep that order:
 `gateway/run.py`'s cron `can_dispatch` closure reads `_external_drain_active`.
 This is best-effort early cron quiescence, not a persistent handover-owned fence:
 `gateway/run_shutdown.py`'s dashboard marker watcher clears the shared flag when
-no marker exists. The early flag still closes the cron gate when observed, and
-`stop_reviews()` separately stops review admission. While this existing handover
+no marker exists. The early flag still closes the cron gate when observed. While this existing handover
 owns the old Telegram transport, its live received events remain admissible through
 the normal auth and session admission path. The allowance requires a registered
 receiving Telegram adapter via `_transport_owner`, not a restored source, relay

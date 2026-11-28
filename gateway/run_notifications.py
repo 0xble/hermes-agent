@@ -467,7 +467,6 @@ class GatewayNotificationsMixin(
         does not send the footer a second time as its own message.
         """
         from urllib.parse import quote as _quote
-        from gateway.checkin_delivery import delivery_metadata
         delivered_any = False
         from gateway.runtime_footer import caption_landed, caption_with_footer
         captioned = False
@@ -492,9 +491,11 @@ class GatewayNotificationsMixin(
             # extraction left a streamed reply that showed the tag as text and never sent the image
             # (#141806).
             url_images, _ = adapter.extract_images(cleaned)
-            _thread_meta = dict(thread_metadata) if thread_metadata is not None else self._thread_metadata_for_source(
-                event.source, self._reply_anchor_for_event(event))
-            _thread_meta = delivery_metadata(event, _thread_meta)
+            _thread_meta = (
+                dict(thread_metadata)
+                if thread_metadata is not None
+                else self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            )
             chat_id = event.source.chat_id
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
             def _is_photo(media_path: str, is_voice: bool) -> bool:

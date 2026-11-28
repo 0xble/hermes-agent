@@ -12,7 +12,7 @@ def queue_owner_failure(job: dict, receipt: str, content: str, *, output_file=No
     from cron.scheduler import _upsert_incident_for_failure
 
     notice = dict(job)
-    for key in ("review", "output_local_only", "failure_deliver", "execution_id"):
+    for key in ("output_local_only", "failure_deliver", "execution_id"):
         notice.pop(key, None)
     notice["deliver"] = "origin"
     _withheld, incident_id = _upsert_incident_for_failure(

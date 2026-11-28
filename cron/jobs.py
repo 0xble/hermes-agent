@@ -47,7 +47,6 @@ from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
 from cron.missed_windows import normalize_max_catch_up_lateness
-from cron.review import apply_review_update, normalize_review, validate_review_delivery
 from cron import extra_fire, jobs_error_text, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
@@ -2068,7 +2067,6 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "keep_pinned_lane": bool,
-    "review": normalize_review,
     "interpreter": _normalize_job_optional_text,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
     "max_catch_up_lateness_seconds": normalize_max_catch_up_lateness,
@@ -2086,7 +2084,6 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
-    "review": normalize_review,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
     "max_catch_up_lateness_seconds": normalize_max_catch_up_lateness,
     "keep_pinned_lane": bool,
@@ -2146,7 +2143,6 @@ def create_job(
     failure_deliver: Optional[str] = None,
     keep_pinned_lane: bool = False,
     priority: Optional[str] = None,
-    review: Optional[dict[str, Any]] = None,
     catch_up: Optional[bool] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -2196,7 +2192,6 @@ def create_job(
 
     raw = locals()
     f = {key: norm(raw[key]) for key, norm in _CREATE_FIELD_NORMALIZERS.items()}
-    validate_review_delivery(f["review"], deliver)
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -2269,7 +2264,6 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]),
         ("keep_pinned_lane", bool(keep_pinned_lane)),
         ("priority", f["priority"]),
-        ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
         ("max_catch_up_lateness_seconds", f["max_catch_up_lateness_seconds"]),
@@ -2488,7 +2482,6 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         if "priority" in updates and updates["priority"] is None:
             updated.pop("priority", None)
-        apply_review_update(updated, updates)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

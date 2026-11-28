@@ -1,27 +1,19 @@
-# Queued Metrics Consent
+# Retired queued metrics consent
 
 Fork patch identity: `queued-metrics-consent`.
 
-Load when changing Relay shared-metrics subscriber delivery, profile-owned consent, or graceful exit flush.
+Retired on 2026-11-27 because shared metrics were off everywhere: `telemetry.shared_metrics.enabled:
+false` and `send: false` in the live profile and both other profiles, so no Relay metrics
+subscriber ran.
 
-## Required Behavior
+Removed: the subscriber's persistence-time consent recheck (`consent_check`, `_collection_enabled`),
+the export-worker join before the final shutdown flush, busy-store latch and export deferral, the
+idle WAL anchor connection, the parked export-flush fixture adaptation and their exclusive tests,
+including `tests/hermes_cli/test_shared_metrics_shutdown_worker.py`.
+`hermes_cli/observability/shared_metrics.py`, `shared_metrics_subscriber.py` and
+`relay_shared_metrics.py` match upstream `v0.23.2`, apart from the incognito collection gate. The
+exit-flush test keeps its subscriber drain before the revocation baseline, a test-only guard against
+a counter landing between the baseline snapshot and exit. This record stays so published
+`Fork-Patch` trailers keep an accountable owner.
 
-Lifecycle admission and asynchronous persistence both honor collection consent. A Relay event queued while collection was enabled cannot continue writing counters after its owning profile revokes collection, even if no later lifecycle hook triggers runtime deactivation. Check the owner's profile at the subscriber's persistence boundary, not the Relay thread's unbound launch profile.
-
-The subscriber's optional consent callback is read-only. It must not deactivate or deregister a runtime from inside a Relay subscriber callback, which would couple the runtime teardown lock to Relay delivery. Keep collection and send consent independent and preserve bounded exit flushing.
-
-Shutdown stops new export scheduling and joins the active export worker before its final synchronous flush. If the bounded join expires, the existing worker owns the queued final flush and subscriber cleanup. Never start a competing shutdown export or deregister the subscriber before that flush. Task-end exports remain off the interactive turn path. The ownership regressions in `tests/hermes_cli/test_shared_metrics_shutdown_worker.py` cover both a completed join and a join timeout. Keep the final export and deferred subscriber cleanup assertions.
-
-Every caller-path store write shares one contention contract: when another process holds the store past the short busy timeout, the write is deferred in memory for the next write or the bounded exit drain. It never raises `database is locked` into the subscriber. The compare-and-set latches (client active, install snapshot, milestones, feature adoption, once-per-day counters) defer through the same path and re-run their compare-and-set when drained, so concurrent processes still latch exactly once. Do not lengthen the caller-path busy timeout to absorb contention. `test_a_latch_the_busy_store_cannot_take_is_deferred_not_raised` and `test_cross_process_client_active_attempts_record_one_install` cover it.
-
-The export follows the same contract. A busy store leaves packaging, or marking a package exported, to the next export and still exports what is already committed (`test_a_busy_store_leaves_packaging_to_the_next_export`). Each store keeps one idle connection open on POSIX WAL stores so the short per-call connections never become the database's last one. It is opened only after the store is confirmed in WAL, never holds a transaction, and a finalizer closes it when the store is dropped or the process exits, so stores still close every connection they open and a later construction can still convert a DELETE-mode file (`tests/hermes_cli/test_shared_metrics_wal.py`). Without it every write rebuilt the WAL index on `BEGIN` and checkpointed and deleted the WAL on close, several disk syncs per counter, and on a slow disk a burst of Relay events kept the subscriber and the flush waiting on it past the 10-second worker join (`test_a_store_keeps_its_wal_open_between_short_connections`). Windows keeps per-call connections only, so deleting the local state still resets it there.
-
-## Verification And Removal
-
-Run `tests/hermes_cli/test_shared_metrics_exit_flush.py`, `tests/hermes_cli/test_relay_shared_metrics_runtime.py`, and `tests/hermes_cli/test_relay_shared_metrics.py` in separate pytest processes, matching hosted per-file isolation. The deterministic subscriber regression revokes consent between 2 counter writes and delivers another queued event, asserting that only the first counter was stored. The native exit test verifies each profile's own consent. Before its revocation baseline, it flushes the owning Relay subscriber so a duration counter already admitted while opted in cannot arrive between the baseline snapshot and exit. Waiting only for `hermes.task_run.finished` is insufficient because the same asynchronous callback persists duration afterward. Keep the post-revocation equality assertion and the separate between-writes consent regression intact.
-
-The runtime suite's parked export-flush fixture must stay parked until the test explicitly releases it, so later task ends all arrive during the same flush and coalesce into exactly 1 extra pass. An unchecked 3-second wait could expire on a slow runner and create 3 passes instead of 2. Use a 60-second guard with an explicit assertion, and retain a timeout failure through fixture teardown because the runtime catches and logs flush exceptions. Keep the `attempts == 2` assertion. Retire this fixture adaptation when upstream preserves the same scheduling precondition and fails loudly on timeout.
-
-Retire when upstream rechecks owning-profile consent during asynchronous persistence and passes these regressions without changing collection, send, or exit bounds.
-
-Contract tests: `tests/hermes_cli/test_shared_metrics_shutdown_worker.py`, `tests/hermes_cli/test_shared_metrics_exit_flush.py`, `tests/hermes_cli/test_relay_shared_metrics_runtime.py`, `tests/hermes_cli/test_relay_shared_metrics.py`.
+Contract tests: none, retired.

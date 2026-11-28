@@ -280,9 +280,7 @@ other writers reported as `unobserved`. They do not change the persistent ledger
 They distinguish outbound classes, not every producer within a class. The 2026-11-06 retained
 logs had no class attribution: the call ledger could split 6,457 edits into 4,707 untagged,
 1,498 goal-triggered and 252 typed-triggered edits, but could not identify a dominant producer.
-Regression: `tests/gateway/test_telegram_progress_batch.py`,
-`tests/gateway/test_supervisor_turn_chrome.py::test_intermediate_supervisor_sends_are_suppressed_without_muting_humans`
-(unchanged: suppress supervisor chrome while preserving human sends and edits), plus the existing daily-quota suite.
+Regression: `tests/gateway/test_telegram_progress_batch.py`, plus the existing daily-quota suite.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |

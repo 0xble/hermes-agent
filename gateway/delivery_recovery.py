@@ -11,7 +11,6 @@ from typing import Optional, TypeVar
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run_shutdown import _log_suppressed
-from hermes_cli.checkins import DISPLAY_KIND
 
 logger = logging.getLogger("gateway.run")
 
@@ -59,36 +58,14 @@ class RuntimeDeliverySettlement:
                 self.cancelled = True
 
 
-async def _recover_obligation_policy(runner, row, chat_key, blocked_chats):
-    """Retain unreadable policy for retry, retire only a proven disarm."""
-    from gateway.checkin_delivery import DISARMED, permits_metadata, recovery_metadata
-    if row.get("supervisor_checkin") and not row.get("resume_turn_id"):
-        reason = "supervisor_checkin_missing_resume_turn_id"
-        logger.warning(
-            "Abandoning supervisor delivery obligation %s: no resume_turn_id; it cannot be resumed",
-            row["obligation_id"],
-        )
-        from gateway.delivery_ledger import abandon_obligation
-        await asyncio.to_thread(abandon_obligation, row["obligation_id"], reason)
-        return None
-    try:
-        policy = await recovery_metadata(
-            runner, row["session_key"], row.get("resume_turn_id"),
-            known_supervisor=bool(row.get("supervisor_checkin")),
-        )
-        permitted = await permits_metadata(runner, policy, retry_on_read_error=True)
-    except (OSError, sqlite3.Error):
-        logger.warning("Delivery policy unreadable for %s; retaining owed reply", row["session_key"], exc_info=True)
-        blocked_chats[chat_key] = row.get("last_error") or "send_path_degraded"
-        await runner._release_runtime_claim_quiet(
-            row["obligation_id"], "failed to release unreadable-policy obligation %s",
-            error=blocked_chats[chat_key])
-        return None
-    if not permitted:
-        from gateway.delivery_ledger import abandon_obligation
-        await asyncio.to_thread(abandon_obligation, row["obligation_id"], DISARMED)
-        return None
-    return policy
+async def _retire_legacy_supervisor_obligation(row) -> bool:
+    """Supervisor check-ins are retired. A row they left owes no delivery, so abandon it with a log."""
+    if not row.get("supervisor_checkin"):
+        return False
+    logger.warning("Abandoning retired supervisor check-in delivery obligation %s", row["obligation_id"])
+    from gateway.delivery_ledger import abandon_obligation
+    await asyncio.to_thread(abandon_obligation, row["obligation_id"], "supervisor_checkin_retired")
+    return True
 
 
 class RuntimeDeliveryRecoveryMixin:
@@ -177,8 +154,7 @@ class RuntimeDeliveryRecoveryMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
-            policy = await _recover_obligation_policy(self, row, chat_key, blocked_chats)
-            if policy is None:
+            if await _retire_legacy_supervisor_obligation(row):
                 continue
             note_event = await self._redelivery_restart_note_event(row)
             from gateway.copy_blocks import split_copy_blocks_for
@@ -187,7 +163,7 @@ class RuntimeDeliveryRecoveryMixin:
             content, copy_blocks = split_copy_blocks_for(adapter, row["content"], inline_quotes=False)
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {**policy, **({"thread_id": row["thread_id"]} if row.get("thread_id") else {})}
+            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
             payloads = [(content, metadata)] if content.strip() else []
             payloads.extend((block, {**metadata, "copy_block": True, "plain": True}) for block in copy_blocks)
             if runtime_settlement is not None and runtime_settlement.cancelled:
@@ -201,11 +177,6 @@ class RuntimeDeliveryRecoveryMixin:
                 adapter, row["chat_id"], payloads, row["obligation_id"]
             )
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
-                from gateway.checkin_delivery import DISARMED
-                if result is not None and getattr(result, "error", None) == DISARMED:
-                    from gateway.delivery_ledger import abandon_obligation
-                    await asyncio.to_thread(abandon_obligation, row["obligation_id"], DISARMED)
-                    continue
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"], result)
                     if note_event is not None:
@@ -250,32 +221,20 @@ class RuntimeDeliveryRecoveryMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            from gateway.checkin_delivery import permits_recovery
-            text = None
-            supervisor_checkin = boundary = False
             try:
                 decision = await self.async_session_store.get_session_metadata(
                     key, "room_silence_decision", {})
                 history = await self.async_session_store.load_transcript(session_id)
                 visible = [message for message in history if isinstance(message, dict)
                            and message.get("role") not in ("session_meta", "system")]
-                prompt = next((message for message in reversed(visible[:-1])
-                               if message.get("role") == "user"), {})
-                supervisor_checkin = prompt.get("display_kind") == DISPLAY_KIND
                 boundary = bool(visible) and visible[-1].get("display_kind") == FAILED_TURN_DISPLAY_KIND
                 text = self._crash_left_reply(history, started, origin,
                                               silence_decision=decision, active_token=token)
-                if text is None or (text and not ledger_on):
-                    continue  # no final reply to deliver: the turn resumes
-                if text and not await permits_recovery(
-                        self, key, token, known_supervisor=supervisor_checkin):
-                    text = ""
             except (OSError, sqlite3.Error):
-                # A saved final reply is still owed. Falling back to the base recovery path
-                # clears the marker and ledgers it, so startup cannot turn it into a fresh resume.
-                logger.warning("Crash-left delivery policy unreadable for %s; ledgering saved reply", key, exc_info=True)
-                if text is None:
-                    continue
+                logger.warning("Crash-left reply unreadable for %s; retaining turn marker", key, exc_info=True)
+                continue
+            if text is None or (text and not ledger_on):
+                continue  # no final reply to deliver: the turn resumes
             if text:
                 for ref, content in await asyncio.to_thread(
                         self._crash_left_parts, key, token, text, started, origin):
@@ -287,7 +246,7 @@ class RuntimeDeliveryRecoveryMixin:
                         # Parts were matched against the ledger above; only a single whole-reply
                         # row still needs the content-based duplicate check.
                         resume_turn_id=token, part=ref != f"crash:{token}" or text != content,
-                        supervisor_checkin=supervisor_checkin, boundary=boundary)
+                        boundary=boundary)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

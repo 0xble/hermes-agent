@@ -166,8 +166,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    from gateway.checkin_delivery import delivery_metadata
-    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
+    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
 
 def _schedule_outbound_platform_stamp(store, session_key: str, platform_message_id: str, message_uid: str | None) -> None:
@@ -4234,8 +4233,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
         fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
         volume budget shed on purpose)."""
-        from gateway.checkin_delivery import DISARMED
-        return getattr(result, "error", None) in {SEND_SHED_BY_BUDGET, DISARMED}
+        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
 
     @staticmethod
     def _is_partial_delivery(result: SendResult) -> bool:
@@ -4617,13 +4615,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         # merged event is likewise unaddressed; a typed human event restores the visible fallback.
         from gateway.response_filters import apply_agent_origin_reply_expectation
         apply_agent_origin_reply_expectation(event)
-        from gateway.cron_review import fail_busy_review
-        if fail_busy_review(event):
-            # A hidden cron review must never queue behind a live turn: a queued event is
-            # later drained in-band without its capture and would post its reply. The
-            # scheduler sends the original report on time instead.
-            event._gateway_accepted = True  # handled: the busy cause reaches the caller
-            return
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
             from gateway.session_ingress_burst import dispatch_busy_burst
@@ -4831,7 +4822,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
             if _copy_index is not None:
                 _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
-            from gateway.checkin_delivery import is_supervisor_checkin
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_message_ref or ""), text_content)
             from gateway.copy_blocks import wrap_copy_block
@@ -4845,8 +4835,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
-                resume_turn_id=getattr(event, "_gateway_active_turn_token", None),
-                supervisor_checkin=is_supervisor_checkin(event, metadata))
+                resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4878,11 +4867,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
-            from gateway.checkin_delivery import DISARMED
-            if getattr(result, "error", None) == DISARMED:
-                from gateway.delivery_ledger import abandon_obligation
-                await asyncio.to_thread(abandon_obligation, obligation_id, DISARMED)
-                return
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id, result)
                 return
@@ -5400,8 +5384,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
         delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
-        from gateway.cron_review import ReviewCapture
-        review_capture = ReviewCapture(event)
 
         def _record_delivery(result, *, required: bool = False):
             nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
@@ -5414,7 +5396,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         _typing_metadata = typing_metadata_for_turn(
             self, event.source.chat_id, _reply_anchor_for_event(event), typing_metadata_for_event(event))
-        typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
+        typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5431,10 +5413,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
-            # A cron review is always muted, but its reply is the scheduler's verdict, not a
-            # presentation: review_capture keeps it off every send path instead.
             with self._media_delivery_scope(event.source):
-                if review_capture.future is None and diagnostic_wake_muted(event):
+                if diagnostic_wake_muted(event):
                     response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
@@ -5444,7 +5424,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            response = review_capture.capture_reply(response, event)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -5535,7 +5514,6 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
-            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -5546,7 +5524,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             self._resolve_deferred_command(event)  # a deferred command's turn-error notice is its outcome
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            await review_capture.notify_error(self, event, e, session_key)
+            await self._notify_turn_error(event, e, session_key)
             from hermes_cli.config_backend import ConfigBackendUnavailable as _outage  # this turn only
             if isinstance(e, (SystemExit, KeyboardInterrupt)) and not isinstance(e, _outage):  # rest contained
                 raise

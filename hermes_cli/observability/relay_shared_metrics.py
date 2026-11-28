@@ -259,15 +259,11 @@ class _Runtime:
         # coalescing concurrent finish hooks into one worker.
         self._flush_lock = threading.RLock()
         self._flush_pending = False
-        self._flush_shutdown = False
-        self._flush_shutdown_pending = False
-        self._flush_shutdown_complete = threading.Event()
         self._flush_thread: threading.Thread | None = None
         self._snapshot_checked_ns: int | None = None
         self._subscriber_name = f"{SUBSCRIBER_NAME}.{self.host.runtime_id}"
         self.subscriber = SharedMetricsSubscriber(
-            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id,
-            consent_check=self._collection_consented,
+            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id
         )
         self.relay.subscribers.register(self._subscriber_name, self.subscriber)
         self.host.retain_managed_execution(self._subscriber_name)
@@ -644,14 +640,6 @@ class _Runtime:
             self._close_and_export()
 
     def _close_and_export(self) -> None:
-        from .shared_metrics_process import EXIT_FLUSH_TIMEOUT_S
-
-        with self._flush_lock:
-            closing = self._flush_shutdown
-            self._flush_shutdown = True
-        if closing:
-            self._flush_shutdown_complete.wait(EXIT_FLUSH_TIMEOUT_S)
-            return
         with self._sessions_lock:
             self._active = False
             session_ids = list(self._sessions)
@@ -662,31 +650,10 @@ class _Runtime:
         for session_id in unseen:
             self._safe(self._close_unseen_segment, session_id)
         if not self._registered:
-            self._flush_shutdown_complete.set()
             return
-        with self._flush_lock:
-            thread = self._flush_thread
-        if thread is not None:
-            if thread is not threading.current_thread():
-                try:
-                    thread.join(EXIT_FLUSH_TIMEOUT_S)
-                except RuntimeError:
-                    # Python can refuse daemon joins during late interpreter finalization.
-                    logger.debug("Shared-metrics export thread join failed", exc_info=True)
-            with self._flush_lock:
-                if self._flush_thread is thread and thread.is_alive():
-                    # A native barrier cannot be interrupted. Let its owner do the final
-                    # flush and cleanup rather than race a second export or discard rows.
-                    self._flush_pending = self._flush_shutdown_pending = True
-                    logger.warning("Shared-metrics export still running at shutdown; final flush remains queued")
-                    return
         self._flush_and_export("Hermes shared-metrics shutdown flush failed")
-        self._finish_export_shutdown()
-
-    def _finish_export_shutdown(self) -> None:
         self._deregister()
         self._release()
-        self._flush_shutdown_complete.set()
 
     @contextlib.contextmanager
     def _owner_scope(self) -> Iterator[None]:
@@ -696,10 +663,6 @@ class _Runtime:
             yield
         finally:
             reset_hermes_home_override(token)
-
-    def _collection_consented(self) -> bool:
-        with self._owner_scope():
-            return _collection_enabled()
 
     def _deregister(self) -> None:
         self._safe(self.relay.subscribers.deregister, self._subscriber_name)
@@ -786,8 +749,6 @@ class _Runtime:
         from agent.memory_provider import spawn_context_thread
 
         with self._flush_lock:
-            if self._flush_shutdown:
-                return
             self._flush_pending = True
             if self._flush_thread is not None:
                 return
@@ -806,12 +767,9 @@ class _Runtime:
                     # Cleared under the lock that schedulers check: a trigger can never land on a
                     # worker that has already decided to exit.
                     self._flush_thread = None
-                    shutdown = self._flush_shutdown_pending
-                    break
+                    return
                 self._flush_pending = False
             self._flush_and_export(failure_message)
-        if shutdown:
-            self._finish_export_shutdown()
 
     def _flush_and_export(self, failure_message: str) -> None:
         """Flush the Relay subscriber, then export under this profile's scope (its send consent,
@@ -1404,11 +1362,12 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
             reconcile_send_consent(connection, send_enabled)
 
 
-def _collection_enabled() -> bool:
-    """Read consent without runtime teardown, including on the Relay subscriber thread."""
+def enabled() -> bool:
+    """Return the shared-metrics policy for the active Hermes profile."""
     from agent.incognito import is_incognito
     if is_incognito():
         return False
+    profile_key = relay_runtime.current_profile_key()
     try:
         config: Any = _raw_config()
     except Exception:
@@ -1416,16 +1375,7 @@ def _collection_enabled() -> bool:
         config = None
     for key in ("telemetry", "shared_metrics"):
         config = config.get(key) if isinstance(config, dict) else None
-    return isinstance(config, dict) and config.get("enabled") is True
-
-
-def enabled() -> bool:
-    """Return the shared-metrics policy for the active Hermes profile."""
-    from agent.incognito import is_incognito
-    if is_incognito():
-        return False
-    profile_key = relay_runtime.current_profile_key()
-    if _collection_enabled():
+    if isinstance(config, dict) and config.get("enabled") is True:
         return True
     if profile_key not in _RUNTIMES:  # the opted-out hot path: nothing to tear down, no lock
         return False

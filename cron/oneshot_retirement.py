@@ -74,11 +74,11 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
         f"Job id: {job['id']}\nScheduled time: {scheduled or 'unknown'}\n"
         f"{timing_label}: {lateness} at {now.isoformat()}\n{outcome}\n{context}\n\n{diagnostic}"
     )
-    # A retirement is a failure, not a reviewed report. Preserve owner-chosen
-    # non-local lanes; only local-only output needs the origin -> home fallback.
+    # A retirement is a failure notice. Preserve owner-chosen non-local lanes;
+    # only local-only output needs the origin -> home fallback.
     from cron.scheduler_delivery import _normalize_deliver_value
     notice = dict(job)
-    for field in ("review", "output_local_only", "execution_id"):
+    for field in ("output_local_only", "execution_id"):
         notice.pop(field, None)
     if (not notice.get("failure_deliver")
             or _normalize_deliver_value(notice["failure_deliver"]).strip().lower() == "local"):

@@ -38,7 +38,6 @@ def _runner(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setattr("gateway.zero_cut_handover_drain.is_zero_cut_handover_enabled", lambda config: True)
-    monkeypatch.setattr("cron.scheduler_review.stop_reviews", lambda: None)
     runner, _ = make_restart_runner()
     runner.adapters = {}
     runner._profile_adapters = {}

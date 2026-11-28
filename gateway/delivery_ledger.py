@@ -259,6 +259,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("resume_marker_token", "resume_marker_token TEXT"),
         ("resume_marker_marked_at", "resume_marker_marked_at TEXT"),
         ("resume_turn_id", "resume_turn_id TEXT"),
+        # Set only by retired supervisor check-ins. Kept so recovery can retire their legacy rows.
         ("supervisor_checkin", "supervisor_checkin INTEGER NOT NULL DEFAULT 0"),
     ):
         if name not in columns:
@@ -348,8 +349,7 @@ def _resume_marker_values(marker: Optional[tuple]) -> tuple:
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
                       resume_marker: Optional[tuple] = None,
-                      resume_turn_id: Optional[str] = None,
-                      supervisor_checkin: bool = False) -> None:
+                      resume_turn_id: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -358,12 +358,11 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile,
-                resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id,
-                supervisor_checkin)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
-             *(_resume_marker_values(resume_marker)), resume_turn_id, int(supervisor_checkin)))
+             *(_resume_marker_values(resume_marker)), resume_turn_id))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -373,7 +372,7 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                             thread_id: Optional[str], content: str, since: float,
                             adapter_profile: Optional[str] = None,
                             resume_turn_id: Optional[str] = None, part: bool = False,
-                            supervisor_checkin: bool = False, boundary: bool = False) -> None:
+                            boundary: bool = False) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A Hermes-authored turn boundary (``boundary``: an
@@ -383,13 +382,12 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     now = time.time()
     values = (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
               content, "pending" if boundary else "attempting", now, now,
-              str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
-              int(supervisor_checkin))
+              str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id)
     insert = """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-               owner_pid, owner_started_at, adapter_profile, resume_turn_id, supervisor_checkin)
-               SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?"""
+               owner_pid, owner_started_at, adapter_profile, resume_turn_id)
+               SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?"""
     with _DB_LOCK, _transaction() as conn:
         if part:
             # A copy part the caller already found missing: its per-part id is the only identity,

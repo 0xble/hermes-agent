@@ -5572,17 +5572,13 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.run_control_identity import make_runtime_identify
         _identify_runtime = make_runtime_identify(runner, build_identify_payload)
 
-        from gateway.cron_review import CronReviewControl
         from gateway.session_snapshot import make_session_snapshot_handler
         from gateway import writer_census as census, zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
-        _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
             verb_handlers={"session-snapshot": make_session_snapshot_handler(runner, _main_loop),
                            "identify": _identify_runtime,
-                           "cron-review": _cron_review_control.submit,
-                           "cron-review-result": _cron_review_control.result,
                            "pause-for-update": _pause_for_update_handler,
                            "agent-update": _agent_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
