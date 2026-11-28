@@ -402,3 +402,13 @@ def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: in
     reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
     return [_typed_user_message_text(row)
             for row in _typed_user_message_records_since(session_id, since=since, limit=limit)]
+
+
+def _judge_response_window(text: str) -> str:
+    """Head plus tail of a long response: the summary leads and the evidence section usually closes."""
+    text = text or ""
+    head, tail = _facade()._JUDGE_RESPONSE_SNIPPET_CHARS, _facade()._JUDGE_RESPONSE_TAIL_CHARS
+    if len(text) <= head + tail:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n… [{omitted} chars omitted] …\n{text[-tail:]}"

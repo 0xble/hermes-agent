@@ -790,3 +790,69 @@ async def test_retry_and_terminal_maps_pruned_when_goal_no_longer_parked(parked,
     await runner._loop_wakeup_watcher(interval=0)
     assert sid not in runner._goal_wait_retries
     assert sid not in runner._goal_wait_terminal
+
+
+async def _continuation_post_turn(runner, source, sid, manager, agent_result, final_text=''):
+    """Settle one real goal-continuation event through the production post-turn hooks."""
+    manager.stop_waiting()
+    manager.state.last_automatic_continuation_at = 0.0
+    manager._save()
+    event = captured_event(runner, source, sid, manager)
+    runner._final_text_for_post_turn_hooks = lambda result, event=None: final_text
+    runner._post_turn_loop_completion = AsyncMock()
+    runner._retry_failed_synthetic_event = AsyncMock(return_value=False)
+    await runner._run_post_turn_hooks(
+        agent_result=agent_result, source=source, is_internal=True, event=event,
+    )
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent_result', [
+    {'final_response': '', 'failed': True},
+    {'final_response': '', 'interrupted': True, 'interrupt_source': 'gateway_watchdog'},
+])
+async def test_empty_continuation_rearms_and_idle_watcher_admits_one_retry(parked, monkeypatch, agent_result):
+    runner, _adapter, _authority, source, sid, _key, manager, rows, _calls = parked
+    await _continuation_post_turn(runner, source, sid, manager, agent_result)
+    armed = goals.load_goal(sid)
+    assert armed.status == 'active' and armed.waiting_since > 0
+    assert armed.waiting_reason == 'continuation turn produced no response'
+    assert armed.consecutive_continuation_failures == 1
+    assert [s for s, _ in goals.list_parked_goals()] == [sid]
+    # The re-armed wait is held until its short delay lapses, then admits exactly once.
+    await runner._goal_wakeup_fire_one(sid)
+    assert rows() == []
+    persisted = goals.GoalManager(sid)
+    assert persisted.state is not None
+    persisted.state.waiting_until = time.time() - 1
+    persisted._save()
+    monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: 1e12)
+    await runner._goal_wakeup_fire_one(sid)
+    await runner._goal_wakeup_fire_one(sid)
+    assert len(rows()) == 1
+    assert goals.load_goal(sid).waiting_since == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_continuation_does_not_rearm_through_post_turn(parked):
+    runner, _adapter, _authority, source, sid, _key, manager, rows, _calls = parked
+    runner._post_turn_goal_continuation = AsyncMock()
+    await _continuation_post_turn(
+        runner, source, sid, manager, {'final_response': 'did real work', 'completed': True}, 'did real work',
+    )
+    state = goals.load_goal(sid)
+    assert state.waiting_since == 0 and state.consecutive_continuation_failures == 0
+    assert rows() == []
+
+
+@pytest.mark.asyncio
+async def test_user_preemption_does_not_rearm_through_post_turn(parked):
+    runner, _adapter, _authority, source, sid, _key, manager, rows, _calls = parked
+    await _continuation_post_turn(
+        runner, source, sid, manager,
+        {'final_response': '', 'interrupted': True, 'interrupt_source': 'gateway_user_turn_preemption'},
+    )
+    state = goals.load_goal(sid)
+    assert state.waiting_since == 0 and state.consecutive_continuation_failures == 0
+    assert rows() == []

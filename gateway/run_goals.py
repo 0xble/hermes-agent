@@ -992,7 +992,58 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             logger.debug("failed internal turn requeue failed", exc_info=True)
             return False
 
-    # health: allow CC -- retry exhaustion warning/pause must remain adjacent to post-turn settlement to preserve the one-retry contract.
+    async def _rearm_failed_goal_continuation(
+        self, *, event: Any, agent_result: Any, session_entry: Any, invalidation_epoch: Optional[int] = None,
+    ) -> Optional[str]:
+        """Re-arm an active goal when its synthetic continuation never produced a response.
+
+        This is deliberately before ordinary post-turn settlement: failed/empty turns do not reach
+        the judge, but the continuation's durable identity still fences the mutation. A user
+        preemption owns the session and its own post-turn path, so it must not be double-armed.
+        """
+        if event is None or not isinstance(agent_result, dict) or not is_goal_continuation_event(event):
+            return None
+        if agent_result.get("interrupt_source") == "gateway_user_turn_preemption":
+            return None
+        # Gateway shutdown/watchdog/transport interrupts are retryable; only a real user
+        # preemption owns the session and is excluded above.
+        key = self._session_key_for_source(getattr(session_entry, "origin", None))
+        if invalidation_epoch is not None and self._session_invalidation_epoch(key) != invalidation_epoch:
+            return None
+        # A queued human input is the owner of the next turn. Do not install a wait behind it;
+        # the human turn's normal post-turn evaluation will either continue or park the goal.
+        adapter = self._delivery_adapter_for(getattr(session_entry, "origin", None))
+        if key and adapter and self._queue_depth(key, adapter=adapter) > 0:
+            return None
+        identity = self._post_turn_goal_identity(event)
+        instance = identity.get("goal_instance")
+        turn_state = getattr(self, "_peek_session_state", lambda _key: None)(key)
+        turn_started_at = (turn_state.conversation.last_turn_started_at or None) if turn_state else None
+        def _rearm():
+            from hermes_cli.goals import GoalManager
+            mgr = GoalManager(session_entry.session_id, default_max_turns=self._goal_max_turns_from_config(),
+                              min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config())
+            return mgr.rearm_after_empty_continuation(
+                expected_instance=instance, turn_started_at=turn_started_at,
+            )
+        return await self._run_in_executor_with_context(_rearm)
+
+    async def _maybe_rearm_failed_goal_continuation(
+        self, *, event: Any, retry_scheduled: bool, successful: bool, final_text: str,
+        agent_result: Any, session_entry: Any, invalidation_epoch: Optional[int],
+    ) -> None:
+        if event is None or retry_scheduled or successful or final_text.strip():
+            return
+        if not is_goal_continuation_event(event):
+            return
+        try:
+            await self._rearm_failed_goal_continuation(
+                event=event, agent_result=agent_result, session_entry=session_entry,
+                invalidation_epoch=invalidation_epoch,
+            )
+        except Exception:
+            logger.debug("failed goal continuation re-arm", exc_info=True)
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -1039,6 +1090,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
+        # Empty continuation turns bypass the evaluator; re-arm only this stamped goal turn.
+        await self._maybe_rearm_failed_goal_continuation(
+            event=event, retry_scheduled=retry_scheduled, successful=successful,
+            final_text=final_text, agent_result=agent_result, session_entry=session_entry,
+            invalidation_epoch=invalidation_epoch,
+        )
         if exhausted_synthetic:
             from gateway.platforms.event import turn_origin_for_event
             origin = turn_origin_for_event(event)

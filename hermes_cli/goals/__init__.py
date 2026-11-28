@@ -1043,6 +1043,10 @@ class GoalState:
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
+    # Consecutive gateway continuations that ended without a usable final response. This is
+    # separate from judge transport failures because the model/provider may have returned cleanly
+    # while the gateway lost the turn's final response.
+    consecutive_continuation_failures: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: list[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -1101,10 +1105,10 @@ class GoalState:
     def from_json(cls, raw: str) -> GoalState:
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in (
+        ints: dict[str, int] = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures",
-            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
-        floats = {k: float(data.get(k) or 0.0) for k in (
+            "consecutive_continuation_failures", "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
+        floats: dict[str, float] = {k: float(data.get(k) or 0.0) for k in (
             "created_at", "last_turn_at", "waiting_until", "waiting_since",
             "last_automatic_continuation_at")}
         return cls(
@@ -1958,16 +1962,6 @@ def _evidence_for_turn(evidence: Optional[list[dict[str, Any]]], previous_turn_a
     return rows
 
 
-def _judge_response_window(text: str) -> str:
-    """Head plus tail of a long response: the summary leads and the evidence section usually closes."""
-    text = text or ""
-    head, tail = _JUDGE_RESPONSE_SNIPPET_CHARS, _JUDGE_RESPONSE_TAIL_CHARS
-    if len(text) <= head + tail:
-        return text
-    omitted = len(text) - head - tail
-    return f"{text[:head]}\n… [{omitted} chars omitted] …\n{text[-tail:]}"
-
-
 def extract_citations(text: str) -> list[str]:
     """Exact identifiers a response cites: backtick spans, quoted strings, URLs, SHAs and long ids.
 
@@ -2685,7 +2679,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
 # Goal authority and recorded-user/evidence helpers live in a topical sibling.
 # The imports keep the facade patch seam used by CLI, gateway, loops and tests.
 _REVISION_EVIDENCE_MIN_CHARS = 12
-from hermes_cli.goals_authority import (
+from hermes_cli.goals.authority import (
     _AUTHORITY_PRESERVE_RE, _REPLACEMENT_ACTION_RE, _REPLACEMENT_BUDGET_TARGET_RE,
     _REPLACEMENT_GATE_TARGET_RE, _REPLACEMENT_NEGATION_RE, _REMOVAL_VERBS,
     _REVISION_QUOTE_MIN_CHARS, _REVISION_SOURCE_MAX_CHARS, _REPLY_QUOTE_RE,
@@ -2697,7 +2691,7 @@ from hermes_cli.goals_authority import (
     _normalize_authority_value, _removal_authority_text, _removal_instruction_units,
     _replacement_action_is_authorized, _replacement_goal_is_negated, _requirement_diff,
     _typed_user_message_records_since, _typed_user_message_text, _unit_is_non_directive,
-    user_messages_since,
+    _judge_response_window, user_messages_since,
 )
 
 
@@ -3043,6 +3037,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         state.paused_by = ""
         state.consecutive_no_progress = 0
         state.backoff_level = 0
+        state.consecutive_continuation_failures = 0
         state.clear_wait()
         if reset_budget:
             state.turns_used = 0
@@ -3544,6 +3539,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         state = self._state
         if not self.is_active():
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        assert state is not None
 
         # A real break in silence resets the no-progress ladder. Discover the current
         # turn's evidence before any wait or gate return so an actionable result can reset it
@@ -3668,6 +3664,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         # Judge failure counters are diagnostics only; neither kind pauses a goal.
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
+        state.consecutive_continuation_failures = 0  # a judged turn ends the empty-continuation streak
 
         # Automatic no-progress waits already provide the sole pacing ladder. Fresh evidence
         # bypasses it by resetting backoff_level above; the hard floor still applies to the

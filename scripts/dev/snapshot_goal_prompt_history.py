@@ -50,7 +50,7 @@ FORMATTER_NAMES: dict[str, tuple[str, ...]] = {
     "barrier_lift": ("GOAL_WAIT_LIFTED_NOTE_OPEN",),
 }
 
-SOURCE_FILES = ("hermes_cli/goals.py", "hermes_cli/goals_legacy_prompts.py", "hermes_cli/goals_autonomy.py")
+SOURCE_FILES = ("hermes_cli/goals.py", "hermes_cli/goals/__init__.py", "hermes_cli/goals_legacy_prompts.py", "hermes_cli/goals_autonomy.py")
 FORMATTER_FIELDS = {
     "autonomy": {"goal", "contract_block", "subgoals_block"},
     "plain": {"goal"},
