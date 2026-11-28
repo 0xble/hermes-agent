@@ -52,7 +52,8 @@ GIT_TIMEOUT_SECONDS = 120
 
 def git(root: Path, *args: str) -> str:
     return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True,
-                          text=True, timeout=GIT_TIMEOUT_SECONDS).stdout
+                          text=True, encoding='utf-8', errors='replace',
+                          timeout=GIT_TIMEOUT_SECONDS).stdout
 
 
 def is_test_file(path: str) -> bool:
@@ -62,7 +63,7 @@ def is_test_file(path: str) -> bool:
 
 def testpaths(root: Path) -> list[str]:
     try:
-        data = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8'))
+        data = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8-sig'))
         paths = data.get('tool', {}).get('pytest', {}).get('ini_options', {}).get('testpaths')
     except (OSError, tomllib.TOMLDecodeError):
         paths = None
@@ -77,7 +78,7 @@ def full_suite_patterns() -> tuple[str, ...]:
     extra = EXTRA_FULL_SUITE_FILE
     if not extra.is_file():
         return FULL_SUITE_PATTERNS
-    lines = [ln.strip() for ln in extra.read_text(encoding='utf-8').splitlines()]
+    lines = [ln.strip() for ln in extra.read_text(encoding='utf-8-sig').splitlines()]
     return FULL_SUITE_PATTERNS + tuple(ln for ln in lines if ln and not ln.startswith('#'))
 
 
@@ -85,7 +86,7 @@ def mapped_targets(changed: list[str]) -> set[str]:
     if not PATH_MAP_FILE.is_file():
         return set()
     targets: set[str] = set()
-    for line in PATH_MAP_FILE.read_text(encoding='utf-8').splitlines():
+    for line in PATH_MAP_FILE.read_text(encoding='utf-8-sig').splitlines():
         if not line.strip() or line.lstrip().startswith('#'):
             continue
         pattern, *outputs = line.split()
@@ -172,7 +173,7 @@ def load_sources(root: Path) -> dict[str, str]:
     sources: dict[str, str] = {}
     for path in (p for p in git(root, 'ls-files', '-z', '--', '*.py').split('\0') if p):
         try:
-            sources[path] = (root / path).read_text(encoding='utf-8', errors='replace')
+            sources[path] = (root / path).read_text(encoding='utf-8-sig', errors='replace')
         except OSError:
             continue
     return sources
