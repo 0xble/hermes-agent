@@ -29,8 +29,10 @@ from pathlib import Path, PurePosixPath
 FULL_SUITE_PATTERNS = (
     'conftest.py', '*/conftest.py',
     'pyproject.toml', 'setup.cfg', 'setup.py', 'tox.ini', 'pytest.ini', '.pytest.ini',
-    'uv.lock', 'poetry.lock', 'requirements*.txt', '*/requirements*.txt',
-    'package.json', 'package-lock.json', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb',
+    'uv.lock', '*/uv.lock', 'poetry.lock', 'requirements*.txt', '*/requirements*.txt',
+    'package.json', '*/package.json', 'package-lock.json', '*/package-lock.json',
+    'pnpm-lock.yaml', '*/pnpm-lock.yaml', 'bun.lock', '*/bun.lock', 'bun.lockb',
+    'Cargo.toml', '*/Cargo.toml', 'Cargo.lock', '*/Cargo.lock', 'go.mod', '*/go.mod', 'go.sum', '*/go.sum',
     '.python-version', '.tool-versions', 'mise.toml', '.mise.toml',
     '.github/workflows/*', '.github/actions/*', '.github/known-flakes*', 'bin/ci', 'bin/ci-*', 'scripts/ci/*', 'ci/*', '.mergify.yml',
     'sitecustomize.py', '*/sitecustomize.py',
@@ -109,8 +111,9 @@ def walk(tree: ast.AST, lazy: bool):
     """Yield nodes that run at import time; with lazy, also function bodies.
 
     A production module's function-local import is deferred on purpose and
-    only runs if that function does, so it is not followed. Tests import
-    inside test bodies and fixtures, so every import in a test file counts.
+    only runs if that function does, so it is not followed. Tests, conftest
+    files and test helpers import inside test bodies and fixtures, so every
+    import there counts.
     """
     stack = [tree]
     while stack:
@@ -124,32 +127,62 @@ def walk(tree: ast.AST, lazy: bool):
                 stack.append(child)
 
 
+def is_test_side(path: str) -> bool:
+    """Tests, conftest.py and helpers under a tests folder: their deferred imports run too."""
+    pure = PurePosixPath(path)
+    return is_test_file(path) or pure.name == 'conftest.py' or bool({'tests', 'test'} & set(pure.parts[:-1]))
+
+
+def module_strings(tree: ast.Module) -> dict[str, list[str]]:
+    """Module-level names bound to a string or a list/tuple of strings."""
+    values: dict[str, list[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = node.value
+            items = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+            strings = [item.value for item in items if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+            if strings and len(strings) == len(items):
+                values[node.targets[0].id] = strings
+    return values
+
+
+def from_import_names(node: ast.ImportFrom, package: list[str]) -> set[str]:
+    if node.level:
+        base_parts = package[:len(package) - (node.level - 1)] if node.level > 1 else package
+        base = '.'.join([*base_parts, *(node.module.split('.') if node.module else [])])
+    else:
+        base = node.module or ''
+    names = {f'{base}.{alias.name}' if base else alias.name for alias in node.names}
+    return names | ({base} if base else set())
+
+
+def dynamic_import_names(node: ast.Call, strings: dict[str, list[str]]) -> list[str]:
+    """importlib.import_module(...) and __import__(...) with a literal or a module constant."""
+    fn = node.func
+    name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', '')
+    if name not in ('import_module', '__import__') or not node.args:
+        return []
+    arg = node.args[0]
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return [arg.value]
+    return strings.get(arg.id, []) if isinstance(arg, ast.Name) else []
+
+
 def imports(path: str, source: str) -> set[str]:
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return set()
     package = list(PurePosixPath(path).parent.parts)
-    found: set[str] = set()
-    for node in walk(tree, lazy=is_test_file(path)):
+    strings = module_strings(tree)
+    found: set[str] = set(strings.get('pytest_plugins', []))
+    for node in walk(tree, lazy=is_test_side(path)):
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                base_parts = package[:len(package) - (node.level - 1)] if node.level > 1 else package
-                base = '.'.join([*base_parts, *(node.module.split('.') if node.module else [])])
-            else:
-                base = node.module or ''
-            if base:
-                found.add(base)
-            found.update(f'{base}.{alias.name}' if base else alias.name for alias in node.names)
+            found |= from_import_names(node, package)
         elif isinstance(node, ast.Call):
-            # importlib.import_module("pkg.mod") and __import__("pkg.mod")
-            fn = node.func
-            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, 'id', '')
-            if name in ('import_module', '__import__') and node.args and isinstance(node.args[0], ast.Constant) \
-                    and isinstance(node.args[0].value, str):
-                found.add(node.args[0].value)
+            found.update(dynamic_import_names(node, strings))
     return found
 
 
