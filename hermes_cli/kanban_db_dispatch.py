@@ -1803,65 +1803,44 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
-# Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
-# safeguards — a memory-DERIVED default cap when none is configured
-# (``resolve_max_in_progress``) and a live memory-PRESSURE guard inside the
-# tick (``_memory_pressure_level``) because a static cap can't see other
-# tenants. Both fail open: unreadable memory → no cap / "unknown" pressure.
+# Host concurrency: ``kanban.max_in_progress`` caps running cards on this host
+# (``DEFAULT_MAX_IN_PROGRESS`` when unset), and a live memory-PRESSURE guard
+# inside the tick (``_memory_pressure_level``) holds spawns back when the host
+# runs short, because a static cap can't see other tenants. The guard fails
+# open: unreadable memory (non-Linux) reads "unknown" and restricts nothing.
 
-# Assumed per-worker footprint for the derived cap; deliberately conservative
-# so the cap errs toward fewer workers on small VMs.
-MEMORY_GUARD_MB_PER_WORKER = 512
-
-# Derived default bounds: never below 2 (smallest VM must still progress),
-# never above 8 (more fan-out must be explicit in config).
-DERIVED_MAX_IN_PROGRESS_FLOOR = 2
-DERIVED_MAX_IN_PROGRESS_CEILING = 8
+# The default host cap, chosen by the operator (2026-11-27); set
+# ``kanban.max_in_progress`` to raise or lower it.
+DEFAULT_MAX_IN_PROGRESS = 12
 
 
 def _system_memory_sample() -> dict:
-    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown. Without /proc (macOS)
-    MemTotal comes from ``sysconf``, so the derived cap applies there too; available memory stays
-    unknown, so the pressure guard does not. The test seam: conftest patches this to ``{}``."""
+    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
+
+    Local import keeps ``kanban_db`` importable without the gateway package.
+    Module-level indirection is also the test seam — conftest patches this to
+    ``{}`` so results don't depend on the CI runner's live memory.
+    """
     try:
         from gateway.lifecycle_ledger import sample_memory
-        sample = sample_memory() or {}
+        return sample_memory() or {}
     except Exception:
-        sample = {}
-    if "mem_total_kib" not in sample and hasattr(os, "sysconf"):
-        with contextlib.suppress(OSError, ValueError):
-            sample["mem_total_kib"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 1024
-    return sample
+        return {}
 
 
-def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
-    """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``; ``None``
-    (no cap) when total memory is unknown (Windows)."""
-    if sample is None:
-        sample = _system_memory_sample()
-    total_kib = sample.get("mem_total_kib")
-    if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
-        return None
-    workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
-    return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
-
-
-def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
-    """Effective global concurrency cap: explicit config wins, else the
-    memory-derived default. All config-parsing callers route through this so
-    both paths agree.
+def resolve_max_in_progress(configured: Optional[int]) -> int:
+    """Effective host concurrency cap: explicit config wins, else
+    ``DEFAULT_MAX_IN_PROGRESS``. Every dispatch entry point routes through this
+    so they agree.
     """
-    if configured is not None:
-        return configured
-    return derive_default_max_in_progress()
+    return configured if configured is not None else DEFAULT_MAX_IN_PROGRESS
 
 
 def configured_max_in_progress() -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
     Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
+    positive integer wins, anything else falls through to the default cap.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -1881,7 +1860,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
-    host-level budget — the memory-derived cap bounds the machine, not the
+    host-level budget — the cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
     """
     try:
@@ -1898,7 +1877,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
-    this a derived cap of N gets multiplied by the number of active boards.
+    this a cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
     """
@@ -2188,7 +2167,7 @@ def _tick_spawn_budget(
     spawns), not a per-tick budget — a per-tick reading would grow concurrency
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
-    cap by N — exactly the fan-out the memory-derived default exists to prevent.
+    cap by N — exactly the fan-out the host cap exists to prevent.
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
