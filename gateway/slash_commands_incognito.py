@@ -16,7 +16,7 @@ class GatewayIncognitoCommandsMixin:
             return True
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        return any(live.route == key and not live.superseded and live.task is not None
+        return any(live.route == key and not live.detached and live.task is not None
                    and live.task is not current and not live.task.done()
                    for live in authority.sessions.values()) if authority is not None else False
 
@@ -27,7 +27,7 @@ class GatewayIncognitoCommandsMixin:
         authority = active_authority(self)
         if authority is not None:
             for sid, live in list(authority.sessions.items()):
-                if live.route == key and not live.superseded:
+                if live.route == key and not live.detached:
                     def pending():
                         with live.event_stream.lock:
                             return authority._pending_rows(SessionRef(authority.profile_id, sid))
