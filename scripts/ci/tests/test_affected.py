@@ -34,7 +34,7 @@ FILES = {
 
 
 def git(root: Path, *args: str) -> str:
-    return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True, text=True, encoding='utf-8').stdout
 
 
 @pytest.fixture
@@ -44,7 +44,7 @@ def repo(tmp_path: Path) -> Path:
     git(tmp_path, 'config', 'user.name', 'ci')
     for path, text in FILES.items():
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / path).write_text(text)
+        (tmp_path / path).write_text(text, encoding='utf-8')
     git(tmp_path, 'add', '-A')
     git(tmp_path, 'commit', '-qm', 'base')
     git(tmp_path, 'switch', '-qc', 'change')
@@ -56,7 +56,7 @@ def change(root: Path, path: str, text: str | None) -> tuple[str, list[str], str
         git(root, 'rm', '-q', path)
     else:
         (root / path).parent.mkdir(parents=True, exist_ok=True)
-        (root / path).write_text(text)
+        (root / path).write_text(text, encoding='utf-8')
         git(root, 'add', path)
     git(root, 'commit', '-qm', 'change')
     return affected.choose(root, 'main')
@@ -110,7 +110,7 @@ def test_missing_base_runs_everything(repo: Path) -> None:
 def test_path_map_selects_node_ids_for_globbed_inputs(repo: Path, tmp_path_factory: pytest.TempPathFactory,
                                                       monkeypatch: pytest.MonkeyPatch) -> None:
     rules = tmp_path_factory.mktemp('map') / 'affected-map'
-    rules.write_text('# comment\n^cases/([^/]+)/ tests/test_unrelated.py::test_case[\\1]\n')
+    rules.write_text('# comment\n^cases/([^/]+)/ tests/test_unrelated.py::test_case[\\1]\n', encoding='utf-8')
     monkeypatch.setattr(affected, 'PATH_MAP_FILE', rules)
     _, tests, _ = change(repo, 'cases/alpha/case.yaml', 'x: 1\n')
     assert tests == ['tests/test_unrelated.py::test_case[alpha]']
