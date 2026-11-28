@@ -709,8 +709,15 @@ class SessionMaintenanceMixin:
             result["pruned"] = pruned = self.prune_sessions(
                 older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True,
                 within_deletion_window=True)
-            if not deletion_window_open():
+            from hermes_state_prune_budget import prune_cancelled
+            if not deletion_window_open() or prune_cancelled():
+                # Each batch already committed. The throttle stays unspent so the next window resumes
+                # the backlog; the partial stamp makes a pass that ends at the window every night visible.
                 result["deadline_reached"] = True
+                self.set_meta("last_auto_prune_partial", str(now))
+                logger.info("state.db auto-maintenance: stopped (window closed or gateway stopping) after pruning "
+                            "%d session(s) inactive for %d days; the rest continues in the next window",
+                            pruned, retention_days)
                 return result
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
@@ -724,7 +731,7 @@ class SessionMaintenanceMixin:
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
             vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
             # A pass that ran to the end of the window must not start a full rewrite after it.
-            if vacuum and pruned > 0 and vacuum_due and deletion_window_open():
+            if vacuum and pruned > 0 and vacuum_due and deletion_window_open() and not prune_cancelled():
                 result["freelist_ratio"] = ratio = self._freelist_ratio()
                 # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
                 # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
@@ -757,6 +764,11 @@ class SessionMaintenanceMixin:
                     logger.debug("state.db auto-maintenance: skipping VACUUM, only "
                                  "%.1f%% of pages reclaimable (threshold %.0f%%)",
                                  ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+            if prune_cancelled():
+                # Shutdown during the sweep: the next window repeats the cheap tail rather than skip it.
+                result["deadline_reached"] = True
+                self.set_meta("last_auto_prune_partial", str(now))
+                return result
             # Record even when pruned == 0 so the throttle holds.
             self.set_meta("last_auto_prune", str(now))
             if closed or pruned > 0:

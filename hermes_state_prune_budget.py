@@ -13,6 +13,8 @@ import time
 
 _CURRENT = ContextVar("session_prune_budget", default=None)
 _UNIT_SECONDS = ContextVar("session_prune_unit_seconds", default=None)
+# A threading.Event the owner sets to stop the pass (gateway shutdown); checked like the deadline.
+_CANCEL = ContextVar("session_prune_cancel", default=None)
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +67,7 @@ class PruneBudget:
                         break
 
     def check(self):
-        if time.monotonic() >= self.deadline:
+        if time.monotonic() >= self.deadline or prune_cancelled():
             raise PruneBudgetExpired("session prune stopped at its deadline; unfinished cleanup remains resumable")
 
     def pause(self, seconds):
@@ -82,6 +84,21 @@ class PruneBudget:
         holders = state_db_write_lock_holders(self.db_path) if self.db_path is not None else []
         logger.warning("Session prune %r continues retrying a foreign SQLite writer: %s",
                        label, " | ".join(holders) or "write-lock holder unavailable")
+
+
+@contextmanager
+def prune_cancel(event):
+    """Stop any prune pass run inside this block once *event* is set, as if its deadline passed."""
+    token = _CANCEL.set(event)
+    try:
+        yield
+    finally:
+        _CANCEL.reset(token)
+
+
+def prune_cancelled():
+    event = _CANCEL.get()
+    return event is not None and event.is_set()
 
 
 @contextmanager
@@ -193,7 +210,9 @@ def prune_sql(conn, *, write=False):
     # the normal busy wait, including in rollback-journal mode.
     if write:
         conn.execute("PRAGMA busy_timeout=0")
-    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    cancel = _CANCEL.get()
+    conn.set_progress_handler(
+        lambda: int(time.monotonic() >= deadline or (cancel is not None and cancel.is_set())), 1000)
     try:
         yield
     except sqlite3.OperationalError as exc:
