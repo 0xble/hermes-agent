@@ -79,6 +79,9 @@ result/transcript evidence for conservative recovery through the durable retry e
   The gateway shutdown sweep (`gateway/run_shutdown.py`) calls `interrupt_all(..., resumable=True)`,
   so every child it stops is marked `gateway_shutdown` before it unwinds and keeps a resumable
   `AUTO_ON_BOOT` record; without the flag a cleanly unwound child reads as a user stop.
+  The mark is a fence (`fence_for_shutdown` in the child registry): it stamps the live
+  children and, atomically with that snapshot, every child registered afterwards, so one
+  that registers between the mark and the interrupt sweep still reads as a restart.
   `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
   continuation path, but recovery authority is based on positive evidence of a user
   stop, not on a restart token. Legacy phase-specific gateway-shutdown reasons and

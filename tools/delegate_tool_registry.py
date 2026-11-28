@@ -25,6 +25,9 @@ _active_subagents: dict[str, dict[str, Any]] = {}
 # and need delegation attribution even though the live registry entry is gone.
 _RECENT_SUBAGENTS_CAP = 200
 _recent_subagents: dict[str, dict[str, Any]] = {}
+# Set once gateway shutdown begins (``fence_for_shutdown``): every child registered from then on carries this stop
+# cause, so one that registers between the shutdown mark and the interrupt sweep still reads as a restart.
+_shutdown_stop_cause: Optional[str] = None
 
 def get_subagent_attribution(task_id: Optional[str]) -> Optional[dict[str, Any]]:
     """``{subagent_id, goal, delegation_id}`` for a process task_id that belongs to a live or recently-finished child
@@ -54,7 +57,21 @@ def _register_subagent(record: dict[str, Any]) -> None:
         return
     record.setdefault("accepting_steer", True)
     with _active_subagents_lock:
+        if _shutdown_stop_cause is not None and record.get("agent") is not None:
+            record["agent"]._delegate_stop_cause = _shutdown_stop_cause
         _active_subagents[sid] = record
+
+
+def fence_for_shutdown(cause: str) -> int:
+    """Stamp *cause* on every live child and, atomically with that snapshot, on every child registered later.
+    Returns how many live children were stamped."""
+    global _shutdown_stop_cause
+    with _active_subagents_lock:
+        _shutdown_stop_cause = cause
+        agents = [r.get("agent") for r in _active_subagents.values() if r.get("agent") is not None]
+        for agent in agents:
+            agent._delegate_stop_cause = cause
+    return len(agents)
 
 def _unregister_subagent(subagent_id: str, *, agent: Any = None, stopping: bool = False) -> Optional[dict[str, Any]]:
     """Retain attribution and trusted owners; cleanup callers hold readiness at stopping until resources close."""

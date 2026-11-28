@@ -480,12 +480,8 @@ def note_gateway_shutdown() -> int:
     """Gateway shutdown is about to stop this process's children: mark them first (in memory and on every profile's
     running records), so each reads as a restart (resumable) rather than a user stop however its run ends, a
     SIGKILL mid-unwind included. Returns how many records were marked."""
-    from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
-    with _active_subagents_lock:
-        live = [r.get("agent") for r in _active_subagents.values()]
-    for agent in live:
-        if agent is not None:
-            agent._delegate_stop_cause = GATEWAY_SHUTDOWN
+    from tools.delegate_tool_registry import fence_for_shutdown
+    fence_for_shutdown(GATEWAY_SHUTDOWN)  # also stamps a child that registers before the interrupt sweep reaches it
     marked = 0
     for db in _profile_dbs():
         marked += _write(db, lambda conn: conn.execute(

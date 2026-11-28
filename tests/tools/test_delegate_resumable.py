@@ -135,6 +135,49 @@ def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(c
         assert (state, pinned) == ("stopped", 0)
 
 
+def test_a_child_registering_between_the_shutdown_mark_and_the_interrupt_still_resumes(monkeypatch):
+    """Race: ``interrupt_all(resumable=True)`` marks the live children, then snapshots and interrupts records. A
+    child that registers in between must still read as a restart (AUTO_ON_BOOT), not a user stop."""
+    import threading
+
+    import tools.delegate_tool_resumable as resumable
+    from tools.async_delegation import interrupt_all
+    from tools.delegate_tool import delegate_task
+
+    started, release = threading.Event(), threading.Event()
+    model = _ScriptedModel()
+
+    def build(**kw):
+        child = model(**kw)
+        ok = child.run_conversation.side_effect
+
+        def run_conversation(user_message, **rest):
+            started.set()
+            release.wait(10)
+            ok(user_message, **rest)
+            return {"final_response": "Operation interrupted.", "interrupted": True, "completed": False}
+        child.run_conversation.side_effect = run_conversation
+        return child
+
+    parent = _parent()
+    real_note, late = resumable.note_gateway_shutdown, {}
+
+    def note_then_spawn():
+        marked = real_note()
+        late["out"] = json.loads(delegate_task(tasks=[{"goal": "late job"}], background=True, parent_agent=parent))
+        assert started.wait(10)  # registered and running before the interrupt snapshot
+        return marked
+
+    monkeypatch.setattr(resumable, "note_gateway_shutdown", note_then_spawn)
+    with patch("run_agent.AIAgent", side_effect=build):
+        interrupt_all(reason="gateway shutdown (test)", resumable=True)
+        release.set()
+        _completion(late["out"]["delegation_id"])
+
+    state, _pinned, record = _db_rows(parent)[late["out"]["subagent_ids"][0]]
+    assert (state, record["resume_mode"], record["stop_cause"]) == ("resumable", "AUTO_ON_BOOT", "gateway_shutdown")
+
+
 def _git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
                    env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
