@@ -8,6 +8,8 @@ Agent cron jobs acquire their own profile's session-store handle before running 
 
 The finite one-shot dispatch is already claimed before `run_job`. Its failed pre-start attempt refunds that claim during the owner-fenced outcome write and sets its retry instant 60 seconds ahead, so an outage beyond the original grace window cannot retire it. Recurring jobs retain their natural next tick without spending repeat budget. Wake-gate scripts and monitors do not run during the outage. All early returns release an acquired handle. Script-only `no_agent` jobs retain their existing execution and repeat behavior.
 
+A canonical fire runs inside the session `gateway.session_cron` creates before its wake gate decides. When it ends before any agent turn, `run_job` ends that owned session with `cron_no_agent` (`cron/scheduler_unused_session.py`) before releasing the store. Cases: a false wake gate, a failed or blocked script, or a blocked setup. Otherwise the empty row stayed open until the idle or startup orphan reaper closed it, and each boot restored it until then. On 2026-11-28 that was about 86% of cron sessions. Legacy fires own no row yet and only release.
+
 Post-run finalization is best-effort and cannot change a run's outcome. A SessionDB call that outlives the cleanup timeout disables the bounded proxy, and every later finalization step, including the title fallbacks, absorbs that failure. `run_job` still returns the run's own success or failure, and agent teardown still runs.
 
 ## Source and Adoption
