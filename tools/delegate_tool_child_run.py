@@ -1316,6 +1316,13 @@ class _ChildRun:
         """Close only after the worker exits; continuation stays blocked through the entire tail."""
         child = self.child
         _close_child(child, "Failed to close child agent after delegation")
+        with _quiet("Failed to release child private interval alias: %s"):
+            from agent.incognito import register_session
+            from agent.incognito_private_dir import release_private_session
+            released_session_id = str(getattr(child, "session_id", "") or "")
+            if released_session_id and released_session_id != str(getattr(self.parent_agent, "session_id", "") or ""):
+                register_session(released_session_id, False)
+                release_private_session(released_session_id)
         # The child's execute_code kernels live exactly as long as the child (pinned against the LRU
         # cap while it runs); dispose them here so they never squat the cap after the child is gone.
         with _quiet("Failed to dispose child execute_code kernels: %s"):

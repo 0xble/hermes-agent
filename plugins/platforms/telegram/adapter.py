@@ -4557,8 +4557,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     # Telegram cannot carry this body as one text message. Preserve it intact in a
                     # UTF-8 .txt document instead of adding chunk suffixes or altering the body.
                     temp_path = None
+                    from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
                     try:
-                        with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as copy_file:
+                        copy_parent = private_temp_parent("telegram-copy")
+                    except PrivateIntervalUnavailable:
+                        # Private turn with no bound interval: never stage the body in public temp.
+                        return SendResult(success=False, error="copy block document unavailable: private interval is unresolved")
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False, dir=copy_parent) as copy_file:
                             copy_file.write(content.encode("utf-8"))
                             temp_path = copy_file.name
                         # Native upload only: the generic fallback sends a warning text whose success
@@ -6177,9 +6183,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 scale = self._IMG_MAX_DIMENSION / max_dim
                 img = img.resize((int(max_w * scale), int(max_h * scale)), Image.LANCZOS)
 
+            from agent.incognito_private_dir import private_temp_parent
+            # A private turn with no bound interval raises OSError: caught below, original is uploaded.
             fd, tmp = tempfile.mkstemp(
                 suffix=".jpg",
                 prefix="tg_compress_",
+                dir=private_temp_parent("telegram-compress"),
             )
             os.close(fd)
 

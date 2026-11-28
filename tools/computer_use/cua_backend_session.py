@@ -445,9 +445,15 @@ class _CuaDriverSession:
 
         call_args, shot_file = dict(args), None
         if name == "get_window_state" and "screenshot_out_file" not in call_args:
-            fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
-            os.close(fd)
-            call_args["screenshot_out_file"] = shot_file
+            from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+            try:
+                fd, shot_file = _tempfile.mkstemp(
+                    prefix="cua_shot_", suffix=".png", dir=private_temp_parent("cua-shot"))
+            except PrivateIntervalUnavailable:
+                pass  # unbound private turn: let the daemon return the image inline, never via public temp
+            else:
+                os.close(fd)
+                call_args["screenshot_out_file"] = shot_file
         driver_command = _driver.resolve_cua_driver_cmd()
         if not driver_command:
             raise RuntimeError(_driver.cua_driver_install_hint())

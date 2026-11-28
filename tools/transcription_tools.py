@@ -448,7 +448,13 @@ def _transcribe_prepared_audio(
     with ExitStack() as cleanup:
         # Never overwrite a neighboring WAV or leave converted voice notes behind.
         if remote and Path(file_path).suffix.lower() == ".caf":
-            work_dir = cleanup.enter_context(TemporaryDirectory(prefix="hermes-caf-", ignore_cleanup_errors=True))
+            from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+            try:
+                caf_parent = private_temp_parent("stt-caf")
+            except PrivateIntervalUnavailable:
+                return _error_result("CAF audio cannot be converted: private interval is unresolved.")
+            work_dir = cleanup.enter_context(
+                TemporaryDirectory(prefix="hermes-caf-", dir=caf_parent, ignore_cleanup_errors=True))
             file_path = _convert_caf_to_wav(file_path, work_dir)
             if not file_path:
                 return _error_result("CAF audio could not be converted to WAV.")

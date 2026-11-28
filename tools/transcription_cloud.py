@@ -165,17 +165,23 @@ def _transcribe_openai(
                 create_kwargs["prompt"] = prompt
             with open(path, "rb") as audio_file:
                 return client.audio.transcriptions.create(file=audio_file, **create_kwargs)
-        with tempfile.TemporaryDirectory(prefix="hermes-stt-") as work_dir:
+        try:
+            transcription = _create_transcription(file_path)
+        except APIStatusError as exc:
+            # 400 + container hint is the documented rejection; some OpenAI-compatible endpoints
+            # reject a container with a bare 5xx instead (#81644). A 5xx is ambiguous, so it earns
+            # the same single transcode retry and, when no transcode is possible, its own error.
+            is_server_error = (exc.status_code or 0) >= 500
+            if not is_server_error and not any(k in str(exc).lower() for k in ("unsupported", "corrupted", "invalid file")):
+                raise
+            # Newer models reject containers whisper-1 accepted (Ogg/Opus voice notes): transcode, retry once.
+            # The scratch dir exists only for the retry; a private turn with no interval fails closed here.
+            from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
             try:
-                transcription = _create_transcription(file_path)
-            except APIStatusError as exc:
-                # 400 + container hint is the documented rejection; some OpenAI-compatible endpoints
-                # reject a container with a bare 5xx instead (#81644). A 5xx is ambiguous, so it earns
-                # the same single transcode retry and, when no transcode is possible, its own error.
-                is_server_error = (exc.status_code or 0) >= 500
-                if not is_server_error and not any(k in str(exc).lower() for k in ("unsupported", "corrupted", "invalid file")):
-                    raise
-                # Newer models reject containers whisper-1 accepted (Ogg/Opus voice notes): transcode, retry once.
+                retry_parent = private_temp_parent("stt-retry")
+            except PrivateIntervalUnavailable:
+                return _error_result("Cannot retry STT: private interval is unresolved")
+            with tempfile.TemporaryDirectory(prefix="hermes-stt-", dir=retry_parent) as work_dir:
                 converted_path, transcode_error = _transcode_audio_for_stt(file_path, work_dir)
                 if transcode_error:
                     if is_server_error:

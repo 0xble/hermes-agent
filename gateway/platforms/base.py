@@ -73,17 +73,14 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
     if not ffmpeg:
         return None
     if output_path is None:
-        from agent.incognito import is_incognito
-        from agent.incognito_private_dir import disposable_path_for_current_session
+        from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
 
-        private = is_incognito()
-        parent = disposable_path_for_current_session() if private else None
-        if private and parent is None:
+        try:
+            parent = private_temp_parent("voice-transcode")
+        except PrivateIntervalUnavailable:
             logger.warning("Refusing voice transcode: private interval is unresolved")
             return None
-        fd, ogg_path = tempfile.mkstemp(
-            prefix="voice_transcode_", suffix=".ogg",
-            dir=str(parent) if parent is not None else None)
+        fd, ogg_path = tempfile.mkstemp(prefix="voice_transcode_", suffix=".ogg", dir=parent)
         os.close(fd)
     else:
         ogg_path = output_path
@@ -299,11 +296,12 @@ def build_auto_tts_output_path(platform) -> str:
     backends like Edge TTS. Everything else keeps the MP3 default. See #36685, #57049.
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
-    from agent.incognito_private_dir import private_path_for_current_session
+    from agent.incognito_private_dir import private_temp_parent
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    private_root = private_path_for_current_session()
-    temp_root = private_root if private_root is not None else Path(tempfile.gettempdir())
-    audio_path = str(temp_root / "hermes_voice" / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
+    # Raises PrivateIntervalUnavailable (an OSError) for a private turn with no bound interval.
+    private_parent = private_temp_parent("hermes_voice")
+    voice_dir = Path(private_parent) if private_parent is not None else Path(tempfile.gettempdir()) / "hermes_voice"
+    audio_path = str(voice_dir / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)
     return audio_path
 
@@ -636,14 +634,22 @@ async def read_httpx_body_with_limit(response, *, media_type: str, body=None) ->
 def _cache_dir_accessors(kind: str, constant_name: str, new_subpath: str, old_name: str):
     """``(get_<kind>_cache_dir, cleanup_<kind>_cache)`` pair. The getter resolves fresh via
     get_hermes_dir (active profile) unless a test monkeypatched the module constant away from
-    its import-time default, and creates the directory; ``cleanup(max_age_hours=MEDIA_CACHE_MAX_AGE_HOURS)`` deletes
-    older files and returns the count."""
+    its import-time default, and creates the directory; private turns use their interval cache
+    and fail closed when no interval is bound."""
     def get_dir() -> Path:
-        d = get_hermes_dir(new_subpath, old_name)
-        current = globals().get(constant_name)
-        default = _CACHE_DIR_IMPORT_DEFAULTS.get(constant_name)
-        if current is not None and default is not None and current != default:
-            d = Path(current)
+        from agent.incognito import is_incognito
+        if is_incognito():
+            from agent.incognito_private_dir import PrivateIntervalUnavailable, private_path_for_current_session
+            private_root = private_path_for_current_session()
+            if private_root is None:
+                raise PrivateIntervalUnavailable("no private interval is bound to this incognito turn")
+            d = private_root / new_subpath
+        else:
+            d = get_hermes_dir(new_subpath, old_name)
+            current = globals().get(constant_name)
+            default = _CACHE_DIR_IMPORT_DEFAULTS.get(constant_name)
+            if current is not None and default is not None and current != default:
+                d = Path(current)
         _secure_media_cache_dir(d)
         return d
 
@@ -5482,7 +5488,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, _spoken_text, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text, event.source)
+                    # This block runs after the handler's own scope and session vars ended, and a drain
+                    # started outside ingress never had them: re-enter the private lane so the spoken
+                    # copy of a private reply is staged in its interval, never in public temp.
+                    from gateway.incognito import private_lane_scope
+                    with private_lane_scope(session_key):
+                        _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text, event.source)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):

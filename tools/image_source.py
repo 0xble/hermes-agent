@@ -168,8 +168,13 @@ def _http_block_reason(url: str) -> Optional[str]:
 
 async def _download_to_bytes(url: str) -> bytes:
     import tempfile
+    from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
     from tools.vision_tools import _download_image
-    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+    try:
+        parent = private_temp_parent("image-download")
+    except PrivateIntervalUnavailable:
+        raise SourceUnsafe("private interval is unresolved; refusing to stage the download", src=url, origin="http")
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False, dir=parent) as tf:
         tmp = Path(tf.name)
     try:
         # Enforces the 50MB stream cap, redirect SSRF guard, and website policy.

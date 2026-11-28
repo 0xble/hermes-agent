@@ -101,8 +101,16 @@ def _check_size(size: int, limit: int) -> None:
 
 @contextlib.contextmanager
 def _temp_copy(data: bytes, suffix: str) -> Iterator[str]:
-    """Materialize backend bytes in a private host temp file; removed even when parsing fails."""
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+    """Materialize backend bytes in a private host temp file; removed even when parsing fails.
+
+    An incognito turn stages it inside its private interval; with no interval bound the copy is
+    refused (``ExtractionError``) rather than written to the shared temp directory."""
+    from agent.incognito_private_dir import PrivateIntervalUnavailable, private_temp_parent
+    try:
+        parent = private_temp_parent("doc-extract")
+    except PrivateIntervalUnavailable as exc:
+        raise ExtractionError("Document extraction unavailable: private interval is unresolved") from exc
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=parent) as fh:
         fh.write(data)
     try:
         yield fh.name
@@ -320,7 +328,7 @@ def _pdf_coverage_note(path: str, display_path: Optional[str] = None) -> str:
 
 def _pdf_coverage_note_from_bytes(data: bytes, display_path: str) -> str:
     """Coverage note for backend PDF bytes via a host temp copy (pdftotext needs a path)."""
-    with contextlib.suppress(OSError), _temp_copy(data, ".pdf") as temp_path:
+    with contextlib.suppress(OSError, ExtractionError), _temp_copy(data, ".pdf") as temp_path:
         return _pdf_coverage_note(temp_path, display_path=display_path)
     return ""
 
