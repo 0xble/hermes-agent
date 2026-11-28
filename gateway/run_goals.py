@@ -1340,6 +1340,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not state.awaiting_response and now < state.next_due_at:
             return
 
+        session_key = None
+
+        def _log_deferral(reason):
+            # Past the guard above the loop is due (or awaiting recovery), so a skip is a starvation.
+            interval = state.interval_seconds or self_paced_floor_seconds()
+            logged_at = self.__dict__.setdefault("_loop_deferral_logged_at", {})
+            log_key = (session_key, sid, reason)
+            if now - logged_at.get(log_key, float("-inf")) >= interval:
+                logged_at[log_key] = now
+                logger.info("loop wakeup: session %s deferred by %s", sid, reason)
+
         route = state.route or {}
         platform_name = route.get("platform", "")
         chat_id = route.get("chat_id", "")
@@ -1349,39 +1360,50 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         adapters = self._adapters_for_profile(profile)
         adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
         if adapter is None:
+            _log_deferral("no adapter")
             return
         source = await asyncio.to_thread(self._build_process_event_source, {
             "session_key": "", "platform": platform_name, "chat_id": chat_id,
             **{k: route.get(k, "") for k in ("chat_type", "thread_id", "user_id", "user_name")},
         })
         if source is None:
+            _log_deferral("no source")
             return
         if profile and not getattr(source, "profile", None):
             source.profile = profile
-        session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
         if not session_key:
+            _log_deferral("no session key")
             return
 
-        def _turn_owner_exists(include_marker: bool = True) -> bool:
+        def _turn_owner_reason(include_marker: bool = True) -> Optional[str]:
             if self._is_session_running(session_key) or session_key in self._running_agents:
-                return True
+                return "turn owner: running"
             if post_turn_bookkeeping_pending(self, session_key):
-                return True  # the finished turn's deferred judge still owns the tick
+                return "turn owner: post-turn bookkeeping"  # the finished turn's deferred judge still owns the tick
             if session_key in getattr(adapter, "_active_sessions", {}):
-                return True
+                return "turn owner: adapter active"
             with suppress(Exception):
                 if self._queue_depth(session_key, adapter=adapter) > 0:
-                    return True
+                    return "turn owner: queued"
             if include_marker:
                 with suppress(Exception):
                     entry = self.session_store._entries.get(session_key)
                     if entry is not None and getattr(entry, "resume_pending", False):
-                        return True
-            return False
+                        return "turn owner: resume marker"
+            return None
 
-        if _turn_owner_exists(include_marker=False):
+        def _turn_owner_exists(include_marker: bool = True) -> bool:
+            return _turn_owner_reason(include_marker) is not None
+
+        def _defer_if_owned(include_marker: bool = True) -> bool:
+            reason = _turn_owner_reason(include_marker)
+            if reason is not None:
+                _log_deferral(reason)
+            return reason is not None
+
+        if _defer_if_owned(include_marker=False):
             return
         # Preserve retired state before compression migration or orphan-tick recovery writes.
         if not await automatic_route_available(self, source, idle_backoff=True):
@@ -1397,6 +1419,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
         except Exception:
             logger.debug("loop wakeup: session ownership lookup failed", exc_info=True)
+            _log_deferral("session lookup failed")
             return
         if current is not None and current.session_id != sid:
             # Compression deliberately carries conversation responsibility forward. /resume and
@@ -1408,9 +1431,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 )
             except Exception:
                 logger.debug("loop wakeup: compression lineage lookup failed", exc_info=True)
+                _log_deferral("compression lookup failed")
                 return
             if tip == current.session_id:
                 await self._migrate_compressed_loop(sid, tip)
+            else:
+                _log_deferral("route moved")
             return
 
         entry = None
@@ -1418,15 +1444,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             entry = self.session_store._entries.get(session_key)
         marker_owned, stale_marker = await self._stale_resume_pending_marker(session_key, entry)
         if marker_owned:
+            _log_deferral("turn owner: resume marker")
             return
-        if stale_marker is not None and (
-            _turn_owner_exists(include_marker=False)
-            or not await self._clear_stale_resume_pending(session_key, stale_marker, sid, "loop wakeup")
-        ):
-            return
+        if stale_marker is not None:
+            if _defer_if_owned(include_marker=False):
+                return
+            if not await self._clear_stale_resume_pending(session_key, stale_marker, sid, "loop wakeup"):
+                _log_deferral("turn owner: resume marker")
+                return
 
         if state.awaiting_response:
-            if _turn_owner_exists():
+            if _defer_if_owned():
                 return
             outcome = await self._run_in_executor_with_context(
                 lambda: LoopManager(session_id=sid).recover_tick(owns_turn=_turn_owner_exists)
@@ -1434,7 +1462,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if outcome:
                 logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
             return
-        if now < state.next_due_at or _turn_owner_exists():
+        if now < state.next_due_at or _defer_if_owned():
             # The adapter routes pending clarification replies before admission. A wake must
             # never enter that path as a fabricated human answer while another turn owns it.
             return
@@ -1453,13 +1481,6 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if mgr is None:
             return
 
-        def _log_deferral(reason):
-            logged_at = self.__dict__.setdefault("_loop_deferral_logged_at", {})
-            log_key = (session_key, sid, reason)
-            if now - logged_at.get(log_key, float("-inf")) >= interval:
-                logged_at[log_key] = now
-                logger.info("loop wakeup: session %s deferred by %s", sid, reason)
-
         # A runnable goal gets the first interval, not indefinite ownership of an idle session.
         # Live goal turns and continuations still win the turn-owner fences below, at any age.
         if goal_blocks and now - mgr.state.next_due_at < interval:
@@ -1468,12 +1489,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if _turn_owner_exists():
+        if _defer_if_owned():
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        if _turn_owner_exists():
+        if _defer_if_owned():
             return
         reservation = self._reserve_background_turn(session_key)
         if reservation is None:
@@ -1712,7 +1733,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 active_loops = await self._run_in_executor_with_context(list_active_loops)
                 now = time.time()
                 for sid, state in active_loops:
-                    await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
+                    try:
+                        await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
+                    except Exception as exc:
+                        logger.warning("loop wakeup failed for %s: %s", sid, exc, exc_info=True)
                 parked_goals = await self._run_in_executor_with_context(list_parked_goals)
                 parked_sids.update(sid for sid, _state in parked_goals)
             finally:

@@ -514,3 +514,103 @@ def test_untagged_internal_events_are_not_loop_fenced():
 
     assert loop_wake_is_current({}, "x") is True
     assert loop_wake_is_current(None, "x") is True
+
+
+def _mark_turn_owner(env, clause):
+    key = env.runner._session_key_for_source(None)
+    if clause == "running":
+        env.runner._running_agents[key] = SimpleNamespace(goal_continuation=False)
+    else:
+        env.adapter._active_sessions = {key: object()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("clause", "label"),
+    [("running", "turn owner: running"), ("adapter", "turn owner: adapter active")],
+)
+async def test_due_loop_blocked_by_turn_owner_logs_labeled_reason_once_per_interval(
+    goal_loop, caplog, clause, label,
+):
+    import logging
+
+    from hermes_cli import loops
+
+    env = goal_loop()
+    _mark_turn_owner(env, clause)
+    due_at = env.loop.state.next_due_at
+
+    def records():
+        return [r for r in caplog.records if f"deferred by {label}" in r.message]
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        for elapsed in (0, 1, env.interval - 1):
+            await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, due_at + elapsed, set())
+        assert len(records()) == 1
+        assert records()[0].levelno == logging.INFO and env.sid in records()[0].message
+
+        await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, due_at + env.interval, set())
+        assert len(records()) == 2
+    assert env.adapter.events == []
+    stored = loops.load_loop(env.sid)
+    assert stored is not None and stored.ticks_fired == 0 and not stored.awaiting_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clause", ["running", "adapter"])
+async def test_not_due_loop_blocked_by_turn_owner_logs_nothing(goal_loop, caplog, clause):
+    import logging
+
+    env = goal_loop()
+    _mark_turn_owner(env, clause)
+    not_due = env.loop.state.next_due_at - 1
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, not_due, set())
+
+    assert [r for r in caplog.records if "deferred by" in r.message] == []
+    assert env.adapter.events == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_isolates_a_raising_loop_from_the_rest_of_the_pass(goal_loop, caplog, monkeypatch):
+    import asyncio
+    import logging
+
+    from hermes_cli import loops
+
+    env = goal_loop()
+    runner = env.runner
+    good = env.loop.state
+    good.next_due_at = 0
+    env.loop._save()
+    boom = loops.LoopManager(session_id="boom-sid")
+    boom.set("explode", interval_seconds=300, route=good.route)
+    # The raising loop is listed first, so only per-item isolation lets the second one fire.
+    monkeypatch.setattr(loops, "list_active_loops", lambda: [("boom-sid", boom.state), (env.sid, good)])
+
+    real_fire_one = runner._loop_wakeup_fire_one
+    seen = []
+
+    async def fire_one(sid, state, now, warned_no_route, profile=None):
+        seen.append(sid)
+        runner._running = False  # one pass only, even if isolation regresses and the pass aborts
+        if sid == "boom-sid":
+            raise RuntimeError("kaboom")
+        await real_fire_one(sid, state, now, warned_no_route, profile)
+
+    runner._loop_wakeup_fire_one = fire_one
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await runner._loop_wakeup_watcher(interval=0)
+
+    assert seen == ["boom-sid", env.sid]
+    assert len(env.adapter.events) == 1
+    failures = [r for r in caplog.records if "loop wakeup failed for boom-sid: kaboom" in r.message]
+    assert len(failures) == 1 and failures[0].levelno == logging.WARNING and failures[0].exc_info
