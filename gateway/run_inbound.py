@@ -1187,8 +1187,10 @@ class GatewayInboundMixin(
             return False
         # A voice note, photo or file is the person speaking as much as typed text is, so it cuts a
         # machine turn the same way; behind the person's own turn media keeps main's busy handling.
+        # An authorized bot's attachment is not the person speaking, so it never preempts.
         media_preempts = (event.message_type in _PREEMPTING_MEDIA_TYPES and mode == "queue"
-                          and not superseded and self._human_preempts_autonomous_turn(event, state))
+                          and not superseded and not getattr(source, "is_bot", False)
+                          and self._human_preempts_autonomous_turn(event, state))
         if (running_agent is _AGENT_PENDING_SENTINEL or media_preempts
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):

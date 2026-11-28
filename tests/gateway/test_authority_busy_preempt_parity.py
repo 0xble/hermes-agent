@@ -117,12 +117,15 @@ def _goal_turn(runner, source, turn, agent):
 
 
 async def _queued_behind(tmp_path, monkeypatch, opener, message_id, *, publish_pending=False, wait_for_busy=True,
-                    active_subagents=False, after_admit=None, message_type=MessageType.TEXT, mode='queue'):
+                    active_subagents=False, after_admit=None, message_type=MessageType.TEXT, mode='queue',
+                    source_is_bot=False):
     """Send a typed queue-mode message behind ``opener`` and return its admitted rows, steers and sends."""
     from tests.waiting import async_wait_until
     from gateway.run import _AGENT_PENDING_SENTINEL
 
     runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, mode)
+    if source_is_bot:
+        source.is_bot = True
     monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
     monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
     if active_subagents:
@@ -271,6 +274,22 @@ async def test_media_behind_machine_turn_is_soft_preempted_once(tmp_path, monkey
     assert steers == []
     assert interrupts == [((None,), {'tool_reason': 'gateway user turn preemption'})], interrupts
     assert len(sent) == 1 and 'Interrupting' in str(sent[0]), sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('message_type', [MessageType.DOCUMENT, MessageType.PHOTO])
+async def test_bot_media_behind_machine_turn_never_preempts(tmp_path, monkeypatch, message_type):
+    """An authorized bot's attachment queues behind a machine turn; only the person's media preempts."""
+    def opener(runner, source, turn, agent):
+        _goal_turn(runner, source, turn, agent)
+
+    rows, steers, interrupts, sent = await _queued_behind(
+        tmp_path, monkeypatch, opener, 'h-bot-media', message_type=message_type, source_is_bot=True,
+        wait_for_busy=False,
+    )
+    assert [(row['request_id'], row['status']) for row in rows] == [('h-bot-media', 'queued')]
+    assert interrupts == [] and steers == [], (interrupts, steers)
+    assert not any('Interrupting' in str(x) for x in sent), sent
 
 
 @pytest.mark.asyncio
