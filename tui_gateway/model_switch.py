@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import time
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -255,6 +256,7 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts. The transcript
     claim is held for the whole commit (the marker writes the chat's transcript), so the idle reaper cannot
     release the lease between the ownership check and the marker."""
+    from tui_gateway.session_lifecycle import _transcript_claim
     with _transcript_claim(session):
         try:
             agent.switch_model(
@@ -271,6 +273,16 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
             logger.warning("In-place model switch failed for TUI agent: %s", exc)
             raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                              f"staying on {getattr(agent, 'model', current_model)}.") from exc
+        from agent.agent_init_fallback import _fallback_entries
+        from hermes_cli.fallback_config import same_model_fallbacks
+        agent._pinned_fallback_model = result.new_model
+        agent._fallback_chain = same_model_fallbacks(
+            _fallback_entries(_load_fallback_model()), result.new_model)
+        agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
+        agent._fallback_index = 0
+        if snapshot is None:
+            session["model_pinned"] = True
+        agent._preflight_fallback = None
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)

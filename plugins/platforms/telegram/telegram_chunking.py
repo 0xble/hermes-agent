@@ -102,12 +102,12 @@ def _carry(chunks: list[str], marks_at: Callable[[int, str], list[str]], indicat
     return out
 
 
-def split_formatted_mdv2(formatted: str, max_length: int, truncate, len_fn) -> list[str]:
+def split_formatted_mdv2(formatted: str, max_length: int, truncate, len_fn, *, indicator_overhead: int = 3) -> list[str]:
     """``TelegramAdapter.send``'s split of already-formatted MarkdownV2 with ``truncate`` (the
     adapter's ``truncate_message``): entities are carried across cuts and the ``(N/M)`` markers are
     MarkdownV2-escaped. Only a split that carries an entity re-cuts with the carry reserve, so plain
     text splits exactly where ``truncate_message`` alone would."""
-    chunks = truncate(formatted, max_length, len_fn=len_fn)
+    chunks = truncate(formatted, max_length, len_fn=len_fn, indicator_overhead=indicator_overhead)
     if len(chunks) <= 1:
         return chunks
     escaped = " \\(%s/%s\\)"
@@ -116,7 +116,9 @@ def split_formatted_mdv2(formatted: str, max_length: int, truncate, len_fn) -> l
 
     carried = _carry(chunks, open_at, escaped)
     if any(len(c) != len(_INDICATOR_RE.sub(lambda m: escaped % m.groups(), r)) for c, r in zip(carried, chunks)):
-        carried = _carry(truncate(formatted, max_length - ENTITY_CARRY_RESERVE, len_fn=len_fn), open_at, escaped)
+        chunks = truncate(formatted, max_length - ENTITY_CARRY_RESERVE, len_fn=len_fn,
+                          indicator_overhead=indicator_overhead)
+        carried = _carry(chunks, open_at, escaped)
     return [separate_chunk_indicator_from_fence(c) for c in carried]
 
 

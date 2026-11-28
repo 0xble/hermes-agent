@@ -601,7 +601,6 @@ class _UrlEmphasisScan:
         for run in _URL_MARK_RUN_RE.finditer(url):
             if not _prose_follows(url, run.end()):
                 continue
-            # A backslash-escaped mark is URL text (``https://x/a\**``): only the marks after it may close.
             start = run.start() + _escaped(url, run.start())
             if start == run.end():
                 continue
@@ -683,9 +682,9 @@ def _stash_inline_code(text: str, stash) -> str:
     """Stash inline code spans: a backtick run opens a span that the next run of the same width on
     the same line closes (CommonMark), so runs inside an open span are content, not new spans.
 
-    Telegram code spans are single-backtick, so every matching-width inline span keeps its
-    content with backticks and backslashes escaped. Multi-backtick padding loses one space
-    on each side, as CommonMark specifies."""
+    Telegram code spans are single-backtick, so a span keeps its content verbatim with ` and \\
+    escaped. A ``...`` span whose content holds backticks, or a ```...``` run, keeps its outer
+    ticks as literal text and its content is scanned for spans of its own (`` `code` ``)."""
     runs = list(re.finditer(r'`+', text))
     breaks = [m.start() for m in re.finditer(r'[\r\n]', text)] + [len(text)]
     next_same, last = [None] * len(runs), {}

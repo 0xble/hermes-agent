@@ -464,17 +464,17 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             if not _run_prompt_submit(rid, sid, session, wakeup, turn_origin="process"):
                 # Refused at admission (another surface owns the chat): no turn will settle this tick. Admission
                 # already released ``running``; only the loop state rolls back here.
-                _notif_abandon_loop_tick(sid, session, mgr)
+                _notif_abandon_loop_tick(sid, session, mgr, rollback_started=True)
     except Exception as exc:
         _notif_log_failure("loop wakeup dispatch failed", exc)
         _notif_release_claim(session, claim)  # still ours unless admission released it before raising
         _notif_abandon_loop_tick(sid, session, mgr)
 
 
-def _notif_abandon_loop_tick(sid: str, session: dict, mgr) -> None:
-    """Roll the fired tick back to the countdown. Never touches ``running``: it may be another turn's by now."""
+def _notif_abandon_loop_tick(sid: str, session: dict, mgr, *, rollback_started: bool = False) -> None:
+    """Roll a refused wakeup back; an admitted turn that later fails remains consumed."""
     with contextlib.suppress(Exception):
-        mgr.abandon_tick()
+        mgr.abandon_tick(rollback_started=rollback_started)
     _publish_session_control_snapshot(sid, session)  # back to the countdown, not "running now"
 
 

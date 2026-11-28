@@ -53,6 +53,18 @@ def test_sweep_clears_pycache_when_checkout_changed(monkeypatch, tmp_path):
     assert recorded.strip().endswith("b" * 40)
 
 
+def test_clear_bytecode_skips_ci_pm_cache(tmp_path):
+    """Launch cleanup must not descend into the CI PM cache, which is not checkout source."""
+    source_cache = _make_pycache(tmp_path / "source")
+    ci_cache = _make_pycache(tmp_path / "source", ".ci/pm-home/cache")
+
+    removed = hermes_main._clear_bytecode_cache(tmp_path / "source")
+
+    assert removed == 1
+    assert not source_cache.exists()
+    assert ci_cache.exists()
+
+
 
 
 

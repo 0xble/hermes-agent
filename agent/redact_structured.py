@@ -78,6 +78,13 @@ def _redact_leaf(value: str, key: Any) -> str:
     try:
         lifted = json.loads(tail)
     except (json.JSONDecodeError, TypeError, ValueError):
+        # An ENV assignment may have consumed the JSON quote. Accept a repaired
+        # leaf only if standalone redaction independently gives the same value
+        # and the whole-payload fixed-point check below also approves it.
+        if key is not None:
+            plain = _redact(value)
+            if plain != value and json.dumps(plain, ensure_ascii=False) == tail + '"':
+                return plain
         return _MASK
     return lifted if isinstance(lifted, str) else _MASK
 

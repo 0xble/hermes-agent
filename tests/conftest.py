@@ -31,7 +31,48 @@ import tempfile
 import threading
 from pathlib import Path
 
+# Keep checkout-home guards independent of tests that monkeypatch the process-wide os module.
+_REAL_LSTAT = os.lstat
+
 import pytest
+
+
+@pytest.fixture
+def short_sock_dir():
+    """Shared socket-safe root, including the legacy discovery directory suffix."""
+    from tests.socket_paths import short_socket_dir
+
+    with short_socket_dir("hermes-gw-" + "x" * 16 + "/control.sock") as path:
+        yield path
+
+
+def reset_pm_path_cache() -> None:
+    """Drop the per-process terminal PATH composition cache between tests.
+
+    A previous test's thread can still be importing ``pm.install`` when the next test starts, and
+    its partially initialized module has no cache yet, so there is nothing to clear.
+    """
+    cache = getattr(sys.modules.get("pm.install"), "_store_path_dirs_cache", None)
+    if cache is not None:
+        cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_camofox_leases(tmp_path, monkeypatch):
+    """Keep Camofox lease files inside the per-test directory, never the host state dir."""
+    from tools import browser_camofox_leases as leases
+
+    monkeypatch.setattr(leases, "_lease_root", lambda: tmp_path / "camofox-tab-leases")
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+    yield
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -267,6 +308,8 @@ from tests._fixtures.live_system_guard import (
 )
 from tests._fixtures.model_peer import model_peer  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+from tests._fixtures.repair_capacity import adequate_repair_capacity
+from tests._fixtures.reply_latency import _isolate_reply_latency  # registers fixture
 
 
 @pytest.fixture(autouse=True)
@@ -320,6 +363,33 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # Synthetic authority ids such as "owned" are relative profile homes in scope
+    # readers. Keep their real initialization (including SOUL.md) inside this test,
+    # rather than materializing those profiles in the checkout shared by workers.
+    set_home_override = hermes_constants.set_hermes_home_override
+    get_home_override = hermes_constants.get_hermes_home_override
+
+    def isolated_home_override(value):
+        if value is not None:
+            # Keep symbolic authority ids under the test home, but do not mistake
+            # an env/user-expanded absolute path for a relative profile id.
+            expanded = Path(os.path.expandvars(os.path.expanduser(str(value))))
+            if not expanded.is_absolute():
+                value = fake_hermes_home / "profile-scopes" / value
+        return set_home_override(value)
+
+    def isolated_get_home_override():
+        # Some profile-scope modules import set_hermes_home_override before this
+        # fixture patches the module attribute. Normalize those aliases at the
+        # read boundary too; otherwise a symbolic authority id such as "owned"
+        # can still become a relative HERMES_HOME.
+        value = get_home_override()
+        if value is not None and not Path(value).is_absolute():
+            return str(fake_hermes_home / "profile-scopes" / value)
+        return value
+
+    monkeypatch.setattr(hermes_constants, "set_hermes_home_override", isolated_home_override)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", isolated_get_home_override)
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
@@ -335,6 +405,7 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
                                            sources=(install_state._active_root,))
     monkeypatch.setattr(install_state, "machine_places", lambda: isolated_places)
     install_state.probe.cache_clear()
+    reset_pm_path_cache()
     from hermes_cli import onboarding_due
 
     onboarding_due.reset_for_tests()
@@ -384,6 +455,15 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     tui_server_mod = sys.modules.get("tui_gateway.server")
     if tui_server_mod is not None and hasattr(tui_server_mod, "_served_profile_homes"):
         monkeypatch.setattr(tui_server_mod, "_served_profile_homes", set())
+    if tui_server_mod is not None:
+        # Watcher state is process-global, while each test owns a fresh home.
+        for _watcher_state in ("_lease_epochs", "_lease_mtimes", "_runtime_marks"):
+            _state = getattr(tui_server_mod, _watcher_state, None)
+            if isinstance(_state, dict):
+                _state.clear()
+        if hasattr(tui_server_mod, "_last_idle_check"):
+            monkeypatch.setattr(tui_server_mod, "_last_idle_check", 0.0)
+
     # A classic CLI's gateway-session toolset reader is process-global too (``_ensure_gateway_session``).
     tools_config_mod = sys.modules.get("hermes_cli.tools_config")
     if tools_config_mod is not None and hasattr(tools_config_mod, "_gateway_plugin_toolsets"):
@@ -433,6 +513,31 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    # A symbolic authority profile must never materialize a home in the checkout
+    # that runs the suite. Keep this guard narrow: tests may create arbitrary
+    # temporary directories, but top-level ``owned``/``fixture`` are synthetic
+    # profile ids, not repository artifacts.
+    checkout_root = Path(__file__).resolve().parent.parent
+    forbidden_homes = tuple(checkout_root / name for name in ("owned", "fixture"))
+
+    def assert_no_checkout_homes():
+        # os.path.lexists, not Path.exists: this also runs at teardown, while a test's own patch of
+        # ``Path.exists`` (the serving-slot probe test pins it to True) is still installed, and the
+        # guard must report what is on disk. lexists also catches a dangling symlink.
+        leaked = []
+        for path in forbidden_homes:
+            try:
+                _REAL_LSTAT(path)
+            except FileNotFoundError:
+                continue
+            leaked.append(str(path))
+        if leaked:
+            raise AssertionError(f"test created a Hermes home in the checkout root: {leaked}")
+
+    assert_no_checkout_homes()
+    yield
+    assert_no_checkout_homes()
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
@@ -490,8 +595,18 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
 
 
+@pytest.fixture
+def monkeypatch(_close_leaked_session_dbs, monkeypatch):
+    """Restore native patches before retiring the resources they may replace.
+
+    Pytest resolves the same-name dependency to its original fixture. Its
+    undo runs before this dependency, preserving the native MonkeyPatch API.
+    """
+    return monkeypatch
+
+
 @pytest.fixture(autouse=True)
-def _close_leaked_session_dbs():
+def _close_leaked_session_dbs(tmp_path):
     """Close every store holder a test constructed but forgot to close.
 
     Root cause of OOM incident 20260816: ~40 files under tests/hermes_cli/
@@ -540,9 +655,7 @@ def _close_leaked_session_dbs():
     try:
         from persistence.sqlite._state.guard import _test_instance_registry as registry
     except Exception:
-        return
-    if not registry:
-        return
+        registry = ()
     for db in list(registry):
         if getattr(db, "_shared_registry_owned", False) and getattr(db, "_reference", None) is None:
             continue
@@ -553,6 +666,26 @@ def _close_leaked_session_dbs():
             # (cross-thread ProgrammingError, already-closed) leaves at most
             # the one connection for the next sweep / process exit.
             pass
+
+    # A per-test home is a finished resource owner. Force-close only shared
+    # generations below this test's tmp_path, preserving module/session fixture
+    # handles outside it. Skipping all registry-owned DBs left one generation
+    # per test alive until the worker hit its file-descriptor limit.
+    close_shared = getattr(sys.modules.get("persistence.sqlite._registry"), "close_all_under", None)
+    if close_shared is not None:
+        close_shared(tmp_path)
+
+    # Agent construction routes logging to each isolated home. Those routed
+    # handlers outlive the agent, so retiring the home must release them too.
+    logs = sys.modules.get("hermes_logging")
+    release_logs = getattr(logs, "release_profile_log_handlers", None)
+    if callable(release_logs):
+        with logs._queue_state_lock:
+            homes = logs._known_log_homes()
+        root = tmp_path.resolve()
+        for home in homes:
+            if home.is_relative_to(root):
+                release_logs(home)
 
 
 @pytest.fixture(autouse=True)
@@ -1064,10 +1197,14 @@ def _wal_is_usable() -> bool:
 #    gateway call sites late-import, so patching the module attribute catches
 #    them wherever they import it from.
 #  • ``hermes_cli.voice.play_audio_file`` — the module-level binding
-#    ``speak_text`` actually plays through. Patching the binding inside
-#    ``hermes_cli.voice`` (not ``tools.voice_mode``) keeps the real function
-#    available to the tests that legitimately exercise it with a mocked
-#    audio backend (``tests/tools/test_voice_mode.py``).
+#    ``speak_text`` actually plays through.
+#  • ``tools.voice_mode.play_audio_file`` — the common sink used by late-import
+#    call sites such as the streaming speaker pipeline.
+#  • ``tools.voice_mode._play_int16_via_tempfile`` — the direct tempfile
+#    fallback used by beeps when sounddevice output is unavailable.
+#
+# Tests that intentionally exercise real playback code opt out with
+# ``@pytest.mark.real_audio_playback`` and keep their own backend mocks.
 #
 # Config cannot re-open this hole: the ``tts:`` section of ``config.yaml``
 # only selects *which* provider speaks, never *whether* to speak — that gate
@@ -1153,7 +1290,7 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
             continue
         try:
             home = proc.environ().get("HERMES_HOME")
-        except (psutil.Error, OSError):
+        except (psutil.Error, OSError, SystemError):
             continue
         if not home:
             continue
@@ -1354,8 +1491,29 @@ def pytest_runtest_call(item):
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
             wait()
+        _drain_shared_metrics_worker()
 
 
+def _drain_shared_metrics_worker() -> None:
+    """Finish the gateway shared-metrics worker's queued jobs before the next pytest phase.
+
+    Cron and gateway code hand each metric to one background worker
+    (``shared_metrics_gateway._submit``). Its first job lazily imports the metrics
+    runtime, and those imports register named loggers. Pytest starts every phase
+    with ``catching_logs.__enter__``, which iterates the live
+    ``logging.Logger.manager.loggerDict``. A job still running from the previous
+    phase can add a logger during that loop, which raises ``RuntimeError: dictionary
+    changed size during iteration`` (hosted job 114104725116, at teardown of
+    ``tests/cron/test_warning_execution_outcome.py``). The loop is in pytest, so the
+    suite waits for the worker at each phase boundary. A sys.modules lookup, not an
+    import: a test that never loaded the module has no worker.
+    """
+    drain = getattr(sys.modules.get("hermes_cli.observability.shared_metrics_gateway"), "drain", None)
+    if drain is not None:
+        drain()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_runtest_setup(item):
     if item.get_closest_marker("require_symlinks"):
         if not _check_symlink_support():
@@ -1363,6 +1521,18 @@ def pytest_runtest_setup(item):
                 "Environment does not support symbolic links "
                 "(requires admin/developer mode on Windows)"
             )
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
 
 
 def pytest_collection_modifyitems(config, items):
@@ -1420,9 +1590,19 @@ def _audio_playback_guard(request, monkeypatch):
         yield
         return
 
+    _voice = None
     try:
         import hermes_cli.voice as _voice
     except Exception:
+        pass
+
+    _voice_mode = None
+    try:
+        import tools.voice_mode as _voice_mode
+    except Exception:
+        pass
+
+    if _voice is None and _voice_mode is None:
         # Optional audio deps missing — nothing importable to speak with.
         yield
         return
@@ -1433,10 +1613,22 @@ def _audio_playback_guard(request, monkeypatch):
     def _blocked_play_audio_file(path, *args, **kwargs):
         return False
 
-    if hasattr(_voice, "speak_text"):
+    def _blocked_play_int16(audio, sample_rate, *args, **kwargs):
+        return None
+
+    if _voice is not None and hasattr(_voice, "speak_text"):
         monkeypatch.setattr(_voice, "speak_text", _blocked_speak_text)
-    if hasattr(_voice, "play_audio_file"):
+    if _voice is not None and hasattr(_voice, "play_audio_file"):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
+    if _voice_mode is not None:
+        if hasattr(_voice_mode, "play_audio_file"):
+            monkeypatch.setattr(
+                _voice_mode, "play_audio_file", _blocked_play_audio_file
+            )
+        if hasattr(_voice_mode, "_play_int16_via_tempfile"):
+            monkeypatch.setattr(
+                _voice_mode, "_play_int16_via_tempfile", _blocked_play_int16
+            )
 
     yield
 
@@ -1652,8 +1844,8 @@ def _capture_real_hermes_root() -> list[Path]:
             pass
     return roots
 
-
 _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
+
 # Captured before any test can patch sys.platform, HOME or XDG_*: a test that runs the real
 # GUI uninstall or update swap would otherwise delete the developer's own Hermes app. Only the
 # ones present (none on CI runners, so the guard costs nothing there), each literal and resolved.
@@ -1681,6 +1873,21 @@ def _forbid_real_user_path_writes(monkeypatch):
     monkeypatch.setattr("hermes_cli._launchers._register_windows_user_path", refuse)
     monkeypatch.setattr("hermes_cli._install_repair._write_user_path_raw", refuse)
 
+# Installer destinations are account-scoped, outside HERMES_HOME. Capture both HOME and
+# the native account home before fixtures replace either, including currently absent dirs.
+_HOST_ACCOUNT_HOMES = {Path.home()}
+try:
+    import pwd
+    _HOST_ACCOUNT_HOMES.add(Path(pwd.getpwuid(os.getuid()).pw_dir))  # windows-footgun: ok — optional POSIX lookup after import pwd
+except (ImportError, KeyError, OSError):
+    pass
+_REAL_HOST_INSTALL_DIRS = sorted({
+    os.path.normcase(form)
+    for home in _HOST_ACCOUNT_HOMES
+    for directory in (home / ".local" / "bin", home / "Library" / "LaunchAgents")
+    for form in (os.path.abspath(directory), os.path.realpath(directory))
+})
+
 
 @pytest.fixture(autouse=True)
 def _forbid_real_hermes_home_io(monkeypatch, request):
@@ -1693,7 +1900,47 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: {
+        "installed Hermes desktop app": _REAL_INSTALLED_GUI_APPS,
+        "host installation directory": _REAL_HOST_INSTALL_DIRS,
+    }).install(monkeypatch)
+
+
+@pytest.fixture
+def isolated_machine_home(tmp_path_factory, monkeypatch):
+    """Machine-changing tests opt into disposable account and child paths."""
+    # Separate from tmp_path: tests that inspect their fixture directory must not see
+    # the harness's home. Shell/native children inherit the same destination.
+    home = tmp_path_factory.mktemp("installer-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    # Git's user config moves with the home. An inherited GIT_CONFIG_GLOBAL or absolute
+    # XDG_CONFIG_HOME would keep the developer's config (commit signing, global hooks) live
+    # while its ``~`` paths resolve under this empty home: fixture commits then fail locally
+    # and pass on a bare CI runner. XDG_CONFIG_HOME itself stays: other tools (uv) need it.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / ".gitconfig"))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    if os.name == "nt":
+        for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
+            target = home / "AppData" / directory
+            target.mkdir(parents=True)
+            monkeypatch.setenv(name, str(target))
+    else:
+        # launchd deliberately consults pwd before HOME so profile pinning cannot move
+        # a real user's service. Keep that production resolver intact inside the fixture.
+        import pwd
+
+        getpwuid = pwd.getpwuid
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only branch
+
+        def isolated_account(account_uid):
+            record = getpwuid(account_uid)
+            if account_uid == uid:
+                record = pwd.struct_passwd((*record[:5], str(home), record[6]))
+            return record
+
+        monkeypatch.setattr(pwd, "getpwuid", isolated_account)
+    return home
 
 
 @pytest.fixture

@@ -14,6 +14,7 @@ import secrets
 import threading
 import time
 from typing import Any, Callable
+import time
 
 from tui_gateway._env import env_float
 
@@ -61,9 +62,15 @@ def _flush_session_messages(session: dict | None) -> bool:
         return False
 
 
+def _reaper_session_items() -> list[tuple[str, dict]]:
+    from tui_gateway import server
+
+    with server._sessions_lock:
+        return list(server._sessions.items())
+
+
 def _reaper_session_snapshot() -> list:
-    with _sessions_lock:
-        return list(_sessions.values())
+    return [session for _, session in _reaper_session_items()]
 
 
 def _flush_dirty_sessions(now: float | None = None) -> int:
@@ -356,8 +363,7 @@ def _session_lease_is_idle(sid: str, session: dict, now: float) -> bool:
 def _release_idle_session_leases(now: float | None = None) -> int:
     """Release the active-session lease of every idle resident Desktop record; returns the count."""
     now = time.time() if now is None else now
-    with _sessions_lock:
-        candidates = [(sid, s) for sid, s in _sessions.items() if s.get("active_session_lease") is not None]
+    candidates = [(sid, s) for sid, s in _reaper_session_items() if s.get("active_session_lease") is not None]
     released = 0
     for sid, session in candidates:
         if not _session_lease_is_idle(sid, session, now):

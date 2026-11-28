@@ -29,6 +29,13 @@ _LEGACY_MAX_ASYNC_WARNED = False
 # delegation.child_timeout_seconds opts back in.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 
+
+def _cfg() -> dict:
+    """The ``delegation`` section, read through the origin so tests can patch it."""
+    from tools.delegate_tool import _load_config
+    return _load_config()
+
+
 # ── Subagent approval callbacks ─────────────────────────────────────────────
 # Subagent worker threads don't inherit the CLI's threading.local approval
 # callback, so prompt_dangerous_approval() would fall back to input() and
@@ -237,7 +244,7 @@ _FAST_REQUEST_OVERRIDE_KEYS = frozenset({"service_tier", "speed"})
 
 def _inherit_service_tier() -> bool:
     """Whether delegated children inherit the parent's effective fast preference."""
-    return is_truthy_value(_load_config().get("inherit_service_tier", False))
+    return is_truthy_value(_cfg().get("inherit_service_tier", False))
 
 
 _INHERITABLE_FAST_MODES = BOUNDED_MODES | STATIC_TIERS
@@ -546,11 +553,12 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, explicit_
     """``delegation.provider`` branch: full bundle via the runtime provider system. ``explicit_base_url`` is handed
     to the resolver the way the main agent hands it ``model.base_url``: the provider keeps its own key on it."""
     configured_provider = v["provider"]
+    from hermes_cli.auth import AuthError
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         endpoint = {"explicit_base_url": explicit_base_url} if explicit_base_url else {}
         # A route's own key (an explicit model alias's) wins over the provider's resolved one.
-        if v["api_key"]:
+        if v.get("api_key"):
             endpoint["explicit_api_key"] = v["api_key"]
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **endpoint)
     except Exception as exc:

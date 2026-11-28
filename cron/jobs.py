@@ -2077,6 +2077,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "catch_up": _normalize_catch_up,
     "priority": _normalize_priority,
     "wrap_response": normalize_wrap_response,
+    "priority": _normalize_priority,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -2097,6 +2098,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "catch_up": _normalize_catch_up,
     "priority": _normalize_priority,
     "wrap_response": normalize_wrap_response,
+    "priority": _normalize_priority,
 }
 
 
@@ -2171,7 +2173,8 @@ def create_job(
     (a venv can be rebuilt or moved after creation). timezone: IANA wall-clock zone
     (None/'' = inherit the profile). grace_minutes: catch-up window (0 = never catch up).
     max_catch_up_lateness_seconds: recurring occurrence deadline (unset is unlimited, 0 permits no lateness);
-    for a one-shot it widens catch-up to max(120s, value), and 0 keeps 120s. wrap_response: None inherits cron.wrap_response, a bool overrides it."""
+    for a one-shot it widens catch-up to max(120s, value), and 0 keeps 120s. wrap_response: None inherits
+    cron.wrap_response, a bool overrides it."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     job_timezone = normalize_job_timezone(job_timezone)

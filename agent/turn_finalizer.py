@@ -6,6 +6,8 @@ imported lazily from ``agent.conversation_loop`` (no cycle, same logger name).""
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import logging
 import os
 import time
@@ -14,7 +16,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
-from agent.interrupt_control import interrupted_during_api_call_reason
+from agent.interrupt_control import interrupted_during_api_call_reason, stamp_interrupt_result
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from session_rules.turns import flatten_message_text
@@ -22,6 +24,7 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 from agent.review_signals import build_review_signals, skill_review_due
 from agent.served_model import result_model_fields
+from agent.skill_review_gate import consume_skill_review_if_due, note_human_turn_for_skill_review
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
@@ -151,8 +154,8 @@ def _resolve_budget_fallback(
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_diagnostic_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— asking model to summarise"
+                ContextNotice(f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                "— asking model to summarise"),
             )
             if not agent.quiet_mode:
                 agent._safe_print(
@@ -245,6 +248,8 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
         from agent.message_sanitization import close_interrupted_tool_sequence
+        # Diagnostic filtering lives in the shared closer so early-abort callers
+        # cannot persist a local status as though it were an assistant reply.
         close_interrupted_tool_sequence(messages, final_response, stopped=True)
 
     # Recovery ``break`` sites can return a final_response with no closing assistant
@@ -336,9 +341,9 @@ def _micro_compact_after_turn(agent, messages, final_response, logger, task_id) 
                 if _spliced:
                     # The splice summarized tool results away: a repeat read must serve them
                     # again, not an "unchanged" stub pointing at a body that is gone (#32106).
-                    from agent.conversation_compression import _reset_read_dedup_caches
+                    from agent.conversation_compression_boundary import mark_context_loss_boundary
 
-                    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+                    mark_context_loss_boundary(agent, task_id)
             if _before != len(messages):
                 logger.info("Micro-compaction: %d -> %d messages", _before, len(messages))
     except Exception as _mc_err:
@@ -646,6 +651,24 @@ def _mirror_turn_to_memory(
             )
 
 
+def _stamp_turn_result_failure(agent, result, final_response, turn_exit_reason, failed, exit_failure) -> None:
+    """Surface the failure in the result without changing the response used for memory sync."""
+    # Persistence failures need a visible gateway error and a machine-readable cause.
+    if failed and str(turn_exit_reason) == "session_persistence_failed":
+        from hermes_constants import profile_cli_selector
+
+        result["error"] = final_response or (
+            "session storage could not be written — check the state database "
+            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
+        )
+        cause = getattr(agent, "_last_persistence_error_cause", None)
+        result["failure_reason"] = "session_persistence_failed:" + (cause or "unknown")
+    elif exit_failure is not None:
+        if failed:
+            result["error"] = final_response or str(turn_exit_reason)
+        stamp_failure(result, exit_failure.reason, exit_failure.retryable)
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -679,6 +702,7 @@ def finalize_turn(
     # left alone: ``_recover_final_from_stream`` owns that recovery (#95514).
     if (
         not final_response
+        and _turn_exit_reason != "session_persistence_failed"
         and not interrupted
         and messages
         and isinstance(messages[-1], dict)
@@ -781,9 +805,14 @@ def finalize_turn(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
 
-    # Skill trigger: decided ONCE, from the tool iterations THIS turn used, before post_llm_call so
-    # the hook's review_signals and the review spawn below agree.
-    _should_review_skills = skill_review_due(agent)
+    # Skill trigger: decided ONCE, from the tool iterations THIS turn used and whether a human
+    # authored input has arrived since the previous automatic skill review. This decision is shared
+    # with post_llm_call and the review spawn below.
+    note_human_turn_for_skill_review(agent, original_user_message)
+    _should_review_skills = (
+        skill_review_due(agent)
+        and getattr(agent, "_skill_review_human_turn_seen", False)
+    )
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
@@ -818,6 +847,7 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    model_fields = result_model_fields(agent, api_call_count=api_call_count, failed=failed)
     result = {
         "final_response": final_response,
         "last_reasoning": _last_turn_reasoning(messages),
@@ -836,7 +866,7 @@ def finalize_turn(
         "response_reused": bool(final_response) and final_response == getattr(agent, "_reused_response_text", None),
         "model": agent.model,
         # requested_model / served_model: proxy-reported deployment or Hermes' own fallback route.
-        **result_model_fields(agent),
+        **model_fields,
         "provider": agent.provider,
         "base_url": agent.base_url,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},
@@ -855,24 +885,7 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
-    # Persistence failures already set failed=True; also stamp `error` so the gateway
-    # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
-    # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        from hermes_constants import profile_cli_selector
-
-        # Never rebind final_response here: the memory sync and the background-review gate
-        # below must still see an empty response on a persistence-failed turn.
-        result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
-        )
-        _cause = getattr(agent, "_last_persistence_error_cause", None)
-        result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
-    elif _exit_failure is not None:
-        if failed:
-            result["error"] = final_response or str(_turn_exit_reason)
-        stamp_failure(result, _exit_failure.reason, _exit_failure.retryable)
+    _stamp_turn_result_failure(agent, result, final_response, _turn_exit_reason, failed, _exit_failure)
     # Cleanup failures are surfaced, but the response is returned either way (#8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
@@ -884,8 +897,7 @@ def finalize_turn(
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
     agent._reused_response_text = None
-    if interrupted and agent._interrupt_message:
-        result["interrupt_message"] = agent._interrupt_message
+    stamp_interrupt_result(agent, result, interrupted)
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
@@ -894,8 +906,9 @@ def finalize_turn(
     from agent.voice_turn_route import end_voice_turn_route
     end_voice_turn_route(agent)
 
+    # The review decision was computed before post_llm_call so the hook and the spawn agree.
     if _should_review_skills:
-        agent._iters_since_skill = 0
+        consume_skill_review_if_due(agent)
 
     _mirror_turn_to_memory(
         agent, original_user_message=original_user_message, final_response=final_response,
@@ -927,4 +940,6 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+    from agent.turn_preflight_gate import _clear_preflight_output_state
+    _clear_preflight_output_state(agent)
     return result

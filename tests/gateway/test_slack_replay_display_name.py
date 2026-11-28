@@ -23,7 +23,7 @@ TEXT = 'Show the comparison.'
 
 async def _slack_gateway(home, monkeypatch, display_name, instance):
     from gateway.config import Platform, PlatformConfig
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.slack import adapter as slack
 
     runner, _, sent, calls = await _gateway(home, monkeypatch)
@@ -36,6 +36,8 @@ async def _slack_gateway(home, monkeypatch, display_name, instance):
         'user': {'is_bot': False, 'profile': {'display_name': display_name}, 'real_name': display_name}}
     adapter._app.client.conversations_info.return_value = {'channel': {'name': 'direct'}}
     adapter._app.client.conversations_replies.return_value = {'messages': []}
+    adapter._app.client.reactions_add.return_value = {'ok': True}
+    adapter._app.client.reactions_remove.return_value = {'ok': True}
     adapter._bot_user_id = BOT
     adapter._running = True
     monkeypatch.setattr(adapter, 'send', runner.adapters[Platform.TELEGRAM].send)
@@ -55,10 +57,9 @@ async def _deliver(adapter, event):
         await asyncio.wait_for(asyncio.gather(*drains), 10)
 
 
-def _rows(authority):
+def _rows(authority, session_id):
     from gateway.session_authority import admission_row
-    return [admission_row(row) for sid in authority.sessions
-            for row in authority.persistence.admissions.list(session_id=sid, pending_only=False)]
+    return [admission_row(row) for row in authority.persistence.admissions.list(session_id=session_id, pending_only=False)]
 
 
 @pytest.mark.asyncio
@@ -75,7 +76,8 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
         await _deliver(adapter, original)
         assert calls == [TEXT]
         assert [text for text in sent if 'home channel' not in text] == ['the answer']
-        before = _rows(authority)
+        session_id, = authority.sessions
+        before = _rows(authority, session_id)
         assert len(before) == 1 and before[0]['status'] == 'terminal'
     finally:
         runner.session_store.close_all_db_handles()
@@ -98,14 +100,24 @@ async def test_slack_answered_root_restart_replay_preserves_identity(tmp_path, m
 
     monkeypatch.setattr(authority, 'admit_native', record_admission)
     message = {**original, 'thread_ts': TS, 'reply_count': 3, 'latest_reply': '1793821177.880909'}
-    if change == 'content':
-        message.update(text='A different request.', edited={'user': USER, 'ts': '1793821400.000000'})
     replay = {'type': 'message', 'subtype': 'message_changed', 'hidden': True,
               'channel': DM, 'channel_type': 'im', 'team': TEAM,
               'ts': '1793821400.000200', 'event_ts': '1793821400.000200', 'message': message}
     try:
         await _deliver(adapter, replay)
-        after = _rows(authority)
+        # A cold adapter must drop a reply-count update without touching admission.
+        assert outcomes == [] and calls == [] and sent == []
+        assert _rows(authority, session_id) == before
+
+        if change == 'content':
+            edited = {**message, 'text': 'A different request.',
+                      'edited': {'user': USER, 'ts': replay['event_ts']}}
+            redelivery = {**replay, 'message': edited, 'previous_message': message}
+        else:
+            # Replay the actual message to exercise durable reconciliation, not the metadata filter.
+            redelivery = message
+        await _deliver(adapter, redelivery)
+        after = _rows(authority, session_id)
         assert calls == [], 'neither the answered request nor a changed copy may execute again'
         assert after == before, 'replay must not alter or replace the committed admission'
         if change in ('identical', 'display-name'):
@@ -135,7 +147,8 @@ async def test_slack_name_reconcile_does_not_erase_sender_ids(tmp_path, monkeypa
     try:
         await _deliver(adapter, {'type': 'message', 'channel': DM, 'channel_type': 'im', 'team': TEAM,
                                  'user': USER, 'text': TEXT, 'ts': TS, 'event_ts': TS})
-        before = _rows(authority)
+        session_id, = authority.sessions
+        before = _rows(authority, session_id)
         assert len(before) == 1 and before[0]['status'] == 'terminal'
         row = before[0]
         payload = deepcopy(row['payload'])
@@ -146,7 +159,7 @@ async def test_slack_name_reconcile_does_not_erase_sender_ids(tmp_path, monkeypa
                                     principal_id=row['principal_id'], session_id=row['target_session_id'],
                                     request_id=TS, payload=payload)
         assert (error.value.reason, error.value.field) == ('admission_conflict', ADMITTED_REQUEST_CONFLICT['field'])
-        assert _rows(authority) == before
+        assert _rows(authority, session_id) == before
         assert calls == [TEXT]
     finally:
         runner.session_store.close_all_db_handles()

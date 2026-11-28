@@ -291,8 +291,13 @@ class SubagentLifecycleService:
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
         from tools.delegate_tool import _build_child_preserving_parent_tools, _credential_overrides, DEFAULT_MAX_ITERATIONS
         from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
-        # Routing precedence: request.provider > delegation config > parent.
-        routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
+        # Explicit lifecycle routes win over the configured default route.
+        routing_cfg = (
+            {"provider": request.provider, "model": request.model or ""}
+            if request.provider is not None else _load_config()
+        )
+        if request.model:
+            routing_cfg = {**routing_cfg, "model": request.model}
         try:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:
@@ -302,6 +307,7 @@ class SubagentLifecycleService:
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
             model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
             task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
+            reasoning_cfg=routing_cfg if request.provider is None else None,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
@@ -355,7 +361,8 @@ class SubagentLifecycleService:
         if agent is not None:
             with contextlib.suppress(Exception):
                 accepted = request_hard_interrupt(
-                    agent, f"Lifecycle cancellation requested: {reason[:500]}", tool_reason="subagent cancellation requested",
+                    agent, f"Lifecycle cancellation requested: {reason[:500]}",
+                    tool_reason="subagent cancellation requested", delegation_reason=reason,
                 )
         return SubagentCancelResult(bool(accepted), unsupported=not accepted, state=SubagentState.CANCEL_REQUESTED)
 

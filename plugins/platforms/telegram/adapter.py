@@ -207,6 +207,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.rich_messages import project_rich_message
 from plugins.platforms.telegram.rich_delivery import is_rich_capability_error, is_rich_fallback_error, rich_message_payload
+from plugins.platforms.telegram.rich_markdown import RICH_EMAIL_TOKEN_RE
 from plugins.platforms.telegram.telegram_audio_meta import (
     _coerce_duration_seconds, _probe_video_geometry, _probe_voice_duration_seconds, _video_thumbnail_jpeg, audio_player_fields, fit_thumbnail_jpeg)
 from plugins.platforms.telegram.telegram_dm_topic_send import dead_topic_may_reroute, dead_topic_retry_kwargs, private_chat, text_topic_must_refuse, topic_gone
@@ -234,22 +235,24 @@ from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, t
 from plugins.platforms.telegram.telegram_clarify_multi import handle_multi_token, multi_prompt_extras, resolve_clarify_choice
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from gateway.approval_actor import picker_refusal, update_prompt_refusal
+from gateway.platforms.helpers import caption_is_command, hand_off_split, hash_for_log, prompt_id_counter, tag_safe_display_name
+from plugins.platforms.telegram.telegram_draft_budget import claim_ai_action
 from plugins.platforms.telegram.callback_answer import TOAST_LIMIT as _TOAST_LIMIT, answer_callback, answer_or_note, refuse_tap
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, bot_api_urls, build_ptb_requests, discover_fallback_ips,
     parse_fallback_ip_env, proxy_target_hosts, telegram_verify)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import mark_send_path_recovered
-from plugins.platforms.telegram.telegram_flood_cooldown import land_persisted_state
-from plugins.platforms.telegram.telegram_send_errors import LOST, classify_send_exception, explain_username_chat_not_found, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind, FLOOD, UNSENT, rich_failure_result
-from plugins.platforms.telegram.telegram_split import (
-    REPLY_FILE_MAX_BYTES, reply_message_count, send_reply_document, split_reply_anchor)
-from plugins.platforms.telegram.telegram_typing_gate import claim_ai_action, typing_may_fire
+from plugins.platforms.telegram.telegram_flood_cooldown import TelegramFloodCooldownMixin, land_persisted_state
+from plugins.platforms.telegram.rich_parts import edit_rich_parts, resume_rich_parts, send_rich_parts
+from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
+from plugins.platforms.telegram.telegram_send_errors import LOST, classify_send_exception, explain_username_chat_not_found, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind, FLOOD, UNSENT
+from plugins.platforms.telegram.telegram_send_errors import rich_failure_result
 from plugins.platforms.telegram.telegram_voice_mention import admit_media, cache_inbound_voice
+from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, observed_media_note, shared_sender_suffix
 from plugins.platforms.telegram.telegram_picker_labels import model_button_labels
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
-from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
 from plugins.platforms.telegram.topic_creation import TopicCreationFailure
 from utils import env_float, env_int, is_truthy_value
 
@@ -290,6 +293,15 @@ def _loop_clock() -> float:
 def _flood_cap_result(wait: float) -> "SendResult":
     """The shared fail-closed SendResult for an over-cap flood wait."""
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
+
+
+def _over_budget(adapter: Any, chat_id: Any) -> Optional[SendResult]:
+    """Return a non-posting draft result when the shared per-chat AI-action budget is spent."""
+    from plugins.platforms.telegram.telegram_draft_budget import claim_ai_action
+    delay = claim_ai_action(adapter, chat_id)
+    if not delay:
+        return None
+    return SendResult(success=True, message_id=None, raw_response={"skipped": True}, retry_after=delay)
 
 
 
@@ -367,45 +379,20 @@ def check_telegram_requirements() -> bool:
 # Fence extraction runs before the shared matching-width inline-code scanner.
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 # MarkdownV2 escaping and the bare-bracket safety net live once, in telegram_markdown.py.
-from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2
 from plugins.platforms.telegram.telegram_markdown import (
-    degrade_unrenderable_links, escape_rich_currency_dollars, normalize_rich_latex, to_markdown_v2)
-from plugins.platforms.telegram.rich_markdown import (
-    RICH_EMAIL_TOKEN_RE, escape_literal_hash_prefixes, rich_normalize_linebreaks)
-from plugins.platforms.telegram.rich_parts import edit_rich_parts, resume_rich_parts, send_rich_parts
+    _EXPANDABLE_QUOTE, _PLACEHOLDER_RE, _escape_bare_bracket, _escape_mdv2, _expand_placeholders, _stash_bare_urls,
+)
 
 
-def _strip_mdv2(text: str) -> str:
-    """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
-    from gateway.copy_blocks import protect_inline_copy_bodies
-    from gateway.platforms.base import restore_inline_copy_bodies
-    text, bodies = protect_inline_copy_bodies(text)
-    from .copy_quotes import protect_quote_fallback
-    text, quote_bodies = protect_quote_fallback(text)
-    cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
-    cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
-    cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
-    cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
-    cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
-    cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
-
-
-_CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
-
-
-def _separate_chunk_indicator_from_fence(text: str) -> str:
-    """Move a ``(N/M)`` chunk marker that ``truncate_message()`` appended to a synthesized closing
-    fence onto its own line — Telegram rejects ````` \\(1/2\\)`` as a fence."""
-    return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
-from plugins.platforms.telegram.telegram_chunking import split_formatted_mdv2, split_raw_carrying_emphasis
-from plugins.platforms.telegram.telegram_split import quotable_text
+from plugins.platforms.telegram.telegram_chunking import (
+    separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
+from plugins.platforms.telegram.telegram_split import (
+    REPLY_FILE_MAX_BYTES, _strip_mdv2, quotable_text, reply_message_count, send_reply_document, split_reply_anchor)
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
 from gateway.platforms.helpers import (
-    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, caption_is_command, convert_table_to_bullets as _wrap_markdown_tables, compile_mention_patterns, hand_off_split, hash_for_log,
-    prompt_id_counter, tag_safe_display_name)
+    TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, convert_table_to_bullets as _wrap_markdown_tables, compile_mention_patterns)
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
@@ -454,42 +441,11 @@ def _rich_is_prose_line(line: str) -> bool:
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
 
-# CommonMark lets an ordered list interrupt a paragraph only when it starts at 1.
-_RICH_INTERRUPTING_ORDERED_ITEM_RE = re.compile(r" {0,3}(?!1[.)])\d{1,9}[.)][ \t]+\S")
-_RICH_CONTAINER_LINE_RE = re.compile(r" {0,3}(?:>|[-+*][ \t]|\d{1,9}[.)][ \t])")
-_RICH_FENCE_LINE_RE = re.compile(r" {0,3}(?:```|~~~)")
-
-
 def _rich_separate_ordered_lists(text: str) -> str:
-    """Open a new block before an ordered list that directly follows a paragraph.
+    """Use the shared code/math-aware scan before applying the fork's visual paragraphs."""
+    from plugins.platforms.telegram.rich_markdown import _rich_separate_ordered_lists as separate
+    return separate(text)
 
-    ``**Label**\\n7. item`` is otherwise one paragraph, so the numbers render as
-    literal text without list layout. Lines continuing a list item or quote
-    are left alone because a list there already nests or ends correctly.
-    Closed fences never reach here; an unclosed one in a draft frame is skipped.
-    """
-    out: list[str] = []
-    state = None  # None, "paragraph", "container", or "fence" for the current block
-    for line in text.split("\n"):
-        if _RICH_FENCE_LINE_RE.match(line):
-            state = None if state == "fence" else "fence"
-        elif state == "fence":
-            pass
-        elif not line.strip():
-            state = None
-        elif state == "paragraph" and _RICH_INTERRUPTING_ORDERED_ITEM_RE.match(line):
-            out.append("")
-            state = "container"
-        elif _RICH_CONTAINER_LINE_RE.match(line):
-            state = "container"
-        elif line[:1].isspace():
-            pass  # indented continuation keeps the current block
-        elif _rich_is_prose_line(line):
-            state = state or "paragraph"
-        else:
-            state = None
-        out.append(line)
-    return "\n".join(out)
 
 
 def _rich_materialize_prose_paragraphs(text: str) -> str:
@@ -540,12 +496,18 @@ _RICH_CODE_RE = re.compile(
 # Preserve closed math, but not dollar-prefixed tickers or prose such as "$6 per US$ unit". A numeric
 # amount followed by an ordinary word is currency here; single-letter variables and backslash math
 # commands survive.
+# An amount followed by prose is currency: a word of 2+ ASCII letters, or a word in a script that
+# math does not use for variables. ASCII, Greek and letterlike symbols stay math, so "$5 и 10$" is
+# prose while "$5 a 10$" and "$2 π r$" may be math. Math never
+# spans a backtick, so "$5 (`$`" cannot swallow the opener of a following code span.
+_RICH_AMOUNT_BEFORE_WORD = (
+    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+(?:[A-Za-z]{2,}|(?:(?![A-Za-z\u0370-\u03ff\u1f00-\u1fff\u2100-\u214f])[^\W\d_])+)\b)")
 _RICH_CURRENCY_PROTECTED_RE = re.compile(
     _RICH_CODE_RE.pattern
     + r"|(?<![\\$])\$\$.*?\$\$"
     + r"|(?<![\\$])\$(?![\s$])"
-    + r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+[A-Za-z]{2,}\b)"
-    + r"[^$\n]*?(?<![\s([{,:;])\$(?![\w$])",
+    + _RICH_AMOUNT_BEFORE_WORD
+    + r"[^$\n`]*?(?<![\s([{,:;])\$(?![\w$])",
     re.DOTALL)
 _RICH_DOLLAR_ENTITY_RE = re.compile(
     _RICH_CODE_RE.pattern + r"|&#(?:0*36|x0*24);", re.DOTALL | re.IGNORECASE)
@@ -568,20 +530,24 @@ _RICH_CURRENCY_PLACEHOLDER = "\x00HERMES_RICH_CURRENCY_{index}\x00"
 
 
 def _protect_rich_currency(text: str) -> str:
-    """Wrap multiple same-line currency amounts in inline code so they cannot pair into ``$…$`` math."""
+    """Escape prose dollars and wrap multiple same-line amounts so they cannot pair as math."""
+    from .telegram_markdown import escape_rich_currency_dollars
+
     stashed: list[str] = []
 
-    def stash(match: "re.Match[str]") -> str:
-        stashed.append(match.group(0))
+    def stash_text(value: str) -> str:
+        stashed.append(value)
         return _RICH_CURRENCY_PLACEHOLDER.format(index=len(stashed) - 1)
 
-    masked = _RICH_CURRENCY_PROTECTED_RE.sub(stash, text)
+    masked = _RICH_CURRENCY_PROTECTED_RE.sub(lambda match: stash_text(match.group(0)), text)
     lines = masked.split("\n")
     for index, line in enumerate(lines):
         if len(_RICH_CURRENCY_AMOUNT_RE.findall(line)) < 2:
             continue
-        lines[index] = _RICH_CURRENCY_AMOUNT_RE.sub(lambda match: f"`{match.group(0)}`", line)
-    protected = "\n".join(lines)
+        lines[index] = _RICH_CURRENCY_AMOUNT_RE.sub(lambda match: stash_text(f"`{match.group(0)}`"), line)
+    # Escape the remaining prose before restoring generated code spans: a stray
+    # backtick in the input can otherwise pair with an inserted opener.
+    protected = escape_rich_currency_dollars("\n".join(lines))
     for index, original in enumerate(stashed):
         protected = protected.replace(_RICH_CURRENCY_PLACEHOLDER.format(index=index), original)
     return protected
@@ -612,7 +578,7 @@ def _rich_normalize_linebreaks(text: str) -> str:
         return text
 
     def _normalize_prose(prose: str) -> str:
-        prose = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(prose))
+        prose = _rich_materialize_prose_paragraphs(prose)
         return _RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose)
 
     out: list[str] = []
@@ -620,6 +586,7 @@ def _rich_normalize_linebreaks(text: str) -> str:
     # then normalize only the prose between them. Boundary newlines are handled
     # by the single-newline regex on each prose run.
     pos = 0
+    text = _rich_separate_ordered_lists(text)
     for m in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text):
         region = m.group(0)
         is_table = _RICH_TABLE_BLOCK_RE.fullmatch(region) is not None
@@ -879,7 +846,8 @@ class _PollingStallError(RuntimeError):
 
 class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramContactMixin, TelegramHeldInboundMixin,
                       TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin,
-                      TelegramVaultCodeMixin, BasePlatformAdapter):
+                      TelegramVaultCodeMixin, TelegramFloodCooldownMixin,
+                      BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Immutable defaults also support connectors assembled without __init__ in tests.
@@ -891,6 +859,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     _ptb_proxy_url: str | None = None  # set by _build_ptb_requests; error text then shows no detail
 
     MAX_MESSAGE_LENGTH = 4096
+    MAX_SPLIT_MESSAGES = 8  # a reply needing more messages goes out as one .md file instead (#152012)
+    REPLY_FILE_MAX_BYTES = REPLY_FILE_MAX_BYTES
+    reply_message_count, send_reply_document = reply_message_count, send_reply_document
     # Two MarkdownV2 parenthesis escapes and a conservative fence-separation newline.
     CHUNK_INDICATOR_OVERHEAD = 3
     MAX_SPLIT_MESSAGES = 8  # a reply needing more messages goes out as one .md file instead (#152012)
@@ -899,6 +870,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
     allow_from_covers_groups = True  # allow_from is global (DMs + groups); group_allow_from adds group-only users
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    SPLITS_OVERSIZED_FINAL_EDIT: bool = True  # edit_message(finalize=True) posts the overflow as continuations
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
     _SPLIT_THRESHOLD = 4000  # chunk near this length ⇒ a client-side split continuation is almost certain
     MEDIA_GROUP_WAIT_SECONDS = 1.5  # default album debounce; extra.media_group_wait_seconds overrides
@@ -921,7 +893,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     REQUIRES_EDIT_FINALIZE: bool = True
     # Progress bubbles edit no faster than the chat's interim-edit floor (10s, chat_budget.py).
     PROGRESS_EDIT_INTERVAL: float = EDIT_FLOOR_SECS
-    SPLITS_OVERSIZED_FINAL_EDIT: bool = True  # edit_message(finalize=True) posts the overflow as continuations
     FALLBACK_ON_FINAL_EDIT_FLOOD: bool = True  # retrying a final edit burns the same flood budget
     RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK: bool = True  # a failed final edit may leave a partial preview
 
@@ -977,6 +948,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
+        self._standalone_rich_request: Optional[Callable[[dict[str, Any]], Awaitable[Any]]] = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1786,7 +1758,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
         """Return the shared raw-Markdown Rich Message payload."""
-        return rich_message_payload(content, skip_entity_detection=skip_entity_detection)
+        payload = rich_message_payload(content, skip_entity_detection=skip_entity_detection)
+        if RICH_EMAIL_TOKEN_RE.search(content):
+            payload["skip_entity_detection"] = True
+        return payload
 
     def _is_rich_capability_error(self, exc: Exception) -> bool:
         """True when the rich endpoint itself is unavailable."""
@@ -1857,9 +1832,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
         Awaited so the store's read-modify-write + ``os.replace`` runs off the loop."""
         from gateway import rich_sent_store
-        # The store never raises (a failed index write must not fail a send that landed), so its
-        # result is the only signal: a broken index silently degrades every later quote-reply.
-        if not await rich_sent_store.record_async(str(chat_id), str(message_id), content):
+        # The store normally never raises, but test doubles and filesystem errors can; preserve
+        # the send and surface the failed index so quote recovery is diagnosable.
+        try:
+            recorded = await rich_sent_store.record_async(str(chat_id), str(message_id), content)
+        except Exception:
+            logger.warning("[Telegram] failed to index sent message %s for quote-reply recovery", message_id, exc_info=True)
+            return
+        if not recorded:
             logger.warning("[Telegram] failed to index sent message %s for quote-reply recovery", message_id)
 
     async def _try_send_rich(
@@ -1881,9 +1861,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         try:
             # Raw Bot API result: return_type=Message would make PTB deserialize a 10.1 shape it doesn't
             # fully model; a post-delivery parse error ≠ send failure.
-            msg = await _await_with_thread_deadline(
-                self._bot.do_api_request("sendRichMessage", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            request = self._standalone_rich_request or self._request_rich_message
+            msg = await request(payload)
         except Exception as exc:
             if self._rich_rejected(exc, "sendRichMessage", "MarkdownV2"):
                 return None
@@ -1900,8 +1879,19 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         from gateway.reply_latency import transport_confirmed
         result = transport_confirmed(content, SendResult(success=True, message_id=str(message_id)),
                                      chat_id=chat_id, thread_id=thread_id)
+        if message_id is None:
+            from plugins.platforms.telegram.telegram_send_errors import idless_send_result
+            return idless_send_result(self.name, chat_id, "sendRichMessage")
         await self._record_sent_text(chat_id, message_id, content)
         return result
+
+    async def _request_rich_message(self, payload: dict[str, Any]):
+        bot = self._bot
+        if bot is None:
+            raise RuntimeError("Telegram bot unavailable")
+        return await _await_with_thread_deadline(
+            bot.do_api_request("sendRichMessage", api_kwargs=payload),
+            timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
@@ -3621,6 +3611,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     def _on_session_handoff(self, event: MessageEvent) -> None:
         self._accept_update()
 
+    async def _handle_dice_message(self, update, context) -> None:
+        from plugins.platforms.telegram.telegram_dice import handle_dice_message
+        await handle_dice_message(self, update, context)
+
     async def handle_message(self, event: MessageEvent) -> None:
         try:
             await apply_root_dm_topic_transfer(self, event)
@@ -3669,8 +3663,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
-        from plugins.platforms.telegram.telegram_dice import handle_dice_message  # #78719
-        app.add_handler(TelegramMessageHandler(filters.Dice.ALL, lambda u, c: handle_dice_message(self, u, c)))
+        app.add_handler(TelegramMessageHandler(filters.Dice.ALL, self._handle_dice_message))  # type: ignore[reportCallIssue, reportOptionalMemberAccess]
         app.add_handler(TelegramMessageHandler(filters.CONTACT, self._handle_contact_message))  # #98598
         media = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL
         app.add_handler(TelegramMessageHandler(media, self._handle_media_message))
@@ -4718,16 +4711,16 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             if not is_entity_parse_error(fmt_err):
                 raise
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            from gateway.copy_blocks import render_copy_blocks_inline
+            await self._edit_text(chat_id, message_id, render_copy_blocks_inline(plain))
         return False
 
     async def _after_legacy_edit(
-        self, chat_id: str, message_id: str, content: str, plain: str, finalize: bool, saturated_preview: bool) -> None:
-        """Bookkeeping once a legacy edit landed: remember a saturated preview (dedup), index a final."""
+        self, chat_id: str, message_id: str, content: str, finalize: bool, saturated_preview: bool,
+    ) -> None:
         if saturated_preview:
             self._last_overflow_preview[(str(chat_id), str(message_id))] = content
         if finalize:
-            # The finalized text is what the user sees and quotes: keep it resolvable (#147287).
             await self._record_sent_text(chat_id, message_id, quotable_text(content))
 
     @durable_egress("edit_message")
@@ -4805,7 +4798,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         _saturated_preview = False
         if finalize:
             self._last_overflow_preview.pop(_preview_key, None)  # the final edit always delivers full content
-        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+        # A copy quote's wire form is longer than its source, so measure the encoded text too.
+        has_copy_wire = any(marker in content for marker in ("[[copy]]", "[[/copy]]", "\x00HERMES_COPY_OPEN\x00", "\x00HERMES_COPY_CLOSE\x00"))
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH or (
+                has_copy_wire
+                and utf16_len(self.format_message(content)) > self.MAX_MESSAGE_LENGTH):
             if finalize:
                 return await self._edit_overflow_split(chat_id, message_id, content, finalize=finalize, metadata=metadata)
             content = self._truncate_stream_overflow_preview(content)
@@ -4820,18 +4817,17 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Previews edit in the final's parse mode (#49536): a plain -> MarkdownV2 flip on the same message makes
         # clients draw the old layout over the new text. A rejected preview retries as raw text (nothing lost).
         formatted = self.format_message(content)
-        plain = (_strip_mdv2(content) if content else content) if finalize else content
+        from gateway.copy_blocks import _has_copy_markers
+        plain = _strip_mdv2(content) if finalize or _has_copy_markers(content) else content
         warn = "[%s] MarkdownV2 edit failed, falling back to plain text: %s"
         try:
-            if finalize:
-                await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
-            else:
-                await self._edit_preview(chat_id, message_id, content)
-            await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
+            await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
+            await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             if "not modified" in err_str:
+                await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
                 return SendResult(success=True, message_id=message_id)
             # Reactive split: MarkdownV2 escapes can inflate the payload past the limit even when raw text fit.
             if "message_too_long" in err_str or "too long" in err_str:
@@ -4844,7 +4840,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     return SendResult(success=True, message_id=message_id)
-                await self._edit_text(chat_id, message_id, truncated)
+                await self._edit_text(chat_id, message_id, _strip_mdv2(truncated) if _has_copy_markers(truncated) else truncated)
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
             # Flood control: short waits retry inline; long waits fail immediately so streaming falls back
@@ -4861,13 +4857,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     return self._record_send_flood_cooldown(chat_id, wait)
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 self._record_send_flood_cooldown(chat_id, wait)
-                await asyncio.sleep(wait)
+                remaining = self._send_flood_cooldown_remaining(chat_id)
+                await asyncio.sleep(max(wait, remaining or 0.0))
                 remaining = self._send_flood_cooldown_remaining(chat_id)
                 if remaining is not None:
                     return _flood_cap_result(remaining)
                 try:
                     await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
-                    await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
+                    await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -4910,6 +4907,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
         from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
         has_copy = _has_copy_markers(chunk)
+        plain = render_copy_blocks_inline(_strip_mdv2(chunk) if finalize else chunk)
         for use_markdown in (True, False) if (finalize or has_copy) else (False,):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
@@ -4919,7 +4917,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
-                    text = _strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk)
+                    text = plain
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -4935,7 +4933,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     try:
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
-                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk),
+                            chat_id=normalize_telegram_chat_id(chat_id), text=plain,
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
@@ -5013,8 +5011,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 self._forget_status_message(chat_id, mid)
                 results[mid] = True
         return results
-    # This delete path never queues a request: True is a confirmed deletion.
-    delete_message_confirmed = delete_message
+    async def delete_message_confirmed(self, chat_id: str, message_id: str) -> bool:
+        """Delete only when confirmed immediately; unlike ordinary cleanup, never queue a delete."""
+        return await self.delete_message(chat_id, message_id)
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> bool:
         """sendMessageDraft works for private chats only (Bot API 9.5) and needs PTB >= 22.6; groups and
@@ -5030,16 +5029,25 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if not self._bot:
             return SendResult(success=False, error="not_connected")
         # Rich draft capability/format failures may use a plain draft. Flood refusals must not retry.
+        plain_drafts = getattr(self, "DRAFT_STREAM_PREFIX_STABLE", False) is True
         try:
-            if self._should_attempt_rich_draft(content) and await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
-                return SendResult(success=True, message_id=None)
+            if not plain_drafts and self._should_attempt_rich_draft(content):  # plain_drafts wins: raw text only
+                if (over := _over_budget(self, chat_id)) is not None:
+                    return over
+                if await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
+                    return SendResult(success=True, message_id=None)
         except FloodRefusal as exc:
             return _flood_cap_result(exc.retry_after)
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
         # Drafts share the regular-send UTF-16 length contract.
-        text = content if len(
-            content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
+        if utf16_len(content) <= self.MAX_MESSAGE_LENGTH:
+            text = content
+        elif plain_drafts:
+            from gateway.platforms.base import fit_prefix
+            text = fit_prefix(content, self.MAX_MESSAGE_LENGTH, utf16_len, suffix="")
+        else:
+            text = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
         from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
@@ -5050,13 +5058,16 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             not has_copy and getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
-        for use_markdown in ((False,) if plain_rich_preview else (True, False)):
+        plain_preview = plain_rich_preview or plain_drafts
+        for use_markdown in ((False,) if plain_preview else (True, False)):
             kwargs: dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
                 "text": self.format_message(text) if use_markdown else render_copy_blocks_inline(text)}
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
+            if (over := _over_budget(self, chat_id)) is not None:
+                return over
             try:
                 if await call_with_flood_guard(self, chat_id, lambda: _await_with_thread_deadline(
                     self._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)):
@@ -6325,6 +6336,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             if waits:
                 return _flood_cap_result(max(waits))
         if undelivered is not None:
+            if delivered and isinstance(undelivered.raw_response, dict) and undelivered.raw_response.get("ambiguous"):
+                return SendResult(success=True, raw_response={"ambiguous": True})
             return undelivered
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
@@ -6558,7 +6571,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         profile_dir = getattr(self, "_update_receipt_dir", None)
         if profile_dir is not None:
             try:
-                persisted = flood_state.record_deadline(profile_dir, key, wait)
+                token = getattr(getattr(self, "config", None), "token", None)
+                persisted = flood_state.record_deadline(profile_dir, flood_state.storage_key(key, token), wait)
                 until[key] = max(until[key], now + max(0.0, persisted - time.time()))
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not persist Telegram flood deadline for chat %s", self.name, key, exc_info=True)
@@ -6585,7 +6599,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if profile_dir is not None:
             storage_error = False
             try:
-                persisted = flood_state.remaining_seconds(profile_dir, key)
+                token = getattr(getattr(self, "config", None), "token", None)
+                persisted = flood_state.remaining_seconds(profile_dir, flood_state.storage_key(key, token))
                 deadline = max(deadline, asyncio.get_running_loop().time() + persisted)
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not read Telegram flood deadline for chat %s", self.name, key, exc_info=True)
@@ -6664,6 +6679,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Send typing indicator. Returns ``_TYPING_SKIPPED_LOCK_BUSY`` when a delivery held the chat lock."""
+        if not getattr(getattr(self, "config", None), "typing_indicator", True):
+            return None
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -6765,8 +6782,17 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         def _ph_wrap(open_: str, close: str):
             return lambda m: _ph(f"{open_}{_escape_mdv2(m.group(1))}{close}")
 
-        # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
-        #    before the normal MarkdownV2 conversions run.
+        # 0) MarkdownV2 has no math. Render known LaTeX macros in prose before
+        #    the normal escaping pass, while leaving code spans and fences verbatim.
+        from .rich_code_regions import map_outside_code
+        from .telegram_markdown import normalize_latex_macros
+        content = map_outside_code(content, normalize_latex_macros)
+        # A doubled literal backslash is data (for example, an escaped Windows
+        # path or an intentionally escaped macro), not a Markdown escape. The
+        # final MarkdownV2 escape pass doubles each slash once, so double this
+        # input run first to preserve both literal slashes in the delivered text.
+        content = map_outside_code(content, lambda prose: re.sub(r"\\\\(?=[A-Za-z])", r"\\\\\\\\", prose))
+        # Rewrite GFM-style pipe tables into Telegram-friendly row groups.
         from .copy_quotes import protect_copy_quotes
         text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
         # 1) Protect fenced code blocks (``` ... ```)
@@ -6821,6 +6847,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             return _ph(f'[{display}]({url})')
 
         text = _MD_LINK_RE.sub(_convert_link, text)
+        url_keys: set = set()
+
+        def _url_ph(value: str) -> str:
+            key = _ph(value)
+            url_keys.add(key)
+            return key
+
+        text = _stash_bare_urls(text, _url_ph)
         # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
         def _convert_header(m):
             inner = re.sub(r'\*\*(.+?)\*\*', r'\1', m.group(1).strip())
@@ -6829,15 +6863,22 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         text = re.sub(r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE)
         text = re.sub(r'(?m)^\*\*(?=>{1,3} )', _EXPANDABLE_QUOTE, text)
         # Resolve nested/multiline asterisk emphasis before the final escaping pass.
-        from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
+        from plugins.platforms.telegram.telegram_markdown import _resolve_emphasis
 
-        # Header/fence placeholders must still interrupt paragraphs during emphasis
-        # parsing. Their replacements have the same line count as their keys.
-        block_source = text
-        for key, value in placeholders.items():
-            if value.startswith(('```', '*')):
-                block_source = block_source.replace(key, '# protected block')
-        text = protect_asterisk_emphasis(text, _ph, _escape_mdv2, block_source=block_source)
+        # Star runs around a bare URL, or inside a ``**bold**`` span, pair by the shared pairer: it
+        # splits a mixed run the way the URL scan does and keeps a lone ``*`` inside bold literal
+        # (``**rm -rf *.tmp**``, #151722). Everything else keeps the block-aware CommonMark pairing,
+        # which honours ``\\*`` escapes and quote continuation lines.
+        if '**' in text or any(key in text for key in url_keys):
+            text = _resolve_emphasis(text, _ph, _escape_mdv2)
+        else:
+            from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
+            block_source = text
+            protected = {key for key, value in placeholders.items() if value.startswith(('```', '*'))}
+            if protected:
+                block_source = _PLACEHOLDER_RE.sub(
+                    lambda m: '# protected block' if m.group(0) in protected else m.group(0), text)
+            text = protect_asterisk_emphasis(text, _ph, _escape_mdv2, block_source=block_source)
         # 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
         text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
         text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
@@ -6855,9 +6896,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         text = text.replace(_EXPANDABLE_QUOTE, '**')
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
-        # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
-        for key in reversed(list(placeholders.keys())):
-            text = text.replace(key, placeholders[key])
+        # 11) Restore placeholders in one pass. A value only nests keys stashed before it, so expanding
+        # values in insertion order resolves every nesting; a str.replace per key rescans the whole
+        # message once per key and is quadratic on a long run of escaped stars (#150997).
+        expanded: dict = {}
+        for key, value in placeholders.items():
+            expanded[key] = _expand_placeholders(value, expanded)
+        text = _expand_placeholders(text, expanded)
         # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans. A span's
         # own escaped \` does not close it, and an escaped \` in prose does not open one.
         _safe_parts = []

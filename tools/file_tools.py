@@ -7,6 +7,7 @@ staleness state).
 """
 
 import base64
+import contextvars
 import errno
 import json
 import logging
@@ -15,10 +16,11 @@ import re
 import stat
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_nt_namespace_error, get_read_block_error, is_blocked_device_path
+from agent.file_safety import (
+    get_credential_write_error, get_nt_namespace_error, get_read_block_error, is_blocked_device_path)
 from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
 from tools.skill_provenance import is_background_review
@@ -28,6 +30,7 @@ from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_bloc
 from tools import file_state
 from hermes_platform.host import facts
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
+from tools import file_tools_paths
 from tools.file_tools_paths import (
     _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
     _resolve_path_for_task)
@@ -44,6 +47,24 @@ from tools.file_tools_read_tracking import (
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
 
 logger = logging.getLogger(__name__)
+
+
+_SANDBOX_READ_CONTEXT = contextvars.ContextVar("sandbox_read_context", default=False)
+
+
+@contextmanager
+def sandbox_read_context():
+    """Make one nested execute_code read bypass model-result deduplication."""
+    token = _SANDBOX_READ_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _SANDBOX_READ_CONTEXT.reset(token)
+
+
+def sandbox_read_active() -> bool:
+    """Whether the current call is a sandbox read that must bypass deduplication."""
+    return _SANDBOX_READ_CONTEXT.get()
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -151,7 +172,7 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, path_t
     """
     from tools.environments.sandbox_scope import hosted_scope
     hosted = hosted_scope() is not None
-    if not _file_ops_uses_host_paths(file_ops) and not hosted:
+    if not current_execution() and not _file_ops_uses_host_paths(file_ops) and not hosted:
         return patch
 
     def _res(raw: str, entry: bool = False) -> str:
@@ -177,6 +198,9 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     Literal first so /dev/stdin is caught before resolving to a terminal path;
     every symlink hop is checked so an alias cannot bypass the guard.
     """
+    if current_execution():
+        from tools.file_backend_state import remote_path
+        return is_blocked_device_path(filepath) or is_blocked_device_path(remote_path(filepath))
     from tools.environments.sandbox_scope import hosted_scope
     expanded = _expand_tilde(filepath)
     if base_dir is not None and not os.path.isabs(expanded):
@@ -327,6 +351,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         with _env_lock:
             if task_id in _active_environments:
                 _last_activity[task_id] = time.time()
+                if current_execution():
+                    cached.env._hermes_owner_tasks.add(current_execution().task_id)
+                    cached.cwd = get_session_cwd(raw_task_id) or cached.cwd
                 return cached
             # Env was cleaned up: rescue its cwd into the session record FILL-ONLY
             # (``cached.cwd`` is the SHARED env's cwd, not this session's own).
@@ -371,26 +398,41 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
 def clear_file_ops_cache(task_id: str | None = None):
     """Clear file-operation state for a finished task, or all tasks."""
+    from hermes_constants import get_hermes_home
+    home = str(get_hermes_home())
+    owner_keys = {tracking_key(task_id)} if task_id else set()
+    with _read_tracker_lock:
+        if task_id:
+            owner_keys.update(key for key, data in _read_tracker.items()
+                              if data.get("node_owner") == task_id and data.get("node_home") == home)
     with _file_ops_lock:
         if task_id:
             _file_ops_cache.pop(task_id, None)
+            for key, ops in list(_file_ops_cache.items()):
+                env = ops.env
+                if (getattr(env, "_hermes_profile_home", None) == home
+                        and task_id in getattr(env, "_hermes_owner_tasks", ())):
+                    _file_ops_cache.pop(key, None)
         else:
             _file_ops_cache.clear()
 
     with _read_tracker_lock:
         if task_id:
-            _read_tracker.pop(task_id, None)
+            for key in owner_keys:
+                _read_tracker.pop(key, None)
         else:
             _read_tracker.clear()
 
     with _patch_failure_lock:
         if task_id:
-            _patch_failure_tracker.pop(task_id, None)
+            for key in owner_keys:
+                _patch_failure_tracker.pop(key, None)
         else:
             _patch_failure_tracker.clear()
 
     if task_id:
-        file_state.get_registry().forget_task(task_id)
+        for key in owner_keys:
+            file_state.get_registry().forget_task(key)
     else:
         file_state.get_registry().clear()
 
@@ -410,7 +452,14 @@ def _special_file_kind(path) -> str | None:
     only; unstattable paths return None and flow to the normal read path.
     """
     try:
-        mode = os.stat(os.fspath(path)).st_mode  # follows symlinks, matching a real read
+        if current_execution():
+            from tools.file_backend_state import remote_state
+            state = remote_state(str(path))
+            if not state.get("exists"):
+                return None
+            mode = state["mode"]
+        else:
+            mode = os.stat(os.fspath(path)).st_mode  # follows symlinks, matching a real read
     except OSError:
         return None
     if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
@@ -572,15 +621,18 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     version = (snapshot or _file_version(resolved_str)) if version_before is not None else None
     stable = version is not None and version[:-1] == version_before == _file_metadata(resolved_str)
     complete = False
+    from tools.file_tools_read_tracking import _backend_mtime
+    read_mtime = None
+    if _on_host(resolved_str):  # a hosted agent's path names its sandbox: never stat it here
+        try:
+            read_mtime = _backend_mtime(resolved_str)
+        except (OSError, RuntimeError):
+            pass
     with _read_tracker_lock:
         count, dedup = _note_read_served(task_data, dedup_key, path, offset, limit)
         task_data["read_history"].add((path, offset, limit))
-        try:
-            if _on_host(resolved_str):
-                _mtime_now = os.path.getmtime(resolved_str)
-                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-        except OSError:
-            pass
+        if read_mtime is not None:
+            task_data.setdefault("read_timestamps", {})[resolved_str] = read_mtime
         baselines = task_data["full_write_baselines"]
         if stable and version is not None and count < 4:
             dedup[dedup_key] = version_before
@@ -608,7 +660,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     except Exception:
         logger.debug("file_state.record_read failed", exc_info=True)
 
-    if complete:
+    if complete and not current_execution():
         try:
             # Background-review read-before-write guard integration (#61521): when the self-improvement
             # review fork reads a skill file with read_file (now whitelisted dispatch-side), register the
@@ -664,7 +716,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         _resolved = PurePosixPath(path) if unanchored else _resolve_path_for_task(path, task_id)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        if current_execution() or _file_ops_uses_host_paths(_get_file_ops(task_id)):
             kind = _special_file_kind(_resolved)
             if kind is not None:
                 return json.dumps({
@@ -683,7 +735,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if block_error:
             return tool_error(block_error)
 
-        extracted = _read_extracted_document(path, _resolved, offset, limit, task_id)
+        extracted = None if current_execution() else _read_extracted_document(path, _resolved, offset, limit, task_id)
         if extracted is not None:
             return extracted
 
@@ -706,8 +758,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # Same rule as skill_view: the review fork shares the parent's task_id and its
         # read-before-write guard needs a real read, which the stub path never records (#95976).
         file_ops = _get_file_ops(task_id)
-        version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
-        if (cached_version is not None and not is_background_review()
+        version_before = _file_metadata(resolved_str) if current_execution() or _file_ops_uses_host_paths(file_ops) else None
+        if (cached_version is not None and not _SANDBOX_READ_CONTEXT.get()
+                and not is_background_review()
                 and version_before == cached_version and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
@@ -794,7 +847,28 @@ def _resolve_or_none(filepath: str, task_id: str, *, entry: bool = False) -> str
     try:
         return str((_resolve_entry_for_task if entry else _resolve_path_for_task)(filepath, task_id))
     except Exception:
+        if current_execution():
+            raise
         return None
+
+
+def _check_credential_spelling(filepath: str, task_id: str) -> str | None:
+    """Credential refusal for the path as the caller spelled it.
+
+    Host resolution realpaths the target, and that resolved target is all the backend
+    guard sees, so a credential location reached through a symlink (a leaf link, or a
+    link nested under a credential directory) would be judged only by where it points.
+    Vetting the unresolved spelling here, beside the backend's check of the target,
+    refuses the write when either is a credential path. SSH, container and node paths
+    are never host-resolved, so the backend already sees their spelling."""
+    paths = file_tools_paths
+    if current_execution() or paths._terminal_env_type_for_task(task_id) == "ssh" or paths._uses_container_paths(task_id):
+        return None
+    text = paths._host_text(filepath, False)
+    if not os.path.isabs(text):
+        root = paths._authoritative_workspace_root(task_id) or os.getcwd()
+        text = os.path.join(paths._host_text(root, False), text)
+    return get_credential_write_error(os.path.normpath(text))
 
 
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
@@ -806,7 +880,7 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
     prompt covers every path of a multi-file patch.
     """
     for p in paths:
-        err = _check_sensitive_path(p, task_id) or (
+        err = _check_sensitive_path(p, task_id) or _check_credential_spelling(p, task_id) or (
             None if cross_profile else _check_cross_profile_path(p, task_id))
         if err:
             return err
@@ -833,12 +907,31 @@ def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> li
     return warnings
 
 
+@contextmanager
+def _post_edit_bookkeeping(result_dict: dict, task_id: str):
+    """Keep a committed backend result when optional metadata refresh fails.
+
+    Discard the caller's read authority and caches rather than letting partially
+    refreshed bookkeeping authorize another overwrite or hide the new bytes.
+    """
+    try:
+        yield
+    except Exception as exc:  # health: allow BLE001 -- post-commit metadata refresh is optional and must not undo the committed write
+        from tools.node_execution import tracking_key
+        with _read_tracker_lock:
+            _read_tracker.pop(tracking_key(task_id), None)
+        result_dict["bookkeeping_warning"] = (
+            f"Post-edit bookkeeping failed: {exc}. Read tracking was cleared; "
+            "re-read the affected paths before another whole-file overwrite.")
+        logger.warning("Post-edit bookkeeping failed for task %s: %s", task_id, exc)
+
+
 def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session_id: str | None) -> None:
     """Post-success bookkeeping: verification-stale marker, then per path refresh
     the read stamp (no false staleness on the next edit) and record the write."""
     _mark_verification_stale(task_id, [path_to_resolved.get(p) or p for p in paths], session_id=session_id)
     for p in paths:
-        _update_read_timestamp(p, task_id)
+        _update_read_timestamp(p, task_id, resolved=path_to_resolved.get(p))
         if path_to_resolved.get(p):
             file_state.note_write(task_id, path_to_resolved[p])
 
@@ -900,6 +993,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     """
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
+           or _check_credential_spelling(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
@@ -938,15 +1032,19 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # Always report the ABSOLUTE path written so a wrong-cwd mismatch
                 # is visible in the response instead of silently landing elsewhere.
                 result_dict["resolved_path"] = _resolved
-            if result_dict.get("error"):
-                _update_read_timestamp(path, task_id)
-            else:
-                if _resolved:
-                    result_dict["files_modified"] = [_resolved]
-                    # Own write = current whole-file content: consecutive
-                    # same-task writes stay unblocked (patch_tool carries it).
-                    _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
-                _note_edited(task_id, [path], path_to_resolved, session_id)
+            # The backend result is authoritative. Metadata failures after
+            # this point cannot turn a committed write into a generic error.
+            if not result_dict.get("error") and _resolved:
+                result_dict["files_modified"] = [_resolved]
+            with _post_edit_bookkeeping(result_dict, task_id):
+                if result_dict.get("error"):
+                    _update_read_timestamp(path, task_id)
+                else:
+                    if _resolved:
+                        # Own write = current whole-file content: consecutive
+                        # same-task writes stay unblocked (patch_tool carries it).
+                        _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
+                    _note_edited(task_id, [path], path_to_resolved, session_id)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -994,6 +1092,10 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    if mode == "replace" and not path:
+        return tool_error(
+            "Missing required parameter 'path': supply the file path to patch.",
+            missing_parameter="path")
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
     _entry_paths: list[str] = []
@@ -1025,8 +1127,6 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.
             if mode == "replace":
-                if not path:
-                    return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
                 _replace_target = _path_to_resolved.get(path) or path
@@ -1050,10 +1150,11 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
-                _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
-                _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
-                # Clear failure counters so a future miss starts a fresh count.
-                _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
+                with _post_edit_bookkeeping(result_dict, task_id):
+                    _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
+                    _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
+                    # Clear failure counters so a future miss starts a fresh count.
+                    _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
         # old_string-not-found hint. Failure escalation is tracked for replace
         # mode only (V4A misses are rare); the generic hint is suppressed when
         # patch_replace already attached a richer "Did you mean?" snippet.
@@ -1092,8 +1193,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # results doesn't trip the repeated-search guard.
         search_key = ("search", pattern, target, str(path), file_glob or "", limit, offset, order)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0, "read_history": set()})
+            task_data = _task_data(task_id)
             count = _bump_consecutive(task_data, search_key)
 
         if count >= 4:
@@ -1172,6 +1272,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # Schemas + Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
+from tools.node_execution import current_execution, node_handler, node_schema, tracking_key
 
 
 def _check_file_reqs():
@@ -1343,11 +1444,17 @@ SEARCH_FILES_SCHEMA = {
 }
 
 
+for _schema in (READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_SCHEMA, SEARCH_FILES_SCHEMA):
+    _schema["parameters"]["properties"]["node"] = node_schema()
+
+
+@node_handler
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid)
 
 
+@node_handler
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1385,11 +1492,12 @@ def _owned(owner: str, fn, **call_kwargs):
         return fn(**call_kwargs)
 
 
+@node_handler
 def _handle_patch(args, **kw):
     from hermes_cli.observability.shared_metrics_harness import record_file_edit
 
     tid = kw.get("task_id") or "default"
-    mode = args.get("mode", "replace")
+    mode = args.get("mode") or "replace"
     return record_file_edit("patch", mode, lambda: _owned(kw.get("session_id") or tid, patch_tool,
         mode=mode, path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
@@ -1399,6 +1507,7 @@ def _handle_patch(args, **kw):
     ))
 
 
+@node_handler
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}
@@ -1469,6 +1578,6 @@ def _patch_schema_overrides():
 
 
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000, dynamic_schema_overrides=_patch_schema_overrides,
-                  compat_args=("mode", "patch", "cross_profile"))
+                  compat_args=("mode", "patch", "cross_profile"), self_checked_args=("path",))
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000,
                   self_checked_args=("pattern",))  # a files listing takes none; the handler refuses a content search without one

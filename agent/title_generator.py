@@ -70,10 +70,7 @@ MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
 # The ceiling is the configured ``max_words`` plus headroom (see generate_title; port of can1357/oh-my-pi#7306).
 _TITLE_WORD_SLACK = 5
-# Upper bound on accepted title word count. Titling is a 3-7 word task; a small tiny-model sometimes ignores
-# the task and answers the user's message instead — that answer must never become the session title (see the
-# answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
-# legitimate wordy titles while excluding full-sentence answers.
+# Absolute safety ceiling for answer-shaped output, retained alongside the configurable fork preference.
 _MAX_TITLE_WORDS = 12
 # Answer-shaped guard, CJK half: Han, kana and Hangul have no inter-word spaces, so the word count above
 # cannot see a full reply in those scripts (a 76-character Chinese answer counts as three "words"). Length

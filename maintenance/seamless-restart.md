@@ -1,6 +1,6 @@
 # Seamless Restart Phase 1 Implementation Plan
 
-Patch identity: `seamless-restart` (legacy single-gateway path).
+Patch identity: `seamless-restart`, `relv0232-process-registry`.
 
 Restart and reconnect replay admission shares the existing recovery owner and
 bounded priority scheduler. Its ordering, long-turn opening window, profile scope

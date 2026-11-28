@@ -118,7 +118,7 @@ def _calling_source(runner) -> Optional[SessionSource]:
 
 async def telegram_topic_tool(args: dict, **_kwargs: Any) -> str:
     from gateway.telegram_topic_sessions import TopicSpec, create_topic_session, edit_topic_session
-    from tools.send_message_tool import _dispatch_on_gateway_loop
+    from gateway.outbound.send import _dispatch_on_gateway_loop
 
     runner = _live_runner()
     if runner is None:

@@ -5,6 +5,7 @@ method_ctx.bind_module), so they reference server.py globals bare.
 """
 
 import contextlib
+import time
 
 from .method_ctx import HandlerRegistry, bind_module
 

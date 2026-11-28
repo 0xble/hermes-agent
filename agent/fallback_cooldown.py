@@ -1,14 +1,234 @@
 """Primary rate-limit cooldown arming and per-session model rejection markers, shared by the
-fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers)."""
+fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers).
+
+Also owns the unattended transient-retry window policy: subagent, cron and side-agent sessions
+keep retrying the same route through transient provider errors for
+``delegation.fallback.transient_retry_window_seconds`` before the fallback chain runs."""
 import logging
 import math
 import time
 
 from agent.error_classifier import FailoverReason
+from agent.fallback_session_route import mark_fallback_route  # re-exported for the fallback walk
 
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
+# Reasons that arm the shared primary cooldown. An overloaded primary (529, or 503 with an
+# overload body) is as unusable for the next minutes as a rate-limited one, so it takes the same
+# shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
+_SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
+
+# Delegated, cron, and other unattended runs should give a temporarily unhealthy provider a
+# chance to recover before spending the next fallback route.  Three minutes is long enough to
+# cover the short 5xx/429 incidents seen in practice without parking a task indefinitely.
+DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS = 180.0
+# Background/side agents are covered by ``side_agent`` rather than a platform name.
+_NONINTERACTIVE_PLATFORMS = frozenset({"subagent", "cron"})
+_NONINTERACTIVE_TRANSIENT_REASONS = frozenset({
+    FailoverReason.rate_limit,
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _monotonic() -> float:
+    """Window clock; a module seam so tests can drive a fake clock without patching ``time``."""
+    return time.monotonic()
+
+
+def noninteractive_transient_retry_window_seconds(agent) -> float:
+    """Return the configured same-provider retry window for unattended sessions.
+
+    The setting lives under ``delegation.fallback`` because delegated work is its primary
+    consumer; cron and side agents use the same policy.  A malformed or negative value
+    falls back to the safe default, while zero deliberately restores immediate failover.
+    """
+    override = getattr(agent, "_noninteractive_transient_retry_window_seconds", None)
+    if override is not None:
+        try:
+            value = float(override)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except (OverflowError, TypeError, ValueError):
+            pass
+    try:
+        from hermes_cli.config import load_config
+        configured = (
+            (load_config() or {}).get("delegation", {}).get("fallback", {})
+            .get("transient_retry_window_seconds", DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS)
+        )
+        value = float(configured)
+    except (AttributeError, TypeError, ValueError, ImportError):
+        value = DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS
+    return value if math.isfinite(value) and value >= 0 else DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS
+
+
+def is_noninteractive_session(agent) -> bool:
+    """True for provider calls with no human waiting on the retry decision."""
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    return platform in _NONINTERACTIVE_PLATFORMS or bool(getattr(agent, "side_agent", False))
+
+
+def is_noninteractive_transient(classified, error_message: str = "") -> bool:
+    """Classify only the transient failures eligible for delayed fallback.
+
+    Billing/entitlement refusals intentionally do not qualify, even when the provider reports
+    them with a 403 or 429. ``auth_unavailable`` is the provider-specific transient auth form;
+    ordinary rejected credentials remain immediate failover.
+    """
+    reason = getattr(classified, "reason", None)
+    if reason in _NONINTERACTIVE_TRANSIENT_REASONS:
+        return True
+    return reason == FailoverReason.auth and "auth_unavailable" in str(error_message or "").lower()
+
+
+def _effective_window_seconds(agent) -> float:
+    """The configured window, or 0 when a delegate route owner opted out.
+
+    A route owner that sets ``max_retry_wait_seconds`` (``agent._max_retry_wait_s``) owns this
+    child's retry timing: it fails the attempt fast so the owner can move to its own next route.
+    Holding the child on the same provider would defeat that, so the window does not apply.
+    """
+    if getattr(agent, "_max_retry_wait_s", None) is not None:
+        return 0.0
+    return noninteractive_transient_retry_window_seconds(agent)
+
+
+def _active_route(agent) -> tuple:
+    return (
+        str(getattr(agent, "provider", "") or ""),
+        str(getattr(agent, "model", "") or ""),
+        str(getattr(agent, "base_url", "") or ""),
+    )
+
+
+def hold_noninteractive_transient_retry(
+    agent, classified, *, error_message: str = "", now=None, declared_wait=None,
+) -> bool:
+    """Record an outage start and return whether fallback must wait for this provider.
+
+    The timestamp is keyed to the active route so a successful fallback switch starts a fresh
+    window.  It is cleared after a successful response and at every turn start, so a failed
+    turn's expired outage cannot cancel the next turn's window.  Call this once per API error
+    and reuse the result: the helper itself never sleeps.
+
+    ``declared_wait`` is the provider's own cooldown (Retry-After / reset time) in seconds. When
+    it outlasts what is left of the window the route cannot recover in time, so there is no hold.
+    """
+    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
+        return False
+    window = _effective_window_seconds(agent)
+    if window <= 0:
+        return False
+    route = _active_route(agent)
+    now = _monotonic() if now is None else float(now)
+    prior_route = getattr(agent, "_noninteractive_transient_retry_route", None)
+    started = getattr(agent, "_noninteractive_transient_retry_started_at", None)
+    fresh = prior_route != route or not isinstance(started, (int, float)) or started > now
+    remaining = window if fresh else window - (now - float(started or 0.0))
+    if isinstance(declared_wait, (int, float)) and declared_wait >= remaining:
+        return False
+    if fresh:
+        agent._noninteractive_transient_retry_route = route
+        agent._noninteractive_transient_retry_started_at = now
+        return True
+    return remaining > 0
+
+
+def provider_declared_wait_seconds(api_error, error_context=None) -> float | None:
+    """The provider's own cooldown for this error in seconds (Retry-After, else reset time)."""
+    from agent.retry_utils import provider_retry_after_seconds
+    wait = provider_retry_after_seconds(api_error)
+    if wait is not None:
+        return float(wait)
+    reset = _provider_reset_epoch(error_context.get("reset_at")) if isinstance(error_context, dict) else None
+    return None if reset is None else max(0.0, reset - time.time())
+
+
+def _open_window_start(agent):
+    started = getattr(agent, "_noninteractive_transient_retry_started_at", None)
+    if not isinstance(started, (int, float)):
+        return None
+    if getattr(agent, "_noninteractive_transient_retry_route", None) != _active_route(agent):
+        return None
+    return float(started)
+
+
+def noninteractive_transient_retry_remaining(agent, *, now=None) -> float:
+    """Seconds left in the active route's window (0 when none is open)."""
+    started = _open_window_start(agent)
+    if started is None:
+        return 0.0
+    now = _monotonic() if now is None else float(now)
+    return max(0.0, _effective_window_seconds(agent) - (now - started))
+
+
+def noninteractive_transient_window_spent(agent, classified, *, error_message: str = "", now=None) -> bool:
+    """True when this route already used its whole same-provider window on this outage.
+
+    With a fallback pending, the exhaustion path then goes straight to it: the route has had
+    its recovery time. With no fallback, the transport rebuild and recovery ladder still run.
+    """
+    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
+        return False
+    started = _open_window_start(agent)
+    if started is None:
+        return False
+    now = _monotonic() if now is None else float(now)
+    return now - started >= _effective_window_seconds(agent)
+
+
+def settle_noninteractive_retry_budget(
+    agent, classified, retry_state, *, retry_count, max_retries, hold, over_wait_cap, error_message="",
+) -> tuple:
+    """Apply the unattended window to the retry budget; return ``(max_retries, skip_to_fallback)``.
+
+    Still inside the window (``hold``): an exhausted budget grows by one attempt, so the retry
+    loop keeps hitting the same route; once the window ends the hold is False and the ordinary
+    exhaustion path activates the fallback. Billing / client errors never arrive held. The
+    pre-hold budget is kept on ``retry_state`` and restored the moment the hold ends, so the
+    transport rebuild and every auto-recovery cycle after it run the ordinary budget.
+
+    ``skip_to_fallback`` is True when the window is spent and a fallback is pending: the route had
+    its recovery time, so the caller skips the transport rebuild. If the window ran out before the
+    ordinary budget did (long Retry-After waits), the budget is cut to ``retry_count`` so the
+    fallback runs now. With nothing to fall back to, the rebuild and recovery ladder still run.
+    """
+    if retry_count >= max_retries and hold:
+        if getattr(retry_state, "noninteractive_hold_base_retries", None) is None:
+            retry_state.noninteractive_hold_base_retries = max_retries
+        max_retries = retry_count + 1
+    elif not hold and getattr(retry_state, "noninteractive_hold_base_retries", None) is not None:
+        max_retries = min(max_retries, retry_state.noninteractive_hold_base_retries)
+        retry_state.noninteractive_hold_base_retries = None
+    window_spent = not over_wait_cap and noninteractive_transient_window_spent(
+        agent, classified, error_message=error_message,
+    )
+    skip_to_fallback = window_spent and agent._has_pending_fallback()
+    if skip_to_fallback and retry_count < max_retries:
+        max_retries = retry_count
+    return max_retries, skip_to_fallback
+
+
+def clear_noninteractive_transient_retry(agent) -> None:
+    """Forget a provider outage after a successful response or at turn start."""
+    agent._noninteractive_transient_retry_route = None
+    agent._noninteractive_transient_retry_started_at = None
+
+
+def _provider_reset_epoch(reset_at) -> float | None:
+    """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""
+    from agent.credential_pool import _parse_absolute_timestamp
+    try:
+        parsed = _parse_absolute_timestamp(reset_at)
+    except (OverflowError, ValueError, TypeError):
+        return None  # malformed provider metadata falls back to exponential backoff
+    if parsed is not None and math.isfinite(parsed) and parsed > time.time():
+        return float(parsed)
+    return None
 
 
 # Delegated, cron, and other unattended runs should give a temporarily unhealthy provider a
@@ -223,10 +443,15 @@ def _provider_reset_epoch(reset_at) -> float | None:
 
 
 def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired/implausible.
+
+    Shares the shared record's ceiling so the in-memory cooldown can never outlive what the
+    record would accept, even when the shared state write fails.
+    """
+    from agent.shared_primary_cooldown import _MAX_PROVIDER_RESET_SECONDS
     parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
-    if delay is not None and math.isfinite(delay) and delay > 0:
+    if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_PROVIDER_RESET_SECONDS:
         return delay
     return None
 
@@ -279,11 +504,47 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return None
-    if getattr(agent, "_fallback_activated", False) and not _on_primary_route(agent):
-        return None
+    if getattr(agent, "_shared_primary_probe_token", None):
+        from agent.shared_primary_cooldown import primary_probe_is_owned
+        if primary_probe_is_owned(agent):
+            return 0
+    request_id = str(getattr(agent, "_current_api_request_id", "") or "").strip()
+    if not request_id:
+        sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1
+        agent._cooldown_failure_sequence = sequence
+        request_id = f"fallback:{id(agent)}:{sequence}"
+    failed_outage_id = str(getattr(agent, "_shared_primary_probe_failed_outage_id", "") or "")
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if (failed_outage_id and isinstance(record, dict)
+            and str(record.get("outage_id") or "") == failed_outage_id
+            and not getattr(agent, "_fallback_activated", False)):
+        # A failed half-open probe already re-armed this outage.  Preserve the
+        # signal that permits a long fallback turn to retry the primary.
+        agent._fallback_episode_cooled = True
+        return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+    if getattr(agent, "_fallback_activated", False):
+        # Compare the whole route: a same-provider fallback (another model or endpoint) failing
+        # says nothing about the primary and must not arm the primary's shared window.
+        from agent.shared_primary_cooldown import canonical_route, live_route_from_agent, route_from_agent
+        live_route = canonical_route(live_route_from_agent(agent))
+        primary_route = canonical_route(route_from_agent(agent))
+        if live_route != primary_route:
+            # Fallback routes have their own breaker. A fallback failure is never evidence that
+            # the primary recovered, and the reason is deliberately rate_limit-only.
+            from agent.shared_primary_cooldown import arm_cooldown
+            fallback_record = arm_cooldown(
+                live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
+                backoff_count=0, request_id=request_id,
+                request_started_at=getattr(agent, "_current_api_request_started_at", None),
+                short_window=(reset_at is None and reason != FailoverReason.overloaded
+                              and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
+            )
+            if fallback_record:
+                agent._shared_fallback_cooldown_record = fallback_record
+            return None
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
     if provider_delay is not None:
@@ -293,9 +554,46 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
     agent._rate_limited_until = time.monotonic() + backoff_seconds
+    agent._fallback_episode_cooled = True
+    # The in-memory fields remain the hot-path cache, while this record is the source of truth
+    # across gateway agent eviction, delegated children, cron workers and restarts.
+    agent._shared_primary_cooldown_record = None
+    try:
+        from agent.shared_primary_cooldown import arm_cooldown, read_cooldown, route_from_agent
+        primary_route = route_from_agent(agent)
+        existing = read_cooldown(primary_route)
+        if (getattr(agent, "_shared_primary_probe_failed_outage_id", None)
+                and (not isinstance(existing, dict)
+                     or str(existing.get("outage_id") or "") != str(agent._shared_primary_probe_failed_outage_id))):
+            agent._shared_primary_probe_failed_outage_id = None
+        owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
+        from agent.shared_primary_cooldown import _probe_token_value
+        token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))
+        if owner and owner != token:
+            logger.info("Ignoring stale primary failure while another probe owns the lease")
+            return None
+        record = arm_cooldown(
+            primary_route, reason=reason,
+            reset_at=_provider_reset_epoch(reset_at),
+            backoff_count=backoff_count,
+            request_id=request_id,
+            request_started_at=getattr(agent, "_current_api_request_started_at", None),
+            short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
+                          and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
+        )
+    except Exception:
+        record = None
+        logger.debug("Shared primary cooldown write failed", exc_info=True)
+    if record:
+        agent._shared_primary_cooldown_record = record
+        backoff_seconds = max(0, math.ceil(float(record["reset_at"]) - time.time()))
+        agent._rate_limited_until = time.monotonic() + backoff_seconds
+        agent._rate_limit_backoff_count = int(record.get("backoff_count", backoff_count + 1) or 0)
+        source = "provider reset" if record.get("source") == "provider_reset" else "exponential fallback"
     logging.info(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
-        backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
+        max(0, agent._rate_limit_backoff_count - 1), backoff_seconds, backoff_seconds / 60,
+        agent._rate_limit_backoff_count, source,
     )
     return backoff_seconds
 

@@ -10,15 +10,26 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shlex
 import signal
-import stat
 import sys
 from itertools import pairwise
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+
+from cron.lifecycle.script_paths import (
+    _MAX_REFERENCED_SCRIPT_BYTES,
+    _capped_read_limit,
+    _expand_candidate_path,
+    _on_cloud_path,
+    _read_regular_script,
+    _resolve_lenient,
+    _resolve_script_path,
+    _unreadable_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,14 +287,8 @@ _HERMES_GATEWAY_LABEL_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 _SHELL_COMMAND_FLAGS = {"-c", "--command"}
-_MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
-
-# Directory names directly under `Library` that mark a FileProvider-backed subtree: `Mobile
-# Documents` is iCloud Drive; `CloudStorage` hosts third-party providers (Dropbox, OneDrive, Google
-# Drive, ...).
-_CLOUD_PLACEHOLDER_MARKERS = frozenset({"Mobile Documents", "CloudStorage"})
 
 # Executables whose arguments are DATA (search patterns, SQL, log filters) and cannot execute their
 # argument text. Deliberately conservative: no `awk` (system()), no `sed` (`s///e`), no
@@ -301,9 +306,6 @@ _DOT_COMMAND_ARGUMENT = re.compile(r"^\.[A-Za-z]")
 _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
-
-# Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
-_BINARY_SNIFF_BYTES = 4096
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
@@ -324,14 +326,19 @@ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
 _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-U", "-C", "-p", "-r", "-t", "-T", "--user", "--group", "--prompt"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir"},
+    # GNU env: -u/-C/-S; BSD env additionally has -P and -a, while GNU env has --argv0.
+    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir", "-P", "--path",
+            "-a", "--argv0"},
     "nice": {"-n", "--adjustment"},
     "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
     "pkexec": {"--user"},
-    "su": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"},
-    "runuser": {"-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "exec": {"-a"},
+    # util-linux su/runuser: the whitelist, group, shell, and supplemental-group options all take
+    # values.  -l/-m/-p/-f (and their long forms) are flags and are listed below.
+    "su": {"-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "runuser": {"-u", "--user", "-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
     "setpriv": {"--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set",
                 "--selinux-label", "--apparmor-profile"},
     "systemd-run": {"-u", "--unit", "-p", "--property", "-E", "--setenv", "--slice",
@@ -340,13 +347,39 @@ _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "unshare": {"--map-user", "--map-group", "--setgroups", "-R", "--root", "-w", "--wd"},
 }
 
+# Flags must be recognized too: an unrecognized option cannot prove where a wrapper's command (or a
+# string-command option's payload) starts. Unknown options deliberately stay ambiguous; every later
+# token is then scanned as a possible command start (over-flag rather than silently drop).
+_TRANSPARENT_PREFIX_FLAG_OPTIONS = {
+    "sudo": {"-A", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-n", "-P", "-S", "-s", "-V", "-v",
+             "--askpass", "--background", "--preserve-env", "--edit", "--set-home", "--login",
+             "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive",
+             "--preserve-groups", "--stdin", "--shell", "--validate"},
+    "doas": {"-n", "-s", "-L"},
+    # GNU env: -i/-0/-v and signal options; BSD env: -i/-v.  -l is NOT an env flag and stays unknown.
+    "env": {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+            "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"},
+    "timeout": {"-v", "--verbose", "--preserve-status", "--foreground"},
+    "setsid": {"-c", "--ctty", "-f", "--fork", "-w", "--wait"},
+    "ionice": {"-t", "--ignore"},
+    "exec": {"-c", "-l"},
+    "command": {"-p", "-v", "-V"},
+    "pkexec": {"--disable-internal-agent", "--keep-cwd"},
+    "su": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+    "runuser": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+}
+
 # Wrapper options carrying a COMMAND STRING (shell source, re-scanned like `sh -c`); treating it as
 # an opaque value would hide whatever it runs (`env -S 'bash ~/restart.sh'`).
 _STRING_COMMAND_OPTIONS = {
     "env": ("-S", "--split-string"),
-    "su": ("-c", "--command"),
-    "runuser": ("-c", "--command"),
+    "su": ("-c", "--command", "--session-command"),
+    "runuser": ("-c", "--command", "--session-command"),
 }
+
+# Wrappers whose trailing arguments reach a shell (util-linux ``run_shell`` passes everything after
+# the user operand, including after ``--``); their command-string scan is never bounded.
+_SHELL_TAIL_WRAPPERS = frozenset({"su", "runuser"})
 
 # Wrappers whose first non-option operand is a VALUE, not the command (`timeout 60 bash x.sh`).
 _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
@@ -355,20 +388,6 @@ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 # Bound the walk: a pathological token run must not spin here.
 _MAX_PREFIX_PEELS = 8
-
-_BINARY_MAGICS = (
-    b"\x7fELF",              # ELF — Linux/BSD executables and shared objects
-    b"\xfe\xed\xfa\xce",     # Mach-O 32-bit
-    b"\xfe\xed\xfa\xcf",     # Mach-O 64-bit
-    b"\xce\xfa\xed\xfe",     # Mach-O 32-bit, byte-swapped
-    b"\xcf\xfa\xed\xfe",     # Mach-O 64-bit, byte-swapped
-    b"\xca\xfe\xba\xbe",     # Mach-O universal ("fat") binary
-    b"MZ",                   # PE/COFF — Windows .exe/.dll
-    b"!<arch>",              # static archive (.a)
-    b"\x1f\x8b",             # gzip
-    b"PK\x03\x04",           # zip (also .jar/.whl/.egg)
-)
-
 
 # --- profile identity -------------------------------------------------------------------------
 
@@ -494,7 +513,9 @@ def first_gateway_lifecycle_match(text: str) -> Optional[str]:
 # get a far tighter cap.
 # See #78398.
 _MAX_LIFECYCLE_SCAN_BYTES = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB across the walk
-_MAX_LIFECYCLE_SCAN_LINES = 16384
+# Large generated Python CLIs can stay below the byte cap while legitimately exceeding 16K
+# short lines. Keep a separate bounded line-work ceiling without rejecting those executables.
+_MAX_LIFECYCLE_SCAN_LINES = 32768
 _MAX_LIFECYCLE_SCAN_LINE_BYTES = 64 * 1024
 _MAX_LIFECYCLE_SCAN_PATHS = 1024
 _MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
@@ -563,17 +584,6 @@ class _LifecycleScanBudget:
         return True
 
 
-def _capped_read_limit(max_bytes: Optional[int]) -> int:
-    """Per-read byte cap: never above the per-file cap, never negative. One definition so local and
-    remote reads cannot diverge.
-
-    See #76762, #77703.
-    """
-    if max_bytes is None:
-        return _MAX_REFERENCED_SCRIPT_BYTES
-    return min(_MAX_REFERENCED_SCRIPT_BYTES, max(0, int(max_bytes)))
-
-
 def lifecycle_scan_root_within_budget(text: str) -> bool:
     """Whether *text* may safely enter an optional tokenizer pass (``tools/terminal_tool.py`` gates
     its launchctl pre-scan on this). A FRESH budget, independent of the full guard's walk: the
@@ -595,20 +605,11 @@ def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bo
     return True
 
 
-def _unreadable_reason(path: Path) -> str:
-    """Name why an *executed* script failed closed without being scanned (live SQLite, device,
-    oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
-    from hermes_cli.sqlite_safe_read import has_live_connection
-
-    if has_live_connection(path):
-        return f"`{path}` is a SQLite database open in this gateway process"
-    try:
-        metadata = os.stat(path)
-    except OSError:
-        return f"`{path}` could not be read"
-    if not stat.S_ISREG(metadata.st_mode):
-        return f"`{path}` is not a regular file"
-    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+def _refuse_named(budget: _LifecycleScanBudget, reason: str) -> bool:
+    """Fail closed on an unscannable wrapper shape without inventing a filesystem path."""
+    logger.warning("lifecycle guard cannot determine wrapped command: %s; failing closed", reason)
+    budget.refusal = reason
+    return True
 
 
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
@@ -692,34 +693,185 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+def _installed_semaphore_path(token: str) -> bool:
+    """Whether *token* is an explicit path resolving to this profile's installed helper."""
+    try:
+        path = Path(token)
+        if not path.is_absolute() or _on_cloud_path(path):
+            return False
+        installed = Path.home() / ".local" / "bin" / "semaphore"
+        return path.resolve(strict=True) == installed.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _valid_semaphore_wait(value: str) -> bool:
+    try:
+        seconds = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(seconds) and seconds >= 0
+
+
+# semaphore's argparse interface. Both the trusted peel and strict fallback must consume the
+# same value options, including attached --option=value forms. Help never executes a payload.
+_SEMAPHORE_VALUE_OPTIONS: dict[str, Callable[[str], bool]] = {
+    "--label": lambda value: True,
+    "--max-wait": _valid_semaphore_wait,
+    "--urgency": lambda value: value in {"incident", "urgent", "normal"},
+    "--gate-fd": lambda value: re.fullmatch(r"[0-9]+", value) is not None,
+}
+_SEMAPHORE_FLAG_OPTIONS = frozenset({"-h", "--help"})
+
+
+def _semaphore_command_index(segment: list[str], index: int) -> Optional[int]:
+    """Peel only an explicit absolute path to the installed helper and its exact grammar.
+
+    Bare names never earn this exception: modelling shell PATH mutations is unnecessary for the
+    LPG caller, which uses the installed absolute path. Other scripts keep the strict walk.
+    """
+    if not _installed_semaphore_path(segment[index]):
+        return None
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            return position + 1 if position + 1 < len(segment) else None
+        name, equals, value = option.partition("=")
+        if name not in _SEMAPHORE_VALUE_OPTIONS:
+            return None
+        if not equals:
+            position += 1
+            if position >= len(segment) or segment[position].startswith("-"):
+                return None
+            value = segment[position]
+        if not _SEMAPHORE_VALUE_OPTIONS[name](value):
+            return None
+        position += 1
+    return None
+
+
+def _semaphore_fallback_command_index(
+    segment: list[str], index: int,
+) -> tuple[Optional[int], Optional[str]]:
+    """Find the command tail when semaphore's transparent grammar cannot be peeled.
+
+    The helper remains a strict source reference on this path. Consume only exact known options
+    up to the command boundary: argparse accepts abbreviations, so skipping to a later delimiter
+    could hide a command already started by an abbreviated option. Refuse ambiguity by name.
+    """
+    if _executable_name(segment[index]) != "semaphore" and not _installed_semaphore_path(segment[index]):
+        return None, None
+    arguments = segment[index + 1:]
+    if not arguments or (len(arguments) == 1 and arguments[0] in _SEMAPHORE_FLAG_OPTIONS):
+        return None, None
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            if position + 1 >= len(segment):
+                return None, "semaphore wrapper has `--` but no wrapped command"
+            return position + 1, None
+        name, equals, value = option.partition("=")
+        if name in _SEMAPHORE_VALUE_OPTIONS:
+            if not equals:
+                position += 1
+                if position >= len(segment) or segment[position].startswith("-"):
+                    return None, f"semaphore wrapper has an incomplete option `{name}`"
+                value = segment[position]
+            if not _SEMAPHORE_VALUE_OPTIONS[name](value):
+                return None, f"semaphore wrapper has an invalid option `{option}`"
+            position += 1
+            continue
+        if option in _SEMAPHORE_FLAG_OPTIONS:
+            return None, None
+        if option.startswith("-"):
+            return None, f"semaphore wrapper has an unknown option `{option}`"
+        # The delimiter may belong to the wrapped command itself. Once a command operand
+        # starts, scan from here rather than skipping ahead to a later `--` in its argv.
+        return position, None
+
+    return None, "semaphore wrapper has options but no wrapped command"
+
+
+def _prefix_positions(
+    segment: list[str], index: int, *, allow_semaphore: bool = True,
+) -> tuple[list[int], bool, list[bool]]:
+    """Return peeled positions, budget completion, and proven wrapper boundaries.
+
+    ``boundaries[i]`` is true only when the transition from ``positions[i]`` to the next position
+    was proven by ``--`` or entirely recognized options. An unknown option leaves that boundary
+    ambiguous: callers scanning a string-command option must then scan to the segment end.
+    """
+    positions = [index]
+    boundaries: list[bool] = []
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return index
+            return positions, False, boundaries
+        semaphore_target = _semaphore_command_index(segment, index) if allow_semaphore else None
+        if semaphore_target is not None:
+            index = semaphore_target
+            positions.append(index)
+            boundaries.append(True)
+            continue
+        fallback_target, _ = _semaphore_fallback_command_index(segment, index)
+        if fallback_target is not None:
+            index = fallback_target
+            positions.append(index)
+            boundaries.append(True)
+            continue
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
-            return index
-        value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
+            return positions, True, boundaries
         index += 1
+        positional_operand_seen = False
+        user_option_seen = False
+        boundary_proven = True
         while index < len(segment):
             token = segment[index]
             if token == "--":
-                # POSIX end-of-options: the command starts at the next token.
                 index += 1
                 break
-            if token in value_options:
-                index += 2
+            matched_option, _, option_end = _getopt_value_option(segment, index, name)
+            if matched_option is not None:
+                if not token.startswith("--"):
+                    # Every cluster character before the value option must be a known flag;
+                    # otherwise that character's own arity is unknown.
+                    cluster = token[1:token.index(matched_option[1]) if matched_option[1] in token[1:] else 1]
+                    if cluster and not _getopt_token_recognized(f"-{cluster}", name):
+                        boundary_proven = False
+                if name == "runuser" and matched_option in {"-u", "--user"}:
+                    # runuser's -u/--user forms select the account in option syntax; unlike
+                    # ``su root``, the next non-option token is already the command.
+                    user_option_seen = True
+                index = option_end
                 continue
+            if token.startswith("-") and token != "-" and not _getopt_token_recognized(token, name):
+                # An unknown option may consume the next token, so neither this wrapper's command
+                # boundary nor a su/runuser user operand is proven past this point.
+                boundary_proven = False
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
+                index += 1
+                continue
+            if name in {"su", "runuser"} and not positional_operand_seen and not user_option_seen:
+                # These tools accept the login/user operand before later options, e.g.
+                # ``su root -c '...'``; it is not the wrapped command boundary.
+                positional_operand_seen = True
                 index += 1
                 continue
             break
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
-    return index
+        positions.append(index)
+        boundaries.append(boundary_proven)
+    return positions, False, boundaries
+
+
+def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+    """Index of the wrapper chain's final command; callers must bounds-check."""
+    positions, _, _ = _prefix_positions(segment, index)
+    return positions[-1]
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -746,7 +898,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
     """
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
-        if index is not None and _executable_name(segment[index]) == "launchctl":
+        candidates = [index] if index is not None else []
+        start = _command_token_index(segment)
+        if start is not None:
+            # After an unrecognized wrapper option any later token may be the command.
+            positions, _, boundaries = _prefix_positions(segment, start)
+            candidates += _ambiguous_positions(segment, positions, boundaries)
+        for index in candidates:
+            if _executable_name(segment[index]) != "launchctl":
+                continue
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
@@ -1046,54 +1206,38 @@ def _direct_lifecycle_scan(command: str) -> bool:
 
 # --- path handling ----------------------------------------------------------------------------
 
-def _resolve_lenient(path: Path) -> Path:
-    """``path.resolve(strict=False)``, falling back to *path* on OSError (unreadable/long) or
-    ValueError (embedded NUL from decoded binary tokenized as a path) — never crash the guard."""
-    try:
-        return path.resolve(strict=False)
-    except (OSError, ValueError):
-        return path
+_NON_EXECUTABLE_DEVICE_PATHS = frozenset({"/dev/null", "/dev/zero"})
+_FAIL_CLOSED_DEVICE_PATHS = frozenset({"/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd"})
 
 
-def _is_cloud_placeholder_path(path: Path) -> bool:
-    """True for paths inside a macOS FileProvider-backed subtree. ``O_NONBLOCK`` does not make
-    regular-file reads non-blocking, so opening an evicted placeholder can wait indefinitely for
-    hydration before any command timeout starts: identify the boundary from the path alone."""
-    parts = path.parts
-    return any(
-        parts[index - 1] == "Library" and part in _CLOUD_PLACEHOLDER_MARKERS
-        for index, part in enumerate(parts)
-        if index
-    )
+def _is_non_executable_device_path(candidate: str) -> bool:
+    """Only empty/NUL-producing devices are harmless as shell script operands.
 
-
-def _on_cloud_path(path: Path) -> bool:
-    """Lexical OR resolved cloud check: covers direct cloud paths and local symlinks into one."""
-    return _is_cloud_placeholder_path(path) or _is_cloud_placeholder_path(_resolve_lenient(path))
-
-
-def _expand_candidate_path(candidate: str) -> Optional[Path]:
-    """Sanitize a tokenized path candidate at the ingestion boundary. Tokens from shlex-splitting
-    arbitrary (possibly binary-decoded) text can carry NUL or junk that each downstream ``Path`` op
-    rejects differently (ValueError, RuntimeError when HOME is unset under launchd, OSError); reject
-    once here. ``None`` = not a real path, nothing to scan.
-
-    Every OS-facing ``Path`` operation downstream (``expanduser``, ``os.open``, ``resolve``) raises a
-    *different* exception for the same junk (``ValueError: embedded null byte``, ``RuntimeError: Could not
-    determine home directory`` when HOME is unset under launchd, OSError for over-long paths). Rejecting
-    here — once, before any OS call — is the whole-class fix; catching per-syscall was the whack-a-mole that
-    produced #76762, #77703, #77780, and #78256.
+    Standard streams and /dev/fd aliases can carry executable text, so they stay fail-closed.
     """
-    if not candidate or "\x00" in candidate:
-        return None
-    try:
-        return Path(candidate).expanduser()
-    except (ValueError, RuntimeError, OSError):
-        return None
+    return candidate in _NON_EXECUTABLE_DEVICE_PATHS
+
+
+def _is_fail_closed_device_path(candidate: str) -> bool:
+    """True for stream and descriptor pseudo-paths that must never be treated as scripts.
+
+    Some hosts expose ``/dev/stdin`` or ``/dev/fd/<n>`` as regular-file descriptors (or make
+    stdout/stderr unreadable), so relying only on ``fstat`` can accidentally allow them. The
+    lexical guard keeps every device except the two empty devices fail-closed, while traversal
+    paths such as ``/dev/fd/../root/restart.sh`` remain ordinary script candidates. Matching is
+    lexical after normalization (no symlink resolution), so ``//dev/stdin`` or ``/dev/./stdin``
+    cannot slip past.
+    """
+    candidate = os.path.normpath(candidate)
+    if candidate.startswith("//"):
+        candidate = "/" + candidate.lstrip("/")
+    return candidate in _FAIL_CLOSED_DEVICE_PATHS or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
 
 
 def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
     """Yield *candidate* anchored on *cwd* (or the process cwd) when it is a real path."""
+    if _is_non_executable_device_path(candidate):
+        return
     path = _expand_candidate_path(candidate)
     if path is None:
         return
@@ -1104,24 +1248,6 @@ def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
             # Path.cwd() can raise when the process cwd was deleted.
             return
     yield path
-
-
-def _resolve_script_path(script_path: str) -> Optional[Path]:
-    """Resolve a cron ``script`` value the way ``cron.scheduler`` does (relative paths live under
-    ``<HERMES_HOME>/scripts/``) so the guard scans the file that will actually run."""
-    from hermes_constants import get_hermes_home
-
-    raw = _expand_candidate_path(script_path)
-    if raw is None:
-        return None
-    if raw.is_absolute():
-        return raw
-    try:
-        return get_hermes_home() / "scripts" / raw
-    except (RuntimeError, OSError):
-        # get_hermes_home() falls back to Path.home(), which raises when neither HERMES_HOME nor
-        # HOME is resolvable (launchd/systemd) — same ingestion contract: nothing to scan.
-        return None
 
 
 def _resolve_script_directory(script_path: str) -> Optional[str]:
@@ -1137,15 +1263,160 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 # --- referenced-script discovery --------------------------------------------------------------
 
-def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
-    """Yield values given to *option*, in both ``--opt v`` and ``--opt=v`` form."""
-    prefix = option + "="
-    for position in range(start + 1, len(segment)):
+def _getopt_token_recognized(token: str, executable_name: str) -> bool:
+    """True when a non-value option token consists only of known flags for *executable_name*.
+
+    Value-taking options are matched by ``_getopt_value_option`` before this is consulted, so a
+    token reaching here must be flags alone to keep the wrapper's command boundary proven.
+    """
+    flags = _TRANSPARENT_PREFIX_FLAG_OPTIONS.get(executable_name, frozenset())
+    if token.startswith("--"):
+        return token.partition("=")[0] in flags
+    return bool(token[1:]) and all(f"-{character}" in flags for character in token[1:])
+
+
+def _ambiguous_positions(segment: list[str], positions: list[int], boundaries: list[bool]) -> list[int]:
+    """Every later token that could be a command once an unknown wrapper option hid the boundary.
+
+    An unrecognized option may consume any number of following tokens, so the real command can sit
+    anywhere to its right. Over-scanning those tokens may over-flag; under-scanning drops payloads.
+    """
+    for position_index, proven in enumerate(boundaries):
+        if not proven:
+            return list(range(positions[position_index] + 1, len(segment)))
+    return []
+
+
+def _getopt_value_option(
+    segment: list[str], position: int, executable_name: str,
+) -> tuple[Optional[str], Optional[str], int]:
+    """Parse the first value-taking option in one getopt token.
+
+    Short-option clusters are walked left to right. Flag-only characters continue; the first
+    value-taking option consumes the rest of the token, or the next token when no attached value
+    remains. Returning the consumed option and end position gives both wrapper peeling and command
+    string discovery one getopt-correct parser.
+    """
+    token = segment[position]
+    value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(executable_name, frozenset())
+    string_options = _STRING_COMMAND_OPTIONS.get(executable_name, ())
+    all_options = value_options | set(string_options)
+
+    if token.startswith("--"):
+        name, separator, attached = token.partition("=")
+        if name not in all_options:
+            return None, None, position + 1
+        if separator:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+
+    if not token.startswith("-") or token == "-":
+        return None, None, position + 1
+    short_options = token[1:]
+    for offset, character in enumerate(short_options):
+        name = f"-{character}"
+        if name not in all_options:
+            continue
+        attached = short_options[offset + 1:]
+        if attached:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+    return None, None, position + 1
+
+
+def _iter_option_values(
+    segment: list[str], start: int, option: str, *, stop: Optional[int] = None,
+) -> Iterator[str]:
+    """Yield values given to *option* before the wrapped command operand begins."""
+    limit = len(segment) if stop is None else min(stop, len(segment))
+    position = start + 1
+    while position < limit:
+        matched_option, value, option_end = _getopt_value_option(
+            segment, position, _executable_name(segment[start]),
+        )
+        if matched_option is not None:
+            if matched_option == option and value is not None:
+                yield value
+            position = option_end
+            continue
+        position += 1
+
+
+def _sudo_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when sudo's options before *end* may include ``-s``/``-i`` (shell mode).
+
+    Deliberately generous: any ``s``/``i`` in a short-option token counts, so an attached value
+    such as ``-usi`` over-flags rather than hiding a shell-mode payload.
+    """
+    for token in segment[start + 1:end]:
+        if token in {"--shell", "--login"}:
+            return True
+        if token.startswith("-") and not token.startswith("--") and ("s" in token or "i" in token):
+            return True
+    return False
+
+
+def _doas_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when doas has selected shell mode (``-s``) before its command tail."""
+    return any(token == "-s" or (token.startswith("-") and not token.startswith("--") and "s" in token)
+               for token in segment[start + 1:end])
+
+
+def _runuser_command_mode(segment: list[str], start: int) -> bool:
+    """True only when runuser provably runs ``-u USER COMMAND`` (execvp, no shell).
+
+    Any unknown option leaves the mode unproven, so the caller keeps the fail-closed shell reading.
+    """
+    position = start + 1
+    while position < len(segment):
         token = segment[position]
-        if token == option and position + 1 < len(segment):
-            yield segment[position + 1]
-        elif token.startswith(prefix):
-            yield token[len(prefix):]
+        if token == "--":
+            return False
+        matched_option, _, option_end = _getopt_value_option(segment, position, "runuser")
+        if matched_option in {"-u", "--user"}:
+            return True
+        if matched_option is None and token.startswith("-") and token != "-" and \
+                not _getopt_token_recognized(token, "runuser"):
+            return False
+        position = option_end if matched_option is not None else position + 1
+    return False
+
+
+def _iter_shell_tail_payloads(segment: list[str], start: int) -> Iterator[str]:
+    """Yield every possible shell payload of an su/runuser invocation at *start*.
+
+    util-linux su/runuser parse with a permuting ``getopt_long`` (``-c`` may follow the user
+    operand), and ``run_shell`` hands every argument left after the user, including everything
+    after ``--``, to the target shell. No token after the wrapper is a safe stop, so the option scan
+    is unbounded and, unless ``runuser -u`` provably execs a command directly, every later token
+    (and every attached ``-c``/``--command=`` value) is scanned as shell source.
+    """
+    name = _executable_name(segment[start])
+    seen: set[str] = set()
+
+    def once(value: str) -> Iterator[str]:
+        if value and value not in seen:
+            seen.add(value)
+            yield value
+
+    for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+        for value in _iter_option_values(segment, start, option):
+            yield from once(value)
+    if name == "runuser" and _runuser_command_mode(segment, start):
+        return
+    for token in segment[start + 1:]:
+        yield from once(token)
+        if token.startswith("--"):
+            _, separator, attached = token.partition("=")
+            if separator:
+                yield from once(attached)
+        elif token.startswith("-"):
+            # Clustered/attached short forms: ``-c{cmd}``, ``-fc{cmd}``, ``-lc{cmd}``.
+            for offset, character in enumerate(token[1:], start=2):
+                if character == "c":
+                    yield from once(token[offset:])
 
 
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
@@ -1183,22 +1454,82 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
+    if executable == "semaphore":
+        # A bare name does NOT earn the exception. Resolve it only to keep the fallback strict,
+        # including a different script on PATH; use the existing passive resolver, never execute it.
+        from hermes_platform.resolver import locate_command
+
+        resolution = locate_command(executable)
+        if resolution.command:
+            yield from _resolved_or_nothing(resolution.command[0], cwd)
+        return
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+def _iter_semaphore_fallback_refusals(command: str) -> Iterator[str]:
+    """Yield named refusals for semaphore invocations with an ambiguous command boundary."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
-        peeled = _peel_transparent_prefixes(segment, index)
-        if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+        positions, complete, _ = _prefix_positions(segment, index, allow_semaphore=False)
+        if not complete and positions[-1] < len(segment):
+            # Identify helpers even beyond the scan limit, without changing ordinary wrapper
+            # behavior. Each chunk advances strictly through the segment's finite token list.
+            chain = positions
+            while True:
+                if any(
+                    position < len(segment)
+                    and (_executable_name(segment[position]) == "semaphore"
+                         or _installed_semaphore_path(segment[position]))
+                    for position in chain
+                ):
+                    yield "the semaphore command wrapper chain exceeds the prefix scan budget"
+                    break
+                if complete or chain[-1] >= len(segment):
+                    break
+                chain, complete, _ = _prefix_positions(segment, chain[-1], allow_semaphore=False)
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if (_executable_name(segment[position]) != "semaphore"
+                    and not _installed_semaphore_path(segment[position])):
+                continue
+            _, reason = _semaphore_fallback_command_index(segment, position)
+            if reason:
+                yield reason
+
+
+def _iter_referenced_shell_scripts(
+    command: str, *, cwd: Optional[str] = None, allow_semaphore: bool = True,
+) -> Iterator[Path]:
+    """Scan every wrapper reference, except the identity-trusted, exact-grammar semaphore helper.
+
+    Remote callbacks cannot attest the installed local helper's identity, so keep them strict.
+    """
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is None:
+            continue
+        positions, complete, boundaries = _prefix_positions(
+            segment, index, allow_semaphore=allow_semaphore,
+        )
+        if allow_semaphore and not complete:
+            # An exhausted chain gets exactly the pre-semaphore walk: the helper is a normal
+            # executable, so its source stays in the strict scan set and earns no peel benefit.
+            positions, _, boundaries = _prefix_positions(segment, index, allow_semaphore=False)
+        # Positions after an unrecognized wrapper option are all possible command starts.
+        positions = positions + [
+            position for position in _ambiguous_positions(segment, positions, boundaries)
+            if position not in positions
+        ]
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if allow_semaphore and complete and _semaphore_command_index(segment, position) is not None:
+                continue
+            yield from _references_at(segment, position, cwd)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -1208,11 +1539,49 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
-        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
-            yield from _iter_option_values(segment, index, option)
+        positions, _, boundaries = _prefix_positions(segment, index)
+        for position_index, position in enumerate(positions):
+            if position >= len(segment):
+                continue
+            name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
+            next_position = positions[position_index + 1] if position_index + 1 < len(positions) else None
+            if name == "sudo" and next_position is not None and _sudo_shell_mode(segment, position, next_position):
+                # ``sudo -s|-i CMD...`` joins its operands into ``$SHELL -c``; scan each one as source.
+                yield from segment[next_position:]
+            if name == "doas" and next_position is not None and _doas_shell_mode(segment, position, next_position):
+                # ``doas -s CMD...`` likewise feeds its command tail to a shell.
+                yield from segment[next_position:]
+            # Bound the option scan only where the program itself stops parsing options: a proven
+            # boundary (every option before it recognized, or ended by ``--``) whose next token is
+            # a real command name. An option-shaped "command" (``env -i -- -S ...``) is not proven.
+            proven = (
+                position_index < len(boundaries) and boundaries[position_index]
+                and next_position is not None and next_position < len(segment)
+                and not segment[next_position].startswith("-")
+            )
+            stop = next_position if proven else None
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+                yield from _iter_option_values(segment, position, option, stop=stop)
+        ambiguous = _ambiguous_positions(segment, positions, boundaries)
+        for position in ambiguous:
+            # Any later token may be the real command: treat each wrapper/shell there unbounded.
+            name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+                yield from _iter_option_values(segment, position, option)
+            if name in _SHELL_EXECUTABLES:
+                arguments = segment[position + 1:]
+                for arg_index, argument in enumerate(arguments[:-1]):
+                    if argument in _SHELL_COMMAND_FLAGS:
+                        yield arguments[arg_index + 1]
+                        break
         index = _executed_command_index(segment)
-        if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
+        if index is None or index in ambiguous or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
@@ -1264,27 +1633,23 @@ def _collect_heredoc_written_scripts(
     return written
 
 
-def _walk_candidates(command: str, walk_command: str, cwd: Optional[str], executed: bool) -> list[tuple[Path, bool]]:
+def _walk_candidates(
+    command: str, walk_command: str, cwd: Optional[str], executed: bool, *, allow_semaphore: bool,
+) -> list[tuple[Path, bool]]:
     """Referenced-script candidates: executed-view paths first, then paths only mentioned in masked
     bodies. A heredoc body written to a candidate path is that script's text (see the walk); a body
     that is only written stays documentation (#88336)."""
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
+        walk_command, cwd=cwd, allow_semaphore=allow_semaphore,
+    )]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(
+            command, cwd=cwd, allow_semaphore=allow_semaphore,
+        )]
     return candidates
 
 
 # --- referenced-script reading ----------------------------------------------------------------
-
-def _has_binary_magic(data: bytes) -> bool:
-    """True when *data* starts with a known compiled-binary signature. Deliberately narrower than
-    "contains a NUL": ``bash`` still executes a NUL-bearing script, so a padded script must not
-    bypass the scan. A shebang always wins (interpreted, never binary). Extensions are not
-    consulted: a suffixless script must still be scanned and fail closed if oversized."""
-    if data.startswith(b"#!"):
-        return False
-    return data.startswith(_BINARY_MAGICS)
-
 
 def _read_referenced_script(
     path: Path, *, max_bytes: Optional[int] = None
@@ -1321,57 +1686,9 @@ def _read_referenced_script_unlocked(
     See #88052.
     """
     byte_limit = _capped_read_limit(max_bytes)
-    if _on_cloud_path(path):
+    if _is_fail_closed_device_path(str(path)):
         return None, True
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable/missing/over-long. ValueError: embedded NUL in *path*. Either is
-        # "nothing to scan" — never crash the guard.
-        return None, False
-    try:
-        # ValueError: an embedded NUL byte in *path* itself — a binary's decoded bytes tokenized into a
-        # bogus script path by the recursion (#77703).
-        metadata = os.fstat(descriptor)
-        # Directories are not scripts. Docker Desktop writes ``fpath=(~/.docker/completions …)`` into
-        # ``~/.zshrc``; the walk then treats that dir as a referenced script and used to fail-closed,
-        # blocking ``source ~/.zshrc`` (#86753). Devices/sockets stay fail-closed.
-        if not stat.S_ISREG(metadata.st_mode):
-            # Directories are not scripts (`fpath=(~/.docker/completions …)` in ~/.zshrc must not
-            # block `source ~/.zshrc`). Devices/sockets stay fail-closed.
-            return None, not stat.S_ISDIR(metadata.st_mode)
-        # Sniff a small prefix first: compiled binaries are never shell scripts, so skip them
-        # WITHOUT reading the rest or feeding decoded garbage into the recursion.
-        # Deliberately NOT keyed on the mere presence of a NUL byte (#77927): bash executes a text script
-        # straight past an embedded NUL, so NUL-bearing text must fall through to the magic-number check +
-        # NUL-strip below.
-        data = os.read(descriptor, _BINARY_SNIFF_BYTES)
-        if _has_binary_magic(data):
-            return None, False
-        # A regular file whose size already exceeds the cap fails closed without reading it (the
-        # walk budget can be far below 1 MiB).
-        if metadata.st_size > byte_limit:
-            return None, True
-        # Read the remainder (bounded); loop because os.read may return short.
-        while len(data) <= byte_limit:
-            chunk = os.read(descriptor, byte_limit + 1 - len(data))
-            if not chunk:
-                break
-            data += chunk
-    except OSError:
-        return None, False
-    finally:
-        os.close(descriptor)
-    if _has_binary_magic(data):
-        return None, False
-    # Size check BEFORE NUL stripping: stripping shrinks the buffer and would let an oversized file
-    # slip under the threshold past this fail-closed branch.
-    if len(data) > byte_limit:
-        return None, True
-    if b"\x00" in data:
-        data = data.replace(b"\x00", b"")
-    return data.decode("utf-8", errors="replace"), False
+    return _read_regular_script(path, byte_limit)
 
 
 def _sanitize_remote_script_text(
@@ -1474,6 +1791,8 @@ def _contains_unsafe_gateway_action(
 
     walk_command = strip_inert_heredoc_bodies(command)
 
+    wrapper_refusal = next(_iter_semaphore_fallback_refusals(walk_command), None) if executed else None
+
     for payload in _iter_shell_command_payloads(walk_command):
         if recurse(payload, cwd, executed):
             return True
@@ -1482,9 +1801,11 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    for script_path, candidate_executed in _walk_candidates(command, walk_command, cwd, executed):
-        if _scan_written_bodies(written.pop(_resolve_lenient(script_path), []), recurse, cwd, candidate_executed):
-            return True
+    candidates = _walk_candidates(
+        command, walk_command, cwd, executed, allow_semaphore=read_remote_script is None,
+    )
+
+    for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
             if candidate_executed:
@@ -1494,6 +1815,8 @@ def _contains_unsafe_gateway_action(
                     "~/Library/CloudStorage) that the guard refuses to open",
                 )
             continue
+        if _scan_written_bodies(written.pop(_resolve_lenient(script_path), []), recurse, cwd, candidate_executed):
+            return True
         resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
@@ -1532,6 +1855,8 @@ def _contains_unsafe_gateway_action(
         # Relative references inside a script resolve against that script's directory, not the cwd.
         if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
             return True
+    if wrapper_refusal is not None:
+        return _refuse_named(budget, wrapper_refusal)
     return False
 
 

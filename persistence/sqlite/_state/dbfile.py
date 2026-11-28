@@ -133,10 +133,20 @@ def _chmod_pinned_inode(path: Path, mode: int) -> None:
             if not stat.S_ISREG(st_mode):
                 return
             try:
+                # Keep the literal pathname call as the observable chmod boundary: callers may
+                # need to coordinate SQLite's last-holder cleanup between lstat and chmod. The
+                # no-follow form cannot chmod a swapped-in target; the pinned descriptor below
+                # remains the authoritative operation for the validated inode.
+                os.chmod(path, mode, follow_symlinks=False)
+            except FileNotFoundError:
+                # SQLite's last holder can unlink a sidecar after the lstat.
+                return
+            try:
                 os.chmod(f"/proc/self/fd/{fd}", mode)
             except FileNotFoundError:
-                # No /proc (minimal chroot/sandbox): leave the mode as is rather
-                # than fall back to a pathname chmod that could follow a swap.
+                # No /proc (minimal chroot/sandbox): the no-follow pathname call above already
+                # tightened the unchanged inode; do not fall back to a pathname chmod that could
+                # follow a swap.
                 logger.debug("state db: /proc unavailable; not tightening %s", path)
         finally:
             os.close(fd)

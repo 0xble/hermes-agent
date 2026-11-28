@@ -56,12 +56,12 @@ def _result(text):
                          ids=["silent-turn", "control-reply"])
 async def test_typing_stops_once_a_silent_turn_returns(monkeypatch, tmp_path, answer, typing_after_agent):
     runner = _runner(monkeypatch, tmp_path)
+    runner._session_db.get_meta = AsyncMock(return_value=None)
     adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
     adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda _source: adapter
     adapter._typing_paused = paused = _CountingPaused(adapter._typing_paused)
-    keep_typing = adapter._keep_typing
-    adapter._keep_typing = lambda chat_id, **kw: keep_typing(chat_id, interval=0.05, **kw)  # fast ticks
+    adapter.typing_refresh_interval = 0.05
     ticks, in_hook, release_hook, release_agent = [], asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def send_typing(chat_id, metadata=None):
@@ -101,12 +101,12 @@ async def test_a_silent_topic_leaves_another_topics_typing_on(monkeypatch, tmp_p
     """The pause is the silent turn's own: a second forum topic of the same chat whose agent is
     still working keeps refreshing "typing" while the silent turn runs its hooks."""
     runner = _runner(monkeypatch, tmp_path)
+    runner._session_db.get_meta = AsyncMock(return_value=None)
     adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
     adapter.gateway_runner = runner
     runner._delivery_adapter_for = lambda _source: adapter
     adapter._typing_paused = paused = _CountingPaused(adapter._typing_paused)
-    keep_typing = adapter._keep_typing
-    adapter._keep_typing = lambda chat_id, **kw: keep_typing(chat_id, interval=0.05, **kw)
+    adapter.typing_refresh_interval = 0.05
     ticks, in_hook, release_hook, release_agent = [], asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     async def send_typing(chat_id, metadata=None):

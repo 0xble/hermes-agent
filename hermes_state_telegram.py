@@ -565,8 +565,11 @@ class SessionTelegramTopicsMixin:
     ) -> bool:
         """Bind one Telegram DM topic thread to one Hermes session. A session may be linked to
         only one topic: rebinding the same pair is idempotent; linking the session to a
-        different topic raises ValueError. ``only_if_unbound`` preserves an existing owner,
-        and ``expected_session_id`` makes a rebind compare-and-swap. A refused CAS returns False.
+        different topic raises ValueError, unless ``move_session`` (a handoff moves the
+        conversation) and that topic is in the same profile: its row is dropped in this transaction.
+        ``only_if_unbound`` preserves an existing owner, and ``expected_session_id`` makes a rebind
+        compare-and-swap: it only replaces a row still naming that id (a concurrent /new or /topic off
+        that rebound or cleared the topic wins). A refused CAS returns False.
         """
         self.apply_telegram_topic_migration()
         now = time.time()

@@ -3955,7 +3955,7 @@ def test_kill_all_signals_all_targets_before_shared_grace(registry, monkeypatch,
     """One SIGTERM-ignoring child cannot consume the sweep grace before the next is signalled."""
     import tools.process_registry as process_registry_module
 
-    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(process_registry_module, "_checkpoint_path", lambda: tmp_path / "processes.json")
     monkeypatch.setattr(
         ProcessRegistry,
         "_daemon_term_grace_seconds",

@@ -236,7 +236,8 @@ def rich_part_count(adapter: Any, content: str, metadata: Optional[dict[str, Any
     MarkdownV2 path owns it (same gates, nothing sent)."""
     if adapter._should_attempt_rich(content, metadata=metadata):
         return 1
-    if ((metadata or {}).get("expect_edits") or not adapter._needs_rich_rendering(content)
+    if ((metadata or {}).get("expect_edits") or "rich_fallback_content" in (metadata or {})
+            or not adapter._needs_rich_rendering(content)
             or not adapter._rich_delivery_enabled() or getattr(adapter, "_rich_send_disabled", False)):
         return None
     parts = _fitting_parts(adapter, content)
@@ -253,13 +254,19 @@ async def send_rich_parts(
     unavailable (nothing was delivered yet). Every part passes the same rich shape checks as a
     single message — only the 32,768-char cap moves from the whole message to each part.
     """
-    if adapter._should_attempt_rich(content, metadata=metadata):
+    try:
+        should_attempt = adapter._should_attempt_rich(content, metadata=metadata)
+    except (AttributeError, TypeError) as exc:
+        logger.warning("Telegram rich eligibility unavailable; using MarkdownV2 fallback: %s", exc)
+        should_attempt = False
+    if should_attempt:
         return await adapter._try_send_rich(chat_id, content, reply_to, metadata)
     # Only SIZE may be the reason this message missed the rich path: ordinary long prose keeps the
     # legacy MarkdownV2 chunker (rich sends stay reserved for the constructs it cannot render), and
     # an ``expect_edits`` metadata still means "this is a preview, not a new message".
     if (
         (metadata or {}).get("expect_edits")
+        or "rich_fallback_content" in (metadata or {})  # Rich-only decoration must stay in one message.
         or not adapter._needs_rich_rendering(content)
         or not adapter._rich_delivery_enabled()
         or getattr(adapter, "_rich_send_disabled", False)
@@ -396,6 +403,11 @@ def _fitting_parts(adapter: Any, content: str) -> Optional[list[str]]:
     paragraph spacer rows, ``\\$`` escapes), so a split whose parts overflow is redone with a
     smaller budget, including raw text under the cap whose sent markdown is over it (one part at
     the full cap). ``None`` when even the smallest budget overflows, or one part already fits."""
+    from gateway.copy_blocks import _has_copy_markers
+
+    if _has_copy_markers(content):
+        # This splitter cannot carry literal-copy boundaries between parts. The legacy path can.
+        return None
     cap = adapter.RICH_MESSAGE_MAX_CHARS
     for budget in (cap, cap * 7 // 8, cap * 3 // 4):
         parts = split_rich_parts(content, budget)

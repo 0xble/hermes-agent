@@ -84,13 +84,13 @@ async def test_supervisor_restart_that_said_goodbye_owes_the_next_boot_a_hello(r
 @pytest.mark.asyncio
 async def test_planned_replace_takeover_sends_no_home_notice(runner, monkeypatch):
     """The real SIGTERM handler, with the takeover marker naming this PID, then the real ``stop()``."""
-    from gateway import run as gateway_run
+    from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
 
     runner, adapter = runner
     monkeypatch.setattr("gateway.status.consume_takeover_marker_for_self", lambda: True)
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
         before = set(asyncio.all_tasks())
-        gateway_run._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
+        _start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
         stop_tasks = set(asyncio.all_tasks()) - before
         await asyncio.wait_for(asyncio.gather(*stop_tasks), timeout=30)
 

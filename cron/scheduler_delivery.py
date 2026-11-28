@@ -9,7 +9,9 @@ late-bound (``_sched`` / module refs at the bottom) so monkeypatching the defini
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import contextvars
 import logging
 import os
 import time
@@ -19,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from gateway.inbound_reply_context import record_cron_delivery, recording_cron_delivery
+from cron.scheduler_delivery_media import _send_media_via_adapter
 
 
 # Log-record parity with the origin module.
@@ -776,6 +779,7 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
         "last_delivery_unverified": new_value, "last_delivery_queued": queued,
         "last_delivery_formatting_degraded": list(job.get("_formatting_degraded_targets") or []) or None,
         "last_delivery_reached_none": job.pop("_delivery_reached_none", None) or None,
+        "last_delivery_formatting_degraded": list(job.get("_formatting_degraded_targets") or []) or None,
     }.items() if (job.get(key) or None) != value}
     if not values:
         return
@@ -823,6 +827,8 @@ class _TargetDelivery:
     # is not — so the queue gate keys on this flag, not on widening a string set.
     live_retryable: Optional[bool] = None
     standalone_in_flight: bool = False  # the standalone send may have delivered (timeout, lost answer, partial)
+    live_delivered_text: bool = False
+    live_delivered_copy_count: int = 0
 
     @property
     def is_relay(self) -> bool:
@@ -1050,6 +1056,9 @@ def _live_send_text(
                 if dispatch["abandoned"]:
                     return None
                 dispatch["started"] = True
+            import functools as _ft
+            record_ids = _ft.partial(contextvars.copy_context().run, record_cron_delivery,
+                                     t.platform_name, t.chat_id, text_to_send)
             return await recording_cron_delivery(router._deliver_to_platform(
                 route_target, text_to_send, route_metadata, transport=t.transport), record_ids)
 
@@ -1139,10 +1148,8 @@ def _live_send_text(
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
         t.live_error = str(err) if err else None
-        if isinstance(send_result, dict):
-            t.live_retryable = send_result.get("retryable")
-        else:
-            t.live_retryable = getattr(send_result, "retryable", None)
+        t.live_retryable = (send_result.get("retryable") if isinstance(send_result, dict)
+                            else getattr(send_result, "retryable", None))
         _warn_live_lane_failure(job, msg, t.is_relay, flood_held=_live_flood_held(t))
         target_errors.append(msg)
         return False, False, None
@@ -1349,6 +1356,86 @@ def _deliver_via_live_adapter(
     return delivered
 
 
+class _StandaloneTimeout(str):
+    """Ambiguous standalone outcome: the Bot API request may still be in flight."""
+
+
+def _standalone_send(
+    t: _TargetDelivery, content: str, media_files: list, *, copy_block: bool = False) -> tuple[Any, Optional[str]]:
+    """Run the standalone sender for one target: ``(result, None)`` or ``(None, error)`` (already
+    logged — WARNING for a shutdown race, ERROR with traceback otherwise)."""
+    from gateway.outbound.send import _send_to_platform
+    job = t.job
+    shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
+
+    send_timeout = _get_standalone_send_timeout()
+
+    async def _send():
+        # The bound lives inside the coroutine: the running-loop fallback below closes ``coro``
+        # unstarted, and a wait_for wrapper created out here would be left never awaited.
+        # notify: the live lane's metadata["notify"] (cron.delivery.notify), so a brief rings either way.
+        return await asyncio.wait_for(_send_to_platform(
+            t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
+            media_files=media_files, notify=t.notify_delivery,
+            args={"copy_block": True} if copy_block else None), timeout=send_timeout)
+
+    def _warned(msg: str) -> tuple[None, str]:
+        logger.warning("Job '%s': %s", job["id"], msg)
+        return None, msg
+
+    def _failed(e) -> tuple[None, str]:
+        msg = f"delivery to {t.where} failed: {e}"
+        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+        return None, msg
+
+    def _timed_out(seconds: int) -> tuple[None, str]:
+        msg = _StandaloneTimeout(
+            f"standalone send to {t.where} timed out after {seconds}s "
+            "(the send may still be in flight)"
+        )
+        logger.error("Job '%s': %s", job["id"], msg)
+        return None, msg
+
+    # Interpreter finalizing (SIGTERM/restart/OOM): asyncio.run and a fresh ThreadPoolExecutor both
+    # raise "cannot schedule new futures after interpreter shutdown" — warn, not ERROR traceback.
+    if _sched._interpreter_shutting_down():
+        return _warned(shutdown_msg)
+    # The live lane failed closed on an empty payload; standalone senders don't (Telegram returns
+    # success=True for empty content WITHOUT an API call) — a phantom delivery would result.
+    if not content.strip() and not media_files:
+        return _warned(f"standalone send skipped (empty text and no media) for {t.where}")
+    coro = _send()
+    try:
+        return asyncio.run(coro), None
+    except TimeoutError:
+        # The send may still complete on the gateway loop (the dispatch shield keeps an in-flight
+        # send un-cancelled); the run is released instead of waiting on it unbounded (#115469).
+        return _timed_out(send_timeout)
+    except RuntimeError as run_err:
+        # asyncio.run() refuses inside a running loop; close the unstarted coro, retry in a thread.
+        coro.close()
+        if _sched._interpreter_shutting_down(run_err):
+            return _warned(shutdown_msg)
+        # The fallback can itself raise (SMTP, result timeout); catch it or remaining targets skip.
+        try:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                # A fresh thread does NOT inherit the profile ContextVars (home override + secret
+                # scope); run in the active context or the sender reads the default bot token.
+                return pool.submit(contextvars.copy_context().run, asyncio.run, _send()).result(
+                    timeout=30), None
+            finally:
+                pool.shutdown(wait=False)
+        except TimeoutError:
+            return _timed_out(30)
+        except Exception as e:
+            if _sched._interpreter_shutting_down(e):
+                return _warned(shutdown_msg)
+            return _failed(e)
+    except Exception as e:
+        return _failed(e)
+
+
 def _mark_formatting_degraded(t: _TargetDelivery) -> None:
     """Record when Telegram had to use standalone after a transient live-path rejection."""
     if t.platform_name.lower() != "telegram":
@@ -1369,18 +1456,15 @@ def _mark_formatting_degraded(t: _TargetDelivery) -> None:
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
     copy_blocks: list[str] | None = None,
-) -> Optional[bool]:
-    """Standalone fallback for a target the live lane did not deliver; True once the text was sent,
-    in full or in part (a split send that failed after a chunk landed)."""
-    from cron import scheduler_delivery_reconnect as reconnect
-
+) -> bool:
+    """Standalone fallback for a target the live lane did not deliver."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     if _live_flood_held(t):
         # The live adapter already recorded the platform deadline. Do not enter the standalone
         # sender at all: it cannot improve the outcome and a future fallback implementation must
@@ -1388,7 +1472,7 @@ def _deliver_standalone(
         msg = f"Telegram delivery deferred for {t.where}: flood-control deadline is active"
         logger.warning("Job '%s': %s", job["id"], msg)
         delivery_errors.extend([*target_errors, msg])
-        return
+        return False
     payloads = [(content, [] if copy_blocks else media_files, False)]
     if not content and copy_blocks:
         payloads = []
@@ -1399,23 +1483,21 @@ def _deliver_standalone(
     combined_warnings = []
     result = None
     err = None
-    partial = False
     delivered_text = False
     delivered_copy_count = 0
+    last_is_copy_block = False
     for payload_content, payload_media, is_copy_block in payloads:
+        last_is_copy_block = is_copy_block
         if is_copy_block:
             result, err = _standalone_send(t, payload_content, payload_media, copy_block=True)
         else:
             result, err = _standalone_send(t, payload_content, payload_media)
         if err is None and result and result.get("error"):
             err = f"delivery error: {result['error']} (target {t.where})"
-            logger.error("Job '%s': %s", job["id"], err)
-            # A sender's failure dict may follow a delivered (or partly delivered) payload: only the
-            # contract's NONE (``gateway.platforms._shared.delivery_state``) makes a replay safe.
-            from gateway.platforms._shared import NONE, PARTIAL, delivery_state
+            from gateway.platforms._shared import NONE, delivery_state
             state = delivery_state(result)
             t.standalone_in_flight = t.standalone_in_flight or state != NONE
-            partial = state == PARTIAL
+            logger.error("Job '%s': %s", job["id"], err)
         if err is not None:
             break
         if is_copy_block:
@@ -1611,6 +1693,8 @@ def _should_wrap_cron_response(job: dict, user_cfg: Any) -> bool:
     return bool(cron_cfg.get("wrap_response", True))
 
 
+
+
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1628,7 +1712,9 @@ def _deliver_result(
     job.pop("_formatting_degraded_targets", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
-        job["_delivery_reached_none"] = (outcome := _origin.unresolved_delivery_outcome(job, for_failure)) is not None
+        from cron.scheduler_delivery_origin import unresolved_delivery_outcome
+        outcome = unresolved_delivery_outcome(job, for_failure)
+        job["_delivery_reached_none"] = outcome is not None  # picked up by _record_delivery_verification
         _record_delivery_verification(job, [])
         return outcome
 
@@ -1741,10 +1827,16 @@ def _deliver_result(
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
-            suppressed_targets, bot_chat_reached = _deliver_bot_chat_result(
+            errors_before = len(delivery_errors)
+            suppressed_targets = _deliver_bot_chat_result(
                 job, target, delivery_content, copy_blocks, suppressed_targets, for_failure=for_failure,
                 delivery_errors=delivery_errors, unverified_targets=unverified_targets)
-            reached += bot_chat_reached
+            receipt = job.get("_bot_chat_delivery_receipts", {}).get(
+                f"bot-chat:{target['chat_id'] or '(own)'}")
+            # No new error = delivered. A queued, claimed or ambiguous send may still arrive (a queued or
+            # claimed one adds no error); anything else reached nobody.
+            reached += len(delivery_errors) == errors_before or bool(
+                receipt and receipt["status"] in ("queued", "claimed", "ambiguous"))
             continue
         if target["platform"] == ROOM_PLATFORM:
             room_error = deliver_to_room(job, content, target["chat_id"], for_failure=for_failure)
@@ -1802,10 +1894,19 @@ from cron import scheduler as _sched
 from cron.scheduler_delivery_room import (
     ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
 from cron import scheduler_delivery_origin as _origin
-from cron.scheduler_delivery_media import _send_media_via_adapter
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
 
+
+# Late-bound standalone lane: the facade remains the seam used by the cron scheduler, while
+# the delivery implementation owns timeout ambiguity and reconnect admission.
+from cron.scheduler_delivery_standalone import _standalone_send
+from cron import scheduler_delivery_reconnect as _reconnect
+
+
+def _queue_for_live_reconnect(*args, **kwargs):
+    """Late-bound reconnect hand-off so tests and adapters can replace the reconnect policy."""
+    return _reconnect.queue_for_live_reconnect(*args, **kwargs)
 
 from cron.scheduler_delivery_sessions import (
     _resolve_cron_surface_mode, _resolve_origin, _cron_mirror_delivery_enabled, _target_matches_origin,
@@ -1813,4 +1914,3 @@ from cron.scheduler_delivery_sessions import (
     _cron_mirror_message, _maybe_mirror_cron_delivery, _open_continuable_cron_thread,
     _seed_cron_session, _seed_cron_thread_session, _seed_cron_channel_session,
 )
-from cron.scheduler_delivery_standalone import _standalone_send

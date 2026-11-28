@@ -64,9 +64,15 @@ def _held_bubble(bot, items):
     return loop, st
 
 
-def _penalty_runs_out(st):
-    st.flood_until = 0.0
+def _penalty_runs_out(st, monkeypatch):
+    from plugins.platforms.telegram import flood_state
+
+    # Advance the persisted wall-clock deadline as well as the in-process windows.
+    later = flood_state.time.time() + 61
+    monkeypatch.setattr(flood_state, "time", SimpleNamespace(time=lambda: later))
+    st.defer_until = st.flood_until = 0.0
     st.adapter.__dict__.get("_telegram_send_cooldown_until", {}).clear()
+    st.adapter.__dict__.get("_telegram_platform_flood_until", {}).clear()
 
 
 def _verbose_command(loop, adapter):
@@ -80,25 +86,25 @@ def _markers(bot):
 
 
 @pytest.mark.asyncio
-async def test_an_oversized_item_refused_mid_way_still_reaches_the_screen():
+async def test_an_oversized_item_refused_mid_way_still_reaches_the_screen(monkeypatch):
     bot = _bot(lambda attempt: RetryAfter(20) if attempt == 1 else None)
     loop, st = _held_bubble(bot, _verbose_command)
 
     for _ in range(6):
-        _penalty_runs_out(st)
+        _penalty_runs_out(st, monkeypatch)
         await loop._deliver_flood_pending_progress(st)
 
     assert set(_markers(bot)) == MARKERS
 
 
 @pytest.mark.asyncio
-async def test_a_carried_oversized_item_is_never_shown_twice():
+async def test_a_carried_oversized_item_is_never_shown_twice(monkeypatch):
     bot = _bot(lambda attempt: BadRequest("Chat write forbidden") if attempt == 2 else None)
     loop, st = _held_bubble(bot, lambda loop, adapter: [
         "short head", "\n".join(f"MARK{i:04d} " + "x" * 45 for i in range(180))])
 
     for _ in range(8):
-        _penalty_runs_out(st)
+        _penalty_runs_out(st, monkeypatch)
         await loop._deliver_flood_pending_progress(st)
 
     shown = _markers(bot)

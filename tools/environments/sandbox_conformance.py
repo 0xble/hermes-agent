@@ -468,7 +468,13 @@ def check_process_notifications_private(provider: RecordingSandboxProvider, a: S
             session.exited = False
             registry._check_watch_patterns(session, f"{secret}\n")
             session._heartbeat_last, session.total_output_chars, session._heartbeat_total_at_last = 0.0, 10, 0
-            registry._emit_heartbeat(session, 1.0)
+            with registry._lock:  # a heartbeat is emitted only for a live process the registry tracks
+                registry._running[session.id] = session
+            try:
+                registry._emit_heartbeat(session, 1.0)
+            finally:
+                with registry._lock:
+                    registry._running.pop(session.id, None)
             registry._emit_output(session, f"{secret}\n")
         queued = list(registry.completion_queue.queue)
         assert {e.get("type") for e in queued} >= {"completion", "watch_match", "heartbeat"}, queued

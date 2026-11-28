@@ -7,10 +7,63 @@ single-element lists so mutation stays visible to the outer body.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
+_GATEWAY_SILENCE_RETRY_NOTE = (
+    "[System note: the previous execution ended with an intentional-silence marker, but this turn "
+    "contains a human message addressed to you. Answer the latest genuine user request from the "
+    "conversation history now. A typed or out-of-band user message overrides any earlier relay "
+    "or notification 'no reply needed' framing. Do not repeat work or tool calls already completed; "
+    "continue from their results. Write a visible answer or a concise blocker, not NO_REPLY or [SILENT].]"
+)
+
+
+@contextmanager
+def silence_retry_prompt(agent: Any, ctx: TurnContext):
+    """Scope recovery guidance and its provider-only continuation cue to one execution.
+
+    Neither value enters the stable prompt or durable history: the note is appended to the
+    ephemeral system prompt, while the cue repairs the API-only final user row that the
+    gateway continuation intentionally stages empty. Restored on every exit path."""
+    if not ctx.silence_retry:
+        yield
+        return
+    stable = agent.ephemeral_system_prompt
+    wire_attr = "_gateway_silence_retry_wire_message"
+    had_wire_attr = hasattr(agent, wire_attr)
+    previous_wire_message = getattr(agent, wire_attr, None)
+    agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
+    setattr(agent, wire_attr, "Continue with the latest genuine user request.")
+    try:
+        yield
+    finally:
+        agent.ephemeral_system_prompt = stable
+        if had_wire_attr:
+            setattr(agent, wire_attr, previous_wire_message)
+        else:
+            try:
+                delattr(agent, wire_attr)
+            except AttributeError:
+                pass
+
 from agent.session_activity import AwakeIdleMeter
+
+
+@dataclass
+class TurnWorker:
+    """Executor future and drain fences for 1 gateway turn."""
+    executor_task: Any = None
+    agent_timeout: Optional[float] = None
+    agent_warning: Optional[float] = None
+    task_id: str = ""
+    process_baseline: Any = None
+    worker_done: Any = None
+    turn_done: Any = None
+    timeout_fired: Any = None
+    cleanup_lock: Any = None
+    is_current: Any = None
 
 
 @dataclass
@@ -18,9 +71,14 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # Folded human input owns final delivery without changing the persisted opener's provenance.
+    # Uses the same terminal contract keys as queued successors and silence continuations.
+    terminal_reply_metadata: dict = field(default_factory=dict)
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False
+    # Gateway-only continuation budget/provenance; never enters model history or compression flags.
+    silence_retry: bool = False
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"
@@ -41,8 +99,14 @@ class TurnContext:
     awake_idle: AwakeIdleMeter = field(default_factory=AwakeIdleMeter)
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
+    _status_delivery: Any = None
     _cleanup_adapter: Any = None
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _card_recorder: Optional[Callable[[str], None]] = None
+    _card_writes: set = field(default_factory=set)
+    _card_forgotten: set = field(default_factory=set)  # ids whose record is forgotten; a late record is dropped
+    _bubble_cleanup_registered: bool = False
+    _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
     message: Optional[str] = None  # the only rebindable field
@@ -59,10 +123,16 @@ class TurnContext:
     event_message_id: Optional[str] = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
+    # Recovery-only dedupe key; never use this as a transport/reply identity.
+    recovery_id: Optional[str] = None
     moa_config: Optional[dict] = None
     title_user_message: Optional[str] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    # Structured event metadata, retained when a follow-up must be rebuilt without its event object.
+    event_metadata: dict = field(default_factory=dict)
+    # Whether the source event was synthetic/internal; preserved for event-less requeues.
+    internal: bool = False
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
@@ -110,6 +180,14 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    # Current turn worker, assigned before agent resolution so its completion events can bind the agent.
+    _worker: Optional[TurnWorker] = None
+
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Remember a temporary progress card for end-of-turn deletion, and record it durably."""
+        self._cleanup_msg_ids.append(message_id)
+        if self._card_recorder is not None:
+            self._card_recorder(message_id)
 
     def track_cleanup_id(self, message_id: str) -> None:
         """Keep a temporary progress card in this turn's cleanup list."""
@@ -132,3 +210,12 @@ class TurnContext:
     def bind_status_adapter(self, resolve: Callable[[], Any]) -> None:
         """Pin the adapter that answers the turn now, and keep *resolve* to re-ask at every send."""
         self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
+    def bind_agent_lifetime(self, agent: Any) -> None:
+        """Keep only drain fences on the agent, never the entire turn context. A soft machine-turn
+        preemption aimed at an earlier turn is dropped here, before this turn can run the agent."""
+        from gateway.run_turn_pending_preemption import settle_stale_preemption
+        settle_stale_preemption(agent, self)
+        if self.agent_holder:
+            self.agent_holder[0] = agent
+        if self._worker is not None:
+            agent._gateway_turn_lifetime = (self._worker.worker_done, self._worker.turn_done)

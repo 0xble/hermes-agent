@@ -54,6 +54,8 @@ def test_bold_without_quote_keeps_its_markers(adapter):
         ("``price=$5`` costs $5", "``price=$5`` costs \\$5"),
         ("`` a`b $5 `` then $7", "`` a`b $5 `` then \\$7"),
         ("Price $5 (`$` or `$6`).", "Price \\$5 (`$` or `$6`)."),
+        ("Price $9 (`$` or `$7`).", "Price \\$9 (`$` or `$7`)."),
+        ("$2+2$ costs $7 vs $8", "$2+2$ costs `$7` vs `$8`"),
     ],
 )
 def test_rich_payload_escapes_currency_but_keeps_math_and_code(adapter, markdown, expected):
@@ -77,6 +79,13 @@ def test_rich_payload_escapes_currency_but_keeps_math_and_code(adapter, markdown
         ("$$x=1$$ so $3'$ and $1:2$", "$$x=1$$ so $3'$ and $1:2$"),
         # A word of two or more letters is prose, in any script.
         ("$5 и 10$", "\\$5 и 10$"),
+        ("$9 и 10$", "\\$9 и 10$"),
+        ("$5 价格 10$", "\\$5 价格 10$"),
+        # A single ASCII letter may be a TeX variable, so it stays math.
+        ("$$x=1$$ so $5 a 10$", "$$x=1$$ so $5 a 10$"),
+        # Greek letters are math variables, not prose.
+        ("Circumference: $2 π r$.", "Circumference: $2 π r$."),
+        ("$2 πr$ and $3 α$", "$2 πr$ and $3 α$"),
     ],
 )
 def test_rich_payload_keeps_spaced_numeric_math_whole(adapter, markdown, expected):

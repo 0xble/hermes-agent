@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- shared cooldown restore must stay at the existing facade seam
 """Assorted AIAgent runtime helpers (message repair/sanitization, credential recovery, primary
 runtime restore, prompt-cache policy, client construction, model switching, tool invocation).
 Each function takes the parent ``AIAgent`` as ``agent`` except the stateless message helpers.
@@ -9,12 +10,14 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from agent.notice_style import ContextNotice
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import _FULL_ARGS_LOG_BOUND, coerce_tool_name
 from session_rules.turns import coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
@@ -30,6 +33,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider,
 )
 from agent.error_classifier import FailoverReason
+from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
@@ -973,15 +977,59 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
         return False
 
 
+def _refresh_from_shared_cooldown(agent) -> str:
+    """Sync an agent already on a provider fallback with the shared primary record.
+
+    Returns ``"active"`` (another process holds the primary in cooldown: the in-memory deadline
+    now follows the record), ``"expired"`` (the record awaits a recovery probe), ``"absent"``
+    (no record: cleared by a recovery elsewhere, by the CLI, or pruned as stale) or
+    ``"unavailable"`` (the state could not be read; callers keep the in-memory deadline).
+    """
+    try:
+        from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent
+        record = read_cooldown(route_from_agent(agent))
+    except Exception:
+        logger.debug("Shared primary cooldown read failed; keeping the in-memory deadline", exc_info=True)
+        return "unavailable"
+    agent._shared_primary_cooldown_record = record
+    if record is None:
+        return "absent"
+    if not is_active(record):
+        return "expired"
+    remaining = max(0, math.ceil(float(record.get("reset_at", 0)) - time.time()))
+    agent._rate_limited_until = time.monotonic() + remaining
+    agent._rate_limit_backoff_count = int(record.get("backoff_count", 0) or 0)
+    return "active"
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
     if not agent._fallback_activated:
-        # Reset the index even without activation: a failed _try_activate_fallback() can strand
-        # _fallback_index past the chain end and silently block future fallbacks (#20465).
+        # Reset the index even without activation, and before adoption walks the chain: a failed
+        # _try_activate_fallback() can strand _fallback_index past the chain end (#20465), which would
+        # make adoption see an exhausted chain and send the turn to the cooled primary.
+        agent._fallback_index = 0
+        if _adopt_shared_primary_cooldown(agent):
+            return False
         agent._fallback_index = 0
         _revert_credential_rotation(agent)
         return False
+    # Reset the chain index even when no fallback was activated this turn. Without this, a turn where
+    # _try_activate_fallback() was called but returned False (chain exhausted or provider not configured)
+    # leaves _fallback_index >= len(_fallback_chain) while _fallback_activated stays False. The next turn
+    # skips this block entirely, stranding the index and silently blocking all future fallback attempts for
+    # the session. Fixes #20465.
+    # The shared record is the source of truth across processes: another agent may have re-armed
+    # the same outage with a longer window after this agent's in-memory deadline was set, or the
+    # outage may have been cleared (a recovery elsewhere, or the CLI).
+    held_shared_record = isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict)
+    shared_state = "unavailable"
+    if getattr(agent, "_provider_fallback_active", False):  # not `/model --once`
+        shared_state = _refresh_from_shared_cooldown(agent)
+        if shared_state == "unavailable":
+            return False  # no verified reset/clear: stay on fallback even without a cached deadline
+    cleared_elsewhere = held_shared_record and shared_state == "absent"
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
     primary_model = str((rt or {}).get("model") or "").strip()
@@ -1004,9 +1052,18 @@ def restore_primary_runtime(agent) -> bool:
         from agent.custom_entry_pool import load_runtime_pool
         loaded = load_runtime_pool(primary_provider, primary_runtime_base_url, (rt or {}).get("requested_provider"), rt or {})
         return loaded if loaded is not None and _matches_primary(loaded) else None
+    # A reopened quota window overrides the shared record too: the first successful primary
+    # response then clears it for every process (complete_primary_recovery).
     if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
         agent._rate_limited_until = 0
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    elif shared_state == "active":
+        return False  # another process holds the primary in cooldown, stay on fallback
+    if shared_state == "expired":
+        # The shared record is authoritative and its window has passed. A later provider reset may
+        # have shortened the outage below this agent's cached deadline, so drop the stale local
+        # deadline. The record itself stays: the primary probe's success clears it with one notice.
+        agent._rate_limited_until = 0
+    if getattr(agent, "_rate_limited_until", 0) > time.monotonic() and not cleared_elsewhere:
         return False  # primary still in rate-limit cooldown, stay on fallback
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
         agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
@@ -1019,20 +1076,24 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
+    from agent.shared_primary_probe_runtime import claim_primary_probe, probe_claim_allows_primary, release_primary_probe
+    probe_outcome = claim_primary_probe(agent, shared_state)
+    if not probe_claim_allows_primary(probe_outcome):
+        return False
+    probe_token = getattr(agent, "_shared_primary_probe_token", None)
     try:
         from agent.route_binding import reinstall_primary_runtime
         reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
         )
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
-        agent._provider_fallback_active = False
-        agent._provider_fallback_route = None
-        if provider_fallback_active:
-            from agent.fallback_notice import announce_primary_restored
-            announce_primary_restored(agent, previous_model, previous_provider)
+        from agent.fallback_notice import finish_fallback_restore
+        finish_fallback_restore(agent, provider_fallback_active, held_shared_record,
+                                previous_model, previous_provider)
         return True
     except Exception as e:
-        logger.warning("Failed to restore primary runtime: %s", e)
+        release_primary_probe(agent, probe_token)
+        logger.warning("Failed to restore primary runtime: %s", e, exc_info=True)
         return False
 
 
@@ -1103,6 +1164,9 @@ def dump_api_request_debug(
     agent, api_kwargs: dict[str, Any], *, reason: str, error: Optional[Exception] = None
 ) -> Optional[Path]:
     """Dump the request body from api_kwargs (minus transport keys) for debugging provider 4xx failures."""
+    from agent.incognito import is_incognito
+    if getattr(agent, "incognito", False) or is_incognito(getattr(agent, "session_id", None)):
+        return None
     try:
         body = {k: v for k, v in copy.deepcopy(api_kwargs).items() if v is not None and k != "timeout"}
         api_key = None
@@ -1138,8 +1202,10 @@ def dump_api_request_debug(
         # Redact secrets first (this fires on every API error with the full request body), leaf-wise:
         # a whole-JSON pass can eat a string's closing quote and the dump would be dropped.
         from agent.redact_structured import redact_structured
-        _redacted_payload = redact_structured(dump_payload)
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        from agent.request_debug import bounded_request_dump, prune_request_dumps
+        _redacted_payload = bounded_request_dump(redact_structured(dump_payload))
+        atomic_json_write(dump_file, _redacted_payload, mode=0o600, default=str)
+        prune_request_dumps(dump_file)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
             print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
@@ -1632,6 +1698,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
     install_served_model_capture(agent, client)
@@ -1906,7 +1974,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     try:
         new_context_length = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
-            config_context_length=effective_context_length, custom_providers=custom_providers,
+            config_context_length=effective_context_length, custom_providers=custom_providers, api_mode=agent.api_mode,
         )
         agent.context_compressor.update_model(
             model=agent.model,
@@ -1928,8 +1996,12 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
 def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
+    agent._fallback_stay_started_at = None
     agent._provider_fallback_active = False
+    agent._provider_fallback_silent_retry = False
     agent._provider_fallback_route = None
+    agent._fallback_episode_cooled = False
     agent._fallback_index = 0
     agent._credential_pool_revert_id = None
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
@@ -2008,6 +2080,9 @@ def switch_model(
         from hermes_constants import resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
         agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        # Config-derived: retire any explicit pick even when the new level compares equal to it.
+        # Surfaces that carry a pick across the switch (/model --reasoning) re-mark it after.
+        agent.reasoning_override = None
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )
@@ -3239,6 +3314,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
+    from agent.steer_delivery import _requeue_pending_steer, report_steer_delivered
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
@@ -3252,6 +3328,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
+    report_steer_delivered(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

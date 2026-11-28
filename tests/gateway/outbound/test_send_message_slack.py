@@ -149,7 +149,7 @@ def test_media_caption_blocks_and_fallback_match_both_routes(
 ):
     from gateway.config import PlatformConfig
     from plugins.platforms.slack import adapter as slack_adapter
-    from tools.send_message_tool import _send_live_adapter_media
+    from gateway.outbound.send import _send_live_adapter_media
 
     client = AsyncMock()
     client.chat_postMessage.side_effect = (

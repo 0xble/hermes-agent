@@ -8,6 +8,7 @@ logs through ``gateway.run``'s logger so its records keep that name.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
 import threading
@@ -54,6 +55,32 @@ def _space_has_thread_of_another_profile(routes, space: str, profile: str) -> bo
 
 def _env_truthy(name: str) -> bool:
     return _auth_env(name).lower() in _TRUTHY
+
+
+@functools.lru_cache(maxsize=64)
+def _resolved_db_parent(path: str) -> Path:
+    return Path(path).resolve().parent
+
+
+def _standalone_runtime_home(runner) -> Optional[Path]:
+    """Parent of this runner's session DB, else the process home.
+
+    A partial runner (identity-restore fixtures) may not have opened a DB. The resolved parent is
+    memoized per DB path: the check-in poll restores every routed session's origin on the event
+    loop every few seconds, and one realpath per session (36,898 on the live gateway, each a
+    handful of GIL-releasing lstat calls) held the loop for seconds per pass under thread load.
+    """
+    db = None
+    with contextlib.suppress(Exception):
+        db = runner._session_db
+    inner = getattr(db, "_db", db)
+    path = getattr(inner, "db_path", None)
+    if path:
+        return _resolved_db_parent(os.fspath(path))
+    with contextlib.suppress(Exception):
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    return None
 
 
 def authz_field(name, field, entry):
@@ -562,7 +589,25 @@ class GatewayAuthorizationMixin:
         if source is None:
             return None
         from gateway.session_identity import identity_of, restore_identity
-        restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
+        transport_profile = getattr(entry, "transport_profile", None)
+        # Rows written before multiplex transport ownership was persisted have no
+        # transport_profile.  The historical agent:main namespace unambiguously
+        # belongs to the default profile, so recover that one legacy route.  A
+        # named namespace may have used a shared bot, so leave it unknown and
+        # preserve the existing fail-closed satellite fallback.
+        if transport_profile is None and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            from hermes_state_keys import profile_from_session_key
+            if profile_from_session_key(getattr(entry, "session_key", None)) == "default":
+                transport_profile = "default"
+        restore_identity(source, runner=self, transport_profile=transport_profile)
+        # Standalone has one bot and one home, so restore does not pin a
+        # RoutingIdentity. Automation still needs affirmative proof this source
+        # was restored here; a wire rebuild has no stamp and stays unproven.
+        if (identity_of(source) is None
+                and not getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+            home = _standalone_runtime_home(self)
+            if home is not None:
+                source._restored_runtime_home = home
         if (getattr(getattr(self, 'config', None), 'multiplex_profiles', False)
                 and not self._names_receiving_bot(source, identity_of(source))
                 and self._fronting_relay(source.platform, None) is not None):
@@ -817,12 +862,12 @@ class GatewayAuthorizationMixin:
         platform = source.platform.value if source.platform else ""
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
-    def _admit_bot_message(self, source: SessionSource) -> bool:
+    def _admit_bot_message(self, source: SessionSource, *, charge: object | None = None) -> bool:
         """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
         if not getattr(source, "is_bot", False):
             return True
-        allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
+        allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source), charge=charge)
         if state == "tripped":
             logger.warning(
                 "Bot loop guard is dropping bot messages in %s chat %s: bot %s sent one message too many "

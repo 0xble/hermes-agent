@@ -778,8 +778,7 @@ def _build_pid_record() -> dict:
     return {
         "pid": os.getpid(), "kind": _GATEWAY_KIND, "argv": _record_argv(),
         "start_time": _get_process_start_time(os.getpid()),
-        # Scoped locks are machine-global; the owner's home lets a cross-profile
-        # --replace place its takeover marker where the target will read it.
+        # Scoped locks are machine-global; the owner's home tells a cross-profile --replace where to put its takeover marker.
         "hermes_home": str(_canonical_hermes_home(_get_process_hermes_home())), "pidns": pid_namespace_id(),
     }
 

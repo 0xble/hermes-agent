@@ -874,7 +874,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         booked: list = []  # a costed call's charge; refunded when the call never reaches the server
         cached_read_only = _tool_is_read_only(server_name, tool_name)
-        error =  _trust_gate_check(server_name, tool_name, booked, args) or _check_circuit_breaker(server_name)
+        error = _trust_gate_check(server_name, tool_name, booked, args) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
         server, error = None, _check_circuit_breaker(server_name)
@@ -930,6 +930,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
                     server, server_name, op, retry_safe=read_only):
                 if still_cleared and _core._tool_read_only_hints.get(hint_key, {}).get(tool_name) is not True:
                     return await _refuse_unconsented_write(server_name, tool_name)
+                # _tool_call_scope owns the elicitation context/callbacks slot (a shared HTTP call must not set it).
                 result = await _call_tool_racing_stdio_death(
                     server, server_name, tool_name, args, meta=meta,
                     progress_callback=_on_progress if report is not None else None)

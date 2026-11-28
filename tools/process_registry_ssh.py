@@ -432,18 +432,33 @@ def handle_process(args, **kw):
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
     node = None
     session = None
+    # The ownership gate runs before anything reads the handle: another conversation's process
+    # answers exactly like a missing one, with no provenance and no node conflict. Handoff keeps
+    # its own parent-owner check, as upstream's handler does.
+    allowed, full_id = True, session_id
+    if action in source._SESSION_ACTIONS and session_id:
+        allowed, full_id = _actionable(session_id, kw)
     try:
         node = _resolve_process_node(args)
         if action == "list":
             result = _list_processes(source, node, kw.get("task_id"))
+        elif not allowed:
+            result = source._not_found(session_id)
         else:
-            session = _lookup_process_session(source, action, session_id, node)
-            result = _dispatch_process_action(source, action, session_id, args, kw, session)
+            # Act on the checked session's full id, never on a prefix the gate did not resolve.
+            session = _lookup_process_session(source, action, full_id, node)
+            result = _dispatch_process_action(source, action, full_id, args, kw, session)
     except NodeError as exc:
         result = {"status": "error", "error": str(exc)}
-        if session is None and session_id:
+        if session is None and session_id and allowed:
             session = source.process_registry._lookup_session(session_id)
     return _annotate_process_result(args, result, node, session)
+
+
+def _actionable(session_id, kw):
+    """``(allowed, full id)`` for this caller: the ownership gate every session action passes."""
+    from tools.process_registry_access import resolve_actionable
+    return resolve_actionable(session_id, kw.get("task_id"), kw.get("session_id"))
 
 
 def _resolve_process_node(args):

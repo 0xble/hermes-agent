@@ -12,7 +12,7 @@ from tests.gateway.test_messaging_stop_owner_turn import _owner, _until
 @pytest.mark.asyncio
 async def test_each_claimed_turn_binds_its_admission_fence(monkeypatch):
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from hermes_scope import LOCAL_OWNER, Fence, TurnScope, current_scope
 

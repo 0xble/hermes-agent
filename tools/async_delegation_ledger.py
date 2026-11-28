@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sqlite3
+import threading
 from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger('tools.async_delegation')
 
-_SCHEMA_RECONCILED: dict[str, tuple[int, int, int, Optional[str]]] = {}
+# Database path -> (device, inode, schema_version, ledger DDL) last reconciled by this process.
+# The stored DDL is the fork's extra content signal for an in-place restore that reuses both the
+# inode and schema cookie; the lock and pre-open identity check are upstream's replacement guards.
+_SCHEMA_READY: dict[str, tuple[int, int, int, Optional[str]]] = {}
+_SCHEMA_READY_LOCK = threading.Lock()
+
+
+def _db_identity(path) -> tuple[int, int] | None:
+    """Stat only: opening/closing another fd would release SQLite's POSIX locks."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if st.st_ino else None
 
 
 def _schema_state(
@@ -44,11 +59,15 @@ def _connect() -> sqlite3.Connection:
     # The ledger shares state.db with SessionDB: use its startup lock and tracked
     # connector, rather than exposing an unprotected empty first-open inode.
     # wal=False: SessionDB owns the journal mode (_initialize_schema applies the barriers).
-    return open_shared_state_db(_db_path(), db_label="state.db (async_delegation)",
-                                wal=False, initialize=_initialize_schema)
+    path = _db_path()
+    # None while the file does not exist yet: the opener creates it under the startup lock, and a
+    # first open has no earlier file to tell apart, so the initializer runs as it does on live.
+    identity = _db_identity(path)
+    initialize = _initialize_schema if identity is None else functools.partial(_initialize_schema, identity=identity)
+    return open_shared_state_db(path, db_label="state.db (async_delegation)", wal=False, initialize=initialize)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | None = None) -> None:
     from hermes_state_repair import apply_durability_barriers
     from hermes_state_schema import reconcile_state_schema
     # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
@@ -66,12 +85,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # carries the ledger's stored table definition: a cheap content signal that changes with its
     # columns, not with row writes, and needs no second column list to keep in sync with SCHEMA_SQL.
     path, state = _schema_state(conn)
-    if path is not None and _SCHEMA_RECONCILED.get(path) == state:
-        return
+    # A pre-open identity that no longer matches means the path was replaced while opening:
+    # reconcile this connection, but never let its state mark the replacement ready.
+    verified = state is not None and (identity is None or state[:2] == identity)
+    if path is not None and verified:
+        with _SCHEMA_READY_LOCK:
+            if _SCHEMA_READY.get(path) == state:
+                return
     reconcile_state_schema(conn)
     path, state = _schema_state(conn)
-    if path is not None and state is not None:
-        _SCHEMA_RECONCILED[path] = state
+    if path is not None and state is not None and (identity is None or state[:2] == identity):
+        with _SCHEMA_READY_LOCK:
+            _SCHEMA_READY[path] = state
 
 
 def _transaction(*, immediate: bool = False):
@@ -120,7 +145,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "route_chain", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "route_chain", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", "unit_id", *_ROUTING_KEYS)
         if key in record}
     if child_sessions := record.get("child_sessions"):
         task_payload["child_execution"] = {
@@ -246,6 +271,9 @@ def _prune_durable_records() -> None:
         _transaction, require_ledger_owner, time,
     )
     require_ledger_owner()
+    # The row a waiting child reports on is neither deleted nor counted against a cap: a silent unit is
+    # 'delivered', the first kind the caps delete, and its one give-up failure is routed through that row.
+    from tools.delegate_tool_auto_resume import KEEP_WAITING_UNITS_SQL as keep
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     from tools.delegation_resume import classify_armed
     classify_armed()
@@ -253,7 +281,7 @@ def _prune_durable_records() -> None:
         old_ids = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?
-                  AND NOT {_RETENTION_OWED_SQL}""", (cutoff,))]
+                  AND NOT {_RETENTION_OWED_SQL}{keep}""", (cutoff,))]
         if old_ids:
             marks = ",".join("?" for _ in old_ids)
             conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", old_ids)
@@ -262,12 +290,12 @@ def _prune_durable_records() -> None:
         ordinary_count = conn.execute(
             f"""SELECT COUNT(*) FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}{keep}""", (cutoff,)
         ).fetchone()[0]
         ordinary = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}{keep}
                 ORDER BY CASE delivery_state
                            WHEN 'superseded' THEN 0
                            WHEN 'delivered' THEN 1
@@ -284,13 +312,13 @@ def _prune_durable_records() -> None:
         protected_count = conn.execute(
             f"""SELECT COUNT(*) FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+                  AND {_RESUMABLE_RETENTION_SQL}{keep}""", (cutoff,)
         ).fetchone()[0]
         protected = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
                   AND {_RESUMABLE_RETENTION_SQL}
-                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}{keep}
                 ORDER BY updated_at ASC, delegation_id ASC
                 LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
         )]
@@ -305,7 +333,7 @@ def _prune_durable_records() -> None:
             from tools.delegation_resume import RESULT_UNDELIVERABLE, SUCCESS_REASONS
             evict = [r[0] for r in conn.execute(f"""SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'
-                       AND NOT {_RESUMABLE_RETENTION_SQL}
+                       AND NOT {_RESUMABLE_RETENTION_SQL}{keep}
                      ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
             marks = ",".join("?" for _ in evict)
             if evict:
@@ -367,9 +395,9 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
     )
     if evt.get("type") != "async_delegation" or evt.get("task_failure_notice"):
         return
-    evt.pop("retry_note", None)  # cancellation may have invalidated a previously persisted promise
+    provisional_note = evt.get("retry_note")
     try:
-        from tools.delegation_resume import retry_note, retry_status, schedule_retry
+        from tools.delegation_resume import is_user_cancel_reason, retry_note, retry_status, schedule_retry
         delegation_id = evt["delegation_id"]
         plan = schedule_retry(delegation_id)
         if plan is None:
@@ -380,7 +408,20 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
                         "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
-    except Exception:  # the retry sweep classifies later if the ledger is unavailable
+        elif plan is None:
+            # A user stop invalidates any already-serialized promise.  For legacy
+            # CLI/TUI/scalar cuts there is no gateway retry plan, so retain the
+            # explicit one-shot resume instruction seeded by the producer.
+            record = retry_status(delegation_id)
+            stopped = bool(record and record["retry_state"] == "cancelled")
+            if stopped or (record and record["event"].get("cut_reason") and
+                           is_user_cancel_reason(record["event"].get("cut_reason"))):
+                evt.pop("retry_note", None)
+            elif provisional_note:
+                evt["retry_note"] = provisional_note
+    except Exception:  # the retry classification deferred; keep the provisional delivery guidance
+        if provisional_note:
+            evt["retry_note"] = provisional_note
         logger.debug("Async delegation %s: retry classification deferred", evt.get("delegation_id"), exc_info=True)
     _stamp_resume_availability(evt)
 

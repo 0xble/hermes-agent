@@ -328,6 +328,8 @@ class TestSendMessageTool:
         # not auto-accepted by the trust window. (Recency trust is covered
         # in test_platform_base.py. The public default flipped to non-strict
         # in 2026-05; this test pins strict on explicitly.)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", tmp_path / "hermes")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path / "hermes" / "cache",))
         monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
         config, telegram_cfg = _make_config()
@@ -369,6 +371,8 @@ class TestSendMessageTool:
         still sent; the payload names the drop and the CLI exit code follows it."""
         from hermes_cli.send_cmd import _emit_result
 
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", tmp_path / "hermes")
+        monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path / "hermes" / "cache",))
         monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
         config, telegram_cfg = _make_config()
         report = tmp_path / "report.pdf"
@@ -812,7 +816,7 @@ class TestStandaloneTelegramRichMessages:
         monkeypatch.setattr("plugins.platforms.telegram.standalone._telegram_bot", lambda _token, extra=None: bot)
         # Discovery loads a profile-owned module namespace. Patch the registered sender's
         # actual bot seam as well as the canonical module used by direct helper tests.
-        from tools.send_message_senders import _plugin_standalone_sender
+        from gateway.outbound.senders import _plugin_standalone_sender
         sender, error = _plugin_standalone_sender("telegram")
         assert error is None
         monkeypatch.setitem(sender.__globals__, "_telegram_bot", lambda _token, extra=None: bot)
@@ -887,10 +891,24 @@ class TestStandaloneTelegramRichMessages:
         bot.do_api_request.assert_awaited_once()
         bot.send_message.assert_not_awaited()
 
-    @pytest.mark.parametrize("message", ["x" * 32769, "line\n" * 5000])
-    def test_oversized_raw_or_normalized_payload_uses_legacy_chunks(self, bot, message):
-        from gateway.platforms.base import utf16_len
+    @pytest.mark.parametrize("message", ["x" * 32769, "line of report text\n" * 1600], ids=["raw", "normalized"])
+    def test_oversized_raw_or_normalized_payload_uses_bounded_rich_parts(self, bot, message):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
         result = asyncio.run(_send_telegram("test-token", "123", message, extra={"rich_messages": "always"}))
+        assert result["success"] is True
+        bot.send_message.assert_not_awaited()
+        parts = [call.kwargs["api_kwargs"]["rich_message"]["markdown"]
+                 for call in bot.do_api_request.await_args_list if call.args[0] == "sendRichMessage"]
+        assert len(parts) > 1
+        assert all(0 < len(part) <= TelegramAdapter.RICH_MESSAGE_MAX_CHARS for part in parts)
+        assert "".join("".join(parts).split()) == "".join(message.split())
+
+    def test_oversized_plain_text_in_auto_mode_uses_legacy_chunks(self, bot):
+        from gateway.platforms.base import utf16_len
+
+        message = "line of report text\n" * 1700
+        result = asyncio.run(_send_telegram("test-token", "123", message, extra={"rich_messages": True}))
         assert result["success"] is True
         bot.do_api_request.assert_not_awaited()
         assert bot.send_message.await_count > 1

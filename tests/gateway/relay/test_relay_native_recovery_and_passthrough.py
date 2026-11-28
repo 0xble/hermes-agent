@@ -69,7 +69,10 @@ async def _wired_relay(runner, connector, url):
 
 
 def _stub_turns(runner, monkeypatch, turns):
-    async def turn(event, *_args, **_kwargs):
+    async def turn(event, source, *_args, **_kwargs):
+        # Keep real route resolution (including legacy transport backfill). Deferred
+        # post-turn hooks only look up existing routes and cannot do this for the stub.
+        assert await runner._hmwa_resolve_session(event, source) is not None
         turns.append(event.text)
         execution_result.get()['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
         return 'reply ' + event.text
@@ -227,7 +230,7 @@ async def test_multiplexed_stamped_admission_queued_across_a_restart_runs_in_its
 
 @pytest.mark.asyncio
 async def test_forwarded_discord_component_is_admitted_like_relayed_text(tmp_path, monkeypatch, caplog):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     from gateway.relay.admitted_authors import note_delivered
     from gateway.session import SessionSource
@@ -265,7 +268,7 @@ async def test_forwarded_discord_component_is_admitted_like_relayed_text(tmp_pat
 async def test_heartbeat_for_a_restored_relay_session_admits_with_warm_egress_routing(tmp_path, monkeypatch):
     """A session whose last input already settled has nothing to recover at boot, so the heartbeat
     is the first thing to reply after a restart: it must not admit with cold egress caches."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     import gateway.run_heartbeat_acceptance as acceptance
 
     connector = _Connector('discord')

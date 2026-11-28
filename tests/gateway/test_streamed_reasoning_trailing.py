@@ -8,6 +8,8 @@ delivers reasoning and answer as ONE message with the 💭 block on top (``_hmwa
 Local viewers are unaffected (they read reasoning off their event stream).
 """
 
+import asyncio
+
 import pytest
 from types import SimpleNamespace
 
@@ -113,15 +115,15 @@ async def test_setup_stream_consumer_gates_on_reasoning(monkeypatch, show_reason
     adapter = ProgressCaptureAdapter(platform=platform)
     runner = _stream_runner(adapter, show_reasoning)
     ctx = SimpleNamespace(
-        mute_notification_reply=False, streaming_tts_consumer_holder=[None], user_config={},
+        session_key=None, session_id=None, persist_user_display_kind=None, mute_notification_reply=False, streaming_tts_consumer_holder=[None], user_config={},
         resolve_display_setting=lambda *_a: None, scheduled_heartbeat=False,
         interim_assistant_messages_enabled=False,
         source=SessionSource(platform=platform, chat_id="42", chat_type="dm"),
         _status_thread_metadata=None, progress_queue=None, event_message_id=None,
         _run_still_current=lambda: True, stream_consumer_holder=[None],
     )
-    consumer, callback, _interim, _want = TurnRunner(runner, ctx)._setup_stream_consumer(
-        "telegram" if platform is Platform.TELEGRAM else "cli")
+    consumer, callback, _interim, _want = await asyncio.to_thread(
+        TurnRunner(runner, ctx)._setup_stream_consumer, "telegram" if platform is Platform.TELEGRAM else "cli")
     streamed = consumer is not None and consumer.stream_deltas_enabled and callback is not None
     assert streamed is expect_stream
 

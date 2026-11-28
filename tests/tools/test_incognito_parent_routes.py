@@ -85,8 +85,8 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
             else:
                 assert not child.incognito and not child._persist_disabled
                 assert child._session_db is not None
-            pinned_model = getattr(child, "_pinned_fallback_model")
-            fallback_chain = getattr(child, "_fallback_chain")
+            pinned_model = child._pinned_fallback_model
+            fallback_chain = child._fallback_chain
             if route == "inherit":
                 assert child.model == parent.model == VENICE
                 assert child.provider == parent.provider

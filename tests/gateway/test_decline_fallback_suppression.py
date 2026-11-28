@@ -59,7 +59,7 @@ def _runner(adapter: _Adapter):
     from gateway.run_turn_runner import TurnRunner
 
     ctx = TurnContext(
-        _status_adapter=adapter,
+        _status_adapter_pinned=adapter,
         _status_chat_id="C1",
         _status_thread_metadata={},
         session_key="sk1",

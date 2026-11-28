@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from hermes_constants import get_hermes_home
-from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
+from tools.interrupt import acting_for_tid, consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
 )
@@ -65,8 +65,14 @@ _live_foreground: "dict[int, tuple[BaseEnvironment, ProcessHandle]]" = {}
 # on a thread that already holds it.
 _live_foreground_cond = threading.Condition(threading.RLock())
 _exit_fenced = False  # one-way, set by the hard-exit kill: no foreground command spawns after it
+_cleanup_fences = 0  # temporary, per graceful cleanup; overlapping callers release only their own fence
 _spawns_in_flight = 0  # past the fence check, child maybe alive, not yet in _live_foreground
-_HARD_KILL_BUDGET_S = 0.5
+_HARD_KILL_BUDGET_S = 0.5  # also bounds the graceful spawn-publication wait; SDK spawn may stall
+_HOST_EXITING_OUTPUT = (
+    "[host is exiting: command not started]\n"
+    "Hermes is restarting or shutting down; the command was NOT run. "
+    "This turn's work will resume after restart. Do not retry this command in this turn."
+)
 
 # Task ids whose shell state a command reads and writes, own id first, then its delegation
 # ancestors; empty means the environment's own snapshot. One environment serves a parent and
@@ -74,22 +80,50 @@ _HARD_KILL_BUDGET_S = 0.5
 # became the parent's shell state (#84536).
 _shell_state_chain: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "terminal_shell_state_chain", default=())
+_shell_state_paths: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_paths", default=())
+
+# A local delegated child may use its own environment object while inheriting its parent's shell
+# snapshot. Keep that fallback handoff in-process and environment-scoped; terminal_tool passes
+# explicit paths, and task ids alone are never used to derive a cross-process path.
+_task_snapshot_paths: dict[str, str] = {}
+_task_snapshot_paths_lock = threading.Lock()
+
+
+def _remember_task_snapshot(task_id: str, path: str) -> None:
+    if task_id:
+        with _task_snapshot_paths_lock:
+            _task_snapshot_paths[task_id] = path
+
+
+def _ancestor_task_snapshot(task_id: str) -> str | None:
+    with _task_snapshot_paths_lock:
+        return _task_snapshot_paths.get(task_id)
+
+
+def _forget_task_snapshots(snapshot_prefix: str) -> None:
+    with _task_snapshot_paths_lock:
+        for task_id, path in tuple(_task_snapshot_paths.items()):
+            if path.startswith(snapshot_prefix):
+                _task_snapshot_paths.pop(task_id, None)
 
 
 @contextmanager
-def shell_state_scope(chain: tuple[str, ...]):
+def shell_state_scope(chain: tuple[str, ...], snapshot_paths: tuple[str, ...] = ()):
     """Run commands against the per-task snapshot of ``chain[0]`` (seeded from its ancestors)."""
     token = _shell_state_chain.set(tuple(chain))
+    paths_token = _shell_state_paths.set(tuple(snapshot_paths))
     try:
         yield
     finally:
+        _shell_state_paths.reset(paths_token)
         _shell_state_chain.reset(token)
 
 
 def _enter_foreground_spawn() -> bool:
     global _spawns_in_flight
     with _live_foreground_cond:
-        if _exit_fenced:
+        if _exit_fenced or _cleanup_fences:
             return False
         _spawns_in_flight += 1
         return True
@@ -113,21 +147,42 @@ def _quiet_kill(kill: Callable, proc) -> None:
         logger.debug("exit-time kill of a foreground command failed", exc_info=True)
 
 
+def foreground_cleanup_in_progress() -> bool:
+    """Non-blocking teardown hint for local kill paths, including late spawn callbacks.
+
+    The admission fence is already owned by cleanup; do not acquire a lock the exiting
+    thread might hold just to decide whether to avoid a host-wide descendant scan.
+    """
+    return _exit_fenced or _cleanup_fences > 0
+
+
 def kill_live_foreground_processes(*, now: bool = False) -> int:
     """Kill every in-flight foreground command's process tree; returns how many were signalled.
 
-    ``now=True`` is for a caller about to ``os._exit``: the graceful kill TERMs, waits and only then
-    KILLs, so a SIGTERM-ignoring command outlives a hard exit that lands inside that window. It also
-    raises the exit fence and waits for spawns already past it to register, so no command started
-    around the snapshot survives, and it never blocks past ``_HARD_KILL_BUDGET_S``: SDK cancels
-    (Modal, Daytona, Vercel) run on daemon threads under that one deadline."""
-    global _exit_fenced
+    Graceful cleanup temporarily fences new spawns while waiting briefly for children already
+    spawning to register, then kills its snapshot and lifts only its own fence. A remote SDK
+    spawn or a same-thread signal handler may never publish; the wait shares the hard-exit
+    path's 0.5s budget rather than hanging shutdown. ``now=True`` is for a caller about to
+    ``os._exit``: the graceful kill TERMs, waits and only then KILLs, so a SIGTERM-ignoring
+    command outlives a hard exit that lands inside that window. The hard path never blocks
+    past ``_HARD_KILL_BUDGET_S``: SDK cancels (Modal, Daytona, Vercel) run on daemon threads
+    under that one deadline."""
+    global _exit_fenced, _cleanup_fences
     if not now:
         with _live_foreground_cond:
-            live = list(_live_foreground.values())
-        for env, proc in live:
-            _quiet_kill(env._kill_process, proc)
-        return len(live)
+            _cleanup_fences += 1
+        try:
+            with _live_foreground_cond:
+                _live_foreground_cond.wait_for(
+                    lambda: _spawns_in_flight == 0, timeout=_HARD_KILL_BUDGET_S)
+                live = list(_live_foreground.values())
+            for env, proc in live:
+                _quiet_kill(env._kill_process, proc)
+            return len(live)
+        finally:
+            with _live_foreground_cond:
+                _cleanup_fences -= 1
+                _live_foreground_cond.notify_all()
     deadline = time.monotonic() + _HARD_KILL_BUDGET_S
     _exit_fenced = True
     if _live_foreground_cond.acquire(timeout=_HARD_KILL_BUDGET_S):
@@ -441,9 +496,25 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         return self._snapshot_path if login else self._shell_state_paths()[0]
 
     def _task_snapshot_path(self, task_id: str) -> str:
-        """Per-task snapshot beside the environment's own (``cleanup`` globs the prefix)."""
+        """Return a task snapshot scoped to this environment so task-id reuse cannot reuse old state."""
         digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
         return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
+
+    def _shell_state_snapshot_paths(self) -> list[str]:
+        """Resolve the current task locally and delegated ancestors from their owning environments."""
+        explicit = _shell_state_paths.get()
+        if explicit:
+            return list(explicit)
+        task_ids = _shell_state_chain.get()
+        paths: list[str] = []
+        for index, task_id in enumerate(task_ids):
+            path = self._task_snapshot_path(task_id) if index == 0 else _ancestor_task_snapshot(task_id)
+            if path is None:
+                path = self._task_snapshot_path(task_id)
+            if index == 0:
+                _remember_task_snapshot(task_id, path)
+            paths.append(path)
+        return paths
 
     def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
@@ -460,6 +531,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         On success ``_snapshot_ready`` is set so commands source the snapshot instead of running
         under ``bash -l``. On failure, fall back to ``bash -l`` per command — unless a non-login
         probe shows login bash itself is dead, in which case prefer ``bash -c``."""
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return
         bootstrap = _snapshot_bootstrap_script(
             excluded_names=self._snapshot_excluded_passthrough_names(), **self._secret_dump_args(),
             **self._snapshot_script_kwargs(self.cwd))
@@ -517,20 +591,24 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
 
     def _shell_state_paths(self) -> list[str]:
         """Snapshot files this command reads, in source order; the first is the one it writes: the
-        task's own (``_task_snapshot_path``), then its delegation ancestors', then the env's own."""
-        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
+        task's own (``_task_snapshot_path``), then its delegation ancestors' (resolved from their
+        owning environments), then the env's own."""
+        chain = self._shell_state_snapshot_paths()
         return [*chain, self._snapshot_path] if chain else [self._snapshot_path]
 
     def _wrap_command(self, command: str, cwd: str, *, cwd_fallback: bool = False) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers.
         ``cwd_fallback`` lets the ``cd`` walk up from a missing *cwd* (see ``execute``)."""
+        from agent.delegation_context import in_process_child_relay_parent_address
+        from agent.incognito import is_incognito
         own, *seed_paths = self._shell_state_paths()
         seeds = [self._quote_shell_path(p) for p in seed_paths]
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
-            persist_env=self._persist_env,
+            relay_parent_address=in_process_child_relay_parent_address(),
+            persist_env=self._persist_env and not is_incognito(),
             pipe_marker=self._pipe_marker,
             seed_snaps=seeds,
             cwd_fallback_marker=self._cwd_fallback_marker if cwd_fallback else "",
@@ -565,12 +643,17 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
     def _wait_for_process(
         self, proc: ProcessHandle, timeout: int = 120, *,
         bounded_capture: bool = False, watch_interrupt_tid: int | None = None,
-        output=None, yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
+        output=None, yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        yield_after_seconds: float | None = None,
+        yield_when: Callable[[], bool] | None = None) -> dict:
         """Poll-based wait with interrupt checking and stdout draining (shared, not overridden).
         ``yield_handler(proc, output_so_far)``: when the tool thread is asked to yield
         (``tools.interrupt.request_yield`` — a user message arrived mid-command), the drain
         thread is stopped, the still-running process is handed to the handler and its dict
         is returned as the result; the process is NOT killed.
+        ``yield_after_seconds`` hands off at a foreground budget only when
+        ``yield_when`` confirms that admission is still pending. Running work
+        retains its normal foreground deadline.
         ``bounded_capture=True`` (foreground terminal-tool path only) retains at most
         ``tool_output.max_bytes`` in a head/tail window so a verbose subprocess cannot OOM the
         process; the default keeps full fidelity for internal consumers. Fires the activity
@@ -591,6 +674,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         drain_thread = _start_drain_thread(proc, output, drain_stop)
         _now = time.monotonic()
         deadline = _now + timeout
+        yield_deadline = _now + min(yield_after_seconds, timeout) if yield_after_seconds is not None else None
         _activity_state = {"last_touch": _now, "start": _now}
         trace = _WaitTrace(proc, timeout, enabled=_DEBUG_INTERRUPT, logger=logger)
         trace.enter()
@@ -612,7 +696,12 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
                     _kill_and_join()
                     return {**self._finalize_wait_result(output, output.render(suffix="\n[Command interrupted]"), 130),
                             "hermes_interrupted": True}
-                if yield_handler is not None and consume_yield(watch_interrupt_tid):
+                user_yield = yield_handler is not None and consume_yield(watch_interrupt_tid)
+                admission_yield = (yield_handler is not None and not user_yield
+                                   and yield_deadline is not None and time.monotonic() >= yield_deadline
+                                   and yield_when is not None and yield_when())
+                if yield_handler is not None and (user_yield or admission_yield):
+                    yield_deadline = None
                     drain_stop.set()
                     drain_thread.join(timeout=1)
                     try:
@@ -621,6 +710,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
                         logger.warning("yield-to-background handoff failed; continuing to wait", exc_info=True)
                         handed = None
                     if handed is not None:
+                        if admission_yield:
+                            handed["yield_reason"] = "semaphore_wait"
                         output.close_spill()
                         return handed
                     drain_stop.clear()
@@ -696,7 +787,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         ``result["output"]``. ``result["cwd_observed"]``/``["cwd"]`` are set only when THIS
         command emitted a marker: a killed/timed-out command emits none. Concurrent callers
         must read ``result["cwd"]`` rather than ``self.cwd``."""
-        pipe_split = _split_cwd_marker(result.get("output", ""), self._pipe_marker) if self._pipe_marker else None
+        pipe_split = (_split_cwd_marker(result.get("output", ""), self._pipe_marker, validate_cwd=False)
+                      if self._pipe_marker else None)
         if pipe_split is not None:
             statuses, cleaned = pipe_split
             result["output"] = cleaned
@@ -741,11 +833,13 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         command: str,
         cwd: str = "",
         *,
-        timeout: int | None = None,
+        timeout: float | None = None,
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
         yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        yield_after_seconds: float | None = None,
+        yield_when: Callable[[], bool] | None = None,
         allow_cwd_fallback: bool = False) -> dict:
         """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
@@ -772,7 +866,11 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         if rewrite_compound_background:
             from tools.terminal_tool_sudo import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
-        effective_timeout = timeout or self.timeout
+        # SDKs such as Modal (protobuf int64) and Daytona require whole seconds.
+        # Floor a fractional budget rather than extending its deadline; one second
+        # is the smallest portable backend timeout. Strict-deadline callers must
+        # skip dispatch themselves when less than one second remains.
+        effective_timeout = max(1, int(timeout or self.timeout))
         exec_command = fill_timeout_token(exec_command, effective_timeout)
         # An explicit ``cwd`` (the session's recorded cd state) can be just as dead as
         # ``self.cwd``; resolving only the latter left every call exiting 126 at ``cd``.
@@ -803,7 +901,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             if parent_activity_cb is not None:
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
-                return {"output": "[host is exiting: command not started]", "returncode": 130}
+                return {"output": _HOST_EXITING_OUTPUT, "returncode": 130}
             spawned = None
             try:
                 spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
@@ -816,12 +914,19 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             output = _new_output_collector(
                 spawned, bounded_capture, control_marker=self._cwd_fallback_marker if allow_cwd_fallback else "")
             output_holder.append(output)
+            # The wait watches parent_tid, and its kill path must resolve that same
+            # thread's shutdown cause rather than treating it as ordinary /stop. Keep an
+            # outer binding: a pre-exec guard's nested execute acts for the tool thread.
+            interrupt_token = acting_for_tid.set(acting_for_tid.get() or parent_tid)
             try:
                 return self._wait_for_process(
                     spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
                     watch_interrupt_tid=parent_tid, output=output,
-                    **({"yield_handler": yield_handler} if yield_handler is not None else {}))
+                    **({"yield_handler": yield_handler, "yield_after_seconds": yield_after_seconds,
+                        "yield_when": yield_when}
+                       if yield_handler is not None else {}))
             finally:
+                acting_for_tid.reset(interrupt_token)
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)
 

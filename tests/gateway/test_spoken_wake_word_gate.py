@@ -38,10 +38,10 @@ def _telegram(voice_mention_patterns):
 
 
 def _voice_note():
-    async def download():
+    async def download(*, read_timeout=None, connect_timeout=None, write_timeout=None, pool_timeout=None):
         return bytearray(OGG)
 
-    async def get_file():
+    async def get_file(*, read_timeout=None, connect_timeout=None, write_timeout=None, pool_timeout=None):
         return SimpleNamespace(file_path="voice/file_1.oga", download_as_bytearray=download)
 
     return SimpleNamespace(

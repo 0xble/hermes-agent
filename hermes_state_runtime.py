@@ -733,7 +733,6 @@ def import_legacy_session_admissions(db, *, epoch: int, source_path, principal_i
     Fingerprinting uses SQL snapshot data, never a raw open/close on a live inode.
     """
     from contextlib import closing
-    from pathlib import Path
     import hashlib
     import sqlite3
     from hermes_cli.sqlite_safe_read import connect_tracked

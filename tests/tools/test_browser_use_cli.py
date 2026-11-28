@@ -14,6 +14,7 @@ Covers the three seams the integration relies on:
 import ipaddress
 import json
 import os
+import sys
 import socket
 import stat
 import subprocess
@@ -62,6 +63,9 @@ def _fake_supervisor_registry(monkeypatch):
     class _Registry:
         def get_or_start(self, task_id, cdp_url, **kw):
             attached.append((task_id, cdp_url))
+
+        def get(self, task_id):
+            return None  # No live supervisor behind the fixture’s fake endpoint.
 
     monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", _Registry())
     return attached
@@ -189,7 +193,8 @@ class TestSubprocessEnvironment:
         """The floor only adds dirs — never drops or reorders what the
         caller's environment already had."""
         original = "/opt/toolchain/bin:/usr/bin:/snap/bin"
-        monkeypatch.setattr(bs, "build_browser_env", lambda: {"PATH": original})
+        from tools import browser_tool
+        monkeypatch.setattr(browser_tool, "_build_browser_env", lambda **_kw: {"PATH": original})
         merged = bu_cli._base_subprocess_env()["PATH"].split(os.pathsep)
 
         assert set(original.split(os.pathsep)) <= set(merged)

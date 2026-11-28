@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import posixpath
 import re
 import socket
 from contextlib import suppress
@@ -26,6 +27,25 @@ from hermes_platform.host.facts import os_family
 # them (direct file I/O, never through these guards); tools.credential_files still mounts the two
 # the skill declares in required_credential_files.
 GOOGLE_WORKSPACE_CREDENTIAL_FILES = ("google_token.json", "google_client_secret.json", "google_oauth_pending.json")
+
+
+def _named_remote():
+    from tools.node_execution import current_execution
+    return current_execution() is not None
+
+
+def _realpath(path) -> str:
+    if _named_remote():
+        from tools.file_backend_state import policy_realpath
+        return policy_realpath(path)
+    return os.path.realpath(path)
+
+
+def _prefetch_realpaths(paths) -> None:
+    """On a named node, resolve all ``paths`` in one round trip so each ``_realpath`` hits the cache."""
+    if _named_remote():
+        from tools.file_backend_state import prefetch_policy_realpaths
+        prefetch_policy_realpaths(paths)
 
 
 def _constants_path(getter_name: str) -> Path:
@@ -54,6 +74,9 @@ def _hermes_dirs() -> list[Path]:
     Both are checked so credential stores at <root>/... stay guarded when
     running under a profile (HERMES_HOME = <root>/profiles/<name>).
     """
+    if _named_remote():
+        from tools.file_backend_state import remote_home
+        return [Path(_realpath(Path(remote_home()) / ".hermes"))]
     return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path()))))
 
 
@@ -72,11 +95,14 @@ def _credential_store_dirs() -> list[Path]:
 
 
 def _resolve_each(paths) -> list[Path]:
-    """``p.resolve()`` for each path, skipping ones that fail to resolve."""
+    """Resolve anchors, retaining local best-effort but failing closed remotely."""
     out: list[Path] = []
     for p in paths:
-        with suppress(Exception):
-            out.append(p.resolve())
+        if _named_remote():
+            out.append(Path(_realpath(p)))
+        else:
+            with suppress(Exception):
+                out.append(p.resolve())
     return out
 
 
@@ -109,6 +135,9 @@ def _is_under(resolved: str | Path, base: str | Path) -> bool:
 def _resolve_target(path: str) -> Optional[Path]:
     """``Path(expanduser(path)).resolve()``, or None when resolution fails (a hosted agent's path:
     its lexical form, see ``sandbox_lexical_path``)."""
+    if _named_remote():
+        from tools.file_backend_state import remote_path
+        return Path(remote_path(path))
     from tools.environments.sandbox_scope import sandbox_lexical_path
     path = local_drive_spelling(path)
     if (lexical := sandbox_lexical_path(path)) is not None:
@@ -116,6 +145,22 @@ def _resolve_target(path: str) -> Optional[Path]:
     with suppress(OSError, RuntimeError):
         return Path(os.path.expanduser(str(path))).resolve()
     return None
+
+
+def _write_path_spellings(path: str) -> set[str]:
+    """Keep the protected location even when a symlink redirects its target."""
+    return {os.path.abspath(path), _realpath(path)}
+
+
+def _lexical_write_path(path: str) -> Optional[str]:
+    """Normalized, unresolved spelling of a write target (``~`` expanded in the target's home).
+
+    A named node's relative path has no controller-side meaning, so it yields None."""
+    if _named_remote():
+        from tools.file_backend_state import file_ops
+        text = file_ops()._expand_path(str(path))
+        return posixpath.normpath(text) if text.startswith("/") else None
+    return os.path.abspath(os.path.expanduser(str(path)))
 
 
 def _guard_homes(path: str = "") -> set[str]:
@@ -127,6 +172,9 @@ def _guard_homes(path: str = "") -> set[str]:
     home). Deny/approval lists are built over the union: process home, real home,
     subprocess home, and the profile home. A ``~name/...`` input resolves to a named
     account's home, which joins the set so ``~root/.ssh/authorized_keys`` stays denied."""
+    if _named_remote():
+        from tools.file_backend_state import remote_home
+        return {remote_home()}
     homes = {os.path.expanduser("~")}
     with suppress(Exception):
         from hermes_constants import get_real_home, get_subprocess_home, _profile_home_path
@@ -140,12 +188,15 @@ def _guard_homes(path: str = "") -> set[str]:
         expanded = os.path.expanduser(f"~{name}")
         if not expanded.startswith("~"):
             homes.add(expanded)
-    return {os.path.realpath(h) for h in homes}
+    return {spelling for home in homes for spelling in _write_path_spellings(home)}
 
 
 def _homes_and_resolved(path: str) -> tuple[set[str], str]:
     """``(guard homes, realpath(expanduser(path)))`` — the write-guard coordinate pair (a hosted
     agent's path: its lexical form, see ``sandbox_lexical_path``)."""
+    if _named_remote():
+        from tools.file_backend_state import remote_path
+        return _guard_homes(path), remote_path(path)
     from tools.environments.sandbox_scope import sandbox_lexical_path
     lexical = sandbox_lexical_path(path)
     return _guard_homes(path), lexical if lexical is not None else os.path.realpath(os.path.expanduser(str(path)))
@@ -169,7 +220,7 @@ def _homes_and_resolved(path: str) -> tuple[set[str], str]:
 # built on resolved paths can fire.
 #
 # Consequently this check MUST run on the *raw* path string before any
-# ``Path.resolve()`` / ``os.path.realpath()`` call, and it does — it is the
+# ``Path.resolve()`` / ``_realpath()`` call, and it does — it is the
 # first check in both :func:`get_read_block_error` and the write-denial
 # classifier.
 #
@@ -294,7 +345,8 @@ def build_write_denied_paths(home: str) -> set[str]:
         *(str(base / f) for base in _credential_store_dirs() for f in hermes_files),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
-    return {os.path.realpath(p) for p in paths}
+    _prefetch_realpaths(paths)
+    return {spelling for path in paths for spelling in _write_path_spellings(path)}
 
 
 # Home-root single-file credential stores. Also hidden by the dashboard Files API (hermes_cli.web_routers.files);
@@ -330,7 +382,8 @@ def build_write_denied_prefixes(home: str) -> list[str]:
         *(os.path.join(home, *d.split("/")) for d in HOME_CREDENTIAL_DIRS),
         "/etc/sudoers.d", "/etc/systemd",
     ]
-    return [os.path.realpath(p) + os.sep for p in paths]
+    _prefetch_realpaths(paths)
+    return [spelling + os.sep for path in paths for spelling in _write_path_spellings(path)]
 
 
 def get_safe_write_roots() -> set[str]:
@@ -338,8 +391,19 @@ def get_safe_write_roots() -> set[str]:
     roots: set[str] = set()
     for path in filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)):
         with suppress(OSError, ValueError):
-            roots.add(os.path.realpath(os.path.expanduser(path)))
+            roots.add(_realpath(os.path.expanduser(path)))
     return roots
+
+
+def build_write_approval_paths(home: str) -> set[str]:
+    """Paths that need human APPROVAL to write but are not hard-denied credentials.
+
+    ``~/.ssh/config`` is routine to edit and holds no key bytes, but can carry
+    ``ProxyCommand`` / ``Match exec``. Interactive file tools prompt
+    (approve-once/session/always, like the terminal tool's ``~/.ssh`` gate);
+    non-interactive callers (ACP shims, background jobs) fail closed.
+    """
+    return _write_path_spellings(os.path.join(home, ".ssh", "config"))
 
 
 # Login shell startup files: approval-gated for the file tools and, via
@@ -355,8 +419,11 @@ def _approval_paths_by_key(home: str) -> dict[str, str]:
     files run at login. Interactive file tools prompt; callers without a human channel fail closed.
     Each class has its own key so an approve-always answer for ``~/.ssh/config`` never authorizes
     ``~/.bashrc`` (or vice versa)."""
-    paths = {os.path.realpath(os.path.join(home, ".ssh", "config")): "ssh_config_write"}
-    paths.update({os.path.realpath(os.path.join(home, name)): "shell_rc_write" for name in SHELL_RC_FILES})
+    # _realpath, not os.path.realpath: on a named node these are the node's paths and resolve there,
+    # never on the controller's filesystem. With no node selected the two are the same call.
+    _prefetch_realpaths([os.path.join(home, ".ssh", "config"), *(os.path.join(home, name) for name in SHELL_RC_FILES)])
+    paths = {_realpath(os.path.join(home, ".ssh", "config")): "ssh_config_write"}
+    paths.update({_realpath(os.path.join(home, name)): "shell_rc_write" for name in SHELL_RC_FILES})
     return paths
 
 
@@ -379,26 +446,36 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     # BEFORE the approval-gated allow so ~/.ssh-style gating cannot re-open it.
     from agent.runtime_self_protection import is_protected_path, split_entry
 
-    if is_protected_path(path) or (entry and is_protected_path(path, follow=False)):
+    if not _named_remote() and (is_protected_path(path) or (entry and is_protected_path(path, follow=False))):
         return "credential"
     denial = _classify_resolved_write_denial(homes, resolved)
-    if denial or not entry:
+    if denial:
         return denial
-    parent, leaf = split_entry(os.path.expanduser(str(path)))
+    lexical = _lexical_write_path(path)
+    # Only credential policy applies to the lexical spelling: safe roots still
+    # describe where the write lands, not where a harmless symlink is located.
+    if lexical and lexical != resolved and _classify_resolved_write_denial(homes, lexical) == "credential":
+        return "credential"
+    if not entry:
+        return None
+    # A named node expands ``~`` in its own home during resolution, never the controller's.
+    parent, leaf = split_entry(str(path) if _named_remote() else os.path.expanduser(str(path)))
     from tools.environments.sandbox_scope import sandbox_lexical_path
-    lexical_parent = sandbox_lexical_path(parent or ".")
-    entry_path = os.path.join(lexical_parent if lexical_parent is not None else os.path.realpath(parent or "."), leaf)
+    lexical_parent = None if _named_remote() else sandbox_lexical_path(parent or ".")
+    entry_base = _realpath(parent or ".") if _named_remote() else (lexical_parent or os.path.realpath(parent or "."))
+    entry_path = os.path.join(entry_base, leaf)
     return _classify_resolved_write_denial(homes, entry_path)
 
 
 def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[str]:
-    """Credential / protected-subpath / safe-root verdict for an already-resolved path."""
+    """Credential / protected-subpath / safe-root verdict for a normalized path."""
     # Only ``~/.ssh/config`` skips the credential deny (so the ``.ssh/`` prefix doesn't swallow it)
     # and reaches the approval prompt. Shell rc files need no exemption, and granting one would let
     # ``~/.bashrc`` -> ``~/.ssh/authorized_keys`` turn the credential deny into a shell_rc_write
     # prompt. The protected-subpath and HERMES_WRITE_SAFE_ROOT checks below still apply.
+    # Both spellings of the config count: the lexical pass hands this an unresolved path.
     key = deny_key(resolved)
-    ssh_configs = {deny_key(os.path.realpath(os.path.join(home, ".ssh", "config"))) for home in homes}
+    ssh_configs = {deny_key(spelling) for home in homes for spelling in build_write_approval_paths(home)}
     if key not in ssh_configs and any(
         key in map(deny_key, build_write_denied_paths(home))
         or any(key.startswith(deny_key(prefix)) for prefix in build_write_denied_prefixes(home))
@@ -406,11 +483,21 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     ):
         return "credential"
 
+    _prefetch_realpaths(os.path.join(str(base), *sub.split("/"))
+                        for base in _credential_store_dirs() for sub in HERMES_PROTECTED_SUBPATHS)
     for base in _credential_store_dirs():
         for sub in HERMES_PROTECTED_SUBPATHS:
-            with suppress(Exception):
-                if deny_path_under(resolved, os.path.realpath(os.path.join(str(base), *sub.split("/")))):
-                    return "credential"
+            anchor = os.path.join(str(base), *sub.split("/"))
+            if _named_remote():
+                if _is_under(resolved, _realpath(anchor)):
+                    # A successful batch is only an optimization. Confirm the matching protected
+                    # anchor through the ordinary resolver so an unavailable anchor cannot become a
+                    # normal lexical deny.
+                    from tools.file_backend_state import confirm_policy_realpath
+                    if _is_under(resolved, confirm_policy_realpath(anchor)):
+                        return "credential"
+            elif deny_path_under(resolved, _realpath(anchor)):
+                return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
@@ -436,7 +523,18 @@ def get_write_denied_error(path: str, *, verb: str = "Write", entry: bool = Fals
         )
     if denial == "nt_namespace":
         return get_nt_namespace_error(path, verb=verb)
-    return f"{verb} denied: '{path}' is a protected system/credential file." if denial else None
+    return _credential_write_error(path, verb) if denial else None
+
+
+def get_credential_write_error(path: str, *, verb: str = "Write") -> Optional[str]:
+    """The credential refusal alone, for vetting the path a caller spelled beside the
+    resolved target its backend guard receives. Safe roots describe where the write
+    lands, so they stay with that target's check."""
+    return _credential_write_error(path, verb) if _classify_write_denial(path) == "credential" else None
+
+
+def _credential_write_error(path: str, verb: str) -> str:
+    return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
 def is_write_approval_required(path: str) -> bool:
@@ -563,10 +661,10 @@ def get_read_block_error(path: str) -> Optional[str]:
     nt_error = get_nt_namespace_error(path, verb="Read")
     if nt_error:
         return nt_error
-    from tools.environments.sandbox_scope import sandbox_lexical_path
     local = local_drive_spelling(path)
-    lexical = sandbox_lexical_path(local)
-    resolved = Path(lexical) if lexical is not None else Path(local).expanduser().resolve()
+    resolved = _resolve_target(local)
+    if resolved is None:
+        return f"Access denied: cannot resolve {path}"
     hermes_dirs = _credential_store_dirs()
     reason = None
     if is_blocked_device_path(os.path.expanduser(local)) or is_blocked_device_path(str(resolved)):

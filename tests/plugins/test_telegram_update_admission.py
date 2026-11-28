@@ -253,6 +253,33 @@ async def test_replay_is_admitted_once_before_dispatch(monkeypatch, tmp_path, ki
             assert len(delivered) == 2
 
 
+@pytest.mark.asyncio
+async def test_pre_handoff_base_failure_keeps_update_retryable(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        original = BasePlatformAdapter.handle_message
+        failed = False
+
+        async def fail_before_handoff(base, event):
+            nonlocal failed
+            if not failed:
+                failed = True
+                event._gateway_accepted = False
+                raise RuntimeError("preparation failed")
+            return await original(base, event)
+
+        monkeypatch.setattr(BasePlatformAdapter, "handle_message", fail_before_handoff)
+        incoming = update(app.bot, kind="command")
+        await app.process_update(incoming)
+        assert not adapter._seen_update_ids
+        assert not adapter._inflight_update_ids
+
+        await app.process_update(incoming)
+        assert len(delivered) == 1
+        assert not adapter._inflight_update_ids
+
+
 async def _check_sticker_handoff(monkeypatch, adapter, app, delivered, stage):
     from gateway import sticker_cache
     from tools import vision_tools
@@ -434,11 +461,13 @@ async def _check_error_registration(monkeypatch, adapter, app):
 async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered):
     scheduled, effects = [], []
     create = app._Application__create_task
+    callbacks_finished = asyncio.Event()
 
     def cancel_on_schedule(coroutine, *args, **kwargs):
         task = create(coroutine, *args, **kwargs)
         if kwargs.get("is_error_handler"):
             scheduled.append((task, coroutine))
+            task.add_done_callback(lambda _: callbacks_finished.set())
             task.cancel()
         return task
 
@@ -454,6 +483,9 @@ async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered)
         await app.process_update(update(app.bot))
         await app.stop()
     assert len(scheduled) == 1 and not effects
+    # A done task can leave its registered callbacks queued for the next loop
+    # iteration. Wait for that boundary before asserting admission cleanup.
+    await asyncio.wait_for(callbacks_finished.wait(), 5)
     assert not adapter._inflight_update_ids and not adapter._seen_update_ids
     # The cancelled PTB task never awaited the callback coroutine: it must be closed too.
     try:
@@ -796,7 +828,18 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
             first.cancel()
             await asyncio.gather(first, return_exceptions=True)
             raise
-        if failure == "cancel":
+        if stage == "media_warning":
+            # The retry notice is a paced delivery, so it runs off the update consumer: the update
+            # is accepted and finished before the notice lands, and a failed or cancelled notice
+            # cannot reopen it.
+            await asyncio.wait_for(first, 2)
+            notices = [task for task in adapter._background_tasks if "media-retry-notice" in task.get_name()]
+            assert len(notices) == 1
+            if failure == "cancel":
+                notices[0].cancel()
+            release.set()
+            await asyncio.gather(*notices, return_exceptions=True)
+        elif failure == "cancel":
             if stage in ("enqueued", "dispatch", "batch_prepare"):
                 release.set()
             else:
@@ -1011,35 +1054,34 @@ async def test_slow_update_does_not_block_other_chats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unserved_update_not_receipted_and_logs_field_names(monkeypatch, caplog):
-    """#141570: an update that no group-0 handler serves (e.g. a chat-title service message) must not be
-    receipted by the group-99 observer's return — the receipt would suppress redelivery of
-    an update nobody served, silently. Instead one INFO line names the update id and the
-    field names only (never values), and a redelivery dispatches again."""
+    """#141570: an update that no group-0 handler serves must not be receipted by the
+    group-99 observer's return. Message payloads now reach the unmatched-message guard;
+    a poll answer remains unserved. Log names only and admit its redelivery again."""
     import logging as stdlib_logging
 
-    unserved_payload = {
+    poll_payload = {
         "update_id": 77,
-        "message": {
-            "message_id": 473, "date": 1800000000,
-            "chat": {"id": 42, "type": "private"},
-            "from": {"id": 88, "is_bot": False, "first_name": "Human"},
-            "new_chat_title": "Lunch club",
+        "poll_answer": {
+            "poll_id": "private-poll-value", "option_ids": [4],
+            "option_persistent_ids": ["private-option-value"],
+            "user": {"id": 88, "is_bot": False, "first_name": "Private Human"},
         },
     }
     async with connected(monkeypatch) as (adapter, app, delivered):
         caplog.set_level(stdlib_logging.INFO, logger="plugins.platforms.telegram.update_admission")
-        unserved = Update.de_json(unserved_payload, app.bot)
-        await app.process_update(unserved)
-        assert not delivered  # no core handler serves a title change
+        answer = Update.de_json(poll_payload, app.bot)
+        await app.process_update(answer)
+        assert not delivered  # no core handler serves poll answers
         assert f"{app.bot.id}:77" not in adapter._seen_update_ids  # not receipted
         records = [r for r in caplog.records if "matched no core handler" in r.message]
         assert len(records) == 1
         text = records[0].getMessage()
         assert "Update 77" in text
-        assert "message(chat,date,from,message_id,new_chat_title)" in text  # field names only
-        assert "Lunch" not in text and "473" not in text and "88" not in text  # never values
+        assert "poll_answer(option_ids,option_persistent_ids,poll_id,user)" in text  # field names only
+        assert "private-poll-value" not in text and "Private Human" not in text and "88" not in text
+        assert "private-option-value" not in text
         # No receipt: a redelivery of the same id dispatches again instead of being dropped.
-        await app.process_update(unserved)
+        await app.process_update(answer)
         records = [r for r in caplog.records if "matched no core handler" in r.message]
         assert len(records) == 2
 

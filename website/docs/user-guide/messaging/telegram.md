@@ -1225,7 +1225,7 @@ gateway:
 
 ## Rendering: Rich Messages, Tables and Link Previews
 
-**Rich Messages (Bot API 10.1).** Final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the streaming preview plain — it uses Telegram's ephemeral draft transport with legacy rendering (tables and other rich-only constructs stay as raw markdown in the preview) — then persists the completed response with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. Ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
+**Rich Messages (Bot API 10.1).** In `auto` mode, final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the streaming preview plain — it uses Telegram's ephemeral draft transport with legacy rendering (tables and other rich-only constructs stay as raw markdown in the preview) — then persists the completed response with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. In `auto` mode, ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
 
 A rich-eligible message longer than the 32,768-character rich text limit is sent as several rich messages, split between blocks (a `<details>` section, table or code block is never cut unless it alone is over the limit, in which case a table repeats its header and a code block reopens in the next part). Any rejection from Telegram (unsupported endpoint on an older `python-telegram-bot`, parser error, oversized blocks/columns) **transparently falls back** to the MarkdownV2 path — your message is never lost. Transient/network errors are *not* silently re-sent (no duplicate final message).
 
@@ -1237,6 +1237,21 @@ A rich-eligible message longer than the 32,768-character rich text limit is sent
 - **Larger or wider tables** fall back to a **fenced code block** with aligned columns so nothing collapses.
 
 LaTeX symbol macros in prose (`\rightarrow`, `\leq`, `\alpha`, ...) are shown as the symbols they name (→, ≤, α), and an inline `$x \leq y$` drops its dollar signs once it is plain text, since MarkdownV2 cannot typeset math. Code spans, code blocks, file paths and unknown macros keep their backslashes. On the rich path the same mapping applies only outside math spans, which Telegram typesets itself.
+
+`rich_messages` accepts a single routing mode:
+
+| Value | Final response behavior |
+|---|---|
+| `always` | Prefer native rich rendering for every eligible nonblank response, including headings, emphasis, and ordinary prose. |
+| `auto` or `true` | Use rich rendering for tables, task lists, details, and block math. |
+| `never` or `false` | Use MarkdownV2, retaining basic bold, italic, links, and code formatting. |
+
+The unset default remains `never`. Quoted boolean tokens (`true`/`false`,
+`yes`/`no`, `on`/`off`, `1`/`0`) remain accepted. Unknown values produce a
+configuration error instead of silently disabling rich rendering. `always`
+retains the same capability, client-risk, size, and fallback guards as `auto`.
+Streaming previews remain independently controlled by `rich_drafts`; final
+edits and fresh final messages follow `rich_messages`.
 
 Rich messages are **opt-in**. The default stays on the legacy MarkdownV2 path because current Telegram clients can make Bot API rich messages difficult to copy as plain text, which is especially painful for command snippets and mobile handoffs. To enable native rendering for tables/task lists/details/math:
 

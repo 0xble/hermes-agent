@@ -35,7 +35,8 @@ async def test_exhausted_request_is_not_rerun_behind_rehomed_follow_ups(native_f
     await authority._drain(admitted[0][1].ref)
     # B was re-homed onto the fresh session; A going back in the head slot would run behind it.
     assert queued_after_reset == [None], "the exhausted request was queued behind a re-homed follow-up"
-    assert executed == ["A"], executed
+    # Keep-context exhaustion does not rotate the session or park the exhausted request.
+    assert executed == ["A", "B"], executed
 
 
 @pytest.mark.asyncio
@@ -130,4 +131,5 @@ async def test_exhausted_request_is_parked_only_where_an_adapter_task_drains_it(
     monkeypatch.setattr(runner, "_handle_message_with_agent", turn)
     await authority._drain(admission.ref)
     parked = queued_after_reset[0]
-    assert (parked is not None and parked.text == "plan my week") is live_waiter, parked
+    # Keep-context exhaustion leaves no adapter-owned retry parked for a later drain.
+    assert parked is None, parked

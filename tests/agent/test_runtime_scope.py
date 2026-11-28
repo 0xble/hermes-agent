@@ -636,9 +636,10 @@ def test_claim_fence_reads_the_claimed_admission(tmp_path):
 
     from gateway.session_authority import admission_row
     from persistence_assembly import open_persistence, profile_scope
+    from gateway.runtime_ownership import exclusive_maintenance
     from tests.persistence_sqlite.authority.test_target_advance_fence import _local_session
 
-    with closing(open_persistence(profile_scope(home=tmp_path))) as db:
+    with closing(open_persistence(profile_scope(home=tmp_path))) as db, exclusive_maintenance([tmp_path]):
         db.runtime.begin_epoch(instance_id="owner")
         epoch = db.runtime.begin_epoch(instance_id="owner")  # a restarted owner: epoch 2
         sid = _local_session(db, epoch, tmp_path)

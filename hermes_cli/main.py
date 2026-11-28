@@ -2055,7 +2055,9 @@ def _clear_bytecode_cache(root: Path) -> int:
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in {"venv", ".venv", "node_modules", ".git", ".worktrees"}
+            # CI keeps a full PM cache and isolated workspaces under .ci/pm-home; walking it on
+            # every first launch can take minutes and is unrelated to checkout bytecode.
+            if d not in {"venv", ".venv", "node_modules", ".git", ".worktrees", ".ci"}
         ]
         if os.path.basename(dirpath) == "__pycache__":
             try:

@@ -179,7 +179,7 @@ async def test_worker_status_mixin_scopes_confirmed_progress(monkeypatch):
     adapter = Adapter()
     latency.bind_agent_start(event(adapter, 'inbound'))
     receipt = latency.current_receipt()
-    ctx = TurnContext(source=event(adapter, 'source').source, _status_adapter=adapter,
+    ctx = TurnContext(source=event(adapter, 'source').source, _status_adapter_pinned=adapter,
                       _status_chat_id='chat', _status_thread_metadata={},
                       _run_still_current=lambda: True, _cleanup_progress=False)
     runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda source: adapter), ctx)

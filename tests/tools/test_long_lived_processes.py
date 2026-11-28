@@ -103,6 +103,9 @@ def test_attach_and_stop_take_the_same_lock_as_start():
 
 
 @pytest.mark.platforms("posix")  # POSIX argv and process-group signals
+# The leader is reaped before the reuse, so its surviving child is an orphan of init: the guard cannot
+# prove a leaderless group is this test's, and really signalling that orphan is the point of the test.
+@pytest.mark.live_system_guard_bypass
 def test_a_reused_name_reaps_the_old_records_children_and_pipes(tmp_path):
     pidfile = tmp_path / "child.pid"
     env = _HostEnv()

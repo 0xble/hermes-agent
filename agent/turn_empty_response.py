@@ -10,6 +10,8 @@ short-circuit) → fallback provider → terminal ``(empty)`` sentinel. Nothing 
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import logging
 import re
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from agent import empty_response_guard as _empty_guard
 from agent.message_metadata import append_message
+from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.message_sanitization import _sanitize_surrogates
 from agent.turn_context_compaction import _refund_api_call
 from agent.turn_recovery import interruptible_backoff_sleep
@@ -29,7 +32,9 @@ _INLINE_THINK_RE = re.compile(r'<think>|<thinking>|<reasoning>', re.IGNORECASE)
 # internal_notification turn plus the producer-notice cards (background-process completions,
 # async delegation results). Mirrors gateway.response_filters.MACHINERY_DISPLAY_KINDS;
 # agent/ cannot import gateway/.
-_MACHINERY_DISPLAY_KINDS = frozenset({"internal_notification", "process_complete", "async_delegation_complete"})
+_MACHINERY_DISPLAY_KINDS = frozenset({
+    "internal_notification", "process_complete", "async_delegation_complete", "supervisor_checkin",
+})
 
 # Loop exit stamped when a machinery turn ends with the model adding nothing.
 NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
@@ -166,6 +171,10 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
         )
     agent._flush_status_buffer()
     reasoning_text = agent._extract_reasoning(assistant_message)
+    if is_responses_reasoning_summary(agent, assistant_message):
+        # A Responses reasoning summary is not a draft answer: never echo it as the
+        # "last thoughts" preview.
+        reasoning_text = ""
     agent._drop_trailing_empty_response_scaffolding(messages)
     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
     assistant_msg["content"] = "(empty)"
@@ -251,7 +260,8 @@ def _machinery_quiet_exit(agent: Any, assistant_message: Any, finish_reason: str
     did not announce a tool call: ``finish_reason="tool_calls"`` with no payload is a dropped
     action, so it keeps the ladder below, whose re-prompt recovers it.
     """
-    if finish_reason == "tool_calls" or not _notification_turn_without_tool_round(messages):
+    if (finish_reason == "tool_calls" or _latest_user_display_kind(messages) == "supervisor_checkin"
+            or not _notification_turn_without_tool_round(messages)):
         return False
     logger.info(
         "Empty response on a machinery turn (%s): ending the turn without a reply",
@@ -294,6 +304,11 @@ def recover_empty_response(
     # final response instead of fallback or retries.
     if (_recovered := _partial_stream_reply(agent)) is not None:
         _turn_exit_reason = "partial_stream_recovery"
+        logger.info(
+            "Partial stream content delivered (%d chars) — using as final response",
+            len(_recovered),
+        )
+        agent._emit_diagnostic_status(ContextNotice("↻ Stream interrupted — using delivered content " "as final response"))
         final_response = _recovered
         return _verdict("break")
 
@@ -308,7 +323,7 @@ def recover_empty_response(
     if (final := take_housekeeping_reply_line(agent)) is not None:
         _turn_exit_reason = "fallback_prior_turn_content"
         logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-        agent._emit_diagnostic_status("↻ Empty response after tool calls — using earlier content as final answer")
+        agent._emit_diagnostic_status(ContextNotice("↻ Empty response after tool calls — using earlier content as final answer"))
         agent._empty_content_retries = 0
         final_response = final
         return _verdict("break")

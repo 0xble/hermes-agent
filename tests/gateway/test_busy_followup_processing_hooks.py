@@ -11,7 +11,12 @@ import asyncio
 
 import pytest
 
-from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wait_for
+from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses
+from tests.waiting import async_wait_until
+
+
+async def _wait_for(predicate, timeout=5):
+    await async_wait_until(predicate, timeout=timeout)
 
 
 class HookAdapter(Adapter):
@@ -31,7 +36,7 @@ async def test_busy_followup_fires_processing_hooks_once(monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.platforms.event import MessageEvent, ProcessingOutcome
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
@@ -68,7 +73,7 @@ async def test_busy_followup_fires_processing_hooks_once(monkeypatch):
 async def _busy_hook_owner(monkeypatch, adapter):
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')

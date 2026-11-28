@@ -309,7 +309,8 @@ async def test_profile_scope_reuses_prepared_authorization_secrets(monkeypatch, 
     for home in (transport, other):
         home.mkdir()
     loads = []
-    monkeypatch.setattr(gateway_run, '_load_profile_secret_scope',
+    # Both ingress preparation and the runtime binder now read from this shared loader.
+    monkeypatch.setattr('tui_gateway.launch_profile_policy.owner_secret_scope',
                         lambda home: loads.append(str(home)) or {'MARK': str(home)})
     runner = SimpleNamespace(_authorization_home_for_source=lambda source: transport)
     async with gateway_run.prepared_authorization_scope(runner, None):

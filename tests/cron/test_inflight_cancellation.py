@@ -500,7 +500,7 @@ def test_listing_and_formatting_survive_scheduler_failure(isolated_store, monkey
     listed = jobs.list_jobs()
     assert listed[0]["id"] == job["id"]
     assert listed[0]["running"] is False and listed[0]["running_since"] is None
-    from tools.cronjob_job_args import _format_job
+    from cron.job_args import _format_job
     assert _format_job(listed[0])["state"] == "scheduled"
 
 
@@ -508,7 +508,7 @@ def test_listing_and_formatting_survive_scheduler_failure(isolated_store, monkey
 def test_listing_without_scheduler_never_imports_it(isolated_store, monkeypatch, claimed):
     import builtins
     import sys
-    from tools.cronjob_job_args import _format_job
+    from cron.job_args import _format_job
 
     job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
     if claimed:

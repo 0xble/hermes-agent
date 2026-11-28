@@ -24,6 +24,7 @@ import time
 from typing import Optional
 
 from agent.i18n import t
+from agent.notice_style import notice_metadata
 from gateway.config import Platform
 from gateway.run_shutdown import _send_error, _send_failed
 
@@ -122,7 +123,8 @@ class GatewayRestartNoticeMixin:
                     metadata[field] = str(data[field])
         result = await transport.send(
             platform, str(chat_id), t("gateway.startup.restarted"),
-            metadata=_non_conversational_metadata(metadata, platform=platform),
+            metadata=notice_metadata(_non_conversational_metadata(metadata, platform=platform),
+                                     platform=platform, style="context"),
         )
         # adapter.send() catches provider errors (e.g. "Chat not found") and returns
         # SendResult(success=False) rather than raising, so inspect the result before claiming success.

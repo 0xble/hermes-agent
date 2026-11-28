@@ -103,10 +103,11 @@ def spawn_hermes(fh: FakeHome, args: list[str], *, extra_env: dict[str, str] | N
         out.close()
 
 
-def kill_tagged(tag: str) -> None:
-    """SIGKILL every live process carrying ``OAUTH_E2E_TAG=<tag>`` (this test's tree only)."""
+def kill_tagged(tag: str) -> list[int]:
+    """SIGKILL every live process carrying ``OAUTH_E2E_TAG=<tag>`` (this test's tree only); the PIDs signalled."""
     needle = f"{TAG_VAR}={tag}".encode()
     me = os.getpid()
+    killed: list[int] = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == me:
             continue
@@ -118,8 +119,10 @@ def kill_tagged(tag: str) -> None:
         if needle in env.split(b"\0"):
             try:
                 os.kill(int(entry), signal.SIGKILL)  # windows-footgun: ok — Linux-gated suite (/proc scan)
+                killed.append(int(entry))
             except OSError:
                 pass
+    return killed
 
 
 def wait_until(pred: Callable[[], Any], timeout: float, what: str, interval: float = 0.05) -> Any:

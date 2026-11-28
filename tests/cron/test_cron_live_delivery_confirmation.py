@@ -477,7 +477,7 @@ class TestShortFloodWaitStaysOnTheLiveLane:
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("cron.scheduler_delivery._record_delivery_verification"), \
              patch("gateway.delivery.DeliveryRouter", return_value=router), \
-             patch("tools.send_message_tool._send_to_platform", _fake_send_to_platform), \
+             patch("gateway.outbound.send._send_to_platform", _fake_send_to_platform), \
              patch("cron.scheduler_delivery.time.sleep", side_effect=sleeps.append), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
             error = _deliver_result(_job(), "Alert with a footnote.[^1]", adapters=_adapters(), loop=loop)

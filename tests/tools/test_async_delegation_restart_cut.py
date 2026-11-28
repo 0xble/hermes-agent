@@ -150,6 +150,10 @@ def test_restart_cut_row_survives_100_dispatches():
         {"task_index": 1, "status": "interrupted", "error": "cut"},
         {"task_index": 2, "status": "interrupted", "error": "cut"},
     ])
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
     for index in range(100):
         handle = ad.dispatch_async_delegation(
             goal=f"turnover-{index}", context=None, toolsets=None, role="leaf", model="m",

@@ -646,7 +646,7 @@ async def test_recovered_followup_real_gateway_turn_persists_recovery_id_at_turn
     runner._hmwa_prepend_reasoning = lambda _result, response, *_args: response
     runner._hmwa_post_turn_hooks = AsyncMock()
     runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
-    runner._hmwa_compression_exhaustion_reset = AsyncMock(side_effect=lambda _result, response, entry, *_args: (response, entry))
+    runner._hmwa_compression_exhaustion_reset = AsyncMock(side_effect=lambda _result, response, entry, *_args, event=None: (response, entry))
     runner._hmwa_deliver_turn_response = AsyncMock(return_value=None)
     runner._clear_durable_active_turn = AsyncMock()
     runner._release_running_agent_state = Mock()

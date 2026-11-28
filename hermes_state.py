@@ -176,6 +176,57 @@ def _reap_collected_stacks() -> None:
             _logger.debug("Releasing a collected hermes_state.SessionDB's store handle failed", exc_info=True)
         del stack  # never pin a released handle while waiting for the next one
 
+    def _open_writer(self) -> None:
+        """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
+        malformed sqlite_master), generation stamp."""
+        # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
+        # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
+        mkdir_under_hermes_home(self.db_path.parent)
+        try:
+            # Only a positively observed SQLite header can bypass startup serialization.
+            # Permission repair can reveal a damaged header after an indeterminate probe.
+            if not has_valid_sqlite_header_preopen(self.db_path):
+                # The directory must be writable before the lock file can be created in it; the
+                # directory never vanishes mid-quarantine, so checking it unlocked is race-free.
+                preflight_db_writability(self.db_path, db_label="state.db", directory_only=True)
+                with quarantine_cross_process_lock(self.db_path) as lock_acquired:
+                    if not lock_acquired:
+                        logger.warning(
+                            "startup quarantine lock for %s not acquired within 5s; proceeding",
+                            self.db_path,
+                        )
+                    # Preflight under the lock: unlocked, it can list state.db just before a
+                    # concurrent opener renames it aside, and os.access on the vanished path
+                    # then reports a writable DB as "read-only for this user".
+                    preflight_db_writability(self.db_path, db_label="state.db")
+                    self._handle_quarantine_if_invalid(already_locked=lock_acquired)
+                    self._connect_and_init_with_lock_patience()
+            else:
+                # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
+                # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
+                preflight_db_writability(self.db_path, db_label="state.db")
+                self._handle_quarantine_if_invalid(already_locked=False)
+                self._connect_and_init_with_lock_patience()
+        except sqlite3.DatabaseError as exc:
+            # A malformed schema fails on the very first statement (before _init_schema), so the
+            # FTS-rebuild layer never sees it: repair sqlite_master in place (backup first), reopen once.
+            if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
+                raise
+            logger.error(
+                "state.db schema is malformed (%s) — attempting automatic "
+                "repair (a backup copy is made first).", exc,
+            )
+            self._close_connection_quietly(self._conn)
+            if not repair_state_db_schema(self.db_path).get("repaired"):
+                raise
+            self._connect_and_init_with_lock_patience()
+        # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
+        self._ensure_db_file_generation()
+        if self._wal_active:
+            # OFD copies of the two POSIX locks that keep a sibling's close from unlinking this WAL
+            # generation: any in-process open()/close() of state.db or -shm cancels SQLite's own
+            # (howtocorrupt §2.2); these survive it. Lifted in close().
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
 
 def _ensure_reaper() -> None:
     """Start the reaper at the first writable open, or again whenever it isn't running."""
@@ -186,12 +237,53 @@ def _ensure_reaper() -> None:
             _reaper = _ReaperThread(target=_reap_collected_stacks, name="sessiondb-reaper", daemon=True)
             _reaper.start()
 
+    def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
+        """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
+        are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
+        conn = _connect_tracked_db(
+            read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
+            check_same_thread=False, timeout=timeout, isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        from hermes_state_search import _register_search_functions
+        _register_search_functions(conn)
+        return conn
 
 def _search_sort(sort: "Optional[str]", orders: "Any") -> "Any":
     """The old class's reading of ``sort``: ``newest`` or ``oldest`` in any case and padding, else relevance."""
     key = sort.strip().lower() if isinstance(sort, str) else ""
     return {order.value: order for order in orders}.get(key, orders.RELEVANCE)
 
+    def _open_writer_conn(self) -> sqlite3.Connection:
+        """Connect + WAL/pragma setup for a writer connection (no schema init). Short timeout:
+        jittered application-level retry handles contention, not SQLite's busy handler;
+        isolation_level=None: explicit BEGIN IMMEDIATE."""
+        conn = _connect_tracked_db(
+            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None, factory=PublicationConnection,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            from hermes_state_search import _register_search_functions
+            _register_search_functions(conn)
+            mode = apply_wal_with_fallback(conn, db_label="state.db")
+            # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
+            # (#86515): the lock-free mode=ro read pool needs a confirmed WAL header, so confirm it here.
+            # Unknown -> reads queue on the writer lock (slow but correct) instead of racing SQLITE_BUSY
+            # on a file that may really be in rollback-journal mode.
+            self._wal_active = mode == "wal" and _on_disk_journal_mode(conn) == "wal"
+            # Existing WAL/SHM files may predate the main-file hardening;
+            # normalize any sidecars that became visible during WAL setup.
+            _secure_state_db_files(self.db_path)
+            if self._wal_active and sys.platform == "darwin":
+                # The periodic PASSIVE checkpoint runs off the writer lock. SQLite's
+                # default auto-checkpoint can otherwise do the same fullfsync work in commit().
+                conn.execute("PRAGMA wal_autocheckpoint=0")
+            apply_database_pragmas(conn, db_label="state.db")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            self._close_connection_quietly(conn)
+            raise
+        return conn
 
 class _SessionDB:
     """``SessionDB`` over one store handle: ``open_persistence`` for a writable store (``db_path`` must name a

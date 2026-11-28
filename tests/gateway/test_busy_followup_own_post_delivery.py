@@ -18,7 +18,13 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run_turn_bubble_cleanup import register_bubble_cleanup
 from gateway.session import SessionSource
-from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wait_for
+from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses
+from tests.waiting import async_wait_until
+
+
+async def _wait_for(predicate, timeout=5):
+    await async_wait_until(predicate, timeout=timeout)
 
 KEY = "agent:main:telegram:group:-1001:7"
 CHAT = "-1001"
@@ -80,7 +86,7 @@ async def test_authority_busy_follow_up_deletes_its_own_progress_bubbles(monkeyp
     this test."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
@@ -142,13 +148,14 @@ async def test_busy_follow_up_goal_notice_keeps_its_bubble_cleanup_without_adapt
     async def manager(*_args, **_kwargs):
         return SimpleNamespace(
             is_active=lambda: True,
-            evaluate_after_turn=lambda *_a, **_kw: {"message": "goal reached"},
+            # An outcome notice: the fork keeps routine parked/continuing status text out of chat.
+            evaluate_after_turn=lambda *_a, **_kw: {"message": "✓ goal reached"},
         )
 
     async def executor(fn):
         return fn()
 
-    async def notice(_source, message):
+    async def notice(_source, message, **_options):
         notices.append(message)
 
     async def no_loop(**_kwargs):
@@ -171,7 +178,7 @@ async def test_busy_follow_up_goal_notice_keeps_its_bubble_cleanup_without_adapt
     assert notices == []  # status follows the reply, not the agent hook
     await _run_own_post_delivery(adapter, KEY, event)
     assert adapter.deleted == ["102"]
-    assert notices == ["goal reached"]
+    assert notices == ["✓ goal reached"]
     assert KEY not in adapter._post_delivery_callbacks
 
 
@@ -188,6 +195,9 @@ async def test_busy_follow_up_loop_notice_keeps_its_bubble_cleanup_without_adapt
     runner.adapters = {Platform.TELEGRAM: adapter}
     event = _event("tick")
     event._hermes_run_generation = 7
+    # The fork settles a tick only for the stamped wake that carried it; an unstamped turn owns none.
+    event.metadata = {LOOP_WAKE_METADATA_KEY: True, "loop_wakeup_instance": 1.0, "loop_wakeup_tick": 3}
+    settled = []
     notices = []
 
     async def session(*_args, **_kwargs):
@@ -196,13 +206,15 @@ async def test_busy_follow_up_loop_notice_keeps_its_bubble_cleanup_without_adapt
     async def manager(_entry, label, *_a, **_kw):
         if label != "loop completion":
             return None
-        return SimpleNamespace(state=SimpleNamespace(awaiting_response=True),
-                               complete_tick=lambda _text: {"message": "loop done"})
+        def complete_tick(_text, *, tick=None):
+            settled.append(tick)
+            return {"message": "loop done"}
+        return SimpleNamespace(state=SimpleNamespace(awaiting_response=True), complete_tick=complete_tick)
 
     async def executor(fn, *args):
         return fn(*args)
 
-    async def notice(_source, message):
+    async def notice(_source, message, **_options):
         notices.append(message)
 
     monkeypatch.setattr(runner.async_session_store, "get_or_create_session", session)
@@ -222,4 +234,5 @@ async def test_busy_follow_up_loop_notice_keeps_its_bubble_cleanup_without_adapt
     await _run_own_post_delivery(adapter, KEY, event)
     assert adapter.deleted == ["103"]
     assert notices == ["loop done"]
+    assert settled == [(1.0, 3)]
     assert KEY not in adapter._post_delivery_callbacks

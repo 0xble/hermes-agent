@@ -238,7 +238,11 @@ relax an exit-code expectation. Regenerate prompt-surface fixtures through
 runner status and presence/absence of a terminal pytest summary on every failed
 attempt. A timed-out or crashed child with no parsed outcomes is reported as
 "NO TEST OUTCOMES RECOVERED", never asserted to have run no tests. Keep the
-failure-count headline and every cause bucket visible.
+failure-count headline and every cause bucket visible. On POSIX the runner asks
+only the pytest child for its thread and live asyncio task stacks before the
+existing deadline. The dump bypasses pytest capture and is included in timeout
+output; process-tree cleanup still runs at the hard cap. Asyncio stacks are
+best-effort if the main thread cannot run Python. Windows cleanup is unchanged.
 
 Update-finish fixtures copy the native `plugins` tree as well as core packages:
 bootstrap performs real registry discovery, so an incomplete fixture creates a
@@ -1185,6 +1189,18 @@ title paint behind a FIFO until the harness captures an incomplete frame.
 It fails with the original immediate assertion and passes with the shared
 screen wait. No runtime behavior changes. Retire this synchronization only
 when the renderer supplies an atomic command-output completion boundary.
+
+The platform-command capture helper joins the adapter's admitted session task
+before returning its send mock. The inherited 40-poll window could return with
+no send while an executor-backed `/stop` handler was still running. Both upstream
+v0.23.0 and fork main retain that window, and their unheld command suites pass.
+An event-held `/stop` with accelerated polling reproduces the same missing-send
+assertion on Telegram, Discord and Slack. Joining the task preserves the real
+command dispatch, response assertions and cleanup without a larger timeout.
+Retire this `fork-ci-reliability` adaptation when upstream captures command
+completion through an equivalent causal boundary.
+
+Contract tests: `tests/e2e/test_platform_commands.py::TestSlashCommands::test_leading_space_stop_waits_for_dispatch`.
 
 ## Pinned tool archive caches
 

@@ -157,7 +157,7 @@ def _rewrite_resolved_user_home(command: str) -> str:
         home = os.path.expanduser("~")
         paths = [home, os.path.realpath(home), os.environ.get("HOME", "")]
         paths += [spelling for path in list(paths) if path for spelling in _msys_drive_spellings(path)]
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return command
     return _fold_home_prefixes(command, paths, "~")
 
@@ -170,7 +170,7 @@ def _rewrite_resolved_hermes_home(command: str) -> str:
         from hermes_constants import get_hermes_home
         home = get_hermes_home().expanduser()
         paths = _home_spellings([str(home), str(home.resolve(strict=False))], command)
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return command
     command = _fold_home_prefixes(command, paths, "~/.hermes")
     # The prefix fold needs a child tail; fold the bare home word too (`mv /opt/data /tmp/x`) so the

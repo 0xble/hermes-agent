@@ -21,7 +21,7 @@ from tests.waiting import async_wait_until
 @pytest.mark.parametrize('busy', [False, True], ids=['idle', 'behind-a-running-turn'])
 async def test_moa_prompt_is_admitted_and_its_preset_runs_on_that_turn_only(monkeypatch, busy):
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
     runner = GatewayRunner(GatewayConfig())
     adapter = Adapter()

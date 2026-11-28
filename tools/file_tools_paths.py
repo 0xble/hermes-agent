@@ -9,6 +9,7 @@ edits to the agent process cwd, e.g. the main repo during a worktree session).
 import logging
 import os
 import posixpath
+from tools.node_execution import current_execution
 import sys
 import time
 from pathlib import Path, PurePosixPath
@@ -38,6 +39,9 @@ def _expand_tilde(path: str, task_id: str = "default") -> str:
     """
     if not path or "~" not in path:
         return path
+    if current_execution():
+        from tools.file_backend_state import remote_path
+        return remote_path(path)
     from tools.environments.sandbox_scope import hosted_scope
     if hosted_scope() is not None:
         return _expand_sandbox_tilde(path, task_id)
@@ -77,6 +81,8 @@ def _hosted_tilde(path: str, task_id: str = "default") -> str:
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
+    if current_execution():
+        return "ssh"
     try:
         from tools.terminal_tool import (
             _active_environments, _env_lock, _get_env_config, _resolve_container_task_id)
@@ -224,6 +230,8 @@ def _ssh_remote_anchor(task_id: str) -> str:
     """
     from agent.runtime_cwd import scope_terminal_cwd
     from tools.terminal_tool import get_session_cwd, resolve_task_overrides
+    if current_execution():
+        return get_session_cwd(task_id) or "~"
     from tools.terminal_tool_config import coerce_ssh_remote_cwd
 
     for raw in (get_session_cwd(task_id), resolve_task_overrides(task_id).get("cwd"), scope_terminal_cwd()):
@@ -357,6 +365,9 @@ def _container_default_cwd(task_id: str = "default") -> str | None:
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory
     (absolute inputs are returned resolved-but-unanchored)."""
+    if current_execution():
+        from tools.file_backend_state import remote_path
+        return PurePosixPath(remote_path(str(_resolve_ssh_path(filepath, task_id))))
     if _terminal_env_type_for_task(task_id) == "ssh":
         return _resolve_ssh_path(filepath, task_id)
     container_paths = _uses_container_paths(task_id)

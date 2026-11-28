@@ -752,9 +752,15 @@ def _spawn_deferred_launchd_reload(
     return True
 
 
-def refresh_launchd_plist_if_needed() -> bool | str:
+def refresh_launchd_plist_if_needed(*, use_planned_handover: bool = True) -> bool | str:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
-    re-reads it immediately."""
+    re-reads it immediately.
+
+    A stopped gateway has no owner to hand over.  In that state, a planned
+    handover refusal must not be allowed to turn a freshly written plist into
+    a kickstart of launchd's stale in-memory definition.  Callers can pass
+    ``False`` to force the direct single-label reload path.
+    """
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
         return False
@@ -769,7 +775,9 @@ def refresh_launchd_plist_if_needed() -> bool | str:
 
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")
-    return _reload_installed_launchd_plist(plist_path)
+    return _reload_installed_launchd_plist(
+        plist_path, use_planned_handover=use_planned_handover
+    )
 
 
 def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: float) -> bool:
@@ -793,8 +801,20 @@ def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: f
         domain, plist_path, label, deadline=time.monotonic() + budget)
 
 
-def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
-    """Re-register the installed bytes (including a saved source-checkout plist)."""
+def _reload_installed_launchd_plist(
+    plist_path: Path, *, use_planned_handover: bool = True
+) -> bool | str:
+    """Re-register the installed bytes (including a saved source-checkout plist).
+
+    Immutable-release transactions must reload the exact plist recorded in their
+    write-ahead transaction.  A slot handover would instead promote the sibling
+    slot, so those callers explicitly use the single-label reload path.
+    """
+    if use_planned_handover:
+        from hermes_cli.gateway_handover import planned_handover
+        handed_over = planned_handover()
+        if handed_over is not None:
+            return handed_over
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -1003,7 +1023,8 @@ def _launchd_start_locked():
             _launchd_ok("✓ Service started")
         return
 
-    _gw().refresh_launchd_plist_if_needed()
+    from gateway.status import get_running_pid
+    _gw().refresh_launchd_plist_if_needed(use_planned_handover=get_running_pid() is not None)
     try:
         _launchctl_kickstart_current(label)
     except subprocess.CalledProcessError as e:
@@ -1082,16 +1103,37 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    from hermes_cli.gateway_handover import planned_handover
+    handed_over = planned_handover()
+    use_planned_handover = None
+
+    def restart_locked():
+        if use_planned_handover is None:
+            return _launchd_restart_locked()
+        return _launchd_restart_locked(use_planned_handover=use_planned_handover)
+
+    if handed_over:
+        return
+    if handed_over is not None:
+        # A stopped gateway has no owner to hand over.  Use the ordinary
+        # start/reload path in that case, but never hide a refusal from a
+        # live gateway by falling back to a drain.
+        from gateway.status import get_running_pid
+        if get_running_pid() is not None:
+            raise RuntimeError("planned handover refused, existing work left intact")
+        # Continue through the ordinary restart route below so a configured
+        # lifetime domain still serializes the start with stop/migrate work.
+        use_planned_handover = False
     if configured_launchd_domain() is None:
-        return _launchd_restart_locked()
+        return restart_locked()
     from hermes_cli.gateway_launchd_lifetime import lifetime_lock
     with lifetime_lock(_gw().get_hermes_home(), announce_wait=True):
         # An explicit restart authorizes a start, but a later stop waits for this
         # transaction and remains authoritative after it returns.
-        return _launchd_restart_locked()
+        return restart_locked()
 
 
-def _launchd_restart_locked() -> int | None:
+def _launchd_restart_locked(*, use_planned_handover: bool | None = None) -> int | None:
     """Restart the invoking profile's launchd gateway. Returns the PID left running with its restart
     pending (live work outlived the drain wait; KeepAlive relaunches it once idle), else None."""
     gateway_service_owner.refuse_foreign_launchd_plist("restart")
@@ -1110,7 +1152,12 @@ def _launchd_restart_locked() -> int | None:
     # kickstart below would hang on the same wall — go straight to the
     # bootout/bootstrap-retry path, which is bounded and reports its own
     # failure instead of stalling the update for 90s.
-    refresh_ok = _gw().refresh_launchd_plist_if_needed()
+    if use_planned_handover is None:
+        refresh_ok = _gw().refresh_launchd_plist_if_needed()
+    else:
+        refresh_ok = _gw().refresh_launchd_plist_if_needed(
+            use_planned_handover=use_planned_handover
+        )
     if refresh_ok == "deferred":
         # The helper's bootout restarts the gateway under the planned-restart marker it wrote for the
         # current pid. A SIGUSR1/kickstart here would retire that pid first, so the helper would boot

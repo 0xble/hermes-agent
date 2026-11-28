@@ -168,7 +168,6 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry = _entry_for_request(session_key, request_id)
             if entry is None:
                 return 0
-            queue.remove(entry)
             targets = [entry]
         elif resolve_all:
             targets = list(queue)

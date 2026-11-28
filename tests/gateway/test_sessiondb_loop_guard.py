@@ -29,8 +29,9 @@ KEPT_ON_LOOP = {
     # Compression-lineage lookups used by the synchronous route helpers.
     ('gateway/session_authority.py', 'logical_owner'), ('gateway/session_authority.py', 'physical_target'),
     # Registered in the same step as the delivery waiter: an await here lets a settled drain hand the
-    # reply to that waiter and the read then drop it (``admit_message``).
-    ('gateway/session_ingress.py', 'admit_message'),
+    # reply to that waiter and the read then drop it. ``admit_message`` hands this step to
+    # ``_await_native_reply``, which now holds the read; ``admit_message`` itself reads nothing.
+    ('gateway/session_ingress.py', '_await_native_reply'),
     # A cron fire's exact-retry check before its off-loop creation commit (``_create``).
     ('gateway/session_cron.py', '_create'),
     # The routing index's one-time load in a fresh process.
@@ -162,7 +163,7 @@ async def test_cron_run_and_inbound_turn_touch_sessiondb_on_the_loop_only_where_
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import register_transport_home
     from tests.gateway.test_command_bypass_active_session import _StubAdapter
 

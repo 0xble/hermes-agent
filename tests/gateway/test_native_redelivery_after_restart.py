@@ -68,7 +68,7 @@ async def _settled(adapter, sent, calls, *, want):
 async def _admitted_before_crash(runner, adapter, *, started, **event_fields):
     """Owner 1 commits the delivery (and, when ``started``, claims it) and dies before answering."""
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42', thread_id='T1')
@@ -85,7 +85,7 @@ async def _admitted_before_crash(runner, adapter, *, started, **event_fields):
 
 async def _restart(runner):
     from gateway.run_runtime import recover_profile_native_sessions
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_constants import get_hermes_home
     second = await initialize_session_authority(runner, profile_id=str(get_hermes_home()), instance_id='after-restart')
     await recover_profile_native_sessions(runner, second)

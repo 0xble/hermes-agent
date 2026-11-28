@@ -211,7 +211,7 @@ def test_child_without_a_chat_fails_closed_instead_of_pending(gate):
         assert done.wait(5)
         assert decisions[0]["approved"] is False
         assert decisions[0].get("status") != "pending_approval"
-        assert decisions[0]["outcome"] == "notify_failed"
+        assert decisions[0]["outcome"] == "blocked"
         assert adapter.calls == []
         assert not approval.has_blocking_approval(SESSION)
     finally:

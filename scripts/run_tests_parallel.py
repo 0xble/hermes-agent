@@ -65,6 +65,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
 from scripts.run_tests_launch import start_pytest
+from scripts.run_tests_timeout import communicate_with_stack_dump, read_stack_dump
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -672,8 +673,9 @@ def _run_one_file_once(
     proc, pgid = start_pytest(file, pytest_args, repo_root, env, _runner_scratch_root())
 
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
+        output, _ = communicate_with_stack_dump(proc, file_timeout, temproot)
         rc = proc.returncode
+        assert rc is not None  # communicate() completed and reaped the child.
     except subprocess.TimeoutExpired:
         _kill_tree(proc, pgid=pgid)
         try:
@@ -685,6 +687,7 @@ def _run_one_file_once(
             f"({file_timeout:.0f}s exceeded; "
             f"process tree SIGKILL'd)\n{output}"
         )
+        output += read_stack_dump(temproot)
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.

@@ -144,10 +144,10 @@ def test_sync_redaction_scrubs_each_repeated_transcript_string_once(monkeypatch)
     calls = 0
     real_scrub = memory_manager.redact_for_egress
 
-    def counted_scrub(text):
+    def counted_scrub(text, **kwargs):
         nonlocal calls
         calls += 1
-        return real_scrub(text)
+        return real_scrub(text, **kwargs)
 
     monkeypatch.setattr(memory_manager, "redact_for_egress", counted_scrub)
     mgr, _provider = _manager()

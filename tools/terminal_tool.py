@@ -27,22 +27,23 @@ import time
 import threading
 import atexit
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
+
+from gateway.session_context import bound_turn_origin
 
 logger = logging.getLogger(__name__)
 
 
-def _redact_terminal_error_text(value: Any) -> str:
-    """Force-redact text before serializing a terminal error envelope."""
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text("" if value is None else str(value), force=True)
-
+from tools.terminal_tool_helpers import (
+    _current_session_key,
+    _current_session_profile,
+    _redact_terminal_error_text,
+)
 
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _call_in_flight, _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
+    _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env as ensure_task_env,
 )
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
@@ -52,10 +53,10 @@ from tools.terminal_tool_config import (
 )
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
-    _record_unavailable_reason, terminal_backend_unavailable_reason,
+    _record_unavailable_reason, terminal_backend_unavailable_reason as terminal_backend_unavailable_reason,
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
-from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
+from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled as managed_nous_tools_enabled
 
 
 def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
@@ -77,14 +78,36 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
+# Interactive foreground heavy-work budget: hand the live shell to the background registry.
+# The helper waits without expiry, so FIFO age and earlier shell side effects survive.
+_FOREGROUND_SEMAPHORE_WAIT_CAP = 120
+_FOREGROUND_SEMAPHORE_WAIT_FLOOR = 10
+
+# The backend starts its relative timer after shell setup, then polls (up to 0.2s)
+# and tears down the process tree / drains output before the cell RPC can reply.
+# Flooring alone can leave almost no slack; reserve a full second even then.
+_CRON_CELL_CLEANUP_MARGIN_S = 1.0
+def _foreground_semaphore_max_wait(effective_timeout: int) -> int:
+    """Bound foreground occupancy without cancelling semaphore admission."""
+    return min(_FOREGROUND_SEMAPHORE_WAIT_CAP, max(_FOREGROUND_SEMAPHORE_WAIT_FLOOR, effective_timeout // 3))
+
+
+def _semaphore_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
+    """Foreground local heavy calls hand off at this budget without expiring their ticket."""
+    if background or env_type != "local" or bound_turn_origin() == "cron":
+        return None
+    return _foreground_semaphore_max_wait(effective_timeout)
+
+
+# Disk usage warning threshold (in GB)
+DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
+
 
 # Approval / sudo-prompt UI callbacks (CLI registers prompt_toolkit-aware
 # ones). Thread-local so overlapping ACP sessions, each on its own executor
 # thread, can't stomp on each other (GHSA-qg5c-hvr5-hjgr). Gateway mode
 # resolves approvals via the per-session queue in tools.approval instead.
 _callback_tls = threading.local()
-
-
 def _get_sudo_password_callback():
     return getattr(_callback_tls, "sudo_password", None)
 
@@ -101,24 +124,6 @@ def set_sudo_password_callback(cb):
 def set_approval_callback(cb):
     """Register the dangerous-command approval prompt callback (per-thread slot)."""
     _callback_tls.approval = cb
-
-
-def _current_session_key() -> str:
-    """Active gateway/WebUI session key, or "" outside sessions (ContextVar with
-    the ``get_session_env`` os.environ fallback for CLI/cron/tests)."""
-    from gateway.session_context import get_session_env
-
-    return get_session_env("HERMES_SESSION_KEY", "")
-
-
-def _current_session_profile() -> str:
-    """Active session's Hermes profile name, or "" (same lookup discipline as
-    :func:`_current_session_key`)."""
-    from gateway.session_context import get_session_env
-
-    return get_session_env("HERMES_SESSION_PROFILE", "")
-
-
 def _container_profile() -> str:
     """Profile whose persistent container a session-bound command uses: the bound home's profile when it is not
     the session's own (a profile-routed subagent runs in its target's home while the session, and the delivery
@@ -140,8 +145,6 @@ def _container_profile() -> str:
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
-
-
 def _docker_volume_uses_host_path(volume_spec: str) -> bool:
     """Return True when a docker volume spec bind-mounts a host path."""
     if not isinstance(volume_spec, str):
@@ -195,8 +198,6 @@ _cleanup_running = False
 # Once-per-process guard for the docker orphan reaper.
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
-
-
 def _maybe_reap_docker_orphans(container_config: dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 
@@ -263,7 +264,10 @@ _session_cwd_lock = threading.Lock()
 _container_aliases: dict[str, str] = {}
 _container_alias_lock = threading.Lock()
 
-
+# Session-less runs that own their local terminal environment (cron runs).
+# Without a session key they would otherwise share "default" with every other
+# session-less run, and the local shell snapshot carries exports between them.
+_run_scoped_tasks: set = set()
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
     command, or on workspace-override registration). None/empty keys collapse
@@ -325,8 +329,6 @@ def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
         if translated:
             return translated
     return None
-
-
 def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
     """Register per-task sandbox overrides (``docker_image``/``modal_image``/
     ``daytona_image`` or a plugin backend's ``<backend>_image``, ``env_type``,
@@ -372,8 +374,6 @@ def clear_task_env_overrides(task_id: str):
     clear_session_cwd(task_id)
     with _container_alias_lock:
         _container_aliases.pop(task_id, None)
-
-
 def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) -> None:
     """Make *child_task_id* resolve to *parent_task_id*'s container (called at
     delegate_task spawn). A missing parent id aliases to ``"default"``."""
@@ -383,6 +383,18 @@ def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) 
         _container_aliases[child_task_id] = str(parent_task_id or "default")
 
 
+def register_run_scoped_task(task_id: str) -> None:
+    """Give session-less *task_id* (a cron run) its own local terminal environment.
+
+    Its delegate_task children own separate local export snapshots."""
+    if task_id:
+        with _container_alias_lock:
+            _run_scoped_tasks.add(task_id)
+
+
+def clear_run_scoped_task(task_id: str) -> None:
+    with _container_alias_lock:
+        _run_scoped_tasks.discard(task_id)
 def _resolve_container_alias(task_id: str) -> str:
     """Follow the child→parent alias chain (cycle-safe) for *task_id*."""
     seen = set()
@@ -400,11 +412,37 @@ def _shell_state_chain(task_id: Optional[str]) -> tuple[str, ...]:
     environment's own). Empty for a task with no alias (#84536)."""
     chain: list[str] = []
     key = task_id
+    from agent.delegation_context import is_delegated_child_context
     with _container_alias_lock:
+        if not is_delegated_child_context():
+            if key and key in _container_aliases:
+                chain.append(key)
+            return tuple(chain)
         while key and key in _container_aliases and key not in chain:
             chain.append(key)
             key = _container_aliases[key]
+        if key and key != "default" and key not in chain:
+            chain.append(key)
     return tuple(chain)
+
+
+def _shell_state_paths(task_id: Optional[str], env: Any) -> tuple[str, ...]:
+    """Return snapshot paths from each task's owning local environment, not task-id hashing."""
+    chain = _shell_state_chain(task_id)
+    if not chain:
+        return ()
+    paths: list[str] = []
+    with _env_lock:
+        for index, owner in enumerate(chain):
+            owner_env = env if index == 0 else _active_environments.get(_resolve_container_task_id(owner))
+            if owner_env is None or not hasattr(owner_env, "_task_snapshot_path"):
+                return ()
+            with _container_alias_lock:
+                owner_is_delegated = owner in _container_aliases
+            paths.append(
+                owner_env._task_snapshot_path(owner) if owner_is_delegated else owner_env._snapshot_path
+            )
+    return tuple(paths)
 
 
 def _is_isolation_override_key(key: str) -> bool:
@@ -529,7 +567,16 @@ def _qualify_task_key(key: str) -> str:
     single-profile gateways (no routed home) keep the historical raw key.
     """
     from tools.environments.sandbox_scope import current_sandbox_key
-    scope = current_sandbox_key() or _routed_home_task_key(profile_scoped=True)
+    hosted_key = current_sandbox_key()
+    if hosted_key:
+        return hosted_key
+    from tools.node_execution import current_execution
+    execution = current_execution()
+    if execution:
+        return execution.key
+    if key.startswith("node:") and len(key) == 69:
+        return key
+    scope = _routed_home_task_key(profile_scoped=True)
     return f"{scope}:{key}" if scope else key
 
 
@@ -563,6 +610,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     hosted_key = current_sandbox_key()
     if hosted_key:
         return hosted_key
+    from tools.node_execution import current_execution
+    execution = current_execution()
+    if execution:
+        return execution.key
+    if task_id and task_id.startswith("node:") and len(task_id) == 69:
+        return task_id
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -649,6 +702,9 @@ def resolve_task_overrides(task_id: Optional[str]) -> dict[str, Any]:
     the terminal and file layers can't drift apart.
     """
     from tools.environments.sandbox_scope import hosted_scope
+    from tools.node_execution import current_execution
+    if current_execution():
+        return {}  # Controller workspace/sandbox overrides never describe a physical node.
     raw = task_id or "default"
     if hosted_scope() is not None:
         # The collapsed id is the agent's bare sandbox key, which only an unscoped registration
@@ -689,10 +745,15 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     only its sandbox key and is refused anything but its own sandbox there.
     """
     from tools.environments.sandbox_scope import admit_env, hosted_scope
-    for key in (effective_task_id, task_id) if hosted_scope() is None else (effective_task_id,):
+    from tools.node_execution import current_execution
+    keys = (effective_task_id,) if current_execution() or hosted_scope() is not None else (effective_task_id, task_id)
+    for key in keys:
         if key and key in _active_environments:
             _last_activity[key] = time.time()
-            return admit_env(_active_environments[key])
+            env = admit_env(_active_environments[key])
+            if current_execution():
+                env._hermes_owner_tasks.add(current_execution().task_id)
+            return env
     return None
 
 
@@ -1013,33 +1074,17 @@ def _atexit_cleanup():
 atexit.register(_atexit_cleanup)
 
 
-def _command_requires_pipe_stdin(command: str) -> bool:
-    """True when PTY mode would break a stdin-driven command: `gh auth login
-    --with-token` waits for EOF on piped stdin, and under a PTY
-    `process.submit()` only sends a newline, so it hangs forever."""
-    normalized = " ".join(command.lower().split())
-    return normalized.startswith("gh auth login") and "--with-token" in normalized
-
-
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, locked_skill_block, self_repo_block, trailing_amp_background_command,
 )
-from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
-from tools.terminal_tool_result import _cwd_fallback_note, finalize_foreground_result
-
-
-def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patterns, background: bool) -> tuple:
-    """Resolve notify_on_complete + watch_patterns both set: drop watch_patterns
-    (combined they produce duplicate async notifications — one per match plus
-    one on exit — that can spam the user long after the process ends).
-    Returns ``(watch_patterns_to_use, conflict_note)``; note is "" without conflict."""
-    if background and notify_on_complete and watch_patterns:
-        return None, (
-            "watch_patterns ignored because notify_on_complete=True; "
-            "these two flags produce duplicate notifications when combined"
-        )
-    return watch_patterns, ""
+from tools.terminal_tool_semaphore import foreground_semaphore_command, wrap_semaphore_command
+from tools.terminal_tool_background import (
+    _PTY_DISABLED_REASON, _command_requires_pipe_stdin,
+    _resolve_notification_flag_conflict as _resolve_notification_flag_conflict,
+    _with_promoted_note, _yield_kwargs, _yielded_result_json, spawn_background_process, yield_to_background_handler,
+)
+from tools.terminal_tool_result import finalize_foreground_result
 
 
 def _rewrite_via_env_mount(path: str, env) -> str | None:
@@ -1244,14 +1289,6 @@ class _ExecPlan:
     auto_background_command: Optional[str] = None
 
 
-_PROMOTED_NOTE = (
-    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process with notify_on_complete=true instead of being refused. Do NOT re-run it. "
-    "Its completion (exit code + output tail) arrives as a notification; poll with "
-    "process_manage(action=\"poll\", session_id=...) if you need it sooner."
-)
-
-
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
     background: bool, _host_local: bool,
@@ -1343,28 +1380,6 @@ def _plan_execution(
     )
 
 
-_PROMOTED_NOTE_POLL_ONLY = (
-    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
-    "tracked background process instead of being refused. Do NOT re-run it. This session cannot receive "
-    "completion notifications, so poll it with process_manage(action=\"poll\", session_id=...) until it exits."
-)
-
-
-def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
-    """Attach the foreground->background promotion note to a spawn result (unchanged on error). The
-    note only promises a notification when the spawn actually kept notify_on_complete (finite sessions
-    such as one-shot runners cannot route one back; the spawn already said so and cleared the flag)."""
-    try:
-        data = json.loads(result_json)
-    except (TypeError, ValueError):
-        return result_json
-    if not isinstance(data, dict) or data.get("error"):
-        return result_json
-    template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
-    data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=FOREGROUND_MAX_TIMEOUT)
-    return json.dumps(data, ensure_ascii=False)
-
-
 def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     """Cached env for the task, else create it under the per-task creation lock.
 
@@ -1409,12 +1424,6 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
         return new_env
 
 
-def _yield_kwargs(command: str, **ctx) -> dict:
-    """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
-    handler = yield_to_background_handler(command=command, **ctx)
-    return {"yield_handler": handler} if handler is not None else {}
-
-
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str, cwd_key: str,
@@ -1449,9 +1458,10 @@ def _run_foreground(
             # Only the session's inherited cwd may fall back (the result tells the model); a
             # ``workdir`` the model named is refused, or a typo would run ``rm -f ./*`` a level up.
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 allow_cwd_fallback=not workdir,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                **_yield_kwargs(command, yield_to_background_handler, env_type=env_type,
+                                cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
             break
@@ -1471,14 +1481,15 @@ def _run_foreground(
                          max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
-    if result.get("yielded_session_id"):  # handed to the background: no exit status yet
-        return json.dumps({
-            "output": result.get("output", ""), "exit_code": None, "error": None,
-            "status": "yielded_to_background", "session_id": result["yielded_session_id"],
-            "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
-            **({"cwd_fallback": note} if (note := _cwd_fallback_note(result.get("cwd_fallback"))) else {}),
-        }, ensure_ascii=False)
-    if metered:
+    if result.get("yielded_session_id"):
+        return _yielded_result_json(result)
+    if (bound_turn_origin() == "cron" and result.get("hermes_timed_out")
+            and yield_when is not None and yield_when()):
+        result["output"] = result.get("output", "") + (
+            "\n[Heavy command not started: terminal timeout expired while waiting for semaphore admission]"
+        )
+    from agent.incognito import is_incognito
+    if metered and not is_incognito(session_id):
         record_terminal_outcome(command, env_type, result)
     return finalize_foreground_result(
         command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
@@ -1537,14 +1548,6 @@ def _pre_exec_block(
             raise _Rejected(blocked)
 
 
-_PTY_DISABLED_REASON = (
-    "PTY disabled for this command because it expects piped stdin/EOF "
-    "(for example gh auth login --with-token). For local background "
-    "processes, call process_manage(action='close') after writing so it receives "
-    "EOF."
-)
-
-
 def _degraded_result(e: EnvironmentConnectionError, task_id: Optional[str]) -> str:
     """Infrastructure failure (SSH host down, Docker daemon unreachable), distinct
     from a nonzero exit. ``terminal.degraded_mode``: warn (default) returns a
@@ -1585,16 +1588,12 @@ def terminal_tool(
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
-    ``force`` (internal, not in the model schema) skips the dangerous-command
-    check after the user confirmed. ``workdir`` is per-command and never
-    recorded as the session cwd. ``pty`` applies to the local backend only.
-    ``notify_on_complete`` and ``watch_patterns`` are mutually exclusive
-    background-only flags: on conflict watch_patterns is dropped. watch_patterns
-    is hard rate-limited (1 notification / 15s / process) and auto-disabled
-    after repeated strikes or a lifetime cap, promoting to notify_on_complete —
-    use it only for rare one-shot signals on long-lived processes. ``heartbeat`` (seconds,
-    background-only, implies notify_on_complete) emits a "still running + output since last
-    time" event every N seconds so the agent stays current on a long job without polling.
+    ``force`` (internal) skips the dangerous-command check after user confirmation.
+    ``workdir`` is per-command, not the session cwd; ``pty`` is local-only.
+    Background-only ``notify_on_complete`` takes precedence over ``watch_patterns``.
+    Watch patterns are rate-limited (1 notice / 15s / process) and switch to completion
+    notices after repeated strikes or a lifetime cap. ``heartbeat`` emits output updates
+    every N seconds in the background and implies ``notify_on_complete``.
     ``persist_on_release`` (background-only) keeps the process alive across agent-lifecycle
     cleanup — session end, context compression, error recovery, max-iteration stop — all of
     which kill the task's background processes; the owning conversation can still stop it via
@@ -1625,12 +1624,12 @@ def terminal_tool(
         env = _acquire_env(plan, task_id)
         # _lookup_active_env stamps whichever of the two keys holds the env.
         from tools.environments.base import shell_state_scope
-        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(_shell_state_chain(task_id)):
+        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(
+            _shell_state_chain(task_id), _shell_state_paths(task_id, env)
+        ):
             env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
-            # Session key for cwd records: the contextvar doesn't cross tool-worker
-            # threads, so fall back to the raw task_id (the top-level agent's
-            # session_key) as a stable anchor.
+            # The session contextvar may be unset on a tool worker; use the raw task id as fallback.
             from tools.approval import get_current_session_key
 
             session_key = get_current_session_key(default="") or (task_id or "")
@@ -1684,7 +1683,7 @@ def terminal_tool(
                 background, notify_on_complete, watch_patterns = True, True, None
             if background:
                 result = spawn_background_process(
-                    command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                    command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                     task_id=task_id, session_key=session_key, cwd_key=cwd_key, workdir=workdir, cwd=cwd,
                     mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                     effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
@@ -1697,14 +1696,19 @@ def terminal_tool(
                     auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
                 )
                 if plan.promoted_from_foreground_timeout is not None:
-                    result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
+                    result = _with_promoted_note(result, plan.promoted_from_foreground_timeout, cap=FOREGROUND_MAX_TIMEOUT)
                 return _metered(None if _host_local else plan, result)
-            return _metered(None if _host_local else plan, _run_foreground(
-                command, env, plan,
-                task_id=task_id, session_id=session_id, session_key=session_key, cwd_key=cwd_key,
-                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
-            ))
+            with foreground_semaphore_command(
+                command, env_type=env_type, environment=getattr(env, "env", None),
+            ) as (execution_command, waiting_for_admission):
+                return _metered(None if _host_local else plan, _run_foreground(
+                    command, env, plan, execution_command=execution_command,
+                    yield_after_seconds=max_wait_seconds if execution_command != command else None,
+                    yield_when=waiting_for_admission,
+                    task_id=task_id, session_id=session_id, session_key=session_key, cwd_key=cwd_key,
+                    workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+                    metered=not _host_local,
+                ))
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:

@@ -6,6 +6,8 @@ import logging
 import asyncio
 from typing import Optional
 
+from gateway.run_notifications_ownership import owns_notice_work
+
 
 logger = logging.getLogger('gateway.run')
 
@@ -56,6 +58,7 @@ class GatewayNotificationsMixin:
             self._detach_batch_flush(tasks, releases, key, current_task, release)
 
 
+    @owns_notice_work
     async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
         """Deliver a same-tick group now, or hold routine results per the batch window.
 
@@ -87,25 +90,38 @@ class GatewayNotificationsMixin:
         # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
         # A retirement can move a subset while this batch waits. Re-resolve the
         # durable routes and regroup before taking any delivery claim.
+        from gateway.run_profile_home import completion_event_scope_or_refuse
         from tools.async_delegation import refresh_retirement_route
         buckets = {}
         for evt in group:
-            async with self._completion_event_scope(evt):
+            scope = await completion_event_scope_or_refuse(self, evt, "async delegation")
+            if scope is None:
+                continue
+            async with scope:
                 await asyncio.to_thread(refresh_retirement_route, evt)
             self._enrich_async_delegation_routing(evt)
             route = self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS)
             buckets.setdefault(route, []).append(evt)
+        if not buckets:
+            return None
         if len(buckets) > 1:
             retry = []
             for subgroup in buckets.values():
-                async with self._completion_event_scope(subgroup[0]):
+                scope = await completion_event_scope_or_refuse(self, subgroup[0], "async delegation")
+                if scope is None:
+                    continue
+                async with scope:
                     result = await self._deliver_async_delegation_group_scoped(subgroup)
                 if result is False:
                     retry.extend(subgroup)
             group[:] = retry
             return False if retry else True
+        group[:] = next(iter(buckets.values()))
         original = list(group)
-        async with self._completion_event_scope(group[0]):
+        scope = await completion_event_scope_or_refuse(self, group[0], "async delegation")
+        if scope is None:
+            return None
+        async with scope:
             outcome = await self._deliver_async_delegation_group_scoped(group)
         if outcome is not False:
             group[:] = original  # Only a failed/aborted batch becomes the narrowed retry payload.
@@ -226,8 +242,12 @@ class GatewayNotificationsMixin:
         admission_evt = primary_evt
         if getattr(self, 'session_authority', None) is not None:
             from gateway.session_automation import producer_identity
+            from tools.process_registry_notifications import completion_resumes_parent, delegation_wakes_parent
+            events = [primary_evt, *(e for e, _ in siblings)]
             admission_evt = dict(primary_evt, _automation_identities=[
-                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
+                producer_identity(self, event) for event in events],
+                **({"_sibling_failed": True} if any(delegation_wakes_parent(e) for e in events) else {}),
+                **({"_sibling_resumes": True} if any(completion_resumes_parent(e) for e in events) else {}))
         delivered = await self._deliver_completion_with_sibling_cleanup(consolidated, admission_evt, siblings)
         if delivered is not False:
             forget(primary_evt)
@@ -466,6 +486,7 @@ class GatewayNotificationsMixin:
         return source, True
 
 
+    @owns_notice_work
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         import asyncio

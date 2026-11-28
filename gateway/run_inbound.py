@@ -1,3 +1,7 @@
+# health: allow FILE_LINES -- the wake admission additions share this facade until the existing inbound mixin extraction is completed.
+# health: allow BLE001 -- command-hook observers are third-party boundaries; failures are logged and must not block control commands.
+# health: allow NESTING -- this dispatch ladder preserves the ordered auth, drain, quick-command, plugin, and adapter fences.
+# health: allow CC -- this admission boundary composes the ordered session, wake, and outbox fences and must remain atomic.
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
@@ -8,8 +12,8 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 import asyncio
+import inspect
 import concurrent.futures
 import dataclasses
 import json
@@ -19,27 +23,39 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from agent.attachment_context import CHANNEL_MESSAGE_BOUNDARY
 from agent.i18n import t
 from gateway.config import Platform
+from gateway.cron_review import is_review_event
 from gateway.inbound_reply_context import reply_pointer
-from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename
-from gateway.run_busy import approval_input_words
+from gateway.platforms.base import EphemeralReply, as_command_reply
+from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename, turn_origin_for_event
+from gateway.platforms.typing_state import resume_typing_after_prompt
+from gateway.run_busy_approval import approval_input_words
+from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
+from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
-from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
+from gateway.run_inbound_transcription import (
+    GatewayInboundTranscriptionMixin,
+    _dedupe_audio_paths,
+    stt_enabled_for_turn,
+    transcript_note,
+)
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
     unauthorized_owner_hint,
 )
+from gateway.attended_model import is_genuine_user_message
 from gateway.session import SessionSource, build_session_context, label_shared_sender
 from gateway.turn_lease import TurnLeaseTimeoutError
+from gateway.zero_cut_handover_drain import handover_accepts_received, handover_runs_admission
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from hermes_cli.observability.shared_metrics_busy import (
     note_busy_admitting, note_busy_outcome, settle_busy_arrival, stamp_busy_arrival)
-from typing import Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -47,6 +63,17 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _is_restore_control_event(event: MessageEvent) -> bool:
+    """Let recognized gateway controls bypass replay fences and reach the busy fast path."""
+    if not getattr(event, "allow_gateway_control", False):
+        return False
+    command = event.get_command()
+    if not command:
+        return False
+    from hermes_cli.commands import should_bypass_active_session
+    return should_bypass_active_session(command)
 
 # ``RelayMediaClient.download`` temp-file prefix: the rest of such a basename is random, not a name.
 _RELAY_MEDIA_PREFIX = "relay_media_"
@@ -74,10 +101,98 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     return message_text.removeprefix(prefix)
 
 
+async def _admit_outbox_event(runner, event, source):
+    """Durably admit Telegram events, including internal notices and delegation completions."""
+    if not getattr(getattr(runner, "config", None), "durable_outbox_enabled", False) or source.platform != Platform.TELEGRAM:
+        return
+    from gateway.outbox import (
+        store_for, bind_turn, event_kind, transport_id,
+        event_admission_scope, local_admission_turn,
+    )
+    import uuid
+
+    home = runner._resolve_profile_home_for_source(source)
+    profile = getattr(source, "profile", None) or "default"
+    kind = event_kind(event)
+    event_id = transport_id(event)
+    if not event_id:
+        event_id = uuid.uuid4().hex
+        event._outbox_transport_id = event_id
+    store = store_for(home)
+    turn_id = local_admission_turn(event, runner, home)
+    if turn_id is None:
+        turn_id, fresh = await asyncio.to_thread(
+            store.admit, str(profile), "telegram", event_id, kind)
+        if fresh:
+            event._outbox_admission_scope = event_admission_scope(event, runner, home)
+    else:
+        fresh = True  # Native queue/deferred replay retains its admitted turn.
+    event._outbox_turn_id = turn_id
+    event._outbox_home = home
+    event._outbox_duplicate = not fresh
+    if not fresh:
+        logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
+    else:
+        bind_turn(home, turn_id)
+
+_MOUNT_PLAN_FAILED = object()
+
+
 class GatewayInboundMixin(
-    GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayInboundMoaMixin,
+    GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin,
+    GatewayLoopWakeMixin, GatewayInboundMoaMixin,
 ):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
+
+
+    def _hm_mounted_owner_probe(self, authority: Any, _quick_key: str):
+        """Read the route's durable FIFO owner for /stop and /new as ``(owner, observed route entry)``.
+
+        SessionStore and the authority's lineage lookup take blocking storage locks. This read-only
+        probe may run off the gateway event loop; it must not inspect or publish ``authority.sessions``.
+        """
+        store = authority.runner.session_store
+        with store._lock:
+            entry = store._entry_locked(_quick_key) if _quick_key else None
+        return authority.logical_owner(entry.session_id if entry else None), entry
+
+    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str, _quick_key: str, observed=None):
+        """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
+        from gateway.session_route_recovery import _mount_plan, _observed_mount_plan
+        try:
+            return _mount_plan(authority, sid)
+        except Exception:
+            # Fall back to the route entry the owner probe observed, with no further storage read, so
+            # /stop and /new can still mount and settle a known owner (detached if the lane moved).
+            logger.debug("Could not read the mount plan for %s", sid, exc_info=True)
+            return _observed_mount_plan(sid, _quick_key, observed) or _MOUNT_PLAN_FAILED
+
+    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan) -> Optional[str]:
+        """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
+
+        Right after a restart startup recovery may not have mounted it yet, but its committed rows
+        are still this chat's. Keep this publication and all authority/session mutations on the loop
+        so they cannot race inbound admission, recovery, or shutdown.
+        """
+        if sid and sid not in authority.sessions:
+            from gateway.session_route_recovery import restore_routed_session
+            try:
+                if plan is not None and plan is not _MOUNT_PLAN_FAILED:
+                    restore_routed_session(authority, sid, plan=plan)
+            except Exception:
+                logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
+            if sid not in authority.sessions:
+                # Unmountable: settling its rows would make ``authorize`` cold-mount it on this loop.
+                # The route stays fenced, so nothing new commits behind /stop or /new.
+                return None
+        return sid
+
+    async def _hm_pre_gateway_dispatch_hook(
+        self, event: MessageEvent, source: SessionSource
+    ) -> Optional[MessageEvent]:
+        """Gate ingress before auth: skip drops; rewrite replaces text; allow/None dispatches."""
+        from gateway.run_inbound_hooks import GatewayInboundHooksMixin
+        return await GatewayInboundHooksMixin._hm_pre_gateway_dispatch_hook(self, event, source)
 
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
         """DM an unauthorized sender a pairing code (rate-limited; groups never reach here)."""
@@ -89,7 +204,6 @@ class GatewayInboundMixin(
         # Rate-limit ALL pairing responses (code or rejection) so a burst of DMs doesn't spam.
         if pairing_store._is_rate_limited(platform_name, source.user_id):
             return
-        # Off the event loop: the store edit waits on a cross-process lock (dashboard, CLI).
         try:
             code = await asyncio.to_thread(
                 pairing_store.generate_code, platform_name, source.user_id, source.user_name or "",
@@ -148,11 +262,8 @@ class GatewayInboundMixin(
         if notifier.first_time(platform_name, source.user_id) and getattr(self, "config", None) is not None:
             await notifier.notify(self, source, hint)
 
-    async def _hm_admit_event(
-        self, event: MessageEvent
-    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
-        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
-        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+    def _hm_preflight_event(self, event: MessageEvent) -> bool:
+        """Apply content-free identity/channel gates before privacy or session lookup."""
         from gateway.run import _is_slack_ignored_channel
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
@@ -179,7 +290,7 @@ class GatewayInboundMixin(
             with suppress(Exception):
                 _intake = self._intake_adapter_for(source)
             drop_rejected_route(_intake, source)  # a parked target is also refused to the sender
-            return None
+            return False
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
 
@@ -198,23 +309,59 @@ class GatewayInboundMixin(
             and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
-            return None
+            return False
+        return True
 
-        # An admission the authority is executing is already ordered by its durable FIFO; parking it
-        # here would settle the row with no turn and replay the input outside it (GW-2).
+    async def _hm_admit_event(
+        self, event: MessageEvent
+    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
+        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
+        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+        if not self._hm_preflight_event(event):
+            return None
+        source = event.source
+        is_internal = bool(getattr(event, "internal", False))
+
+        # Capture before any admission buffer can park input for shutdown spooling,
+        # including restore gates, compression deferral, and orphan FIFO rescue.
+        from gateway.reply_latency import record_received, stamp_received
+        stamp_received(event)
+
+        reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
+        startup_restore_keys = getattr(self, "_startup_restore_keys", None)
+        # Session-key normalization precedes the turn's key derivation. The
+        # pre_gateway_dispatch hook runs only after this gate and must not rewrite
+        # the routing identity of an already admitted event.
+        reconnect_key = None
+        if (reconnect_keys or startup_restore_keys or getattr(self, "_startup_restore_in_progress", False)) and not is_internal:
+            normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+            reconnect_key = self._session_key_for_source(normalized)
         from gateway.session_ingress import executing_admission
         if (
-            getattr(self, "_startup_restore_in_progress", False)
-            and not is_internal
+            not is_internal
+            and (
+                getattr(self, "_startup_restore_in_progress", False)
+                or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
+                or (startup_restore_keys and startup_restore_keys.get(reconnect_key, 0))
+            )
             and not getattr(event, "_hermes_startup_restore_replay", False)
             and not executing_admission.get()
+            and not _is_restore_control_event(event)
         ):
-            self._queue_startup_restore_event(event)
+            # Persist only after the normal user and bot admission checks on drain.
+            self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
+        # Adapter admission can precede this task by an arbitrary delay on an idle lane.
+        from gateway.wake import automatic_event_is_current
+
+        if not await automatic_event_is_current(self, event):
+            return None
         if is_internal:
+            await _admit_outbox_event(self, event, source)
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
+            record_received(event)
             return event, source, False
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -260,12 +407,22 @@ class GatewayInboundMixin(
                 logger.warning("Unauthorized user: %s on %s", source.user_id, source.platform.value)
             return None
         # Charge each admitted event once, including retries and drained busy follow-ups.
+        # Authorization above still checks the live conversation cooldown on every attempt.
         if not getattr(event, "_bot_loop_admitted", False):
-            if not (self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
+            charge = object() if getattr(source, "is_bot", False) else None
+            admit_for_source = getattr(self, "_admit_bot_message_for_source")
+            admit_chain = getattr(self, "_admit_bot_chain")
+            admitted = (admit_for_source(source) if charge is None
+                        else admit_for_source(source, charge=charge))
+            if not admitted or not admit_chain(event):
                 return None
+            if charge is not None:
+                guard = getattr(self, "_bot_loop_guard_instance")()
+                conversation = getattr(self, "_bot_loop_guard_conversation")(source)
+                setattr(event, "_busy_bot_loop_charge", (guard, conversation, charge))
             event._bot_loop_admitted = True
-        from gateway.reply_latency import record_received
         record_received(event)
+        await _admit_outbox_event(self, event, source)
         return event, source, False
 
     def _relay_fyi_passive_enabled(self, source: Optional[SessionSource] = None) -> bool:
@@ -554,7 +711,8 @@ class GatewayInboundMixin(
             _clarify_adapter = self._delivery_adapter_for(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    resume_typing_after_prompt(_clarify_adapter, _quick_key, source.chat_id,
+                                               self._event_thread_metadata(event, source))
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
                 # A typed answer to a native card (numeric pick, or text after "Other") never
@@ -750,7 +908,21 @@ class GatewayInboundMixin(
             )
             self._hm_evict_running_agent(_quick_key, "stale_running_agent_eviction")
 
-    def _hm_evict_reaped_agent(self, _quick_key: str) -> None:
+    def _hm_reaped_session_id(self, _quick_key: str) -> Optional[str]:
+        """The session id behind *_quick_key* when its durable row is ended, else None. Takes the
+        session-store lock and reads state.db, so callers run it off the event loop."""
+        _reap_store = getattr(self, "session_store", None)
+        # Public, lock-held accessors: peek_session_id returns a non-str on stubbed stores in
+        # bare test runners — the isinstance() / ``is True`` gates keep this inert unless a
+        # real SessionStore answers.
+        _reap_peek = getattr(_reap_store, "peek_session_id", None)
+        _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
+        _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
+        if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+            return _reap_sid
+        return None
+
+    async def _hm_evict_reaped_agent(self, _quick_key: str) -> None:
         """Evict the in-memory turn slot of a session whose durable row was ended while the gateway
         lived (``ws_orphan_reap`` / ``agent_close``): otherwise the fast-path queues every next
         message into the dead runtime. The cold path re-attaches via ``get_or_create_session``."""
@@ -759,14 +931,14 @@ class GatewayInboundMixin(
             # detached/ 405 suppressions in production. Evict the stale slot so the next message falls
             # through to the cold path and re-attaches or creates a fresh session; /status then correctly
             # shows 代理运行中: 否 before the heal and a live turn after.
-            _reap_store = getattr(self, "session_store", None)
-            # Public, lock-held accessors: peek_session_id returns a non-str on stubbed stores in
-            # bare test runners — the isinstance() / ``is True`` gates keep this inert unless a
-            # real SessionStore answers.
-            _reap_peek = getattr(_reap_store, "peek_session_id", None)
-            _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
-            _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
-            if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+            # The probe waits on the session-store lock, which a turn worker holds across its
+            # state.db write: on the loop thread that wait tripped the liveness watchdog.
+            _state = self._peek_session_state(_quick_key)
+            _probed_agent = _state.turn.agent if _state else None
+            _reap_sid = await asyncio.to_thread(self._hm_reaped_session_id, _quick_key)
+            # Only the run the probe judged: a fresh turn that replaced it during the await is live.
+            _state = self._peek_session_state(_quick_key)
+            if _reap_sid and _state is not None and _state.turn.agent is _probed_agent is not None:
                 logger.warning(
                     "Evicting stale _running_agents entry for %s — "
                     "durable session %s is ended (reaped) in state.db; "
@@ -817,7 +989,8 @@ class GatewayInboundMixin(
                 await self._hm_stop_owner_turn(_quick_key)
             # Any recognized slash command dispatches per its declared busy_policy (dispatch /
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
-            return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
+            return True, as_command_reply(
+                await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source))
 
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
         # photo-only follow-up; adapter-level batching absorbs them.
@@ -842,11 +1015,46 @@ class GatewayInboundMixin(
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
-        if not sid or sid not in authority.sessions:
+        # SessionStore's routing map, lineage lookup, and cold mount plan are guarded by blocking
+        # storage locks. Keep those read-only operations off the gateway event-loop thread. Mounting
+        # then publishes authority state and must remain serialized on the loop.
+        sid = None
+        fenced = False
+        if authority:
+            from gateway.session_store_async import run_store_call
+            try:
+                sid, observed = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+            except Exception:
+                logger.debug("Could not probe the owner for %s before stopping it", _quick_key, exc_info=True)
+                authority.fence_route(_quick_key)
+                fenced = True
+                return
+            plan = None
+            if sid and sid not in authority.sessions:
+                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key, observed)
+                sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
+        if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
-                authority.fence_route(_quick_key)
+                if not fenced:
+                    authority.fence_route(_quick_key)
+                    fenced = True
+                # The initial probe can finish before a first admission publishes its durable owner.
+                # Fence first, then take one fresh off-loop snapshot so that input is cancelled rather
+                # than left queued behind /new or /stop.
+                from gateway.session_store_async import run_store_call
+                try:
+                    sid, observed = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                except Exception:
+                    logger.debug("Could not reprobe the owner for %s after fencing it", _quick_key, exc_info=True)
+                    return
+                plan = None
+                if sid and sid not in authority.sessions:
+                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid, _quick_key, observed)
+                sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
+            if not sid:
+                return
+        if authority is None:
             return
         from gateway.session_contract import SessionActor, SessionRef
         from gateway.session_persistence import authority_persistence
@@ -864,7 +1072,9 @@ class GatewayInboundMixin(
             # Input (and a command's turn) that arrived before this and is not committed yet never
             # commits after it; one that committed before the fence is in the second listing and
             # cancelled below. A paused FIFO keeps both, like its queued followers.
-            authority.fence_route(_quick_key)
+            if not fenced:
+                authority.fence_route(_quick_key)
+                fenced = True
             if (ordered := getattr(authority, '_ordered_writes', None)) is not None:
                 # An input that passed the fence before it moved commits before the listing, which cancels it.
                 async with ordered:
@@ -875,9 +1085,11 @@ class GatewayInboundMixin(
                 # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
                 with suppress(AuthorityRefusal):
                     await authority.cancel_queued(actor, ref, row.admission_id)
+        if authority is None or sid not in authority.sessions:
+            return
         handle = authority._handle(ref)
         if handle.execution_state == 'running':
-            # Settled meanwhile (stale_generation): there is no claimed turn left to stop.
+            # The claim can settle between the snapshot and this generation-fenced Stop.
             with suppress(AuthorityRefusal):
                 await authority.interrupt(actor, ref, handle.execution_generation)
 
@@ -925,11 +1137,10 @@ class GatewayInboundMixin(
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
-                steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+                steered = self._try_agent_verb(running_agent, "steer", steer_text, _quick_key, event=event)
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
-            self._fold_into_running_turn(running_agent, _quick_key, event)
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
@@ -965,8 +1176,9 @@ class GatewayInboundMixin(
         must NOT also be admitted as its own turn; False when the caller should admit it (queue mode,
         a demotion, or an interrupt — the ended turn lets the FIFO run the follow-up next)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.meeting_lane import busy_input_mode
         superseded = self._clarify_takeover(event, _quick_key)
-        mode = "interrupt" if superseded else self._effective_busy_input_mode(source)
+        mode = "interrupt" if superseded else await busy_input_mode(self, event, _quick_key)
         if (mode == "interrupt" and not superseded and not getattr(event, "internal", False)
                 and not event.get_command() and (self._hm_text_only(event) or event.message_type == MessageType.VOICE)
                 and self._hm_in_telegram_grace(event, source, _quick_key)):
@@ -974,7 +1186,9 @@ class GatewayInboundMixin(
         state = self._peek_session_state(_quick_key)
         running_agent = state.turn.agent if state else None
         adapter = self._delivery_adapter_for(source)
-        if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
+        if self._draining or adapter is None or running_agent is None:
+            return False
+        if (running_agent is _AGENT_PENDING_SENTINEL
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
             if self._human_preempts_autonomous_turn(event, state):
@@ -1005,10 +1219,28 @@ class GatewayInboundMixin(
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        # Steered input can stay in this turn and never reach turn-start admission.
+        schedule_activity: Any = getattr(self, "_schedule_attended_user_activity", None)
+        if callable(schedule_activity):
+            schedule_activity(event, source, _quick_key)
+        if turn_origin_for_event(event) == "user":  # a queued restart resume's preclaim may hold this slot
+            self._promote_background_admission(_quick_key)
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            # The runner slot can still be live when the adapter guard is not (reconnect,
+            # handoff turn); a hidden review must neither interrupt nor queue behind it.
+            return None
         from gateway.run import _AGENT_PENDING_SENTINEL
-        if getattr(event, "internal", False) and not event.get_command():
-            # Main's rule (run_busy's busy handler, which the shared runtime's busy dispatch skips):
-            # an internal synthetic event never interrupts or steers the running turn.
+        if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
+            if await self._route_plaintext_approval_while_busy(event, _quick_key):
+                return None
+            self._preserve_drain_event(_quick_key, event)
+            return None
+        if event.internal and not event.get_command():
+            # Shared busy dispatch skips the adapter's internal FIFO guard. Completions must
+            # never interrupt or steer a running turn, regardless of human busy policy.
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
@@ -1017,8 +1249,16 @@ class GatewayInboundMixin(
         if _handled:
             return _result
 
-        effective_busy_input_mode = ("interrupt" if self._clarify_takeover(event, _quick_key)
-                                     else self._effective_busy_input_mode(source))
+        from gateway.meeting_lane import busy_input_mode
+        effective_busy_input_mode = (
+            "interrupt" if self._clarify_takeover(event, _quick_key)
+            else await busy_input_mode(self, event, _quick_key)
+        )
+        from gateway.response_filters import is_passive_fyi_relay_event
+        if effective_busy_input_mode == "interrupt" and is_passive_fyi_relay_event(
+            event, source, enabled=bool(self._relay_fyi_passive_enabled(source)),
+        ):
+            effective_busy_input_mode = "queue"
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
             return None
 
@@ -1027,20 +1267,13 @@ class GatewayInboundMixin(
         if running_agent is _AGENT_PENDING_SENTINEL:  # agent still being set up
             if event.get_command() == "stop":  # force-clean the sentinel so the session is unlocked
                 cancel_preagent_setup(self, _quick_key)  # and end the setup still holding its claim
+                self._latch_user_stop(_quick_key)
                 self._release_running_agent_state(_quick_key)
+                await self._pause_goal_for_stop(_quick_key, source)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return pending_setup_busy_notice(self, _quick_key, source)
-        if self._draining:
-            queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
-            if queue_during_drain:
-                self._queue_or_replace_pending_event(_quick_key, event)
-            return (
-                t("gateway.busy.drain_queued", action=self._status_action_gerund())
-                if queue_during_drain
-                else t("gateway.busy.drain_rejected", action=self._status_action_gerund())
-            )
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
             self._queue_or_replace_pending_event(_quick_key, event)
@@ -1063,9 +1296,130 @@ class GatewayInboundMixin(
         self._queue_or_replace_pending_event(_quick_key, event)
         return None
 
+    def _hm_quick_commands(self) -> dict:
+        """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""
+        cfg = self.config
+        qc = (cfg.get("quick_commands") if isinstance(cfg, dict) else getattr(cfg, "quick_commands", None)) or {}
+        return qc if isinstance(qc, dict) else {}
+
+    @staticmethod
+    def _normalize_alias_target(qcmd: object) -> Optional[str]:
+        """``/name`` for an alias quick command with a usable target, else ``None``.
+
+        Rejects a bare or slash-only target: a name-less expansion would crash the busy-path
+        guard's ``split()[0]`` and can never resolve to a command anyway."""
+        if not isinstance(qcmd, dict) or qcmd.get("type") != "alias":
+            return None
+        target = str(qcmd.get("target") or "").strip()
+        if not target.lstrip("/").strip():
+            return None
+        return target if target.startswith("/") else f"/{target}"
+
+    def _quick_command_alias_text(
+        self, event: MessageEvent, profile_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the expanded text for a configured alias quick command, without mutating
+        ``event``; ``None`` when the typed command is a built-in or no alias matches.
+
+        Built-in dispatch resolves ``resolve_command`` names only, so an alias like ``s`` → ``/steer``
+        is invisible to every busy-path guard and gets queued as user text. Both the adapter's
+        Level-1 guard and ``_handle_message`` call this BEFORE the running-session split so aliases
+        behave identically idle and mid-run. A routed profile resolves against its own snapshot
+        (``_snapshot_profile_busy_modes``), so it never inherits the primary's aliases; the primary
+        config is consulted only when no snapshot exists for that profile name."""
+        get_command = getattr(event, "get_command", None)
+        if not callable(get_command):
+            return None
+        command = get_command()
+        if not isinstance(command, str) or not command:
+            return None
+        from hermes_cli.commands import resolve_command
+        if resolve_command(command) is not None:
+            return None  # built-ins keep precedence over aliases
+        if not profile_name:
+            source = getattr(event, "source", None)
+            profile_name = str(getattr(source, "profile", "") or "").strip() or None
+        quick_commands = None
+        if profile_name:
+            snapshots = getattr(self, "_quick_commands_by_profile", None)
+            if isinstance(snapshots, dict) and profile_name in snapshots:
+                quick_commands = snapshots[profile_name]
+        if quick_commands is None:
+            quick_commands = self._hm_quick_commands()
+        if not isinstance(quick_commands, dict):
+            return None
+        target = self._normalize_alias_target(quick_commands.get(command))
+        if target is None:
+            return None
+        get_command_args = getattr(event, "get_command_args", None)
+        raw_args = get_command_args() if callable(get_command_args) else ""
+        user_args = raw_args.strip() if isinstance(raw_args, str) else ""
+        return f"{target} {user_args}".strip()
+
+    @classmethod
+    def _hm_expand_alias_quick_command(cls, event: MessageEvent, qcmd: dict) -> Optional[str]:
+        """Rewrite ``event.text`` to an alias quick command's target; returns the new command name."""
+        target = cls._normalize_alias_target(qcmd)
+        if target is None:
+            return None
+        event.text = f"{target} {event.get_command_args().strip()}".strip()
+        return target.lstrip("/").split()[0]
+
+    async def _hm_command_hooks(  # health: allow CC -- ordered hook dispatch is the control-command fence and preserves observer/interceptor semantics.
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, command: str, canonical: str,
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str]]:
+        """Fire ``pre_command`` (observer) and ``command:<canonical>`` (interceptor) hooks →
+        ``(handled, result, new_command)`` (``new_command`` set when a handler rewrote the command).
+        The running-agent path deliberately does NOT fire these — a slow or hostile plugin must not
+        interfere with the operator's escape hatches for a live agent."""
+        raw_args = event.get_command_args().strip()
+        platform = source.platform.value if source.platform else ""
+        async def _dispatch_hooks():
+            try:
+                from hermes_cli.plugins import fire_pre_command_hook
+                fire_pre_command_hook(
+                    surface="gateway", command=str(canonical), alias_used=str(command),
+                    args_raw=raw_args, session_key=_quick_key, platform=platform,
+                )
+            except Exception as _pre_cmd_err:  # health: allow BLE001 -- plugin observer failures are isolated from command control dispatch.
+                logger.debug("pre_command hook dispatch failed (non-fatal): %s", _pre_cmd_err)
+
+            # Handlers may return ``{"decision": "deny" | "handled" | "rewrite", ...}`` to intercept
+            # dispatch; handlers returning nothing behave as plain observers.
+            hook_ctx = {
+                "platform": platform, "user_id": source.user_id, "command": canonical,
+                "raw_command": command, "args": raw_args, "raw_args": raw_args,
+            }
+            try:
+                return await self.hooks.emit_collect(f"command:{canonical}", hook_ctx)
+            except Exception as _hook_err:  # health: allow BLE001 -- plugin interceptor failures are isolated and return no decisions.
+                logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
+                return []
+
+        _started, hook_results = await self._invoke_loop_wake_effect(event, _dispatch_hooks)
+        if not _started:
+            return _CommandDispatch.SUPPRESSED, None, command
+
+        for hook_result in hook_results:
+            if not isinstance(hook_result, dict):
+                continue
+            decision = str(hook_result.get("decision", "")).strip().lower()
+            message = hook_result.get("message")
+            message = message if isinstance(message, str) and message else None
+            if decision == "deny":
+                return True, message or t("gateway.hooks.command_blocked", command=command), None
+            if decision == "handled":
+                return True, message, None
+            if decision == "rewrite":
+                new_command = str(hook_result.get("command_name", "")).strip().lstrip("/")
+                if new_command:
+                    event.text = f"/{new_command} {str(hook_result.get('raw_args', '')).strip()}".strip()
+                    return False, None, event.get_command()
+        return False, None, None
+
     async def _hm_resolve_command(
-        self, event: MessageEvent, source: SessionSource, _quick_key: str
-    ) -> tuple[bool, Optional[str], Optional[str], Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, _quick_key: str,
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str], Optional[str]]:
         """Resolve the slash command (aliases, access gate, hooks) → ``(handled, result, command,
         canonical)``; when ``handled`` the caller returns ``result`` as-is (may be None)."""
         from hermes_cli.commands import (is_gateway_known_command, is_interrupt_then_dispatch,
@@ -1101,10 +1455,10 @@ class GatewayInboundMixin(
             return True, _denied, command, canonical
 
         _handled, _result, new_command = await self._hm_command_hooks(
-            event, source, _quick_key, command, canonical
+            event, source, _quick_key, command, canonical,
         )
         if _handled:
-            return True, _result, command, canonical
+            return _handled, _result, command, canonical
         if new_command is not None:
             command = new_command
             _cmd_def, canonical = _canon(command)
@@ -1142,7 +1496,8 @@ class GatewayInboundMixin(
     async def _hm_rewrite_turn_to_prompt(self, event, source, name: str, ack: str, build) -> tuple[bool, Optional[str]]:
         """Ack, then rewrite the turn to ``build()`` and fall through to the agent (keeps role
         alternation; works on any backend). A failing builder replies with a retry hint."""
-        await self._send_command_ack(source, ack, name)
+        if self._loop_wake_command_identity(event) is None:
+            await self._send_command_ack(source, ack, name)
         try:
             event.text = await asyncio.to_thread(build)
         except Exception:
@@ -1232,6 +1587,10 @@ class GatewayInboundMixin(
             return True, usage
         with suppress(Exception):
             event.text = payload
+        # Admission saw "/queue <header>" and could not match the header; the stripped
+        # payload is what the turn persists, so judge agent origin on it now.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
         return False, None
 
     # Idle-path built-ins with bespoke flow (confirmations, prompt rewrites, one-shot MoA), each
@@ -1243,7 +1602,7 @@ class GatewayInboundMixin(
     async def _hm_dispatch_canonical_command(
         self, event: MessageEvent, source: SessionSource, _quick_key: str,
         canonical: Optional[str],
-    ) -> tuple[bool, Optional[str]]:
+    ) -> tuple[_CommandHandled, Optional[str]]:
         """Dispatch built-in idle-path commands → ``(handled, result)``; prompt-rewriting commands
         mutate ``event.text`` and return ``(False, None)`` to fall through to the agent."""
         plain_handler = (
@@ -1252,10 +1611,95 @@ class GatewayInboundMixin(
         )
         if plain_handler is not None:
             async with self._async_profile_scope_for_source(source):
-                return True, await plain_handler(event)
+                _started, result = await self._invoke_loop_wake_effect(event, plain_handler, event)
+                return (True, result) if _started else (_CommandDispatch.SUPPRESSED, None)
         if canonical in self._HM_CANONICAL_COMMANDS:
-            return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
+            handler = getattr(self, f"_hm_cmd_{canonical}")
+            started, result = await self._invoke_loop_wake_effect(
+                event, handler, event, source, _quick_key,
+            )
+            return result if started else (_CommandDispatch.SUPPRESSED, None)
         return False, None
+
+    @staticmethod
+    def _hm_is_registered_command(event: MessageEvent) -> bool:
+        command = event.get_command()
+        if not command:
+            return False
+        from hermes_cli.commands import resolve_command
+        return resolve_command(command) is not None
+
+    async def _hm_dispatch_quick_and_plugin_commands(  # health: allow NESTING -- ordered command routing retains the drain, alias, plugin, and built-in fences.
+        self, event: MessageEvent, source: SessionSource, command: Optional[str]
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str]]:
+        """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
+        ``(handled, result, command)``; an alias quick command rewrites ``command``."""
+        if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
+            self._preserve_drain_event(self._session_key_for_source(source), event)
+            return True, None, command
+
+        # User-defined quick commands (bypass agent loop, no LLM call)
+        qcmd = self._hm_quick_commands().get(command) if command else None
+        if qcmd is not None:
+            # Quick commands are slash capabilities too — and type:exec ones run a shell command in
+            # the gateway process. They are never in the registry, so the early gate never fires for
+            # them; apply the same admin/user policy to the raw typed name here.
+            # The early gate above only fires for registry-known commands, so quick commands (never in the
+            # registry) would otherwise reach this dispatch sink unchecked. (#44727)
+            _denied = self._check_slash_access(source, command)
+            if _denied is not None:
+                return True, _denied, command
+            qtype = qcmd.get("type")
+            if qtype == "exec":
+                exec_cmd = qcmd.get("command", "")
+                if not exec_cmd:
+                    return True, t("gateway.quick_command.no_command", command=command), command
+                _started, result = await self._invoke_loop_wake_effect(
+                    event, self._hm_run_exec_quick_command, command, exec_cmd,
+                )
+                return (True, result, command) if _started else (_CommandDispatch.SUPPRESSED, None, command)
+            if qtype != "alias":
+                return True, t("gateway.quick_command.unsupported_type", command=command), command
+            new_command = self._hm_expand_alias_quick_command(event, qcmd)
+            if new_command is None:
+                return True, t("gateway.quick_command.no_target", command=command), command
+            command = new_command  # Fall through to normal command dispatch below
+
+        # Plugin-registered slash commands. Underscores normalize to hyphens so Telegram's
+        # underscored autocomplete form matches plugin commands registered with hyphens.
+        if command:
+            try:
+                from hermes_cli.plugins import get_plugin_command_handler
+                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                if plugin_handler:
+                    async def _fenced(call, is_coroutine):
+                        # Enter the effect through the loop-wake fence with no await between the
+                        # check and the handler; a sync handler is re-fenced inside its worker.
+                        if is_coroutine:
+                            return await self._invoke_loop_wake_effect(event, call)
+                        started, result = await self._run_in_executor_with_context(
+                            self._invoke_loop_wake_sync_effect, event, call)
+                        if started and inspect.isawaitable(result):
+                            pending = result
+
+                            async def _await_pending():
+                                return await pending
+
+                            started, result = await self._invoke_loop_wake_effect(event, _await_pending)
+                            if not started and asyncio.iscoroutine(pending):
+                                pending.close()
+                        return started, result
+
+                    started, result = await self._hm_run_plugin_handler(
+                        plugin_handler, event, source, invoke=_fenced)
+                    if not started:
+                        return _CommandDispatch.SUPPRESSED, None, command
+                    return True, result, command
+            except Exception as e:
+                logger.warning("Plugin command dispatch failed: %s", e)
+        return False, None, command
 
     def _hm_bundle_slash_rewrite(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, command: str
@@ -1373,10 +1817,11 @@ class GatewayInboundMixin(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Replies owned by in-flight work: pending /update prompt, clarify, slash-confirm.
-        Only events that may control the gateway (``allow_gateway_control``) can answer them, never
-        an admitted turn: it was offered here before its commit, or a slash command queued it."""
+        Only gateway-control human events may answer prompts, never internal wakes or an
+        already admitted turn whose prompt was offered before commit."""
         from gateway.session_ingress import executing_admission
-        if not event.allow_gateway_control or getattr(event, "_fifo_only", False) or executing_admission.get():
+        if (not event.allow_gateway_control or getattr(event, "internal", False)
+                or getattr(event, "_fifo_only", False) or executing_admission.get()):
             return None
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
@@ -1388,15 +1833,42 @@ class GatewayInboundMixin(
     async def _hm_dispatch_idle_commands(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> tuple[bool, Optional[str]]:
-        """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent.
-        A command rewritten into a turn keeps the /stop and /new epoch it arrived under, read before
-        the (slow, off-loop) rewrite, so a reset during it drops the command, as on the busy path."""
+        """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
         stop_epoch = self._route_stop_epoch(_quick_key)
-        _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
+        async def _loop_command_current() -> bool:
+            if await self._prepare_loop_wake_execution(event, source):
+                return True
+            self._log_loop_wake_suppressed(event, "superseded before command dispatch")
+            return False
+
+        if not await _loop_command_current():
+            return True, None
+        _handled, _result, command, canonical = await self._hm_resolve_command(
+            event, source, _quick_key,
+        )
+        async def _loop_command_fallthrough():
+            if not await _loop_command_current():
+                return True, None
+            return False, None
+
         if not _handled:
-            _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
+            # after resolution and immediately before entering an effectful handler.
+            if not await _loop_command_current():
+                return True, None
+            _handled, _result = await self._hm_dispatch_canonical_command(
+                event, source, _quick_key, canonical,
+            )
+        if not _handled and canonical in {"learn", "plan"}:
+            # Resolution may rewrite a command; only its canonical handler builds the prompt.
+            if not await _loop_command_current():
+                return True, None
+            return await self._admit_command_turn(event, source, _quick_key, stop_epoch)
         if not _handled:
-            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
+            if not await _loop_command_current():
+                return True, None
+            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(
+                event, source, command,
+            )
         if not _handled:
             # Skill-slash resolution is disk-bound (cold skill scan, skill file loads, the
             # unavailable-skill rglob over every skills dir) and uncached on a first hit; on a
@@ -1405,8 +1877,16 @@ class GatewayInboundMixin(
             _result = await self._run_in_executor_with_context(
                 self._hm_skill_slash_rewrite, event, source, _quick_key, command)
             _handled = _result is not None
-        if not _handled and command:  # rewritten into a turn: the authority's FIFO, like text
+        if not _handled and command:
             _handled, _result = await self._admit_command_turn(event, source, _quick_key, stop_epoch)
+        if not _handled:
+            return await _loop_command_fallthrough()
+        if _handled is _CommandDispatch.SUPPRESSED:
+            return True, None
+        # Only an effectful handled command settles here; rewrites settle after model work.
+        await self._post_command_loop_completion(event, source)
+        if _handled and canonical != "retry":  # /retry returns the re-run agent turn's own reply
+            _result = as_command_reply(_result)
         return _handled, _result
 
     def _hm_rescue_orphaned_fifo(
@@ -1425,7 +1905,8 @@ class GatewayInboundMixin(
             # behind them, so arrival order (#28503) holds: oldest orphan runs as this turn, the rest drain
             # in order, the new message last.
             _orphan_adapter = self._delivery_adapter_for(source)
-            if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
+            if (_orphan_adapter is None or getattr(event, "internal", False) or event.get_command()
+                    or getattr(event, "_gateway_compression_deferred", False)):
                 return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
@@ -1442,6 +1923,125 @@ class GatewayInboundMixin(
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
+    def _schedule_attended_user_activity(self, event, source, session_key: str, *, profile_scope=None):
+        """Keep receipt-time bookkeeping alive without delaying busy input or commands.
+
+        ``profile_scope`` is a zero-argument factory for an async profile scope, entered inside
+        the background task. Callers on a receive loop that hold no scope use it, so secret
+        hydration never runs before the input returns."""
+        if not is_genuine_user_message(event) or getattr(event, "_attended_activity_marked", False):
+            return
+        if getattr(event, "_attended_activity_task", None) is not None:
+            return
+        from gateway.reply_latency import record_received
+        record_received(event)
+        mark = self._mark_attended_user_activity
+        if profile_scope is None:
+            work = mark(event, source, session_key, retry_on_failure=True)
+        else:
+            async def scoped():
+                async with profile_scope():
+                    return await mark(event, source, session_key, retry_on_failure=True)
+            work = scoped()
+        task = asyncio.create_task(work)
+        event._attended_activity_task = task
+        self._retain_background_task(task)
+
+    async def _mark_attended_user_activity(
+        self, event, source, session_key: str | None = None, *, retry_on_failure: bool = False,
+    ) -> bool:
+        """Persist genuine Brian activity only for an existing session when attended routing is enabled."""
+        if not is_genuine_user_message(event):
+            return False
+        if getattr(event, "_attended_activity_marked", False):
+            return True
+        pending = getattr(event, "_attended_activity_task", None)
+        if pending is not None and pending is not asyncio.current_task():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                if not pending.cancelled():
+                    raise
+            except Exception:
+                logger.debug("attended-model receipt task failed", exc_info=True)
+            if getattr(event, "_attended_activity_marked", False):
+                return True
+        from gateway.reply_latency import record_received
+        record_received(event)
+        stamp = event._attended_activity_received_at
+        try:
+            from datetime import datetime
+            from gateway.run import _load_gateway_config
+            from gateway.attended_model import parse_attended_config
+            attended_cfg = await asyncio.to_thread(
+                lambda: parse_attended_config(_load_gateway_config()),
+            )
+            if not attended_cfg.enabled:
+                return False
+            if not session_key:
+                session_key = self._session_key_for_source(source)
+            if not session_key:
+                return False
+            entry = await self.async_session_store.lookup_by_session_key(session_key)
+            if entry is None:
+                return False
+            state = self._session_state(session_key)
+            from gateway.session_state import session_opening_pending
+            if attended_cfg.start_new_sessions and session_opening_pending(
+                entry, attended_new_session=state.conversation.attended_new_session,
+            ):
+                # Preserve the creation boundary before mark_user_activity updates updated_at.
+                state.conversation.attended_new_session = True
+            await self.async_session_store.mark_user_activity(
+                entry.session_key, when=datetime.fromtimestamp(stamp),
+            )
+            previous = state.conversation.last_user_activity_at
+            if previous is None or stamp > previous:
+                state.conversation.last_user_activity_at = stamp
+            event._attended_activity_marked = True
+            return True
+        except Exception:
+            logger.debug("attended-model activity stamp failed", exc_info=True)
+            if retry_on_failure:
+                # Steering consumes the event, so only ordinary failures retry here.
+                # False eligibility results and task cancellation are terminal.
+                return await self._mark_attended_user_activity(event, source, session_key)
+            return False
+
+    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from agent.delegation_context import top_level_delegation_context
+        from gateway.incognito import event_scope, transition_pending, slash_refusal
+        from gateway.outbox import scoped_turn_entry, restore_turn, store_for
+        # Preflight resets the task's session identity for this fresh turn, so it runs
+        # inside the scope that restores an inline caller's identity afterward.
+        with top_level_delegation_context():
+            if not self._hm_preflight_event(event):
+                return None
+            async with event_scope(self, event):
+                refusal = slash_refusal(event)
+                if refusal is not None:
+                    return refusal
+                key_for = getattr(self, "_session_key_for_source", None)
+                key = key_for(event.source) if callable(key_for) else None
+                if isinstance(key, str) and transition_pending(key):
+                    return "Incognito is switching. Retry this message after the confirmation."
+                token = scoped_turn_entry()
+                result = None
+                try:
+                    result = await self._handle_admitted_message(event)
+                    return result
+                finally:
+                    turn_id = getattr(event, "_outbox_turn_id", None)
+                    try:
+                        if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                                and not getattr(event, "_gateway_compression_deferred", False)):
+                            await asyncio.to_thread(
+                                store_for(event._outbox_home).finish_admission,
+                                turn_id, "completed" if result is not None else "empty")
+                    finally:
+                        restore_turn(token)
+
+
     async def _hm_authority_admission(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, is_internal: bool,
     ) -> tuple[bool, Optional[str]]:
@@ -1449,11 +2049,16 @@ class GatewayInboundMixin(
         (preempted, plugin-consumed or admitted to its durable FIFO); ``(False, None)`` to continue
         on the in-process path. Raises ``AuthorityRefusal('profile_mismatch')`` for a scope this
         process does not serve."""
+        # Durable admission stores the full input envelope. Private lanes retain the
+        # normal in-process serialization and RAM session/outbox owners instead.
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return False, None
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
+        from gateway.session_ingress import executing_admission
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
-            from gateway.session_ingress import executing_admission
             if not executing_admission.get():
                 # A message the adapter saw as idle still waits when an earlier queued turn runs
                 # outside its session guard: the running-turn check is the busy test that counts.
@@ -1464,6 +2069,7 @@ class GatewayInboundMixin(
                     return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy)
                 finally:
                     settle_busy_arrival(event)  # never admitted, refused or dropped: its fate is known
+                    self._forget_admitted_voice(event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -1503,7 +2109,7 @@ class GatewayInboundMixin(
             await self._send_busy_ack_reply(event, self._delivery_adapter_for(source), notice)
         return True, await admit_message(authority, event)
 
-    async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:  # health: allow CC -- this is the single ordered admission boundary for session controls and loop wakes.
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1511,41 +2117,72 @@ class GatewayInboundMixin(
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        if getattr(event, "_outbox_duplicate", False):
+            # The original response was already acknowledged. Returning it
+            # here would send it a second time.
+            return None
+        if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
+            from gateway.session_retry_admission import refuse_deferred_retry
+            refuse_deferred_retry(event)
+            session_key = self._session_key_for_source(source)
+            self._schedule_attended_user_activity(event, source, session_key)
+            self._preserve_drain_event(session_key, event)
+            return None
+        # Expand alias quick commands before the running-session split (fork patch: the idle
+        # path re-expands harmlessly since the target is then a resolvable built-in).
+        alias_text = self._quick_command_alias_text(event)
+        if alias_text is not None:
+            event.text = alias_text
+        _attended_activity_marked = False
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
-        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
-        # not on the adapter's raw inbound: profile routing, the ignored-channel
-        # guard, plugin hooks and user authorization all reject events above,
-        # and a rejected event must not be able to clear a refusal belonging to
-        # an active turn. This is also the single entry point every lane shares
-        # — Discord interaction passthrough builds its own MessageEvent and
-        # calls handle_message directly, so a teardown on the relay's inbound
-        # handler left those turns muted.
-
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
             return _paused_notice
 
+        from gateway.telegram_retire import intercept
+        _retire_reply = await intercept(self, event)
+        if _retire_reply is not None:
+            return _retire_reply
         _quick_key = self._session_key_for_source(source)
-        _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
+        _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply
 
-        _owned, _authority_reply = await self._hm_authority_admission(event, source, _quick_key, is_internal)
+        # Routed profile authorities own non-command external turns. Busy preemption still
+        # applies before durable FIFO admission; the fork's zero-cut busy path remains below
+        # for in-process ownership.
+        _owned, _authority_reply = await self._hm_authority_admission(
+            event, source, _quick_key, is_internal,
+        )
         if _owned:
             return _authority_reply
 
-        # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
-        self._hm_evict_idle_stale_agent(_quick_key)
-        if self._is_session_running(_quick_key):
-            self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+        from gateway.zero_cut_busy import handle_local_busy, queue_foreign_owner, _NOT_HANDLED
+        if await queue_foreign_owner(self, event, _quick_key):
+            return None
+        _busy_result = await handle_local_busy(self, event, source, _quick_key)
+        if _busy_result is not _NOT_HANDLED:
+            return _busy_result
 
+        # Dispatch idle commands before the attended activity bookkeeping.  The disabled path must
+        # retain the pre-feature command latency: checking the opt-in config here would otherwise add
+        # a worker hop before every /command and can miss the adapter's bounded response window.
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
+            # Activity bookkeeping is telemetry for an already-dispatched command.  Do not hold the
+            # adapter's bounded command response on the opt-in config/store worker hop.
+            self._schedule_attended_user_activity(event, source, _quick_key)
             return _result
+
+        # Non-command messages are stamped after the session slot is claimed, immediately before
+        # model resolution. Awaiting the store lookup before the claim reopens the duplicate-agent
+        # race that the pending sentinel is designed to close.
+        if self._is_session_running(_quick_key):
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.
@@ -1558,72 +2195,126 @@ class GatewayInboundMixin(
             if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
                 return None
             if self._is_session_running(_quick_key):
+                # The passive check awaits; a turn that started meanwhile owns the session now.
                 return await self._hm_handle_running_session_message(event, source, _quick_key)
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
-            if self._external_drain_active:
+            # External input stays closed; the released owner may finish its committed FIFO.
+            if (self._external_drain_active and not handover_accepts_received(self, source)
+                    and not handover_runs_admission(self)):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
+
+        # Both human inputs and gateway wakes remain retryable while compression
+        # owns the transcript. Slash controls above remain available.
+        if await self._defer_compression_locked_event(_quick_key, event):
+            return None
+        if self._is_session_running(_quick_key):
+            # The durable lock lookup yielded; another turn may now own the slot.
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
+
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
+        _loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if not self._loop_wake_execution_fence_sync(event, _loop_fence):
+            self._log_loop_wake_suppressed(event, "superseded before the session slot claim")
+            return None
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        event._gateway_compression_deferred = False
 
+        # A rewrite continues the wake's admission generation. No await may separate this
+        # check from sentinel installation, and no rejected wake inherits a successor token.
+        _loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if not self._loop_wake_execution_fence_sync(event, _loop_fence):
+            if _active_session_lease is not None:
+                _active_session_lease.release()
+            self._log_loop_wake_suppressed(event, "superseded before the running-agent sentinel")
+            return None
+        _run_generation = (
+            _loop_fence[2] if _loop_fence is not None
+            else self._begin_session_run_generation(_quick_key)
+        )
         _claim_state = self._session_state(_quick_key)
+        _invalidation_epoch = self._session_invalidation_epoch(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.agent_published_event = asyncio.Event()
         _claim_state.turn.turn_ended_event = asyncio.Event()
         _claim_state.turn.event = event
-        _claim_state.turn.started_ts = time.time()
+        _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
+        from gateway.reply_latency import bind_agent_start
+        bind_agent_start(event)
         self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
-
+        # The admission context is set by the durable executor, not by direct legacy dispatch.
+        from gateway.session_ingress import executing_admission
+        _preserve_lease_wait_on_shutdown = False
         try:
+            # Mark genuine user activity inside the claimed turn, before resolving the model. This
+            # preserves the attended route's same-turn semantics without delaying the sentinel claim.
+            _attended_activity_marked = await self._mark_attended_user_activity(event, source, _quick_key)
+            if _attended_activity_marked:
+                event._attended_activity_marked = True
             from gateway.session_moa_turn import arm_admitted_moa
             arm_admitted_moa(self, _quick_key, event)  # restored by the finally below
-            # Fail-open plugin consume inside the claimed slot (#129958); once per message.
-            if not is_internal:
-                _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+            if not is_internal and not executing_admission.get():  # fail-open plugin consume, inside the claimed slot (#129958)
+                from gateway.run_inbound_consumer import run_post_admission_hook
+                _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)
                 if _consumed:
                     return _consumer_reply
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
-                # A rejected message, not a completed turn: return before the /goal judge so it
-                # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                # The bounded wait expired or its durable spool failed. No turn ran,
+                # so refund the wake tick and bypass the /goal judge for the resend notice.
                 logger.error(
-                    "Rejecting turn for routing key %s on session %s after "
-                    "turn-lease timeout; transcript load was not started and "
-                    "the user must resend",
+                    "Cannot run queued turn for routing key %s on session %s: "
+                    "turn-lease wait expired or input could not be preserved; "
+                    "transcript load was not started and the user must resend",
                     _quick_key, exc.session_id,
                 )
+                await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
+                if not getattr(event, "_gateway_compression_deferred", False):
+                    await self._defer_post_turn_hooks(
+                        agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                        session_key=_quick_key, generation=_run_generation, invalidation_epoch=_invalidation_epoch,
+                    )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            # Shutdown may replay an unfinished turn, but a stop/reset invalidates
+            # its generation even when the gateway is already draining.
+            _preserve_lease_wait_on_shutdown = (
+                self._draining and self._is_session_run_current(_quick_key, _run_generation)
+            )
+            raise
         finally:
-            # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
-            # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
+            with suppress(Exception):
+                self._session_state(_quick_key).conversation.attended_new_session = False
+                self._session_state(getattr(event, "_hermes_attended_session_key", _quick_key)).conversation.attended_new_session = False
+            # One-shot restore runs on every exit; the generation guard ignores displaced turns.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
             # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
             # clears it only once the reply is in the delivery ledger (else a kill in between
             # left neither marker nor ledger row and the persisted reply was never sent).
+            if getattr(event, "_gateway_lease_wait_spool", None) is not None:
+                from gateway.run_turn_lease_wait import retire_lease_wait
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        retire_lease_wait, self, event, discard=not _preserve_lease_wait_on_shutdown,
+                    )
             if not getattr(event, "_turn_marker_handoff", False):
                 await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement
@@ -1634,6 +2325,14 @@ class GatewayInboundMixin(
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            # Deferred commands wait for the runner's turn, not the adapter task that received them:
+            # the two can diverge (an internal wake running after /stop), so resume them here.
+            _deferred_adapter = self._delivery_adapter_for(source)
+            _resume_deferred = getattr(_deferred_adapter, "resume_deferred_commands", None)
+            if callable(_resume_deferred):
+                _resume_deferred(_quick_key)
+            if getattr(event, "_gateway_compression_deferred", False):
+                self._start_compression_deferred_drain(_quick_key, _deferred_adapter)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
@@ -1668,22 +2367,16 @@ class GatewayInboundMixin(
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
-        """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
-        message_text = label_shared_sender(
+        """Attribute only the current sender; backfill is added after media enrichment."""
+        return label_shared_sender(
             source, message_text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
-        # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
-        if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
-        return message_text
 
     @staticmethod
     def _classify_inbound_media(
         event: MessageEvent, pending_stt_prepared: bool
     ) -> tuple[list, list, list, list]:
-        """Split ``event.media_urls`` into (image, STT-voice, audio-file, video) paths. Per-attachment
-        MIME wins over the message-level type (a document sent alongside an image must not be routed
-        as an image). MessageType.AUDIO / mixed DOCUMENT audio is a file attachment, never STT."""
+        """Split ``event.media_urls`` into (image, STT-voice, audio-file, video) paths."""
         from gateway.run import _event_media_is_audio, _event_media_is_image, _event_media_is_stt_input
         image_paths, audio_paths, audio_file_paths, video_paths = [], [], [], []
         for i, path in enumerate(event.media_urls or []):
@@ -1700,11 +2393,11 @@ class GatewayInboundMixin(
         return image_paths, audio_paths, audio_file_paths, video_paths
 
     async def _enrich_inbound_images(
-        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
+        self, event: MessageEvent, source: SessionSource, session_key: str,
+        message_text: str, image_paths: list[str],
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
+        # models.dev and Ollama probes can block, so resolve the mode off the event loop.
         _img_mode = await asyncio.to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
@@ -1719,11 +2412,10 @@ class GatewayInboundMixin(
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
-        # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
-        # runtime explicitly rather than consulting process-global compatibility mirrors.
+        # Bind this event and runtime before the agent turn; a queued event may have a different origin.
         vision_runtime = None
         try:
-            turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+            turn_model, runtime_kwargs = await self._resolve_session_agent_runtime_async(
                 source=source, session_key=session_key,
             )
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
@@ -1731,29 +2423,27 @@ class GatewayInboundMixin(
             logger.debug("vision enrichment: session runtime resolution failed", exc_info=True)
 
         from agent.auxiliary_client import scoped_runtime_main
-
-        with scoped_runtime_main(vision_runtime):
+        from agent.proxy_request_class import bind_aux_request_origin
+        with scoped_runtime_main(vision_runtime), bind_aux_request_origin(turn_origin_for_event(event)):
             return await self._enrich_message_with_vision(message_text, image_paths)
 
-    async def _echo_stt_transcripts(
-        self, adapter, source: SessionSource, transcripts: list[str], *, metadata=None, log_context: str = "Transcript"
-    ) -> int:
-        """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)
-        → how many sends the platform accepted."""
-        from gateway.bot_peer_notices import automatic_notices_allowed
-        accepted = 0
-        for tx in transcripts if automatic_notices_allowed(source) else ():
-            try:
-                result = await adapter.send(
-                    source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata)
-            except Exception as echo_exc:
-                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
-                continue
-            if getattr(result, "success", False):
-                accepted += 1
-            else:
-                logger.debug("%s echo refused: %s", log_context, getattr(result, "error", None))
-        return accepted
+    async def _enrich_inbound_voice(
+        self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
+    ) -> str:
+        message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+            message_text, audio_paths,
+        )
+        # Echo each successful transcript back immediately when configured so users can verify STT
+        # quality in real time. On transcription failure do NOT send a hardcoded notice: that
+        # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
+        if _successful_transcripts and self._should_echo_stt_transcripts():
+            _echo_adapter = self._delivery_adapter_for(source)
+            if _echo_adapter:
+                _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                await self._echo_stt_transcripts(
+                    _echo_adapter, source, _successful_transcripts, event=event, metadata=_echo_meta,
+                )
+        return message_text
 
     @staticmethod
     def _inbound_attachment_display_name(path: str, original_name: str = "") -> tuple[str, str]:
@@ -1846,10 +2536,11 @@ class GatewayInboundMixin(
             # it's disambiguation (*which* prior message), not deduplication.
             # Adapters resolve the original message (or the user's native partial quote).
             # A preview here silently loses later list items and code; keep that context intact.
-            reply_text = event.reply_to_text
             own = bool(getattr(event, "reply_to_is_own_message", False))
-            replied_to = (source.platform, source.chat_id, event.reply_to_message_id)
-            message_text = f"{reply_pointer(str(reply_text), own_message=own, replied_to=replied_to)}\n\n{message_text}"
+            chat_id = getattr(source, "chat_id", None)
+            replied_to = (source.platform, chat_id, event.reply_to_message_id) if chat_id else None
+            pointer = reply_pointer(str(event.reply_to_text), own_message=own, replied_to=replied_to)
+            message_text = f"{pointer}\n\n{message_text}"
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
@@ -1877,26 +2568,26 @@ class GatewayInboundMixin(
         _msg_custom_providers = []
         with suppress(Exception):
             _msg_cfg = _load_gateway_config()
-            _msg_model_cfg = _msg_cfg.get("model", {})
-            if isinstance(_msg_model_cfg, dict):
-                _msg_raw_ctx = _msg_model_cfg.get("context_length")
-                if _msg_raw_ctx is not None:
-                    _msg_config_ctx = int(_msg_raw_ctx)
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
+        _msg_cfg = _msg_cfg or {}
+        _msg_model_cfg = _msg_cfg.get("model", {})
+        from hermes_cli.model_alias_runtime import resolve_default_route
+        _msg_default_route = resolve_default_route(_msg_cfg)
+        if isinstance(_msg_model_cfg, dict):
+            _msg_raw_ctx = _msg_model_cfg.get("context_length")
+            if _msg_raw_ctx is not None:
+                _msg_config_ctx = int(_msg_raw_ctx)
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
 
-                _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
-            except Exception:
-                _msg_custom_providers = _msg_cfg.get("custom_providers") or []
+            _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+        except Exception:
+            _msg_custom_providers = _msg_cfg.get("custom_providers") or []
         # GatewayRunner has no self._model/self._base_url; resolve the session's actual runtime.
-        _msg_model, _msg_runtime = self._resolve_session_agent_runtime(
+        _msg_model, _msg_runtime = await self._resolve_session_agent_runtime_async(
             source=source, session_key=session_key, user_config=_msg_cfg,
         )
         _msg_base_url = _msg_runtime.get("base_url") or ""
-        if isinstance(_msg_model_cfg, dict):
-            _msg_configured_model = _msg_model_cfg.get("default") or _msg_model_cfg.get("model")
-        else:
-            _msg_configured_model = _msg_model_cfg  # (no dict → no pin was read; ctx is already None)
+        _msg_configured_model = _msg_default_route.model
         if _msg_model != _msg_configured_model:
             _msg_config_ctx = None
         if _msg_config_ctx is not None:
@@ -1905,8 +2596,8 @@ class GatewayInboundMixin(
 
                 if await should_clear_context_pin_async(
                     None, None,  # model match already checked above
-                    _msg_model_cfg.get("base_url"), _msg_base_url,
-                    _msg_model_cfg.get("provider"), _msg_runtime.get("provider"),
+                    _msg_default_route.base_url, _msg_base_url,
+                    _msg_default_route.provider, _msg_runtime.get("provider"),
                 ):
                     _msg_config_ctx = None
             except Exception:
@@ -1921,7 +2612,7 @@ class GatewayInboundMixin(
         return await get_model_context_length_async(
             _msg_model, base_url=_msg_base_url, api_key=_msg_runtime.get("api_key") or "",
             config_context_length=_msg_config_ctx, provider=_msg_runtime.get("provider") or "",
-            custom_providers=_msg_custom_providers,
+            custom_providers=_msg_custom_providers, api_mode=_msg_runtime.get("api_mode") or "",
         )
 
     async def _expand_inbound_context_references(
@@ -1947,6 +2638,7 @@ class GatewayInboundMixin(
         @ references behave the same. Side effect: buffers per-session native image paths when the
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
+        await self._adopt_admitted_voice(event)
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
         # Prefer the caller's resolved session key so this write key matches the consume key at the
@@ -1958,9 +2650,13 @@ class GatewayInboundMixin(
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
-            message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            message_text = await self._enrich_inbound_images(event, source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+        # Keep current media after the recall boundary, not among discarded backfill.
+        # The sender prefix stays on the caption, after the media notes.
+        if channel_context := getattr(event, "channel_context", None):
+            message_text = channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         message_text = self._prepend_inbound_media_file_notes(
             message_text, audio_file_paths, video_paths, self._inbound_original_names(event))
         message_text = self._prepend_inbound_document_notes(event, message_text)
@@ -2002,9 +2698,11 @@ class GatewayInboundMixin(
         return paths
 
     async def _mark_durable_active_turn(self, event: MessageEvent, session_key: str) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Persist the exact resolved routing key for this running turn; never a cron review's, which boot would resume."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = None if is_review_event(event) else await self.async_session_store.mark_turn_active(
+                session_key, human=bool(getattr(self, "_is_user_turn_event", lambda _event: not event.internal)(event))
+            )
         except Exception as exc:
             logger.warning("Could not persist active-turn marker for %s: %s", session_key, exc)
             return False
@@ -2097,8 +2795,8 @@ class GatewayInboundMixin(
         from session_rules.turns import sanitize_context
 
         analysis_prompt = (
-            "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
+            "Concisely describe this image in English using 2-4 sentences "
+            "(~150 words). Preserve quoted text and identifiers in their original language. "
             "Cover the main subject, key visible text/data/code, and overall context. "
             "If it is a chart, diagram, or scientific figure, include the important "
             "labels, legend, and key values. Skip decorative details."
@@ -2133,3 +2831,304 @@ class GatewayInboundMixin(
             return user_text
         prefix = "\n\n".join(enriched_parts)
         return f"{prefix}\n\n{user_text}" if user_text else prefix
+    _EMPTY_TEXT_PLACEHOLDER = "(The user sent a message with no text content)"
+
+    @classmethod
+    def _prepend_media_prefix(cls, prefix: str, user_text: str) -> str:
+        """``prefix`` + the user's text; the Discord empty-content placeholder is dropped as redundant."""
+        if user_text and user_text.strip() != cls._EMPTY_TEXT_PLACEHOLDER:
+            return f"{prefix}\n\n{user_text}"
+        return prefix
+
+    @staticmethod
+    def _untranscribed_audio_note(path: str) -> str:
+        """One minimal neutral marker for every STT failure. Never mention "no STT provider" or setup
+        steps — persisted in history they make the model keep volunteering STT-setup advice."""
+        from tools.credential_files import to_agent_visible_cache_path
+        agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+        return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
+
+    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> tuple[Optional[str], str]:
+        """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
+        result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
+        if not result.get("success"):
+            fallback = await asyncio.to_thread(transcribe_audio_local_fallback, path)
+            if fallback.get("success"):
+                logger.info("Configured STT failed for %s; recovered with local STT", path)
+                result = fallback
+        if not result["success"]:
+            logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
+            return None, self._untranscribed_audio_note(path)
+        transcript = result["transcript"]
+        # STT may return success=True with an empty/whitespace transcript (silence, cut-off);
+        # empty quotes make the agent reply to nothing and can loop, so emit a sentinel note.
+        # See #41603.
+        if not (transcript or "").strip():
+            return None, (
+                "[The user sent a voice message but it came through "
+                "empty or inaudible — speech-to-text returned no "
+                "words. Do not guess at the content; ask the user "
+                "to resend or type it out.]"
+            )
+        # Plain quoted line: a "The user sent a voice message..." wrapper read as a meta-instruction
+        # and made the LLM comment on voice mode instead.
+        return transcript, transcript_note(transcript, path)
+
+    async def _enrich_message_with_transcription(
+        self, user_text: str, audio_paths: list[str], clip_memo: dict | None = None
+    ) -> tuple[str, list[str]]:
+        """Transcribe voice clips once, retaining media markers for every successful clip."""
+        from gateway.run import _probe_audio_duration
+        audio_paths = await asyncio.to_thread(_dedupe_audio_paths, audio_paths)
+        if not stt_enabled_for_turn(self):
+            notes = []
+            for path in audio_paths:
+                abs_path = os.path.abspath(path)
+                duration_str = await _probe_audio_duration(abs_path)
+                suffix = f" (duration: {duration_str})" if duration_str else ""
+                notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
+            return (self._prepend_media_prefix("\n\n".join(notes), user_text) if notes else user_text), []
+        try:
+            from tools.transcription_tools import transcribe_audio, transcribe_audio_local_fallback
+        except ModuleNotFoundError as e:
+            logger.error("Transcription module unavailable: %s", e)
+            return self._prepend_media_prefix("[voice message could not be transcribed]", user_text), []
+        enriched_parts = []
+        successful_transcripts: list[str] = []
+        for path in audio_paths:
+            try:
+                if clip_memo is not None and path in clip_memo:
+                    transcript, note = clip_memo[path]
+                else:
+                    logger.info("Transcribing user voice: %s", path)
+                    transcript, note = await self._transcribe_one_clip(
+                        path, transcribe_audio, transcribe_audio_local_fallback,
+                    )
+                    if clip_memo is not None:
+                        clip_memo[path] = (transcript, note)
+                if transcript is not None:
+                    successful_transcripts.append(transcript)
+                enriched_parts.append(note)
+            except Exception as e:
+                logger.error("Transcription error: %s", e)
+                note = self._untranscribed_audio_note(path)
+                if clip_memo is not None:
+                    clip_memo[path] = (None, note)
+                enriched_parts.append(note)
+        if enriched_parts:
+            user_text = self._prepend_media_prefix("\n\n".join(enriched_parts), user_text)
+        return user_text, successful_transcripts
+
+    def _pending_event_audio_paths(self, event) -> list[str]:
+        """Return STT-eligible paths from a pending voice message."""
+        from gateway.run import _event_media_is_stt_input
+        return [
+            path for i, path in enumerate(getattr(event, "media_urls", None) or [])
+            if _event_media_is_stt_input(event, i)
+        ]
+
+    async def _transcribe_pending_audio_event_once(
+        self, event, user_text: Optional[str] = None
+    ) -> tuple[str | None, list[str]]:
+        """Transcribe a pending audio event once and cache the result on the event: the interrupt
+        monitor and the pending-drain path both need it — one STT call and one echo per message."""
+        if hasattr(event, "_gateway_pending_stt_text"):
+            return event._gateway_pending_stt_text, list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
+        # Concurrent callers (queued-voice prefetch, interrupt monitor, drain) share one STT call.
+        task = getattr(event, "_gateway_pending_stt_task", None)
+        if task is None:
+            audio_paths = self._pending_event_audio_paths(event)
+            if not audio_paths:
+                return user_text if user_text is not None else (getattr(event, "text", None) or None), []
+            text = user_text if user_text is not None else (getattr(event, "text", "") or "")
+            semaphore = getattr(self, "_pending_stt_semaphore", None)
+            if semaphore is None:
+                semaphore = self._pending_stt_semaphore = asyncio.Semaphore(2)
+            clip_memo = getattr(event, "_gateway_pending_stt_clips", None)
+            if clip_memo is None:
+                clip_memo = {}
+                event._gateway_pending_stt_clips = clip_memo
+
+            async def _transcribe():
+                # Limit provider calls (including local fallback) across pending messages, not
+                # just clips within one message. Queued events can fill the FIFO at once.
+                async with semaphore:
+                    return await self._enrich_message_with_transcription(text, audio_paths, clip_memo)
+
+            task = self._retain_background_task(asyncio.create_task(_transcribe()))
+            event._gateway_pending_stt_task = task
+
+            def _settle(completed):
+                if getattr(event, "_gateway_pending_stt_task", None) is not completed:
+                    return  # the event was merged and its STT cache invalidated
+                del event._gateway_pending_stt_task
+                if completed.cancelled():
+                    return
+                try:
+                    enriched, transcripts = completed.result()
+                except Exception:
+                    return  # a later drain may retry a failed task
+                event._gateway_pending_stt_text = enriched
+                event._gateway_pending_stt_transcripts = list(transcripts)
+
+            task.add_done_callback(_settle)
+        try:
+            enriched_text, successful_transcripts = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if getattr(event, "_gateway_pending_stt_task", None) is task:
+                del event._gateway_pending_stt_task
+            raise
+        if getattr(event, "_gateway_pending_stt_task", None) is not task:
+            # A merge changed the event while STT ran; retry from the merged event's own text, not
+            # the pre-merge snapshot, or a caption merged mid-STT is cached away.
+            return await self._transcribe_pending_audio_event_once(event)
+        del event._gateway_pending_stt_task
+        event._gateway_pending_stt_text = enriched_text
+        event._gateway_pending_stt_transcripts = list(successful_transcripts)
+        return enriched_text, successful_transcripts
+
+    def _prefetch_queued_voice_transcript(self, event, adapter) -> None:
+        """Start STT for a voice message queued behind an active run, so its transcript echoes now
+        and the queued turn reuses it instead of transcribing after the current task finishes."""
+        if (
+            adapter is None or getattr(event, "internal", False)
+            or hasattr(event, "_gateway_pending_stt_text")
+            or getattr(event, "_gateway_pending_stt_prefetch", None) is not None
+            or not self._pending_event_audio_paths(event)
+        ):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop (sync caller): the drain path transcribes as before
+        from gateway.run import _interim_metadata
+        # The echo lands mid-turn: mark it interim so stream-is-the-message adapters keep the live
+        # stream open rather than sealing it with the transcript.
+        metadata = _interim_metadata(
+            self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+        )
+        event._gateway_pending_stt_prefetch = self._retain_background_task(asyncio.create_task(
+            self._transcribe_and_echo_pending_voice(
+                event, adapter, event.source, event.text or "", log_context="Voice-queue",
+                metadata=metadata,
+            )
+        ))
+
+    async def _echo_pending_stt_transcripts_once(
+        self, event, adapter, source, transcripts: list[str], *, metadata=None,
+        log_context: str = "Transcript",
+    ) -> None:
+        """Echo pending-event STT transcripts to the chat at most once. Tracked as a COUNT (not a
+        set — identical transcripts are distinct deliveries): ``merge_pending_message_event`` can
+        append a second voice note and invalidate the cache; the re-run returns earlier transcripts
+        as a prefix, so only the unsent tail is echoed."""
+        if not transcripts or not self._should_echo_stt_transcripts() or adapter is None:
+            return
+        already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
+        event._gateway_pending_stt_echoed = max(already_echoed, len(transcripts))
+        accepted = await self._echo_stt_transcripts(
+            adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
+        )
+        shown = event.__dict__.setdefault("_gateway_pending_stt_shown", set())
+        shown.update(already_echoed + index for index in accepted)
+
+    @staticmethod
+    def _admitted_voice_key(event) -> Optional[tuple[str, str, str]]:
+        """Transport identity shared by a live event and the event a durable claim restores from it."""
+        source, message_id = getattr(event, "source", None), getattr(event, "message_id", None)
+        if source is None or source.platform is None or not message_id:
+            return None
+        return source.platform.value, str(source.chat_id), str(message_id)
+
+    def _prefetch_admitted_voice(self, event) -> None:
+        """Start STT at durable admission, independently of when the FIFO runs this turn.
+
+        The claimed turn runs a NEW event restored from the committed row, so the live event's
+        in-flight STT is published under its transport identity for that turn to adopt
+        (``_adopt_admitted_voice``) instead of transcribing and echoing a second time."""
+        try:
+            key = self._admitted_voice_key(event)
+            if key is None or key in self.__dict__.get("_admitted_voice_prefetches", {}):
+                return  # a redelivery or repeated recovery adopts the existing single-flight
+            self._prefetch_queued_voice_transcript(event, self._delivery_adapter_for(event.source))
+            # Steer fallback and interrupt mode already transcribed (and echoed) it: publish that too.
+            if (getattr(event, "_gateway_pending_stt_prefetch", None) is not None
+                    or hasattr(event, "_gateway_pending_stt_text")):
+                self.__dict__.setdefault("_admitted_voice_prefetches", {})[key] = event
+        except Exception:
+            logger.warning("Queued voice prefetch could not start; the turn will transcribe", exc_info=True)
+
+    def _forget_admitted_voice(self, event) -> None:
+        key = self._admitted_voice_key(event)
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        if key is not None and registry and registry.get(key) is event:
+            del registry[key]
+
+    async def _adopt_admitted_voice(self, event) -> None:
+        """Give a claimed turn the STT result (and echo ledger) its queued live event already started."""
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        key = self._admitted_voice_key(event) if registry else None
+        live = registry.get(key) if key is not None else None
+        if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
+            return
+        # Restored media is the committed copy (``<sha256>/<name>``) of the same clip.
+        live_paths = self._pending_event_audio_paths(live)
+        restored_paths = self._pending_event_audio_paths(event)
+        if [os.path.basename(p) for p in live_paths] != [os.path.basename(p) for p in restored_paths]:
+            return
+        del registry[key]
+        prefetch = getattr(live, "_gateway_pending_stt_prefetch", None)
+        if prefetch is not None:
+            try:
+                await asyncio.shield(prefetch)
+            except asyncio.CancelledError:
+                if not prefetch.cancelled():
+                    raise  # this turn was cancelled, not the prefetch
+            except Exception:
+                return
+        if not hasattr(live, "_gateway_pending_stt_text"):
+            return  # STT failed or was cancelled: the turn transcribes as before
+        # Preserve the prefetched words, but point the attachment marker at the durable copy
+        # owned by the claimed turn, not the adapter's temporary recording.
+        enriched = live._gateway_pending_stt_text
+        for old, new in zip(live_paths, restored_paths):
+            if old != new:
+                enriched = enriched.replace(
+                    f"\n[User sent audio: {self._agent_audio_path(old)}]",
+                    f"\n[User sent audio: {self._agent_audio_path(new)}]",
+                )
+        event._gateway_pending_stt_text = enriched
+        transcripts = event._gateway_pending_stt_transcripts = list(
+            getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
+        # The queued echo ledger reserves attempts before sending, but only accepted sends
+        # count as shown. Retry refused echoes on the claimed turn without paying for STT again.
+        shown = getattr(live, "_gateway_pending_stt_shown", ())
+        owed = [text for index, text in enumerate(transcripts) if index not in shown]
+        if owed and self._should_echo_stt_transcripts():
+            source = event.source
+            if adapter := self._delivery_adapter_for(source):
+                metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                await self._echo_stt_transcripts(adapter, source, owed, event=event, metadata=metadata)
+
+    async def _transcribe_and_echo_pending_voice(
+        self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET
+    ) -> tuple[str, list[str]]:
+        """Transcribe a pending voice event and echo transcripts once → ``(enriched_text,
+        transcripts)`` for ``agent.interrupt()`` or the pending-drain flow; ``(text, [])`` when there
+        is no STT-eligible media (caller owns the ``_build_media_placeholder`` fallback)."""
+        if not self._pending_event_audio_paths(event):
+            return text, []
+        try:
+            enriched_text, transcripts = await self._transcribe_pending_audio_event_once(event, text)
+            if metadata is _UNSET:
+                metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+            await self._echo_pending_stt_transcripts_once(
+                event, adapter, source, transcripts, metadata=metadata, log_context=log_context
+            )
+            return enriched_text or text, transcripts
+        except Exception as trans_exc:
+            logger.warning("%s transcription failed: %s", log_context, trans_exc)
+            return text, []

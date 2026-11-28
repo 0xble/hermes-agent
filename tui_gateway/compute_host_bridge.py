@@ -466,6 +466,8 @@ def _send_claimed_compute_host_control(sid: str, session: dict, *, route_name: s
 def _compress_via_compute_host(rid, params: dict, session: dict) -> dict:
     """``session.compress`` for a turn-isolated session: forward ``/compress`` to the host."""
     sid = str(params.get("session_id") or "")
+    from tui_gateway import server
+
     focus_topic = _str_param(params, "focus_topic")
     try:
         ack = _send_claimed_compute_host_control(
@@ -474,21 +476,21 @@ def _compress_via_compute_host(rid, params: dict, session: dict) -> dict:
     except queue.Empty:
         # Waiter gave up, host still compressing; the late-ack handler adopts the rotated session when it
         # lands. Not an error (a 5019 here reported timeouts that later succeeded).
-        return _ok(rid, {"status": "pending", "turn_isolation": True,
+        return server._ok(rid, {"status": "pending", "turn_isolation": True,
                          "message": ("compression still running in the background; "
                                      "the transcript will refresh when it finishes")})
     except SessionNotOwned:
         raise  # refused before the host was contacted: the dispatcher answers 4090, not a host failure
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- transport-specific failures become a request-level error, not a dispatcher crash
         return _err(rid, 5019, f"compute-host compress failed: {exc}")
     if (resp := _compute_host_ack_error(rid, ack, 4009, "compute-host compress failed")) is not None:
         return resp
     _apply_compute_host_metadata_mirror(session, ack)
     if isinstance(host_result := ack.get("result"), dict):
         # Host-owned result verbatim (carries `status: aborted` / `summary.aborted`).
-        return _ok(rid, {**host_result, "turn_isolation": True})
+        return server._ok(rid, {**host_result, "turn_isolation": True})
     host_info = ack.get("session_info") if isinstance(ack.get("session_info"), dict) else {}
-    return _ok(rid, {
+    return server._ok(rid, {
         "status": "compressed", "turn_isolation": True,
         # `messages` goes top-level for the transcript replacement; don't duplicate it in the ack.
         "host_ack": {key: value for key, value in ack.items() if key != "messages"}, "info": host_info,

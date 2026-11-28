@@ -151,7 +151,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
         # chat_id -> Hermes profile the connector routed the inbound to (multiplex mode). Echoed
         # on every outbound frame's metadata so the connector can stamp the SAME profile on the
         # next passthrough_forward for that chat; empty on a single-profile gateway.
-        self._profile_by_chat: dict[str, str] = {}
+        self._profile_by_chat: dict[str, Optional[str]] = {}
         # Chats the connector has refused (see the terminal-decline latch).
         # chat_id -> (thread_id, initial_name) of the auto-thread the CONNECTOR
         # created for our latest send; read by the semantic thread-rename lane.
@@ -988,13 +988,13 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
                 ("chat_type", self._chat_type_by_chat),
                 ("profile", self.__dict__.setdefault("_profile_by_chat", {})),
             ):
-                if (fill_only and attr == "profile" and
-                        any(cache.get(chat) for cache in (
-                            self._dm_user_by_chat, self._scope_by_chat, self._chat_type_by_chat))):
-                    continue
                 value = getattr(src, attr, None)
                 if value:
                     put(cache, chat, str(value))
+                elif attr == "profile" and not fill_only:
+                    # Only live capture records absence, so an older restore cannot
+                    # supply the first stamp after live traffic. Keep any known stamp.
+                    self._profile_by_chat.setdefault(chat, None)
             # Latest message ts: the status anchor for typing frames that carry no turn's own anchor.
             message_id, _chat = _event_ids(event)
             if message_id:

@@ -180,7 +180,7 @@ def _db_flush_scan_start(agent, messages: list[dict]) -> int:
 def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any]:
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
     role = msg.get("role", "unknown")
-    content = msg.get("content")
+    content = msg.get(REPLAY_PERSISTED_CONTENT, msg.get("content"))
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
     timestamp = msg.get("timestamp")
@@ -199,7 +199,10 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
-        "role": role, "content": _durable_content(content),
+        # Tool receipts already have a native structured-content codec in SessionDB.
+        # Projecting them to text here would lose parts before replay, even though
+        # the live request kept them. Other roles retain their existing projection.
+        "role": role, "content": content if role == "tool" else _durable_content(content),
         "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),
@@ -604,9 +607,11 @@ class SessionPersistenceMixin:
 
     def _save_trajectory(self, messages: list[dict[str, Any]], user_query: str, completed: bool):
         """Save conversation trajectory to JSONL file."""
+        from agent.incognito import is_incognito
         from tools.hosted_tool_policy import host_feature_enabled
-        if not self.save_trajectories or not host_feature_enabled("trajectory_export"):
-            return  # hosted: no host file for a tenant's transcript
+        if (getattr(self, "incognito", False) or is_incognito(getattr(self, "session_id", None))
+                or not self.save_trajectories or not host_feature_enabled("trajectory_export")):
+            return
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
         _save_trajectory_to_file(trajectory, self.model, completed)
 

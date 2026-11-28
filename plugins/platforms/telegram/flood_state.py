@@ -12,6 +12,13 @@ from pathlib import Path
 import os
 import sqlite3
 import time
+import json
+
+
+def storage_key(chat_id: str, token: str | None) -> str:
+    """Key durable state by the public bot ID, never by the credential itself."""
+    bot_id, sep, _ = (token or "").partition(":")
+    return f"{bot_id}:{chat_id}" if sep and bot_id.isascii() and bot_id.isdigit() else chat_id
 
 
 def _fallback_dir(profile_dir: Path, chat_id: str) -> Path:
@@ -74,19 +81,36 @@ def record_deadline(profile_dir: Path, chat_id: str, wait: float) -> float:
 
 
 def remaining_seconds(profile_dir: Path, chat_id: str) -> float:
-    """Return the persisted remaining wait, or zero when no deadline exists."""
+    """Return the persisted remaining wait, or zero when no deadline exists.
+
+    Read the pre-SQLite per-bot JSON receipt as a compatibility fallback. Existing gateways may
+    still have that file on disk after upgrading; its wall-clock entries are clamped to the same
+    five-minute safety window as newly restored state.
+    """
     path = Path(profile_dir) / "telegram-flood-state.db"
-    if not path.exists():
+    if path.exists():
+        with closing(sqlite3.connect(path, timeout=1.0)) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS deadlines (chat_id TEXT PRIMARY KEY, until REAL NOT NULL)")
+            row = conn.execute("SELECT until FROM deadlines WHERE chat_id = ?", (chat_id,)).fetchone()
+            if row is not None:
+                remaining = row[0] - time.time()
+                if remaining <= 0:
+                    conn.execute("DELETE FROM deadlines WHERE chat_id = ? AND until = ?", (chat_id, row[0]))
+                    conn.commit()
+                    newer = conn.execute("SELECT until FROM deadlines WHERE chat_id = ?", (chat_id,)).fetchone()
+                    return max(0.0, newer[0] - time.time()) if newer else 0.0
+                return remaining
+
+    bot_id, sep, raw_chat = str(chat_id).partition(":")
+    if not sep or not bot_id.isdigit():
+        raw_chat = str(chat_id)
+        bot_id = ""
+    legacy = Path(profile_dir) / f"telegram_flood_cooldown_{bot_id}.json" if bot_id else None
+    if legacy is None or not legacy.exists():
         return 0.0
-    with closing(sqlite3.connect(path, timeout=1.0)) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS deadlines (chat_id TEXT PRIMARY KEY, until REAL NOT NULL)")
-        row = conn.execute("SELECT until FROM deadlines WHERE chat_id = ?", (chat_id,)).fetchone()
-        if row is None:
-            return 0.0
-        remaining = row[0] - time.time()
-        if remaining <= 0:
-            conn.execute("DELETE FROM deadlines WHERE chat_id = ? AND until = ?", (chat_id, row[0]))
-            conn.commit()
-            newer = conn.execute("SELECT until FROM deadlines WHERE chat_id = ?", (chat_id,)).fetchone()
-            return max(0.0, newer[0] - time.time()) if newer else 0.0
-    return remaining
+    try:
+        saved = json.loads(legacy.read_text(encoding="utf-8-sig")).get("until") or {}
+        deadline = float(saved.get(raw_chat, 0.0)) if isinstance(saved, dict) else 0.0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
+    return max(0.0, min(deadline - time.time(), 300.0))

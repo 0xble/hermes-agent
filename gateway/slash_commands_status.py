@@ -303,10 +303,12 @@ class GatewayStatusCommandsMixin:
         status_agent = agent if is_running else self._cached_agent_for(session_key)
         await self._rehydrate_session_model_override_async(session_key)
         active_override = self._session_model_override(session_key) or {}
+        default_runtime = {}
         if (status_agent is None or status_agent is _AGENT_PENDING_SENTINEL) and not active_override.get("model"):
             # Nothing resident and no /model pin: the next turn runs the channel/config default, so a
             # SessionDB route recorded under an older default is history, not the current model.
-            default_route = await asyncio.to_thread(self._status_next_turn_route, source, session_key)
+            next_model, default_runtime = await asyncio.to_thread(self._status_next_turn_route, source, session_key)
+            default_route = (next_model, _clean_str(default_runtime.get("provider")))
             persisted_route, session_row = _routes_for_default(default_route, persisted_route, session_row)
         model_name, provider_name, context_used, context_total, route = _status_model_route(
             status_agent, active_override, persisted_route, session_row, session_entry
@@ -315,7 +317,10 @@ class GatewayStatusCommandsMixin:
             # Same resolver /context uses (off-loop: it can probe /models). A window the resolver only
             # invented (unknown model → DEFAULT_FALLBACK_CONTEXT) stays hidden rather than being shown
             # as a real limit; the occupancy-only line below is honest for that case.
-            resolved = await self._resolve_route_context(source, model_name, route)
+            context_route = route if not default_runtime or route.get("base_url") else {
+                **default_runtime, "_runtime_resolved": True,
+            }
+            resolved = await self._resolve_route_context(source, model_name, context_route)
             if resolved is not None and resolved.context_source != "default":
                 context_total = _int_value(resolved.context_length)
 
@@ -377,11 +382,11 @@ class GatewayStatusCommandsMixin:
         lines += ["", t("gateway.status.platforms", platforms=', '.join(p.value for p in self.adapters))]
         return "\n".join(lines)
 
-    def _status_next_turn_route(self, source, session_key) -> tuple[str, str]:
-        """``(model, provider)`` the next turn resolves for this session, from the turn's own resolver
+    def _status_next_turn_route(self, source, session_key) -> tuple[str, dict]:
+        """``(model, runtime)`` the next turn resolves for this session, from the turn's own resolver
         (``_resolve_session_agent_runtime``: a LOCAL session's frozen launch policy, channel_overrides
         incl. provider-only ones, then the profile's config) inside the owning profile's scope, which
-        slash dispatch does not bind on a multiplexed runner. ``("", "")`` when it cannot resolve: the
+        slash dispatch does not bind on a multiplexed runner. ``("", {})`` when it cannot resolve: the
         recorded route is then left as is rather than replaced by a guess."""
         try:
             with self._profile_scope_for_source(source):
@@ -390,9 +395,8 @@ class GatewayStatusCommandsMixin:
                     source=source, session_key=session_key, fallback=False, record_notice=False)
         except Exception:  # health: allow BLE001 -- /status is fail-open; the turn reports the error
             logger.debug("/status could not resolve the next turn's route", exc_info=True)
-            return "", ""
-        # The agent records its runtime provider as the usage row's billing_provider.
-        return _clean_str(model), _clean_str(runtime.get("provider"))
+            return "", {}
+        return _clean_str(model), runtime
 
     async def _status_session_db_facts(self, session_id: str):
         """``(title, session_row, db_total_tokens, persisted_route)`` for /status; each fail-open.

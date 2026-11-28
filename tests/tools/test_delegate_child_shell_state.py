@@ -10,7 +10,9 @@ Adapted from the regression test posted on the issue by ar-labs-agent.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 import uuid
 
 import pytest
@@ -40,6 +42,32 @@ def _sh(command: str, task_id: str, *, child: bool) -> str:
     result = json.loads(raw)
     assert result.get("exit_code", 0) == 0 and not result.get("error"), result
     return result["output"].strip()
+
+
+def test_reused_task_id_ignores_old_global_snapshot_and_cleanup_removes_scoped_snapshot(child_env, monkeypatch):
+    """A task id alone must not select state left by another environment/process."""
+    from tools.environments.base import shell_state_scope
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("TMPDIR", str(child_env))
+    task_id = "reused-task-id"
+    digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+    stale = child_env / f"hermes-task-snap-{digest}.sh"
+    stale.write_text("export PATH=/bogus/stale/path\ncd /bogus/stale/cwd\n", encoding="utf-8")
+    env = LocalEnvironment(cwd=str(child_env), timeout=30)
+    scoped = Path(env._task_snapshot_path(task_id))
+    try:
+        assert scoped != stale
+        with shell_state_scope((task_id,)):
+            result = env.execute('printf "%s|%s" "$PATH" "$PWD"')
+        assert result["returncode"] == 0, result
+        assert "/bogus/stale/path" not in result["output"]
+        assert str(child_env) in result["output"]
+        assert scoped.exists()
+    finally:
+        env.cleanup()
+        stale.unlink(missing_ok=True)
+    assert not scoped.exists()
 
 
 @pytest.fixture(params=["gateway-session", "cli"])

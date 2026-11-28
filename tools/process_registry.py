@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Literal, NamedTuple, Optional
 from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import (
-    format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
+    format_process_notification, heartbeat_output_tail, is_child_process_notification, promote_to_completion_notice, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_env import EnvironmentProcessMixin
 from tools.process_registry_ssh import SSHProcessBinding, SSHProcessMixin, process_provenance
@@ -56,7 +56,6 @@ from tools.process_registry_results import (
 from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wait import monotonic as _monotonic, plan_for as _wait_plan, max_wait_timeout, process_deadline_floor
 from tools.process_registry_wsl import _is_wsl_launcher_command
-from tools.process_registry_wait import max_wait_timeout, process_deadline_floor
 
 logger = logging.getLogger(__name__)
 
@@ -737,7 +736,10 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSurvivalMixin, ProcessOutputLogMixin,
+from tools.process_registry_readers import ProcessRegistry as ProcessReadersMixin
+
+
+class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSurvivalMixin, ProcessOutputLogMixin,
                       ProcessOwnershipMixin, EnvironmentProcessMixin, SSHProcessMixin, ProcessEnvScopeMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
@@ -831,7 +833,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # Serialize the liveness check and enqueue with _move_to_finished so a
         # stale heartbeat cannot arrive after its completion notification.
         with self._lock:
-            if session.exited or session.id not in self._running:
+            if session.exited:
                 return
             session._heartbeat_last = now
             with session._lock:
@@ -856,7 +858,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # the registry lock. Recheck after transformation because exit can win.
         _redact_process_result(notification)
         with self._lock:
-            if not session.exited and session.id in self._running:
+            if not session.exited:
                 self.completion_queue.put(notification)
 
     @staticmethod
@@ -909,7 +911,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session._watch_disabled = True
                 # Promote so the agent still gets exactly one notification on exit,
                 # plus exactly one summary so it sees why things went quiet.
-                session.notify_on_complete = True
+                promote_to_completion_notice(self, session)
                 self._emit_watch_disabled(
                     session, session._watch_suppressed,
                     f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -929,7 +931,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             lifetime_exhausted = session._watch_hits >= WATCH_LIFETIME_MAX_HITS
             if lifetime_exhausted:
                 session._watch_disabled = True
-                session.notify_on_complete = True
+                promote_to_completion_notice(self, session)
         output = "\n".join(matched_lines[:20])
         if len(output) > 2000:
             output = output[:2000] + "\n...(truncated)"
@@ -1472,28 +1474,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session, decoder, _append_chunk, "Process",
                 session.process.wait, lambda: session.process.returncode)
 
-    def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
-        """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
-        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
 
-        A process may close stdout long before it exits.  The reader owns a dedicated
-        daemon thread, so it must keep waiting rather than publish a false completion
-        and discard the only ``Popen`` handle that can reap the child.
-        """
-        with suppress(Exception):
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                append(tail)
-        try:
-            wait()
-        except Exception as e:
-            # A PTY child reaped by isalive() already has its exitstatus; only an
-            # unknown status must stay tracked for later reconciliation.
-            if exit_code() is None:
-                logger.warning("%s wait failed; leaving process tracked: %s", label, e)
-                return
-            logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
 
 
     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
@@ -1695,39 +1676,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
         }
-
-    def _release_finished_handles(self, session: ProcessSession):
-        """Close a finished session's OS handles (Popen pipes / PTY master).
-
-        Best-effort and idempotent: the session may have no local Popen (env
-        backends, detached recovery), or the handles may already be closed by
-        the reader loop / kill path. Closing a Popen's stream objects does not
-        kill anything — the child has already exited — it only releases the
-        parent's pipe FDs, which is exactly the retained-resource leak.
-        """
-        proc = session.process
-        if proc is not None:
-            for stream in (proc.stdout, proc.stderr, proc.stdin):
-                if stream is not None:
-                    with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
-                        stream.close()
-        if session._pty is not None:
-            # A live ptyprocess reader sits in a blocking read holding the PTY file
-            # object's buffer lock, and that read only ends once every holder of
-            # the slave side is gone. A descendant that setsid()s past the kill
-            # keeps it open, so close() here would block forever (under _lock on
-            # the prune path). The reader closes the PTY itself via
-            # _finish_reader once its read ends. pywinpty reads don't block, so
-            # Windows closes here as before.
-            reader = session._reader_thread
-            if (not _IS_WINDOWS and reader is not None and reader.is_alive()
-                    and reader is not threading.current_thread()):
-                return
-            # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
-            # closes the master fd exactly once; it raises only if the child
-            # ignores SIGKILL, which we don't want to surface on the finish path.
-            with suppress(Exception):
-                session._pty.close()
 
     # ----- Query Methods -----
 
@@ -2241,6 +2189,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             "status": status, "command": session.command,
             **ProcessRegistry._exit_fields(session), **_completion_output(session), **process_provenance(session)}
 
+    def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
+        """True when a detached entry was closed without a collected exit status and the PID is no
+        longer alive. Such a record is still retained and listed: callers need to see the unknown
+        outcome and can then poll it."""
+        return bool(
+            session is not None and session.exited and session.exit_code is None
+            and session.detached and session.pid_scope == "host"
+            and not self._is_host_pid_alive(session.pid))
+
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
         deadline: Optional[float] = None,
@@ -2532,9 +2489,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             sessions.update(self._finished)
             sessions.update(self._running)
         from hermes_constants import get_hermes_home
-        home = str(get_hermes_home())
-        selected = [s for s in sessions.values() if self._matches_ssh_scope(s, home, node)]
         from tools.environments.sandbox_scope import sandbox_visible
+        home = str(get_hermes_home())
+        selected = [s for s in sessions.values() if self._matches_ssh_scope(s, home, node) and sandbox_visible(s.sandbox_key)]
         all_sessions = [
             refreshed for refreshed in (
                 self._refresh_detached_session(s) for s in selected if sandbox_visible(s.sandbox_key)
@@ -2731,7 +2688,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 all_sessions = tuple(s for s in all_sessions if self._matches_ssh_scope(s, home))
             candidates = [
                 s for s in all_sessions
-                if (task_id is None or s.owner_task_id == task_id)
+                if (task_id is None or s.owner_task_id == task_id) and sandbox_visible(s.sandbox_key)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and (s.persist_on_release or is_restart_safe(s)))
                 and not (source == "gateway_shutdown" and is_restart_safe(s))
@@ -2741,6 +2698,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and not s.exited and is_restart_safe(s)
+                and sandbox_visible(s.sandbox_key)
             ]
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]
@@ -3308,6 +3266,7 @@ def _list_processes(task_id, node=None) -> dict:
         _redact_process_result(p)
         for p in process_registry.list_sessions(
             task_id=task_id, session_key=caller_session_key() or None, include_retained=True,
+            # An explicit node lists that node's handles only: another node's is never refreshed.
             **({"node": node} if node is not None else {}))]}
 
 
@@ -3325,28 +3284,10 @@ _SESSION_ACTIONS = {
 
 
 def _handle_process(args, **kw):
-    action = args.get("action", "")
-    # Coerce to string — some models send session_id as an integer
-    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
-    if action == "list":
-        return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
-    if action == "handoff":
-        if not session_id:
-            return tool_error("session_id is required for handoff")
-        from tools.process_registry_handoff import handoff_process
-        return json.dumps(handoff_process(session_id, args, kw.get("task_id")), ensure_ascii=False)
-    if action in _SESSION_ACTIONS:
-        if not session_id:
-            return tool_error(f"session_id is required for {action}")
-        from tools.process_registry_access import resolve_actionable
-        allowed, session_id = resolve_actionable(session_id, kw.get("task_id"))
-        if not allowed:
-            return json.dumps(_not_found(session_id), ensure_ascii=False)
-        handler, redact = _SESSION_ACTIONS[action]
-        from tools.process_registry_wait_policy import apply_wait_poll_policy
-        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
-        return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+    # Named-node routing and provenance live with the SSH process code; it applies the
+    # ownership gate (tools.process_registry_access) before any session action.
+    from tools.process_registry_ssh import handle_process
+    return handle_process(args, **kw)
 
 
 registry.register(

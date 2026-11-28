@@ -57,7 +57,7 @@ def _turn_runner(
         _build_stream_consumer_config=lambda *_a, **_kw: (object(), None),
     )
     ctx = SimpleNamespace(
-        mute_notification_reply=False,
+        session_key=None, session_id=None, persist_user_display_kind=None, mute_notification_reply=False,
         streaming_tts_consumer_holder=[None],
         stream_consumer_holder=[None],
         user_config={},

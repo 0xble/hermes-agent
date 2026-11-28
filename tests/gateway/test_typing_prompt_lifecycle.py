@@ -25,7 +25,7 @@ def _turn(platform, adapter):
     runner._session_key_for_source = lambda source: "session"
     _, _, send_metadata = runner._run_agent_progress_threading(source, event.message_id, False)
     ctx = TurnContext(source=source, session_key="session", event_message_id=event.message_id,
-                      _status_adapter=adapter, _status_chat_id=source.chat_id,
+                      _status_adapter_pinned=adapter, _status_chat_id=source.chat_id,
                       _status_thread_metadata=send_metadata)
     turn = TurnRunner(runner, ctx)
     turn._close_native_stream_boundary = lambda *args, **kwargs: True

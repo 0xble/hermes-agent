@@ -100,3 +100,49 @@ def policy_realpath(path: str) -> str:
     if text not in execution.policy_paths:
         execution.policy_paths[text] = remote_path(text)
     return execution.policy_paths[text]
+
+
+def confirm_policy_realpath(path: str) -> str:
+    """Re-resolve one prefetched policy anchor through the normal failure boundary.
+
+    Batches are an optimization only: a batch cannot observe test/runtime hooks that make one
+    anchor unavailable. A caller that has a matching protected anchor must confirm that anchor
+    with the ordinary resolver before returning a deny.
+    """
+    execution = current_execution()
+    if execution is None:
+        raise RuntimeError("Remote policy resolution requires a bound node")
+    text = str(path)
+    execution.policy_paths[text] = remote_path(text)
+    return execution.policy_paths[text]
+
+
+def prefetch_policy_realpaths(paths) -> None:
+    """Resolve many policy anchors in ONE target round trip, filling the per-invocation cache.
+
+    The write guards compare a target against dozens of credential anchors; resolving each with
+    its own target interpreter costs one transport round trip apiece. This is only a batch of the
+    same ``os.path.realpath`` that ``remote_path`` runs: any failure caches nothing, so the
+    per-path resolution still runs and still fails closed rather than falling back lexically.
+    """
+    execution = current_execution()
+    if execution is None:
+        raise RuntimeError("Remote policy resolution requires a bound node")
+    missing = [text for text in dict.fromkeys(str(p) for p in paths) if text not in execution.policy_paths]
+    if len(missing) < 2:
+        return
+    ops = file_ops()
+    expanded = [ops._expand_path(text) for text in missing]
+    if any(text.startswith("~") for text in expanded):
+        return
+    result = ops._exec_python_snippet(
+        "import os,json; print(json.dumps([os.path.realpath(p) for p in " + repr(expanded) + "]))")
+    if result.exit_code:
+        return
+    try:
+        resolved = json.loads(result.stdout)
+    except ValueError:
+        return
+    if not isinstance(resolved, list) or len(resolved) != len(missing):
+        return
+    execution.policy_paths.update(zip(missing, resolved))

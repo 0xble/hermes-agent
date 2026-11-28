@@ -3,9 +3,9 @@
 Extends the exit-code semantics table in ``terminal_tool`` with a bounded scan of failed-command
 output mapped to ONE short, actionable recovery hint. Rules: only fires on non-zero exit; first
 match wins, patterns ordered by observed production frequency; scans only the first
-``_SCAN_CHARS`` so hints key on error headers (the one exception, the wrapper's own failed ``cd``,
-reads the last line of the final ``_SCAN_CHARS``), not deep context; hints state the *next action*
-in 1-2 sentences. The general rules are pure; the pytest-specific runner hint performs only
+``_SCAN_CHARS`` so hints key on error headers, not deep context (the one exception, the
+wrapper's own failed ``cd``, reads the last line of the final ``_SCAN_CHARS``); hints state the
+*next action* in 1-2 sentences. The general rules are pure; the pytest-specific runner hint performs only
 bounded local path-existence checks and never reads configuration or spawns a process.
 """
 

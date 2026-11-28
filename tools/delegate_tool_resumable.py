@@ -310,7 +310,7 @@ def record_start(run: Any) -> None:
             record = {**prev, **spec, **_owner_identity(), "subagent_id": sid,
                       "delegation_id": getattr(child, "_delegation_id", None), "owners": sorted(owners),
                       # The async unit whose ledger row reports this run (``<call>-k`` with independent completions).
-                      "unit_id": getattr(child, "_delegation_unit_id", None),
+                      "unit_id": getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None),
                       "start_cwd": start_cwd, "cwd": durable["cwd"], "worktree": prev.get("worktree")
                       or run.worktree_info, "outcome": "running", "resume_mode": None,
                       # Kept across continues: a tree the child made in an earlier run is still its own.
@@ -528,7 +528,26 @@ def _abandoned_entry(record: dict[str, Any]) -> tuple[dict[str, Any], Optional[s
 def plan_recovery(path: Any, alive) -> dict[str, tuple[Any, Any, list[str], Any]]:
     """Boot, before the recovery write: ``{subagent_id: (owner_pid, owner_started_at, pin_paths, stored row)}`` for
     every ``running``/``claimed`` record of *path*'s store whose owner is gone."""
-    return recovery_plan(_write(path, lambda ledger: ledger.list_inflight_subagents()) or (), alive)
+    return recovery_plan(_read_only(path, lambda ledger: ledger.list_inflight_subagents()) or (), alive)
+
+
+def _read_only(path: Any, fn) -> Any:
+    """``fn(ledger)`` over a read-only handle, so boot's recovery probe holds no writer transaction while the git
+    probes run. A missing store has no abandoned rows; a reader that cannot answer falls back to ``_write``."""
+    if path is None:
+        return None
+    from persistence import ProfileScope
+    from persistence_assembly import open_persistence_reader
+    target = path.profile_dir if isinstance(path, ProfileScope) else Path(path)
+    if not target.exists():
+        return None
+    try:
+        with open_persistence_reader(target) as store:
+            return fn(store.coordination)
+    except Exception:
+        logger.warning("Read-only resumable recovery probe failed for %s; retrying with the writer path", path,
+                       exc_info=True)
+        return _write(path, fn)
 
 
 def recovery_plan(rows: Iterable[Any], alive) -> dict[str, tuple[Any, Any, list[str], Any]]:

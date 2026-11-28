@@ -587,8 +587,8 @@
     "plugins/platforms/telegram/adapter.py gateway.authz_mixin._coerce_allow_set": 1,
     "plugins/platforms/telegram/adapter.py gateway.copy_blocks._has_copy_markers": 4,
     "plugins/platforms/telegram/adapter.py gateway.copy_blocks.map_outside_copy_blocks": 1,
-    "plugins/platforms/telegram/adapter.py gateway.copy_blocks.protect_inline_copy_bodies": 2,
-    "plugins/platforms/telegram/adapter.py gateway.copy_blocks.render_copy_blocks_inline": 3,
+    "plugins/platforms/telegram/adapter.py gateway.copy_blocks.protect_inline_copy_bodies": 1,
+    "plugins/platforms/telegram/adapter.py gateway.copy_blocks.render_copy_blocks_inline": 4,
     "plugins/platforms/telegram/adapter.py gateway.outbox.durable_control": 1,
     "plugins/platforms/telegram/adapter.py gateway.outbox.durable_egress": 1,
     "plugins/platforms/telegram/adapter.py gateway.platforms.base._TEXT_INJECT_EXTENSIONS": 1,
@@ -848,6 +848,9 @@
     "plugins/web/xai/provider.py tools.interrupt.is_interrupted": 1,
     "plugins/web/xai/provider.py tools.xai_http.has_xai_credentials": 1,
     "plugins/web/xai/provider.py tools.xai_http.hermes_xai_user_agent": 1,
+    "plugins/platforms/telegram/rich_parts.py gateway.copy_blocks._has_copy_markers": 1,
+    "plugins/platforms/telegram/telegram_split.py gateway.copy_blocks.protect_inline_copy_bodies": 1,
+    "plugins/platforms/telegram/telegram_split.py gateway.copy_blocks.restore_inline_copy_bodies": 1,
     "plugins/web/xai/provider.py tools.xai_http.resolve_xai_http_credentials": 1
   },
   "core_to_module": {

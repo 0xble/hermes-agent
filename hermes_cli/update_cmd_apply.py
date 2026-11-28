@@ -35,7 +35,8 @@ def _run_immutable_rollback(args, gateway_mode: bool) -> None:
         plist_body = None
         if plist and plist.exists() and not source_layout and previous is not None:
             plist_body = gateway.generate_launchd_plist(release_target=previous).encode("utf-8")
-        callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist and plist.exists() else None
+        callback = (lambda: gateway_launchd._reload_installed_launchd_plist(
+            plist, use_planned_handover=False)) if plist and plist.exists() else None
         result = rollback(home, plist_path=plist if plist and plist.exists() else None,
                           plist_body=plist_body, reload_callback=callback)
     if result.get("reload_pending"):

@@ -28,7 +28,7 @@ _PRE_SEND_LIVE_REJECTIONS = frozenset({"Not connected"})
 
 
 def _standalone_send(
-    t: _TargetDelivery, content: str, media_files: list) -> tuple[Any, Optional[str]]:
+    t: _TargetDelivery, content: str, media_files: list, *, copy_block: bool = False) -> tuple[Any, Optional[str]]:
     """Run the standalone sender for one target: ``(result, None)`` or ``(None, error)`` (already
     logged — WARNING for a shutdown race, ERROR with traceback otherwise). A timeout also sets
     ``t.standalone_in_flight``: the dispatch shield keeps a timed-out send un-cancelled, so the
@@ -46,7 +46,8 @@ def _standalone_send(
         # notify: the live lane's metadata["notify"] (cron.delivery.notify), so a brief rings either way.
         return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files, notify=t.notify_delivery, force_document=t.force_document),
+            media_files=media_files, notify=t.notify_delivery, force_document=t.force_document,
+            args={"copy_block": True} if copy_block else None),
             timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:
@@ -55,7 +56,6 @@ def _standalone_send(
 
     def _failed(e) -> tuple[None, str]:
         msg = f"delivery to {t.where} failed: {e}"
-        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
         # An exception escaping the sender says nothing about what already went out, unless it
         # proves the request never left.
         from gateway.platforms._shared import request_never_left
@@ -105,12 +105,17 @@ def _standalone_send(
             # A result timeout leaves the pooled thread's send running: same in-flight ambiguity.
             if isinstance(e, TimeoutError):
                 return _in_flight(30 + send_timeout - base_timeout)
+            logger.error("Job '%s': delivery to %s failed: %s", job["id"], t.where, e, exc_info=True)
             return _failed(e)
     except Exception as e:
+        logger.error("Job '%s': delivery to %s failed: %s", job["id"], t.where, e, exc_info=True)
         return _failed(e)
 
 
-def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
+def _queue_for_live_reconnect(
+    t: _TargetDelivery, content: str, media_files: list, delivery_errors: list,
+    *, copy_blocks: list[str] | None = None,
+) -> None:
     """Hand a payload the live lane rejected retryably and the standalone lane then definitively
     failed (or provably could not attempt) to the delivery ledger, as a failed row owned by the
     adapter that rejected it: the post-reconnect sweep / retry timer redelivers it (#125363).
@@ -129,12 +134,18 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
         if not retryable_live_rejection or not ledger_enabled():
             return
         session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
-        record_obligation(
-            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
-            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-        mark_failed(obligation_id, str(t.live_error))
+        job_ref = f"job:{t.job.get('id', '?')}"
+        rows = [(job_ref, content)] if content else []
+        from gateway.copy_blocks import wrap_copy_block
+        rows += [(f"{job_ref}#copy{index}", wrap_copy_block(block))
+                 for index, block in enumerate(copy_blocks or [])]
+        for message_ref, queued_content in rows:
+            obligation_id = compute_obligation_id(session_key, message_ref, queued_content)
+            record_obligation(
+                obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
+                chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
+                adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
+            mark_failed(obligation_id, str(t.live_error))
         # Arm the in-process drain: this row lands in ``pending_retries`` (backoff tier 0, due in
         # ~30s), but the only arming sites for the flood worker are boot adoption and the
         # agent-reply finalizer — cron enters neither, so without this a retryable-marked row on
@@ -154,7 +165,15 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
         logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
                        t.job.get("id"), t.where, exc_info=True)
         return
-    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    row_count = len(rows)
+    if is_reconnect_only(t.live_error) or t.live_retryable is True:
+        row_label = "row" if row_count == 1 else "rows"
+        note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
+    elif row_count == 1 and content:
+        note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    else:
+        row_label = "row" if row_count == 1 else "rows"
+        note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
     if media_files:
         note += f" ({len(media_files)} attachment(s) not queued)"
     logger.warning("Job '%s': %s", t.job.get("id"), note)

@@ -35,7 +35,7 @@ async def _owner(tmp_path, monkeypatch, run_job):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {'model': {}, 'platform_toolsets': {'cli': []}})
     monkeypatch.setattr(jobs, 'get_job', lambda jid: {'id': jid, 'prompt': 'report', 'model': 'm', 'name': 'job'})

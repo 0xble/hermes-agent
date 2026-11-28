@@ -120,7 +120,7 @@ def test_resume_context_links_through_model_dispatch_unit(monkeypatch, shape):
     if shape == "tasks":
         task["context"] = brief
     unit = SimpleNamespace(task_list=[task], context=brief if shape == "legacy" else None,
-                           children=[(0, task, object())], top_role="leaf", creds={"model": "m"}, live_writers=[])
+                           children=[(0, task, SimpleNamespace())], top_role="leaf", creds={"model": "m"}, live_writers=[])
     try:
         handle = _dispatch_unit(unit, "deleg_model_replacement", None, {
             "session_key": "agent:main:telegram:dm:1", "parent_session_id": "sess-owner",
@@ -196,7 +196,7 @@ def test_expired_model_dispatch_does_not_fall_back_to_inline_execution(monkeypat
     assert reason is None
     task = {"goal": "build the model", "context": dr.build_recovery_instruction(record)}
     batch = dispatch._Batch(max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
-                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, object())],
+                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, SimpleNamespace())],
                             parent_agent=SimpleNamespace(session_id="sess-owner"),
                             creds={"model": "m"}, top_role="leaf", live_writers=[], live_paths=[],
                             live_deleg_id="deleg_expired_model", origin_wake_sid="wake",
@@ -235,7 +235,7 @@ def test_managed_retry_storage_failure_does_not_run_inline_or_consume_claim(monk
     assert reason is None
     task = {"goal": "build the model", "context": dr.build_recovery_instruction(record)}
     batch = dispatch._Batch(max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
-                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, object())],
+                            overall_start=time.monotonic(), task_list=[task], context=None, children=[(0, task, SimpleNamespace())],
                             parent_agent=SimpleNamespace(session_id="sess-owner"),
                             creds={"model": "m"}, top_role="leaf", live_writers=[], live_paths=[],
                             live_deleg_id="deleg_storage_replacement", origin_wake_sid="wake",

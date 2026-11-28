@@ -449,6 +449,10 @@ def _gave_up_completion(record: dict[str, Any], reason: str, row: dict[str, Any]
             "dispatched_at": row.get("dispatched_at"), "completed_at": time.time(),
             **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
     evt, result, _silent = completion_event(unit, {"results": [entry], "error": None}, "failed")
+    if evt.get("results") and isinstance(evt["results"][0], dict):
+        evt["results"][0].setdefault("subagent_id", sid)
+    if result.get("results") and isinstance(result["results"][0], dict):
+        result["results"][0].setdefault("subagent_id", sid)
     return evt, result
 
 

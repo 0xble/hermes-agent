@@ -10,6 +10,9 @@ import logging
 import sys
 from typing import Any, List, Optional
 
+from gateway.session_context import bound_turn_origin
+from tools.terminal_tool_result import _cwd_fallback_note
+
 logger = logging.getLogger("tools.terminal_tool")
 
 # A silent background process (no notify_on_complete / watch_patterns) is right
@@ -72,6 +75,65 @@ _ROUTING_FIELDS = (
     # before the process finished, instead of injecting it into the NEW one.
     ("parent_session_id", "HERMES_SESSION_ID"),
 )
+
+
+_PROMOTED_NOTE = (
+    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
+    "tracked background process with notify_on_complete=true instead of being refused. Do NOT re-run it. "
+    "Its completion (exit code + output tail) arrives as a notification; poll with "
+    "process_manage(action=\"poll\", session_id=...) if you need it sooner."
+)
+
+
+_PROMOTED_NOTE_POLL_ONLY = (
+    "Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a "
+    "tracked background process instead of being refused. Do NOT re-run it. This session cannot receive "
+    "completion notifications, so poll it with process_manage(action=\"poll\", session_id=...) until it exits."
+)
+
+
+_PTY_DISABLED_REASON = (
+    "PTY disabled for this command because it expects piped stdin/EOF "
+    "(for example gh auth login --with-token). For local background "
+    "processes, call process_manage(action='close') after writing so it receives "
+    "EOF."
+)
+
+
+def _with_promoted_note(result_json: str, requested_timeout: int, *, cap: int) -> str:
+    """Attach the foreground->background promotion note to a spawn result (unchanged on error). The
+    note only promises a notification when the spawn actually kept notify_on_complete (finite sessions
+    such as one-shot runners cannot route one back; the spawn already said so and cleared the flag)."""
+    try:
+        data = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(data, dict) or data.get("error"):
+        return result_json
+    template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
+    data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=cap)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _command_requires_pipe_stdin(command: str) -> bool:
+    """True when PTY mode would break a stdin-driven command: `gh auth login
+    --with-token` waits for EOF on piped stdin, and under a PTY
+    `process.submit()` only sends a newline, so it hangs forever."""
+    normalized = " ".join(command.lower().split())
+    return normalized.startswith("gh auth login") and "--with-token" in normalized
+
+
+def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patterns, background: bool) -> tuple:
+    """Resolve notify_on_complete + watch_patterns both set: drop watch_patterns
+    (combined they produce duplicate async notifications — one per match plus
+    one on exit — that can spam the user long after the process ends).
+    Returns ``(watch_patterns_to_use, conflict_note)``; note is "" without conflict."""
+    if background and notify_on_complete and watch_patterns:
+        return None, (
+            "watch_patterns ignored because notify_on_complete=True; "
+            "these two flags produce duplicate notifications when combined"
+        )
+    return watch_patterns, ""
 
 
 def _looks_like_homebrew_ci_poller(command: str) -> bool:
@@ -150,6 +212,29 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
     process_registry.pending_watchers.append(watcher)
 
 
+def _annotate_launch_hint(
+    result_data: dict, command: str, *, auto_backgrounded: bool, notify_on_complete: bool, watch_patterns,
+) -> None:
+    """Explain how to follow the process without re-launching a converted command."""
+    if auto_backgrounded:
+        result_data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
+    elif not notify_on_complete and not watch_patterns:
+        result_data["hint"] = _SILENT_BACKGROUND_HINT
+    if command and _looks_like_homebrew_ci_poller(command):
+        existing = result_data.get("hint", "")
+        result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
+                               else _HOMEBREW_CI_POLLER_HINT)
+
+
+def _annotate_local_cwd_fallback(proc_session, result_data: dict, requested_cwd: str) -> None:
+    """Report when the local spawner substituted a fallback for a dead cwd."""
+    from tools.environments.local import _msys_to_windows_path
+
+    used = getattr(proc_session, "cwd", None)
+    if used and used not in (requested_cwd, _msys_to_windows_path(requested_cwd)):
+        result_data["cwd_fallback"] = _cwd_fallback_note({"requested": requested_cwd, "used": used})
+
+
 def spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
@@ -203,24 +288,16 @@ def spawn_background_process(
         if survive_restart:
             result_data["survive_restart"] = True
         if effective_cwd:
-            from tools.environments.local import _msys_to_windows_path
-            from tools.terminal_tool_result import _cwd_fallback_note
             # spawn_local resolves a dead cwd itself; spawn_via_env records where the sandbox fell back.
-            used = getattr(proc_session, "cwd", None)
-            if used and used not in (effective_cwd, _msys_to_windows_path(effective_cwd)):
-                result_data["cwd_fallback"] = _cwd_fallback_note({"requested": effective_cwd, "used": used})
+            _annotate_local_cwd_fallback(proc_session, result_data, effective_cwd)
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        if auto_backgrounded:
-            result_data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
-        elif not notify_on_complete and not watch_patterns:
-            result_data["hint"] = _SILENT_BACKGROUND_HINT
-        if command and _looks_like_homebrew_ci_poller(command):
-            existing = result_data.get("hint", "")
-            result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
-                                   else _HOMEBREW_CI_POLLER_HINT)
+        _annotate_launch_hint(
+            result_data, command, auto_backgrounded=auto_backgrounded,
+            notify_on_complete=notify_on_complete, watch_patterns=watch_patterns,
+        )
 
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
@@ -272,6 +349,34 @@ _YIELDED_NOTE = (
     "exits (notify_on_complete). Read the user's message and respond to it now; use "
     "process_manage(action='poll'|'wait'|'log', session_id=...) to check on this command."
 )
+
+
+_SEMAPHORE_YIELDED_NOTE = (
+    "This command is still queued for semaphore admission and has moved to the background "
+    "with the same shell and ticket. You will be notified when it exits "
+    "(notify_on_complete). Do NOT re-run it."
+)
+
+
+def _yield_kwargs(command: str, make_yield_handler, **ctx) -> dict:
+    """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
+    from agent.incognito import is_incognito
+    # Neither private sessions nor scheduled turns can persist an adopted command.
+    if is_incognito() or bound_turn_origin() == "cron":
+        return {}
+    handler = make_yield_handler(command=command, **ctx)
+    return {"yield_handler": handler} if handler is not None else {}
+
+
+def _yielded_result_json(result: dict) -> str:
+    """Build the foreground handoff result, which has no exit status yet."""
+    return json.dumps({
+        "output": result.get("output", ""), "exit_code": None, "error": None,
+        "status": "yielded_to_background", "session_id": result["yielded_session_id"],
+        "pid": result.get("pid"), "notify_on_complete": True,
+        "note": _SEMAPHORE_YIELDED_NOTE if result.get("yield_reason") == "semaphore_wait" else _YIELDED_NOTE,
+        **({"cwd_fallback": note} if (note := _cwd_fallback_note(result.get("cwd_fallback"))) else {}),
+    }, ensure_ascii=False)
 
 
 def yield_to_background_handler(

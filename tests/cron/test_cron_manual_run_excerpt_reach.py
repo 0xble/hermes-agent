@@ -26,7 +26,9 @@ def _run_and_complete(deliver):
     stored: dict = {}
 
     async def _send(platform, pconfig, chat_id, text, **kwargs):
-        return {"success": True, "message_id": "7"} if chat_id == GOOD else {"error": "chat not found"}
+        if chat_id == GOOD:
+            return {"success": True, "message_id": "7"}
+        return {"error": "chat not found", "delivery": "none"}
 
     with patch("gateway.config.load_gateway_config", return_value=config), \
          patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \

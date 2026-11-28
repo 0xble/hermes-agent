@@ -12,6 +12,7 @@ whole-file overwrite of content this task never saw or that changed since.
 
 import fnmatch
 import os
+from tools.node_execution import current_execution
 import unicodedata
 from pathlib import Path
 
@@ -223,10 +224,15 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
             raise
         normalized = os.path.normpath(filepath)  # a hosted ``~`` with no sandbox meaning: judged as written
     try:
-        anchored = str(_resolve_path_for_task(filepath, task_id))
-        lexical = sandbox_lexical_path(anchored)  # a hosted agent's sandbox path: never resolved here
-        resolved = lexical if lexical is not None else os.path.realpath(anchored)
+        anchored = target = str(_resolve_path_for_task(filepath, task_id))
+        if current_execution():
+            resolved = target
+        else:
+            lexical = sandbox_lexical_path(anchored)  # a hosted agent's sandbox path: never resolved here
+            resolved = lexical if lexical is not None else os.path.realpath(anchored)
     except (OSError, ValueError, RuntimeError):
+        if current_execution():
+            raise
         resolved = normalized if hosted else os.path.realpath(normalized)
 
     # Basenames and operator patterns gate EVERYWHERE, the Hermes home included:
@@ -246,7 +252,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     # itself is usually named ``.hermes``; without this every state/cache/session write
     # there would prompt. ``_hermes_exempt_homes`` also covers the ROOT when the active
     # home is a named profile (#110630).
-    for real_home in _hermes_exempt_homes():
+    for real_home in (() if current_execution() else _hermes_exempt_homes()):
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
@@ -597,7 +603,8 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         # remote backend, whose files the host-side existence check below never finds).
         return None
     try:
-        exists = Path(resolved).exists()
+        from tools.file_backend_state import remote_state
+        exists = remote_state(resolved)["exists"] if current_execution() else Path(resolved).exists()
     except OSError:
         return None
     if not exists:

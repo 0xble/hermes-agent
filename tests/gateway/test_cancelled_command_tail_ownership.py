@@ -35,7 +35,7 @@ async def _stop_retains_wake_for_command_tail():
         "api_call_count": 1, "max_iterations": 60,
     }
     runner._running_agents[key] = agent
-    runner._running_agents_ts[key] = time.time() - 120
+    runner._session_state(key).turn.started_ts = time.time() - 120
     runner._pause_goal_for_stop = AsyncMock()
     runner._async_session_store = MagicMock()
     runner._async_session_store.get_resume_pending_marker = AsyncMock(return_value=None)

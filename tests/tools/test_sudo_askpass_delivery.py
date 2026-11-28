@@ -775,6 +775,9 @@ def test_live_local_backend_noclobber_startup_keeps_caller_input(configured_pass
     temp.mkdir()
     monkeypatch.setenv("TERMINAL_TEMP_DIR", str(temp))
     env = LocalEnvironment(cwd=str(tmp_path), timeout=10, env={"TMPDIR": str(temp), "BASH_ENV": str(startup)})
+    # The probe runs ``sudo`` from the backend's own PATH, not the fake the command exports below, so its
+    # answer is the host's. Pin it like ``live_env``: this test is about the form, not the probe.
+    env._sudo_askpass_ok = True
     try:
         assert env.execute(f"export PATH={fake.parent}:$PATH")["returncode"] == 0
         # The export must survive into the next command under noclobber, or the host's sudo runs.

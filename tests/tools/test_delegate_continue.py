@@ -420,7 +420,7 @@ def test_timeout_continue_waits_for_worker_close_and_resource_cleanup(monkeypatc
             cleanup_done.set()
 
     # Force the existing inactivity-timeout path only after the worker reaches its barrier.
-    def timeout_first(run, settled, timeout):
+    def timeout_first(_run, settled, _future, timeout):
         if len(model.builds) == 1:
             assert worker_started.wait(10)
             raise TimeoutError()

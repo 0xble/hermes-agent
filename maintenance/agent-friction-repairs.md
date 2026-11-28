@@ -64,7 +64,10 @@ lifecycle behavior passing, and make the file tools (`read_file`, `write_file`,
 UDS and file-based transports so failed reads cannot feed empty fallback content
 into a later write. UDS is proven end to end; the file transport is proven by
 the shared `_parse_tool_result` path, which also rejects a `read_file` result
-that omits its content via the dedup stub. Skill-view coverage must prove that
+that omits its content via the dedup stub. The generated tool functions raise;
+`_call` is the transport and returns every reply unchanged, so a raw client
+still reads the server's refusal of an ungranted tool as an error envelope
+(`tests/tools/test_code_execution_rpc.py`). Skill-view coverage must prove that
 compaction and tail demotion retain reload markers for all served skill bodies,
 failed views do not create reload obligations, and byte-identical repeat views
 are the only ones that return `content_returned: false`. Sandbox RPC reads bypass

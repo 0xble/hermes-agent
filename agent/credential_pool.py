@@ -7,7 +7,7 @@ from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMix
 from agent.credential_pool_errors import _normalize_error_context, redact_error_text
 from agent.credential_pool_selection import CredentialPoolSelectionMixin
 from agent.credential_pool_timestamps import _parse_absolute_timestamp
-from agent.credential_pool_errors import _normalize_error_context, _withhold_private_error_text
+from agent.credential_pool_errors import _withhold_private_error_text
 
 import logging
 import os

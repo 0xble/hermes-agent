@@ -133,3 +133,37 @@ def chunk_markdown_message(content: str, max_length: int = 4096,
     if len(chunks) > 1:
         chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
     return chunks
+
+
+def safe_markdown_split(remaining: str, split_at: int, cp_limit: int) -> int:
+    # Don't split inside an inline code span or an open Markdown link:
+    # an unpaired backtick breaks MarkdownV2, and a cut between "[" and
+    # its closing ")" strands a half link in each chunk. One guard's
+    # retreat can re-expose the other's hazard in the shorter candidate
+    # (retreating past the "[" may also cross a backtick), so the guards
+    # settle split_at to a fixed point; it strictly decreases per move,
+    # which guarantees termination.
+    while True:
+        candidate = remaining[:split_at]
+        moved = False
+        backtick_count = candidate.count("`") - candidate.count("\\`")
+        if backtick_count % 2 == 1:
+            last_bt = candidate.rfind("`")
+            while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                last_bt = candidate.rfind("`", 0, last_bt)
+            if last_bt > 0:
+                safe_split = max(
+                    candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt))
+                if safe_split > cp_limit // 4:
+                    split_at = safe_split
+                    moved = True
+        link_lb = _open_link_bracket(candidate)
+        if link_lb > 0:
+            safe_split = max(
+                candidate.rfind(" ", 0, link_lb), candidate.rfind("\n", 0, link_lb))
+            if safe_split > cp_limit // 4:
+                split_at = safe_split
+                moved = True
+        if not moved:
+            break
+    return split_at

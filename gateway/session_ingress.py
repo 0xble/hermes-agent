@@ -91,6 +91,12 @@ async def admit_message(authority, event):
         messaging_admission.reset(ingress)
     if receipt.status == 'terminal':
         return None
+    return await _await_native_reply(authority, event, receipt, accepted)
+
+
+async def _await_native_reply(authority, event, receipt, accepted):
+    from gateway.session_refusals import internal_input, log_internal_refusal
+
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
     authority.native_waiters.add(receipt.admission_id)
     waiter = authority.waiters.setdefault(receipt.admission_id, asyncio.get_running_loop().create_future())

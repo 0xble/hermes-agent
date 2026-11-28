@@ -1853,6 +1853,28 @@ Every name in `hermes_cli.plugins.VALID_HOOKS` has at least one core fire site. 
 | `post_compaction` | `agent/compaction_events.py` `fire_post_compaction` |
 | `post_curator_run` | `agent/curator.py` `_notify_post_curator_run` |
 
+### `post_steer_delivered` delivery observation
+
+Dispatches once after each completed native steer-row insertion, under the
+active turn/profile scope. Python callbacks are bounded by
+`plugins.hook_callback_timeout` and fail open on timeout; the worker is abandoned
+without joining it, so delivery and later callbacks proceed. `0` disables the
+bound. A timed-out callback may continue running in the background.
+`turn_id` is the same admitted identity supplied to
+`pre_llm_call` and `pre_api_request`; `session_id` is the current session (which can
+rotate during compression). `delivery_id` is a host-minted UUID4 per insertion,
+and `ordinal` starts at 1 in each turn and spans both drain sites. `text` is the
+exact drained text without the out-of-band marker frame. The existing `steer()`
+entry point strips each input and joins several pending inputs with `\n`; that
+joined batch is one delivery, not heuristically split into original messages.
+
+No event fires for a requeue, an empty drain, or next-turn fallback. Fallback is
+ordinary `user_message` on a new admitted turn. Retries and transcript replay
+do not emit deliveries. Callback returns cannot rewrite or veto the inserted row;
+failures are logged and do not break the turn. This is an insertion receipt, not
+a durable provider-acceptance or exactly-once persistence guarantee. Keep callbacks
+fast. Privacy: `text` contains the user’s raw drained steer.
+
 ### `pre_llm_call` context injection
 
 When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.

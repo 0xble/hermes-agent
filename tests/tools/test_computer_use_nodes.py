@@ -71,7 +71,7 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
     monkeypatch.setattr(cua_backend_driver, "resolve_cua_driver_cmd", wrong_target)
     monkeypatch.setattr(cua_backend, "desktop_identity", wrong_target)
     monkeypatch.setattr(cua_backend_capture, "_linux_x11_active_window_id", wrong_target)
-    tool.reset_backend_for_tests()
+    tool._shutdown_backend_atexit(), tool._reset_screenshot_dedup()
     importlib.import_module("tools.computer_use_tool")
     a, b = tmp_path / "profile-a", tmp_path / "profile-b"
     config(a)
@@ -87,7 +87,7 @@ def endpoint(tmp_path, monkeypatch, grant_computer_use_approvals):
     try:
         yield a, b, update, calls
     finally:
-        tool.reset_backend_for_tests()
+        tool._shutdown_backend_atexit(), tool._reset_screenshot_dedup()
         set_multiplex_active(before)
 
 

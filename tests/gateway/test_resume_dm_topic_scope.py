@@ -35,7 +35,7 @@ def _runner(db, source):
     runner._async_session_store = SimpleNamespace(
         _store=runner.session_store, get_or_create_session=AsyncMock(return_value=entry),
         load_transcript=AsyncMock(return_value=[]), switch_session=AsyncMock(return_value=entry),
-        set_model_override=AsyncMock())
+        set_model_override=AsyncMock(), set_reasoning_override=AsyncMock())
     runner._gateway_session_origin_for_id = lambda _sid: None
     return runner
 

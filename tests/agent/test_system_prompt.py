@@ -71,7 +71,7 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     else:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
     monkeypatch.setattr(
         model_tools,
         "get_tool_definitions",
@@ -561,6 +561,7 @@ class TestTelegramRichMessagesHint:
         assert "Standard Markdown auto-converts" in stable
         assert "lean into it" not in stable
         assert "task lists" not in stable
+        assert "<details><summary>" not in stable
 
     def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
         """When rich_messages is True in gateway.platforms, the extension
@@ -574,7 +575,8 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" in stable
         assert "task lists" in stable
         assert "math/formulas" in stable
-        # The base hint's "(no tables)" steer must be explicitly superseded, after it, not left to contradict.
+        assert "dense secondary content" in stable
+        # The rich hint explicitly supersedes the base hint's no-tables guidance.
         assert stable.index("does not apply") > stable.index("(no tables)")
 
     def test_rich_hint_from_top_level_platforms(self):

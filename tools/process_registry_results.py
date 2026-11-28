@@ -216,8 +216,6 @@ def save_cut_pending_result(
     sweep passes its remaining budget so an unrelated writer holding the lock can
     never delay the stop signals; a skipped write returns False and stays retryable.
     """
-    if session.sandbox_key:
-        return False
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -226,7 +224,7 @@ def save_cut_pending_result(
     try:
         from hermes_constants import assert_named_profile_home_live
         assert_named_profile_home_live(directory)
-        make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Snapshot before taking the result lock: the two locks are never nested.
         from tools.process_registry_ssh import binding_record
         with session._lock:
@@ -270,7 +268,7 @@ def prune_completed_results(*, deadline: float | None = None) -> None:
         _RESULT_WRITE_LOCK.release()
 
 
-def _owns_result(owner: str, parent: str | None) -> bool:
+def _owns_result(owner: str, parent: str | None, *, db_path=None) -> bool:
     if not parent:
         return False
     if owner == parent:
@@ -279,8 +277,15 @@ def _owns_result(owner: str, parent: str | None) -> bool:
 
     # Pure lineage read on the hot path of every retained-result load; a writable open here
     # was one more writer handle per call inside the gateway (#100896).
-    with open_persistence_reader(profile_scope().profile_dir) as persistence:
-        return persistence.lineage.tip(parent) == owner
+    target = db_path if db_path is not None else profile_scope().profile_dir
+    try:
+        with open_persistence_reader(target) as persistence:
+            return persistence.lineage.tip(parent) == owner
+    except (OSError, sqlite3.Error, *STORE_FAILURES):
+        # Ownership checks are advisory when the profile store is unavailable. The direct
+        # owner/session-key checks remain authoritative; an unavailable lineage store must
+        # not turn an otherwise valid process action into a database error.
+        return False
 
 
 def load_completed_results(prefix: str = "") -> dict:
@@ -315,8 +320,8 @@ def load_completed_results(prefix: str = "") -> dict:
             fields = {key: record[key] for key in _RESULT_FIELDS if key in record}
             fields["ssh_binding"] = restore_binding(record.get("ssh_binding"))
             session = ProcessSession(
-                **fields, sandbox_key=record.get("sandbox_key", ""),
-                exited=True, output_buffer=record["output"],
+                **fields,
+                sandbox_key=record.get("sandbox_key", ""), exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
             results[session.id] = session

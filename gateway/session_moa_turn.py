@@ -61,21 +61,21 @@ def arm_admitted_moa(runner, session_key, event):
     runner._evict_cached_agent(session_key)
 
 
-async def queue_busy_moa(runner, event, session_key, source):
-    """A ``/moa <prompt>`` while a turn runs: its own queued admission with the preset, behind the
-    running turn (whose model is untouched). Without an authority to admit it, the old refusal."""
+async def queue_busy_moa(runner, event, session_key, source, adapter, prompt) -> bool:
+    """Queue an authority-backed MoA prompt with its own preset. Otherwise let the caller
+    defer the original command until idle, without touching the running turn's model."""
     from agent.i18n import t
     from gateway.run_busy import _busy_accepted
-    from hermes_cli.moa_config import moa_usage
-    prompt = event.get_command_args().strip()
-    if not prompt:
-        return moa_usage()
-    adapter = runner._delivery_adapter_for(source)
     queued = runner._queued_turn_event(event, prompt, False)
-    epoch = runner._route_stop_epoch(session_key)  # before the config read: a /stop during it drops this
-    if adapter is None or not admit_moa_turn(runner, queued, source, session_key, await default_preset()):
-        return t("gateway.busy.reject_moa")
+    if source.platform == Platform.LOCAL or not runner._command_turn_admitted(queued, session_key):
+        return False
+    epoch = runner._route_stop_epoch(session_key)
+    preset = await default_preset()
+    if runner._route_stop_epoch(session_key) != epoch:
+        return True  # fenced during the config read; do not defer it after /stop or /new
+    if not admit_moa_turn(runner, queued, source, session_key, preset):
+        return False
     await _busy_accepted()
     await runner._queue_command_turn(session_key, event, queued, adapter, t("gateway.queue.queued"),
                                      stop_epoch=epoch)
-    return None  # its commit sends the ack
+    return True  # its commit sends the ack

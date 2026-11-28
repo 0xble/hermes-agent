@@ -1056,6 +1056,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         if platform == Platform.RELAY:
             from gateway.session_native_recovery_routes import recover_after_late_connection
             await recover_after_late_connection(self)
+        # A spool held while this adapter was offline must be reclaimed before its
+        # interrupted session resumes, then replayed after the resumed answer.
+        self._start_reconnect_spool_recovery(platform)
 
     def _start_reconnect_spool_recovery(self, platform) -> None:
         """One retained recovery worker per platform, independent of the reconnect watcher."""

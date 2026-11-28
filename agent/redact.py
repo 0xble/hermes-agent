@@ -4,6 +4,15 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+from agent.redact_pattern_structure import (
+    _skip_char_class, _unbounded_quantifier_follows, _pattern_structure,
+    _extract_literal_prefix, _has_top_level_alternation, _has_nested_unbounded_repeat
+)
+
+from agent.redact_commands import (
+    _command_segments, _is_under_hermes_home, _is_secret_file_arg, _command_reads_secret_file, is_env_dump_command, redact_terminal_output
+)
+
 import copy
 import json
 import logging
@@ -11,13 +20,15 @@ import os
 import re
 import shlex
 import threading
+from typing import Any
+import unicodedata
 from urllib.parse import unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+from agent.file_safety import HOME_CREDENTIAL_FILES
 from agent.redact_approval_display import sanitize_command_for_display  # re-exported: callers import it from agent.redact
-from agent.redact_command_segments import _command_segments
 from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
 from agent.redact_control_split import mask_control_split_tokens, mask_prefix_matches
 from agent.redact_db_url import _DSN_PW_PLACEHOLDER_RE, _is_userinfo_placeholder, redact_db_url_query_passwords
@@ -32,17 +43,25 @@ from agent.redact_headers import (
     redact_header_credentials,
 )
 from agent.redact_partial_keys import _redact_partial_private_keys
-from agent.redact_hermes_home import _is_under_hermes_home
-from agent.redact_pattern_shape import _pattern_structure
 from agent.redact_secret_sources import redact_secret_source_values
 from agent.redact_spaced_cfg import redact_spaced_cfg_assignments
 from agent.redact_zhipu import _ZHIPU_API_KEY_RE
 from agent.redact_vault_values import (  # re-exported: callers import these from agent.redact
+    clear_vault_date_components,
     clear_vault_redaction_values,
+    has_any_vault_date_components,
+    has_vault_date_components,
+    has_vault_scoped_components,
+    mark_vault_protected_tab,
+    redact_registered_vault_number,
+    redact_registered_vault_snapshot,
     redact_registered_vault_values,
+    redaction_generation,
+    register_vault_card_component,
+    register_vault_date_component,
     register_vault_redaction_value,
+    vault_read_has_protected_field_context,
 )
-from agent.file_safety import HOME_CREDENTIAL_FILES
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +71,6 @@ logger = logging.getLogger(__name__)
 REDACT_WALK_MAX_DEPTH = 320
 REDACT_WALK_DEPTH_MARKER = "[redacted: nesting limit]"
 
-# Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match any known vendor prefix regex
 # (e.g. opaque tokens, short OAuth codes).
@@ -1152,7 +1170,7 @@ def _redact_python_repr_fields(text: str) -> str:
 
 
 def _redact_python_diagnostic_repr_fields(text: str) -> str:
-    """Mask repr fields only on pytest/error lines in source-preserving output."""
+    """Mask repr fields and opaque Bearers only on pytest/error diagnostic lines."""
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         ending = ""
@@ -1166,7 +1184,13 @@ def _redact_python_diagnostic_repr_fields(text: str) -> str:
         if match is None:
             match = _PYTHON_EXCEPTION_LINE_RE.match(body_line)
         if match is not None:
-            lines[index] = match.group("prefix") + _redact_python_repr_fields(match.group("body")) + ending
+            lines[index] = (
+                match.group("prefix")
+                + _BEARER_RESIDUE_RE.sub(
+                    "Bearer [redacted]", _redact_python_repr_fields(match.group("body"))
+                )
+                + ending
+            )
     return "".join(lines)
 
 
@@ -1355,7 +1379,16 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         text = redact_cookie_assignments(text, mask)
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):  # before the ENV passes: their ``\S+``
             text = redact_spaced_cfg_assignments(text, mask)        # value stops at a quoted value's space
-        _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
+        redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
+
+        def _redact_env(match: re.Match) -> str:
+            # An unquoted, fully masked value that ends a JSON string is already safe. The ENV
+            # regex takes the terminating JSON quote and closers into its value; a second pass
+            # must not remove them, wherever in the string the assignment sits (``export X=***"``).
+            # The value holds nothing but the mask, so leaving it exposes nothing.
+            if not match[2] and re.fullmatch(r'\*{3}"[,}\]]*', match[3]):
+                return match[0]
+            return redact_env(match)
         text = _ENV_ASSIGN_RE.sub(_redact_env, text)
         if "://" not in text:  # lowercase names would match URL params
             # Skip URLs — the query string may contain ``token=``/``key=`` params that are intentionally
@@ -1482,9 +1515,13 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+_JSON_KEY_FULL_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
-                          redact_url_credentials: bool = False, keep_phone_numbers: bool = False) -> str:
+                          redact_url_credentials: bool = False, keep_phone_numbers: bool = False,
+                          vault_tab: str | None = None, vault_origin: str = "") -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
@@ -1528,7 +1565,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not text:
         return text
     # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
-    text = redact_secret_source_values(redact_registered_vault_values(text))
+    text = redact_secret_source_values(
+        redact_registered_vault_values(text, tab=vault_tab, origin=vault_origin))
     if not (force or _redact_enabled()):
         return text
     return redact_credential_shapes(text, force=force, code_file=code_file, file_read=file_read,
@@ -1695,78 +1733,33 @@ _HERMES_HOME_PREFIXES = ("$HERMES_HOME/", "${HERMES_HOME}/")
 _HOME_PREFIXES = ("$HOME/", "${HOME}/")
 
 
-def _is_secret_file_arg(arg: str) -> bool:
-    """``.env``-style, shell rc or credential-store basename (``.netrc``, ``.pgpass``, ...)
-    anywhere; ``credentials`` / ``config`` only under ``.aws`` (the bare names are too generic), and
-    ``config.yaml`` only under a ``.hermes`` directory, ``$HERMES_HOME``, or the resolved
-    Hermes home (never arbitrary YAML). The resolved-home arm is what covers native Windows,
-    where the home directory is ``%LOCALAPPDATA%\\hermes`` and carries no ``.hermes`` segment."""
-    path = arg.strip("\"'").replace("\\", "/")
-    hermes_home = False
-    for prefix in _HERMES_HOME_PREFIXES:
-        if path.startswith(prefix):
-            path = path[len(prefix):]
-            hermes_home = True
-            break
-    for prefix in _HOME_PREFIXES:
-        if path.startswith(prefix):
-            path = path[len(prefix):]
-            break
-    if "$" in path:
-        return False
-    parts = [part.lower() for part in path.split("/") if part]
-    if not parts:
-        return False
-    if parts[-1] in _ENV_FILE_BASENAMES or parts[-1] in _SHELL_RC_BASENAMES:
-        return True
-    if parts[-1] in HOME_CREDENTIAL_FILES or parts[-2:] in ([".aws", "credentials"], [".aws", "config"]):
-        return True
-    # ``config.yaml`` plus the ``config.yaml.good.<stamp>`` / ``.corrupt.<stamp>`` copies Hermes
-    # writes under ``backups/config/`` — same contents, same secrets.
-    if parts[-1] != "config.yaml" and not parts[-1].startswith(("config.yaml.good.", "config.yaml.corrupt.")):
-        return False
-    return hermes_home or ".hermes" in parts[:-1] or _is_under_hermes_home(path)
+# execute_code output is script stdout, not a command line, so redact_terminal_output's command
+# classifier never sees an env dump there (#95509). A whole line of ``NAME=value`` (optionally
+# ``export``-prefixed, no space around ``=``) is the ``.env`` / ``env`` shape; source assignments
+# (``MAX_TOKENS = 100``, indented or embedded code) do not match and keep the code_file behaviour.
+_ENV_DUMP_LINE_RE = re.compile(r"^((?:export[ \t]+)?)([A-Z][A-Z0-9_]*)=(\S.*)$", re.MULTILINE)
 
 
-def _command_reads_secret_file(command: str | None) -> bool:
-    """True if ``command`` reads a secret-bearing file (see ``_is_secret_file_arg``) to
-    stdout. Defense-in-depth, not a boundary: indirect reads (``sudo cat .env``, ``$(cat
-    .env)``, unresolved variable paths) are not detected, matching ``is_env_dump_command``."""
-    if not command or not isinstance(command, str):
-        return False
-    for seg in _command_segments(command):
-        tokens = seg.split()  # not shlex: it mangles Windows paths (``C:\Users\...\.env``)
-        if not tokens:
-            continue
-        reader = tokens[0].rsplit("/", 1)[-1].lower()
-        if reader not in _FILE_READ_COMMANDS:
-            continue
-        positional = [
-            arg if not arg.startswith("-") else m.group(1)
-            for arg in tokens[1:]
-            if not arg.startswith("-")
-            or (reader not in _PATTERN_FIRST_COMMANDS and (m := _PS_COLON_PARAM_RE.fullmatch(arg)))
-        ]
-        if reader in _PATTERN_FIRST_COMMANDS:
-            positional = positional[1:]
-        if any(_is_secret_file_arg(arg) for arg in positional):
-            return True
-    return False
+def _mask_env_dump_line(m: "re.Match[str]", mask_env) -> str:
+    # The whole line is one assignment, so its value is the rest of the line: ``env`` prints
+    # ``DB_PASSWORD=first second`` raw and a .env quotes it. _ENV_ASSIGN_RE's ``\S+`` would stop at
+    # the first space and leave the remaining words visible.
+    prefix, key, value = m.groups()
+    quote = value[0] if len(value) > 1 and value[0] in "'\"" and value[-1] == value[0] else ""
+    inner = value[1:-1] if quote else value
+    if _should_redact_assignment(key, inner, check_keyword=True):
+        return f"{prefix}{key}={quote}{_mask_token(inner)}{quote}"
+    return _ENV_ASSIGN_RE.sub(mask_env, m.group(0))
 
 
-def is_env_dump_command(command: str | None) -> bool:
-    """True if any pipeline/sequence segment starts with an _ENV_DUMP_COMMANDS
-    token. Conservative: unrecognized → False (callers fall back to code_file=True)."""
-    if not command or not isinstance(command, str):
-        return False
-    for seg in _command_segments(command):
-        try:
-            tokens = shlex.split(seg)
-        except ValueError:
-            tokens = seg.split()
-        if tokens and tokens[0] in _ENV_DUMP_COMMANDS:
-            return True
-    return False
+def redact_code_output(output: str, *, force: bool = False) -> str:
+    """Redaction for execute_code stdout/stderr: code_file=True, plus the ENV-assignment pass on
+    lines shaped like an env dump so opaque prefix-less credentials are masked."""
+    redacted = redact_sensitive_text(output, force=force, code_file=True)
+    if not redacted or "=" not in redacted or not (force or _redact_enabled()):
+        return redacted
+    mask_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{_mask_token(g[2])}{g[1]}", check_keyword=True)
+    return _ENV_DUMP_LINE_RE.sub(lambda m: _mask_env_dump_line(m, mask_env), redacted)
 
 
 REDACTION_UNAVAILABLE = "[redaction-unavailable]"
@@ -1802,71 +1795,8 @@ def redact_for_egress(text: str, *, urls: bool = False, keep_phone_numbers: bool
     return text
 
 
-def redact_terminal_output(output: str, command: str | None = None, *, force: bool = False) -> str:
-    """Single redaction policy for ALL terminal-output surfaces: the ENV/YAML-assignment
-    pass runs only when ``command`` is an env dump or reads a secret-bearing file (``.env``,
-    shell rc, a credential store like ``.netrc``, Hermes ``config.yaml``); otherwise
-    code_file=True avoids false positives on source/config dumps."""
-    if not output:
-        return output
-    secret_file = _command_reads_secret_file(command)
-    code_file = not (secret_file or is_env_dump_command(command))
-    redacted = redact_sensitive_text(output, force=force, code_file=code_file, secret_file=secret_file)
-    # Source-preserving output still gets the Python-repr pass on high-confidence
-    # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is
-    # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
-    if code_file and (force or _redact_enabled()) and ":" in redacted and "'" in redacted:
-        redacted = _redact_python_diagnostic_repr_fields(redacted)
-    return redacted
-
-
-
-# execute_code output is script stdout, not a command line, so redact_terminal_output's command
-# classifier never sees an env dump there (#95509). A whole line of ``NAME=value`` (optionally
-# ``export``-prefixed, no space around ``=``) is the ``.env`` / ``env`` shape; source assignments
-# (``MAX_TOKENS = 100``, indented or embedded code) do not match and keep the code_file behaviour.
-_ENV_DUMP_LINE_RE = re.compile(r"^((?:export[ \t]+)?)([A-Z][A-Z0-9_]*)=(\S.*)$", re.MULTILINE)
-
-
-def _mask_env_dump_line(m: "re.Match[str]", mask_env) -> str:
-    # The whole line is one assignment, so its value is the rest of the line: ``env`` prints
-    # ``DB_PASSWORD=first second`` raw and a .env quotes it. _ENV_ASSIGN_RE's ``\S+`` would stop at
-    # the first space and leave the remaining words visible.
-    prefix, key, value = m.groups()
-    quote = value[0] if len(value) > 1 and value[0] in "'\"" and value[-1] == value[0] else ""
-    inner = value[1:-1] if quote else value
-    if _should_redact_assignment(key, inner, check_keyword=True):
-        return f"{prefix}{key}={quote}{_mask_token(inner)}{quote}"
-    return _ENV_ASSIGN_RE.sub(mask_env, m.group(0))
-
-
-def redact_code_output(output: str, *, force: bool = False) -> str:
-    """Redaction for execute_code stdout/stderr: code_file=True, plus the ENV-assignment pass on
-    lines shaped like an env dump so opaque prefix-less credentials are masked."""
-    redacted = redact_sensitive_text(output, force=force, code_file=True)
-    if not redacted or "=" not in redacted or not (force or _redact_enabled()):
-        return redacted
-    mask_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{_mask_token(g[2])}{g[1]}", check_keyword=True)
-    return _ENV_DUMP_LINE_RE.sub(lambda m: _mask_env_dump_line(m, mask_env), redacted)
-
 # --- Prefix pre-screen: derived from _PREFIX_PATTERNS so a new prefix can't
 # silently break the gate (every match contains its pattern's literal prefix).
-
-def _extract_literal_prefix(pattern: str) -> str:
-    """Leading literal chars of a regex (up to the first metacharacter)."""
-    meta = "[(\\.?*+|{^$"
-    for i, ch in enumerate(pattern):
-        if ch in meta:
-            return pattern[:i]
-    return pattern
-
-
-def _has_top_level_alternation(pattern: str) -> bool:
-    return _pattern_structure(pattern)[0]
-
-
-def _has_nested_unbounded_repeat(pattern: str) -> bool:
-    return _pattern_structure(pattern)[1]
 
 
 _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in _PREFIX_PATTERNS)

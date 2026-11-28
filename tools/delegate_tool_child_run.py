@@ -660,20 +660,13 @@ def _build_tool_trace(messages: Any) -> list[dict[str, Any]]:
                 tool_trace[-1].update(result_meta)  # no tool_call_id: pair with the latest call
     return tool_trace
 
-def _build_result_entry(
-    child: Any, result: dict[str, Any], task_index: int, duration: float, schema: _SchemaOutcome,
-) -> dict[str, Any]:
-    """Parent-visible result entry (status, exit_reason, tool trace, tokens, cost).
-    ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
-    wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
+def _result_outcome(result: dict[str, Any]) -> tuple[str, bool, str, str, str]:
+    """Classify a child result and preserve any real partial assistant text."""
     summary = result.get("final_response") or ""
-    # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
-    # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
     interrupt_note = ""
     if result.get("interrupted", False):
         status, exit_reason = "interrupted", "interrupted"
-        # The synthetic closing row is not child output; preserve only real earlier assistant text.
         from session_rules.turns import flatten_message_text
         placeholders = {"", summary.strip(), "Operation interrupted.", INTERRUPTED_TAIL_MARKER}
         partial = next((t for m in reversed(result.get("messages") or []) if m.get("role") == "assistant"
@@ -683,23 +676,24 @@ def _build_result_entry(
         elif summary.strip() == INTERRUPTED_TAIL_MARKER:
             summary = ""
         if (stale_after := result.get("_stale_stop_seconds")) is not None:
-            # The heartbeat's stale verdict stopped it (``await_child``): a timeout, as when it never unwinds.
             status = exit_reason = "timeout"
             interrupt_note = (f"Subagent stopped making progress — no activity for {stale_after:g}s "
                               "(heartbeat stale threshold); it was stopped.")
     elif result.get("failed") or result.get("error"):
-        # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
-        # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
         status, exit_reason = "failed", "error"
     else:
-        # exit_reason ("completed" vs "max_iterations") tells the parent HOW the task ended; completed=False with no
-        # failure = budget exhaustion. A declared schema still violated after the bounded retry does NOT fail the
-        # run: the child's raw final text is the deliverable (audits of up to 68 min were written off as "failed"
-        # over a stray code fence or one missing field); ``schema_valid: false`` + ``schema_errors`` carry the
-        # contract verdict, and the summary is prefixed with a notice so a status-only reader cannot mistake it
-        # for validated output.
         exit_reason = "completed" if result.get("completed", False) else "max_iterations"
         status = "completed" if usable_summary else "failed"
+    return summary, usable_summary, status, exit_reason, interrupt_note
+
+
+def _build_result_entry(
+    child: Any, result: dict[str, Any], task_index: int, duration: float, schema: _SchemaOutcome,
+) -> dict[str, Any]:
+    """Parent-visible result entry (status, exit_reason, tool trace, tokens, cost).
+    ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
+    wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
+    summary, usable_summary, status, exit_reason, interrupt_note = _result_outcome(result)
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
@@ -993,7 +987,9 @@ class _ChildRun:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
         return _close_subagent_steering(self.subagent_id, self.child) if self.subagent_id else None
 
-    def wait_liveness_aware(self, settled: threading.Event, child_timeout: Optional[float]) -> None:
+    def wait_liveness_aware(
+        self, settled: threading.Event, child_future: Any = None, child_timeout: Optional[float] = None
+    ) -> None:
         """Wait for the worker or the stale verdict, where ``child_timeout`` bounds INACTIVITY, not total runtime.
 
         A configured cap used to be a dispatch-to-death stopwatch, so it only ever killed children the runtime had
@@ -1097,7 +1093,7 @@ class _ChildRun:
         # Set when the stale verdict — not the configured cap — ended the wait; the entry must name that cause.
         stale_after: Optional[float] = None
         try:
-            self.wait_liveness_aware(settled, child_timeout)
+            self.wait_liveness_aware(settled, future, child_timeout)
             if not future.done():
                 stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
                 if stale_after is None:

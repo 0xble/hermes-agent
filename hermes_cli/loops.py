@@ -1117,7 +1117,8 @@ class LoopManager(LoopRevisionsMixin):
                 "reason": "loop changed during the tick", "message": ""}
 
     @snapshot_control
-    def abandon_tick(self, *, tick: Optional[tuple[Any, Any]] = None, owns_turn=None) -> bool:
+    def abandon_tick(self, *, tick: Optional[tuple[Any, Any]] = None, owns_turn=None,
+                     rollback_started: bool = False) -> bool:
         """Release a pre-start claim, or skip a started tick without replaying it.
 
         ``fire_tick`` normally claims and starts in one CAS, so admission failures after that
@@ -1147,7 +1148,7 @@ class LoopManager(LoopRevisionsMixin):
 
         def settle(state: LoopState) -> None:
             state.awaiting_response = False
-            if phase == "claimed":
+            if phase == "claimed" or rollback_started:
                 state.ticks_fired = max(0, fired - 1)  # legacy pre-start claim: nothing ran
             # Deterministic caps also govern a released tick (a revise may have lowered them).
             cap = self._cap_stop(state)

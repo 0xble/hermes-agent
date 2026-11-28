@@ -1838,9 +1838,7 @@ def _grouped_fanout(monkeypatch, tasks, gates):
 
 
 def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch):
-    """With delegation.independent_completions on, a finished ungrouped task must not wait for its siblings;
-    tasks sharing a `group` must."""
-    import tools.delegate_tool as dt
+    """With independent completions on, only tasks sharing a group wait for each other."""
     monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: {"independent_completions": True})
     gates = [threading.Event() for _ in range(4)]
     tasks = [
@@ -1937,7 +1935,6 @@ def test_units_of_one_call_share_a_single_capacity_slot():
 def test_multi_task_call_is_one_completion_unless_independent_completions(monkeypatch):
     """Default: a background fan-out returns as ONE message when every task is done, so an orchestrator
     is not woken N times per call; `group` is inert until delegation.independent_completions is on."""
-    import tools.delegate_tool as dt
     monkeypatch.setattr("tools.delegate_tool_config._load_config", dict)
     gates = [threading.Event() for _ in range(3)]
     tasks = [{"goal": "review PR 1 thoroughly and report"}, {"goal": "review PR 2 thoroughly and report", "group": "g"},

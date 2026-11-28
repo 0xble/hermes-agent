@@ -14,8 +14,8 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from contextlib import contextmanager
+from dataclasses import dataclass
 from contextvars import ContextVar, copy_context
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set
@@ -229,9 +229,11 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
-    execution_timeout: float | None = None
-    # Explicit tool-search deferral can still override an eager plugin tool.
+    # Plugin-owned tools may opt into the direct model-visible surface. Tool-search config can still
+    # explicitly defer an eager tool by name.
     eager: bool = False
+    execution_timeout: float | None = None
+    # Plugin tools share their manifest's content-observation privacy admission.
     incognito_safe: bool = True
     # Argument names the handler accepts that the schema does not advertise (legacy call
     # shapes, wrong-tool guards). tools/arg_validation.py never flags them, and a call that
@@ -285,6 +287,11 @@ _check_fn_ever_good: set[tuple[Callable, Optional[str]]] = set()  # probes that 
 _check_fn_core_drop_warned: set[tuple[Callable, Optional[str]]] = set()  # once-per-process WARNING gate
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
+_BROWSER_IDENTITY_KEYS = (
+    "HERMES_SESSION_ID",
+    "HERMES_BROWSER_CONTROL_PRINCIPAL",
+    "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
+)
 _NO_CACHE_CHECK_FNS: set[Callable] = set()
 # Bumped by invalidate_check_fn_cache(): anything derived from the dropped verdicts is void.
 _check_fn_epoch = 0
@@ -344,6 +351,14 @@ def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped. Single-profile
     processes keep the process-wide cache; a multiplex gateway installs a Hermes-home override
     per profile turn, so the canonical profile key is the boundary."""
+    try:
+        from gateway.session_context import get_session_env
+        if all(str(get_session_env(key, "") or "").strip() for key in _BROWSER_IDENTITY_KEYS):
+            from gateway.browser_control_broker import browser_control_enabled
+            if browser_control_enabled():
+                return CHECK_FN_CACHE_BYPASS
+    except Exception:
+        pass
     try:
         from agent.secret_scope import serves_routed_profile
         from hermes_constants import get_hermes_home_override
@@ -640,7 +655,7 @@ class ToolRegistry:
             alias: target for alias, target in self._toolset_aliases.items() if target != toolset}
 
     def _merged_tools(self, scope: Optional[str] = None) -> dict[str, ToolEntry]:
-        """Return global tools overlaid with one profile's plugin tools."""
+        """Return global tools overlaid with one profile and the current execution scope."""
         entries = {**self._tools, **self._scoped_tools.get(hermes_home_key(scope), {})}
         if scope is None:
             entries.update(self._scoped_tools.get(_session_slot_key(), {}))
@@ -665,11 +680,16 @@ class ToolRegistry:
     def get_entry(self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
         """Active profile's entry by name, falling back to global."""
         with self._lock:
-            return self._lookup(name, scope or self.current_scope_key(), explicit_scope=scope is not None)
+            if scope is None:
+                return self._lookup(name, self.current_scope_key(), explicit_scope=False)
+            return self._lookup(name, scope)
 
     def _lookup(self, name: str, scope_key: Optional[str], *, explicit_scope: bool = True) -> Optional[ToolEntry]:
-        """``_merged_tools(scope).get(name)`` without building the merged dict. An implicit scope
-        (the caller passed none) also sees the current session's tool overlay, as the merge does."""
+        """Look up a tool without building the merged dict.
+
+        An implicit scope also sees the current execution overlay, while an
+        explicit profile lookup stays pinned to the requested profile.
+        """
         if not explicit_scope:
             session_scoped = self._scoped_tools.get(_session_slot_key())
             if session_scoped is not None and name in session_scoped:
@@ -845,9 +865,9 @@ class ToolRegistry:
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: float | None = None,
         dynamic_schema_overrides: Callable | None = None, override: bool = False,
-        scope: Optional[str] = None, execution_timeout: float | None = None,
+        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None, incognito_safe: bool | None = None,
         compat_args: Iterable[str] = (), self_checked_args: Iterable[str] = (),
-        deadline_floor: Callable | None = None, eager: bool = False, incognito_safe: bool | None = None):
+        deadline_floor: Callable | None = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -911,11 +931,12 @@ class ToolRegistry:
                 name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
-                max_result_size_chars=max_result_size_chars, execution_timeout=execution_timeout,
-                dynamic_schema_overrides=dynamic_schema_overrides, compat_args=frozenset(compat_args),
+                max_result_size_chars=max_result_size_chars,
+                dynamic_schema_overrides=dynamic_schema_overrides, eager=bool(eager),
+                incognito_safe=(owner is None if incognito_safe is None else incognito_safe is True),
+                execution_timeout=execution_timeout, compat_args=frozenset(compat_args),
                 self_checked_args=frozenset(self_checked_args),
-                deadline_floor=deadline_floor, eager=bool(eager),
-                incognito_safe=(owner is None if incognito_safe is None else incognito_safe is True))
+                deadline_floor=deadline_floor)
             self._generation += 1
 
     def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
@@ -1084,14 +1105,17 @@ class ToolRegistry:
         from tools.hosted_tool_policy import hosted_tool_refusal
         if refusal := hosted_tool_refusal(name):  # deny-by-default in a hosted scope, before any handler
             return tool_error(refusal)
+        from agent.incognito import tool_refusal
+        refusal = tool_refusal(name, args)
+        if refusal:
+            return tool_error(refusal)
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
-        from agent.incognito import is_incognito, tool_refusal
-        if refusal := tool_refusal(name, args):
-            return tool_error(refusal)
-        if not entry.incognito_safe and is_incognito(kwargs.get("session_id")):
-            return tool_error("This plugin tool is unavailable in incognito mode.")
+        if not entry.incognito_safe:
+            from agent.incognito import is_incognito
+            if is_incognito(kwargs.get("session_id")):
+                return tool_error("This plugin tool is unavailable in incognito mode.")
         from tools.arg_validation import check_tool_args, flag_unknown_args
         refusal, unknown, valid = check_tool_args(entry, args)
         if refusal is not None:

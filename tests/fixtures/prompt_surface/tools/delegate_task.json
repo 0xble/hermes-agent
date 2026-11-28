@@ -4,13 +4,14 @@
   "parameters": {
     "properties": {
       "action": {
-        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child without stopping it; 'stop' = end one child early (partial result still returns); 'continue' = give a FINISHED child a follow-up: it resumes its own conversation and returns like a spawn. Control actions return immediately; tasks are ignored unless spawning.",
+        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child (subagent_id + message) without stopping it; 'stop' = end one child early (subagent_id; partial result still returns); 'continue' = give a FINISHED child a follow-up: it resumes its own conversation and returns like a spawn. 'resume' = for a background delegation that was INTERRUPTED (unknown/interrupted/stalled outcome), claim its one-shot recovery brief (subagent_id = its delegation_id); it returns a 'recovery_context' to pass as the context of a normal spawn — it does NOT spawn anything. Control actions return immediately; goal/tasks are ignored unless spawning.",
         "enum": [
           "spawn",
           "list",
           "steer",
           "stop",
-          "continue"
+          "continue",
+          "resume"
         ],
         "type": "string"
       },
@@ -19,7 +20,7 @@
         "type": "string"
       },
       "subagent_id": {
-        "description": "Required for action='steer'/'stop'/'continue' (ids from the spawn response or action='list').",
+        "description": "Required for action='steer'/'stop'/'continue' (ids from the spawn response or action='list'); the delegation_id for action='resume'.",
         "type": "string"
       },
       "tasks": {
@@ -46,6 +47,17 @@
               "properties": {},
               "required": [],
               "type": "object"
+            },
+            "reasoning_effort": {
+              "description": "Reasoning effort for this subagent. Omit to use the model alias's or role's default.",
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ],
+              "type": "string"
             }
           },
           "required": [

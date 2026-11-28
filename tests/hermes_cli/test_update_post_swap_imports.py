@@ -111,7 +111,8 @@ found = []
 class NewTreeFinder:
     def find_spec(self, name, path=None, target=None):
         spec = importlib.machinery.PathFinder.find_spec(name, path)
-        # Windows may load a standard-library codec lazily after the install moves.
+        # Windows' subprocess/bootstrap path imports the stdlib codec lazily after the move;
+        # that is not code loaded from the checkout and must not be classified as a generation mix.
         if name.startswith("encodings."):
             return None
         where = [spec.origin or "", *(spec.submodule_search_locations or [])] if spec else []

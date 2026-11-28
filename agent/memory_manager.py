@@ -6,15 +6,15 @@ registered at a time (tool-schema bloat, conflicting backends).
 
 from __future__ import annotations
 
-import contextvars
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.incognito import incognito_scope, is_incognito
@@ -42,6 +42,33 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+# memory.prefetch_max_age_seconds default: recall buffered by the previous turn's queue_prefetch_all
+# is injected only within this window. Generated and trivial turns neither consume nor replace the
+# buffer, so without a bound the next human turn could inject a result keyed on a message hours old.
+DEFAULT_PREFETCH_MAX_AGE_S = 1800.0
+# Wall clock, not monotonic: macOS's monotonic clock stops while the host sleeps, which would let a
+# buffer survive an overnight sleep as "fresh". Module-level so tests can move time.
+_now = time.time
+
+
+def parse_prefetch_max_age(value: Any) -> Optional[float]:
+    """``memory.prefetch_max_age_seconds`` -> seconds, or None for no bound (``0`` or negative).
+    Unset, unparseable or non-finite values (``nan``, ``inf``) fall back to the default: ``nan > 0``
+    is false, so NaN would otherwise read as "no bound" and silently disable the age check."""
+    if value is None or value == "" or isinstance(value, bool):
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        logger.warning("memory.prefetch_max_age_seconds=%r is not a number; using %.0f",
+                       value, DEFAULT_PREFETCH_MAX_AGE_S)
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    if not math.isfinite(seconds):
+        logger.warning("memory.prefetch_max_age_seconds=%r is not finite; using %.0f",
+                       value, DEFAULT_PREFETCH_MAX_AGE_S)
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    return seconds if seconds > 0 else None
 # A background provider call (sync_turn / queue_prefetch) running longer than this is treated as
 # stuck. Well above the shutdown drain bound and the prefetch timeout so a slow-but-healthy backend
 # is never counted.
@@ -88,15 +115,92 @@ def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
 
 # -- Provider egress scrubbing -----------------------------------------------
 
+_SCRUB_CACHE_MAX_ENTRIES = 4096
+_SCRUB_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_SCRUB_CACHE: OrderedDict[tuple[str, int, str, bool], str] = OrderedDict()
+_SCRUB_CACHE_BYTES = 0
+_SCRUB_CACHE_LOCK = threading.Lock()
+
+
 def _scrub(text: str, *, urls: bool = True) -> str:
     """The shared egress scrub. Like chat-platform and cron delivery it holds even when
     ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
     and fails closed. ``urls`` also masks URL query credentials: right for what a provider stores,
     wrong for a tool argument it may fetch (a pre-signed ``?X-Amz-Signature=`` URL to index)."""
-    return redact_for_egress(text, urls=urls)
+    global _SCRUB_CACHE_BYTES
+
+    try:
+        key = (hermes_home_key(), redaction_generation(), text, urls)
+        with _SCRUB_CACHE_LOCK:
+            cached = _SCRUB_CACHE.get(key)
+            if cached is not None:
+                _SCRUB_CACHE.move_to_end(key)
+                return cached
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text, urls=urls)
+
+    scrubbed = redact_for_egress(text, urls=urls)
+    try:
+        # Character accounting is deliberately independent of text encoding. Transcripts can contain
+        # surrogateescape values and lone surrogates that strict UTF-8 rejects.
+        size = len(text) + len(scrubbed)
+        if size > _SCRUB_CACHE_MAX_BYTES:
+            return scrubbed
+        with _SCRUB_CACHE_LOCK:
+            previous = _SCRUB_CACHE.pop(key, None)
+            if previous is not None:
+                _SCRUB_CACHE_BYTES -= len(text) + len(previous)
+            _SCRUB_CACHE[key] = scrubbed
+            _SCRUB_CACHE_BYTES += size
+            while (len(_SCRUB_CACHE) > _SCRUB_CACHE_MAX_ENTRIES
+                   or _SCRUB_CACHE_BYTES > _SCRUB_CACHE_MAX_BYTES):
+                old_key, old_value = _SCRUB_CACHE.popitem(last=False)
+                _SCRUB_CACHE_BYTES -= len(old_key[2]) + len(old_value)
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text, urls=urls)
+    return scrubbed
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{16,}")
+_LEARNED_PATTERN_CACHE: OrderedDict[frozenset[str], re.Pattern[str]] = OrderedDict()
+_LEARNED_PATTERN_CACHE_MAX_ENTRIES = 64
+_LEARNED_PATTERN_CACHE_LOCK = threading.Lock()
+
+
+def _learned_pattern(learned: frozenset[str]) -> re.Pattern[str]:
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        pattern = _LEARNED_PATTERN_CACHE.get(learned)
+        if pattern is not None:
+            _LEARNED_PATTERN_CACHE.move_to_end(learned)
+            return pattern
+    pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        _LEARNED_PATTERN_CACHE[learned] = pattern
+        _LEARNED_PATTERN_CACHE.move_to_end(learned)
+        while len(_LEARNED_PATTERN_CACHE) > _LEARNED_PATTERN_CACHE_MAX_ENTRIES:
+            _LEARNED_PATTERN_CACHE.popitem(last=False)
+    return pattern
+
+
+def _has_embedded_learned_token(text: str, learned: frozenset[str]) -> bool:
+    token_chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.+/")
+    for token in learned:
+        start = text.find(token)
+        while start >= 0:
+            end = start + len(token)
+            if ((start and text[start - 1] in token_chars)
+                    or (end < len(text) and text[end] in token_chars)):
+                return True
+            start = text.find(token, start + 1)
+    return False
+
+
+def _apply_learned_tokens(text: str, learned: frozenset[str]) -> str:
+    if not learned or not any(token in text for token in learned):
+        return text
+    if not _has_embedded_learned_token(text, learned):
+        return _TOKEN_RE.sub(lambda match: "[redacted]" if match.group(0) in learned else match.group(0), text)
+    return _learned_pattern(learned).sub("[redacted]", text)
 
 
 def _redact_for_provider(*values: Any, urls: bool = True) -> Any:
@@ -133,8 +237,8 @@ def _redact_for_provider(*values: Any, urls: bool = True) -> Any:
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
-        scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
+        learned_tokens = frozenset(learned)
+        scrubbed = [walk(v, lambda t: _apply_learned_tokens(t, learned_tokens)) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 
 
@@ -198,6 +302,26 @@ class _StuckCallGate:
             for state in (self.calls, self.last_ok, self.probe_at, self.skips):
                 state.pop(key, None)
 
+_MEMORY_HANDOFF_GUARD = threading.Lock()
+
+
+def memory_handoff_lock(owner: Any) -> threading.Lock:
+    """Per-agent lock making "claim ``_memory_manager`` for shutdown" one atomic step.
+
+    ``AIAgent.shutdown_memory_provider()`` sets ``_memory_provider_shutdown`` and captures the manager under it;
+    gateway eviction reads both and detaches the manager under it, so exactly one side calls ``shutdown_all()``.
+    Created lazily (under a module guard) so ``__new__``-built and mock agents get one too. Hold it only for
+    those reads and writes, never across ``shutdown_all``. The one exception is eviction's pre-release session
+    commit, which holds it across ``on_session_end`` so /new or /reset cannot claim shutdown mid-commit."""
+    lock = vars(owner).get("_memory_handoff_lock")
+    if lock is None:
+        with _MEMORY_HANDOFF_GUARD:
+            lock = vars(owner).get("_memory_handoff_lock")
+            if lock is None:
+                lock = threading.Lock()
+                owner._memory_handoff_lock = lock
+    return lock
+
 
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
@@ -212,12 +336,27 @@ class MemoryManager:
     _PREFETCH_GATE = _StuckCallGate()
     _BACKGROUND_GATE = _StuckCallGate()
 
-    _PRIVACY_FLUSH_TIMEOUT_S = 10.0
-
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None, read_only: bool = False) -> None:
-        self._read_only = bool(read_only)
-        self._session_id = None
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 recall_synthetic_turns: bool = False,
+                 prefetch_max_age_seconds: Optional[float] = DEFAULT_PREFETCH_MAX_AGE_S,
+                 read_only: bool = False) -> None:
+        self.read_only = bool(read_only)
         self._providers: list[MemoryProvider] = []
+        # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
+        # automatic recall. Read by the turn-start and post-turn prefetch gates.
+        self.recall_synthetic_turns = recall_synthetic_turns
+        # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
+        self._prefetch_max_age = prefetch_max_age_seconds
+        self._prefetch_queued_at: Optional[float] = None
+        # Session the providers are on (initialize_all / on_session_switch) and the one they last
+        # switched away from, both guarded by the generation lock. A prefetch for the session just
+        # left cannot start after the switch. Only that session is refused, so a session id that
+        # rotates without a switch notice keeps its recall.
+        self._session_id = ""
+        self._left_session_id = ""
+        # A queued task that has not reached its providers yet skips once a discard (or a newer
+        # queue) has superseded it.
+        self._prefetch_generation = PrefetchGeneration()
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
         self._has_external: bool = False
@@ -236,6 +375,7 @@ class MemoryManager:
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
         self._shutting_down = False
+        self._shutdown_started = False  # shutdown_all() ran (or is running); guards a second retirement
         self._teardown_claim: Optional[str] = None  # see claim_teardown()
         self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
@@ -248,30 +388,42 @@ class MemoryManager:
         self._agent_context = "primary"
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
+    # Bounds how long entering incognito waits for already-queued public memory writes.
+    _PRIVACY_FLUSH_TIMEOUT_S = 10.0
+
     @property
     def read_only(self) -> bool:
-        return self._read_only or is_incognito(self._session_id)
+        from agent.incognito import is_incognito
+        return getattr(self, "_read_only", False) or is_incognito(getattr(self, "_session_id", None))
 
     @read_only.setter
     def read_only(self, enabled: bool) -> None:
         self._read_only = bool(enabled)
 
     def flush_public_writes(self) -> bool:
+        """Wait for writes queued while public. Call before the session is marked private,
+        so these public turns reach the providers instead of being refused. Bounded."""
         with self._sync_executor_lock:
             pending = [future for future, kind in self._background_futures.items() if kind == "write"]
-        _, unfinished = wait(pending, timeout=self._PRIVACY_FLUSH_TIMEOUT_S)
+        _done, unfinished = wait(pending, timeout=self._PRIVACY_FLUSH_TIMEOUT_S)
         if unfinished:
-            logger.warning("Incognito: %d public memory write(s) still pending at the boundary", len(unfinished))
+            logger.warning("Incognito: %d public memory write(s) still pending at the boundary",
+                           len(unfinished))
         return not unfinished
 
     def set_read_only(self, enabled: bool) -> None:
-        if enabled == self._read_only:
+        enabled = bool(enabled)
+        if enabled == getattr(self, "_read_only", False):
             return
         if enabled:
             self.flush_public_writes()
         self._read_only = enabled
+        self._privacy_epoch = getattr(self, "_privacy_epoch", 0) + 1
         for provider in self._providers:
-            provider.read_only = enabled
+            try:
+                provider.read_only = enabled
+            except Exception:
+                logger.warning("Incognito: memory provider privacy transition failed")
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
@@ -314,6 +466,13 @@ class MemoryManager:
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
+        # Third-party providers are duck-typed.  A slots-only provider may intentionally
+        # expose no privacy flag; it must still be registerable and receive caller-scoped
+        # homes through the normal lifecycle hooks.
+        try:
+            provider.read_only = self.read_only
+        except (AttributeError, TypeError):
+            pass
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
             logger.warning(
@@ -397,6 +556,7 @@ class MemoryManager:
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
         clean_query = _redact_for_provider(clean_query)
+        self._discard_stale_prefetch()
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
@@ -462,10 +622,36 @@ class MemoryManager:
             if status is None:
                 continue
             # count <= 0: content injected but no discrete count (reflect)
-            detail = ("recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
-                      if status.count > 1 else "recalled relevant memory")
+            detail = status.detail or (
+                "recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
+                if status.count > 1 else "recalled relevant memory")
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
+
+    def _discard_stale_prefetch(self) -> None:
+        """Drop provider recall buffered by an earlier ``queue_prefetch_all`` once it is older than
+        ``prefetch_max_age_seconds``. The buffer is keyed on the last turn that queued, which can be a
+        human message many generated or trivial turns back. Within the bound that result is still the
+        latest human intent and is kept; past it, injecting nothing beats injecting an old topic."""
+        # Check the age, clear the timestamp, obsolete the manager token and drop provider buffers in
+        # one critical section, the one queue_prefetch_all starts its token in and a queued dispatch
+        # holds. A fresh request is then either seen by the check (and kept) or starts after the
+        # discard, and a dispatch that passed its check either finishes first (and is dropped here)
+        # or sees the obsolete token and never reaches a provider.
+        # Duck-typed providers that predate the hook have nothing to call.
+        def _discard_if_stale() -> bool:
+            queued_at, max_age = self._prefetch_queued_at, self._prefetch_max_age
+            if queued_at is None or max_age is None or _now() - queued_at <= max_age:
+                return False
+            self._prefetch_queued_at = None
+            logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)",
+                         _now() - queued_at, max_age)
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            return True
+
+        if self._prefetch_max_age is not None:
+            self._prefetch_generation.discard_if(_discard_if_stale)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
@@ -476,11 +662,32 @@ class MemoryManager:
         if not clean_query or not self._owner_allows("queue_prefetch"):
             return
         clean_query = _redact_for_provider(clean_query)
-        self._submit_background(lambda: self._each_provider(
-            "queue_prefetch failed (non-fatal)",
-            lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
-            providers=providers,
-        ), kind="prefetch")
+        # The result's age is measured from its query's turn, which is now. Checking the session and
+        # starting the token is one critical section with on_session_switch, so a request for a
+        # session the providers already left never starts a fresh token after the switch.
+        def _accept() -> bool:
+            if session_id and session_id == self._left_session_id and session_id != self._session_id:
+                return False
+            self._prefetch_queued_at = _now()
+            return True
+
+        generation = self._prefetch_generation.begin_if(_accept)
+        if generation is None:
+            logger.debug("Skipping memory prefetch queued for session %s after switching to %s",
+                         session_id, self._session_id)
+            return
+
+        def _queue() -> None:
+            # Dispatch while holding the token's lock: a concurrent age-bound discard waits for the
+            # dispatch to finish and then drops what it queued, or runs first and this check fails.
+            # providers' queue_prefetch only spawns their worker, so the hold is short.
+            with self._prefetch_generation.publishing(generation) as current:
+                if not current:  # expired (or superseded) while waiting behind a slow sync
+                    return
+                self._each_provider("queue_prefetch failed (non-fatal)",
+                                    lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
+                                    providers=providers)
+        self._submit_background(_queue, kind="prefetch")
 
     @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
@@ -490,18 +697,20 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[list[dict[str, Any]]] = None,
-                 turn_author: Optional[dict[str, Any]] = None) -> None:
+                 turn_author: Optional[dict[str, Any]] = None,
+                 display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
-        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
+        ``turn_author`` and the turn's provenance (``display_kind``, ``platform``) reach only providers
+        whose ``sync_turn`` accepts them.
 
         Everything forwarded is provider egress: turn strings AND the ``messages`` transcript slice
         (tool outputs included) go through ``_redact_for_provider`` so secrets are never archived
         verbatim in a provider's store (#115104).
         """
-        if self._fork_turn_hooks_suppressed():
+        if self.read_only or self._fork_turn_hooks_suppressed():
             return
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
@@ -509,7 +718,8 @@ class MemoryManager:
             return
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
-        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
+                           "display_kind": display_kind, "platform": platform}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: dict[str, Any] = {"session_id": session_id}
@@ -527,16 +737,16 @@ class MemoryManager:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
         unavailable outside shutdown, run inline — the historical fail-safe."""
+        if self.read_only and kind == "write":
+            return
         if kind == "write":
-            if self.read_only:
-                return
-            work = fn
-
-            def guarded_write():
-                if not self.read_only:
-                    return work()
-
-            fn = guarded_write
+            original_fn = fn
+            def guarded_fn():
+                # Only public work is accepted. Re-check in case it waited past a boundary.
+                if self.read_only:
+                    return
+                return original_fn()
+            fn = guarded_fn
         fn = ctx_bound(in_owner_home(self._bound_scope, fn))
         executor = None if self._shutting_down else self._sync_executor
         if executor is None and not self._shutting_down:
@@ -663,17 +873,18 @@ class MemoryManager:
         accepted = self._tool_call_keywords(provider)
         if accepted is not None:
             kwargs = {k: v for k, v in kwargs.items() if k in accepted}
-        args = _redact_for_provider(args, urls=False)  # the provider may fetch a URL argument
-        from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
-        try:
-            with incognito_scope(self.read_only, self._session_id):
+        from agent.incognito import incognito_scope
+        with incognito_scope(self.read_only, self._session_id):
+            args = _redact_for_provider(args, urls=False)  # the provider may fetch a URL argument
+            from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
+            try:
                 result = provider.handle_tool_call(tool_name, args, **kwargs)
-        except Exception as e:
-            logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
-            record_provider_memory_call(provider.name, tool_name, args, raised=True)
-            return tool_error(f"Memory tool '{tool_name}' failed: {e}")
-        record_provider_memory_call(provider.name, tool_name, args, result)
-        return result
+            except Exception as e:
+                logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
+                record_provider_memory_call(provider.name, tool_name, args, raised=True)
+                return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+            record_provider_memory_call(provider.name, tool_name, args, result)
+            return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         if self.read_only or self._fork_turn_hooks_suppressed() or not self._owner_allows("on_turn_start"):
@@ -695,11 +906,19 @@ class MemoryManager:
         self._each_provider("on_turn_start failed", _tick)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        if self.read_only or self._fork_turn_hooks_suppressed() or not self._owner_allows("on_session_end"):
+        if self.read_only or self._fork_turn_hooks_suppressed():
+            return
+        if not self._owner_allows("on_session_end"):
+            return
+        # Builtin and Hindsight inherit the no-op hook. Scrubbing their entire
+        # transcript has no egress consumer and can monopolize a shutdown worker.
+        consumers = [p for p in self._providers if callable(getattr(p, "on_session_end", None))
+                     and getattr(p.on_session_end, "__func__", None) is not MemoryProvider.on_session_end]
+        if not consumers:
             return
         messages = _redact_messages_for_egress(messages or [])
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
-                            exc_info=True)
+                            exc_info=True, providers=consumers)
 
     def commit_session_boundary_async(self, messages: list[dict[str, Any]], *, new_session_id: str,
                                       parent_session_id: str = "", reason: str = "new_session") -> None:
@@ -743,10 +962,26 @@ class MemoryManager:
             return
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
-            "on_session_switch failed",
-            lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
-        )
+
+        # A queued prefetch captured the previous session's query. Obsolete its token and switch the
+        # providers under the same lock its dispatch holds, so it either dispatches before the switch
+        # (whose reset then drops it) or sees the obsolete token and never reaches the new session.
+        def _switch_providers() -> None:
+            self._prefetch_queued_at = None
+            if self._session_id != new_session_id:
+                self._left_session_id = self._session_id
+            self._session_id = new_session_id
+            # Drop any buffer or in-flight worker keyed on the old session first; not every provider's
+            # on_session_switch does (Hindsight's does via the same hook).
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            self._each_provider(
+                "on_session_switch failed",
+                lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id,
+                                              reset=reset, **kwargs),
+            )
+
+        self._prefetch_generation.discard(_switch_providers)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:
@@ -821,7 +1056,9 @@ class MemoryManager:
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[dict[str, Any]] = None) -> None:
         """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
-        if self.read_only or not self._owner_allows("on_memory_write"):
+        if self.read_only:
+            return
+        if not self._owner_allows("on_memory_write"):
             return
         content, metadata = _redact_for_provider(content, dict(metadata or {}))
 
@@ -933,7 +1170,13 @@ class MemoryManager:
             self.shutdown_all()
 
     def shutdown_all(self) -> None:
-        """Drain the background executor (bounded), then shut providers down in reverse order."""
+        """Drain the background executor (bounded), then shut providers down in reverse order.
+
+        Idempotent: only the first call retires providers; later calls (racing teardown paths) return at once."""
+        with self._sync_executor_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])
@@ -998,6 +1241,11 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+
+        def _record_session() -> None:
+            self._session_id = session_id or ""
+
+        self._prefetch_generation.discard(_record_session)
         self._bound_scope = bound_scope(kwargs["hermes_home"], kwargs.get("agent_identity"))
         _context = kwargs.get("agent_context")
         self._agent_context = _context if isinstance(_context, str) and _context.strip() else "primary"

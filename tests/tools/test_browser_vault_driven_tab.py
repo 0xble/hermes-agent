@@ -158,6 +158,10 @@ def test_browser_exec_records_its_daemons_tab_on_the_vault_supervisor(tmp_path, 
     monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", _Registry())
     monkeypatch.setattr(bs, "get_session_info",
                         lambda key: {"cdp_url": "ws://127.0.0.1:47000/devtools/browser/x", "features": {"local": True}})
+    # The fork's local route asks agent-browser for the packaged Chromium (_run_browser_command).
+    monkeypatch.setattr("tools.browser_tool_session._run_browser_command",
+                        lambda key, *_a, **_kw: {"success": True, "data": {
+                            "cdpUrl": "ws://127.0.0.1:47000/devtools/browser/x"}})
     monkeypatch.setattr(bu_cli, "harness_current_target", lambda env: "T-own")
     cli = tmp_path / "browser-use"
     cli.write_text("#!/bin/sh\ncat > /dev/null\necho ok\n", encoding="utf-8")
@@ -201,6 +205,12 @@ def test_a_call_the_bot_desktop_fence_refuses_leaves_the_driven_tab_alone(tmp_pa
     monkeypatch.setattr(bs, "get_session_info",
                         lambda key: {"cdp_url": "ws://127.0.0.1:47000/devtools/browser/x", "features": {"local": True}})
     monkeypatch.setattr(bs, "run_fenced", lambda info, fn: {"success": False, "code": "human_has_control", "error": "x"})
+    # The fork's local route and fence live in browser_tool_session (agent-browser's packaged Chromium).
+    monkeypatch.setattr("tools.browser_tool_session._run_browser_command",
+                        lambda key, *_a, **_kw: {"success": True, "data": {
+                            "cdpUrl": "ws://127.0.0.1:47000/devtools/browser/x"}})
+    monkeypatch.setattr("tools.browser_tool_session.run_fenced",
+                        lambda info, fn: {"success": False, "code": "human_has_control", "error": "x"})
     monkeypatch.setattr(bu_cli, "_route_exec_current", bot_desktop_route)
     monkeypatch.setattr(bu_cli, "harness_current_target", lambda env: "T-sidecar")
     cli = tmp_path / "browser-use"

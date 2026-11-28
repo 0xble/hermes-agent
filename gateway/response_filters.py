@@ -235,12 +235,11 @@ _BRACKETED_SILENCE_MARKERS = tuple(
     sorted(m for m in LIVE_GATEWAY_SILENT_MARKERS if m.startswith("["))
 )
 
-# The persisted user-row kind of a self-injected MessageEvent(internal=True) turn; only these
-# machinery kinds may vanish on a bare silence marker.
+# Persisted kinds of self-injected MessageEvent(internal=True) turns.
 INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
-# Async-result cards the in-process TUI persisted: a producer's internal event naming one (with a
-# display_text) persists as that row kind instead of internal_notification.
-PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete"})
+# A producer's internal event naming a card (with display_text) retains this row kind.
+PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete",
+                                         "supervisor_checkin"})
 MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
 # Loop exit the agent stamps when a machinery turn ends with the model adding nothing
 # (agent/turn_empty_response.py NOTIFICATION_NO_REPLY_EXIT mirrors this; agent/ cannot import gateway/).
@@ -252,6 +251,7 @@ PRODUCER_CARD_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_N
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
+_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:.*)?$")
 
 
 def _strip_format_characters(text: str) -> str:
@@ -318,15 +318,17 @@ def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
 
 
 def is_intentional_silence_response(response: Any) -> bool:
-    """True only when ``response`` is exactly a silence marker.
+    """True when the display text is exactly a silence marker.
 
+    ``LOOP_COMPLETE`` is a control marker, not assistant content. Strip a trailing
+    top-level completion line before judging silence so every gateway delivery lane uses
+    the same display-text verdict while loop detection retains the raw response.
     Prose that merely mentions ``NO_REPLY`` must be delivered normally. A blank
     response is not silence either — that is the empty-response failure path.
     """
+    if isinstance(response, str):
+        response = strip_trailing_loop_complete_marker(response)
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
-
-
-_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:.*)?$")
 
 
 def _fenced_line_states(lines: list[str]) -> list[bool]:
@@ -513,6 +515,23 @@ def ends_with_partial_loop_complete_marker(text: Any) -> bool:
     return _LOOP_COMPLETE_MARKER.startswith(candidate)
 
 
+def ends_with_partial_silence_marker(text: Any) -> bool:
+    """True while the last top-level line of streamed ``text`` could still be a marker.
+
+    Mid-stream previews hold an edit while this is true, so prose followed by a
+    trailing ``NO_REPLY`` never shows the marker before the final strip removes it.
+    """
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    return is_partial_silence_marker(lines[end - 1])
+
+
 def _split_trailing_line(text: str) -> tuple[str, str]:
     """``(head, last line)`` of ``text`` with trailing blank space ignored; head is ``""`` when
     there is only one line."""
@@ -528,27 +547,17 @@ def strip_trailing_silence_marker(response: Any) -> Any:
     reader. A bare marker is returned unchanged (that is the silence verdict, decided by
     :func:`is_intentional_silence_response`), and a marker inside a line is prose.
     """
-    if not isinstance(response, str):
+    if not isinstance(response, str) or is_intentional_silence_response(response):
         return response
-    head, tail = _split_trailing_line(response)
-    return head if head.strip() and is_intentional_silence_response(tail) else response
-
-
-def ends_with_partial_silence_marker(text: Any) -> bool:
-    """True while a streamed reply's last line could still become a trailing silence marker
-    (``"answer\\n\\nNO_RE"``), so a stream preview never shows a marker it later retracts."""
-    if not isinstance(text, str):
-        return False
-    head, tail = _split_trailing_line(text)
-    return bool(head.strip()) and is_partial_silence_marker(tail)
+    return _strip_trailing_marker_lines(response, is_intentional_silence_response, preserve_bare=True)
 
 
 class SilenceMarkerStreamHold:
     """Delta gate for a live reply stream that may be, or end in, a silence marker.
 
     :meth:`feed` returns the part of the reply that is safe to show (or speak) now: nothing
-    while the whole reply could still become a bare marker, everything but the last line while
-    that line could still become a closing one. :meth:`finish` releases what the completed reply
+    while the whole reply could still become a bare marker or opens with one. The last line is
+    held while it could become a closing marker. :meth:`finish` releases what the completed reply
     delivers, so a held line that never became a marker (``"NO problem"``) still arrives in full.
     """
 
@@ -557,16 +566,21 @@ class SilenceMarkerStreamHold:
         self._sent = 0
 
     def feed(self, delta: str) -> str:
-        buf = self._buf = self._buf + delta
-        if is_partial_silence_marker(buf):
+        self._buf += delta
+        if is_partial_silence_marker(self._buf) or opens_with_silence_marker(self._buf):
             return ""
-        if ends_with_partial_silence_marker(buf):
-            return self._release(len(_split_trailing_line(buf)[0]))
-        return self._release(len(buf))
+        head, _ = _split_trailing_line(self._buf)
+        end = (len(strip_trailing_silence_marker(head))
+               if ends_with_partial_silence_marker(self._buf) else len(self._buf))
+        return self._release(end)
 
     def finish(self) -> str:
-        if is_intentional_silence_response(self._buf):
+        delivered = strip_edge_silence_markers(self._buf)
+        if is_intentional_silence_response(delivered):
             return ""
+        if opens_with_silence_marker(self._buf):
+            self._sent = len(self._buf)
+            return delivered
         return self._release(len(strip_trailing_silence_marker(self._buf)))
 
     def _release(self, upto: int) -> str:
@@ -680,18 +694,24 @@ def reaction_answered(agent_result: dict | None) -> bool:
                 and agent_result.get("completed") is not False)
 
 
-def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
-    """Silence markers suppress delivery only for successful agent turns.
+def reaction_answered(agent_result: dict | None) -> bool:
+    """A delivered reaction answers a completed turn, never hides an execution failure."""
+    return bool(isinstance(agent_result, dict) and agent_result.get("acknowledged_by_reaction")
+                and not any(agent_result.get(key) for key in ("failed", "partial", "interrupted", "error"))
+                and agent_result.get("completed") is not False)
 
-    The loop's quiet exit on a runtime-notification turn (``notification_no_reply``:
-    the model was handed a completion/delegation notice and added nothing) counts as
-    intentional silence too, and only ever with no text to deliver;
-    ``silence_allowed`` still gates it by turn kind at the delivery seam, so a human
-    turn that somehow carried the reason gets a visible fallback instead of a drop.
+
+def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
+    """Silence markers or reaction-only replies suppress successful turn delivery.
+
+    A machinery turn with the quiet notification exit also counts as intentional silence,
+    but only when it has no text to deliver.
     """
     if not (isinstance(agent_result, dict) and not agent_result.get("failed")):
         return False
     if is_intentional_silence_response(response):
+        return True
+    if reaction_answered(agent_result) and not (response or "").strip():
         return True
     return (reaction_answered(agent_result) or agent_result.get("turn_exit_reason") == NOTIFICATION_NO_REPLY_EXIT) and not (
         isinstance(response, str) and response.strip()
@@ -730,7 +750,9 @@ def display_metadata_for_event(event: Any) -> dict:
     ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
+    from gateway.checkin_delivery import transcript_metadata
+    return {**_producer_card(event), **({"title_preview": preview} if preview else {}),
+            **transcript_metadata(event)}
 
 
 def persisted_user_metadata_for_event(event: Any) -> dict:
@@ -759,7 +781,7 @@ def silence_allowed(
     Marker recognition stays with the caller. Extra health restrictions apply only to the new
     room permission, preserving the established internal/unaddressed semantics.
     """
-    if is_machinery_display_kind(display_kind) or reply_expected is False:
+    if reaction_answered(agent_result) or is_machinery_display_kind(display_kind) or reply_expected is False:
         return True
     return (allow_silence is True and isinstance(agent_result, dict)
             and not any(agent_result.get(k) for k in ("failed", "partial", "interrupted", "error"))
@@ -778,8 +800,17 @@ def is_partial_silence_marker(text: Any) -> bool:
     A buffer whose canonical form is a non-empty *prefix* of a marker (``"NO"`` on
     the way to ``"NO_REPLY"``, or an exact marker not yet terminated by stream-end)
     is held back so a raw marker is never shown and then retracted.  Divergence
-    from every marker, or exceeding the cap, resumes normal streaming.
+    from every marker, or exceeding the cap, resumes normal streaming.  A trailing
+    complete or partial ``LOOP_COMPLETE`` line is ignored, so ``[SILENT]\\nLOOP``
+    stays held on its way to a combined silent response.
     """
+    if isinstance(text, str):
+        head, sep, tail = text.rstrip().rpartition("\n")
+        tail_key = tail.strip().upper()
+        if sep and tail_key and (
+            _LOOP_COMPLETE_MARKER.startswith(tail_key) or is_loop_complete_marker(tail)
+        ):
+            text = head
     return any(
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)

@@ -39,7 +39,7 @@ def cfg(monkeypatch):
     config = {"model_aliases": json.loads(json.dumps(ALIASES))}
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
     monkeypatch.setattr(routes, "_active_provider", lambda _cfg: _Roles())
-    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+    monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials",
                         lambda route, parent: {"model": route["model"], "provider": route["provider"],
                                                "base_url": None, "api_key": None, "api_mode": None,
                                                "request_overrides": {}})
@@ -152,7 +152,7 @@ def test_keyed_alias_without_a_url_keeps_its_own_key(cfg, monkeypatch):
     inherited one, through to the runtime provider resolver."""
     cfg["model_aliases"]["keyed"] = {"model": "m-k", "provider": "openrouter", "api_key": "alias-key"}
     seen = []
-    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+    monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials",
                         lambda route, parent: seen.append(dict(route)) or {"model": route["model"],
                                                                             "provider": route["provider"]})
     (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "keyed"}], {}, _parent())
@@ -174,7 +174,7 @@ def test_endpoint_alias_without_a_key_cannot_inherit_parent_key(cfg, monkeypatch
     cfg["model_aliases"]["remote"] = {"model": "m-remote", "provider": "custom:remote",
                                          "base_url": "https://remote.example/v1"}
     captured = []
-    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+    monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials",
                         lambda route, parent: captured.append(dict(route)) or {
                             "model": route["model"], "provider": route["provider"], "base_url": route["base_url"],
                             "api_key": None, "api_mode": "chat_completions", "request_overrides": {},

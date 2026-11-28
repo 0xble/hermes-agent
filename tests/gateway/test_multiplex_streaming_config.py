@@ -52,7 +52,7 @@ def test_turn_stream_consumer_follows_the_profile_running_the_turn(monkeypatch, 
                                                                     multiplex, expect):
     monkeypatch.setattr("gateway.stream_consumer.GatewayStreamConsumer", _Consumer)
     ctx = SimpleNamespace(
-        mute_notification_reply=False, streaming_tts_consumer_holder=[None], user_config={},
+        session_key=None, session_id=None, persist_user_display_kind=None, mute_notification_reply=False, streaming_tts_consumer_holder=[None], user_config={},
         resolve_display_setting=lambda *_args: None, scheduled_heartbeat=False,
         interim_assistant_messages_enabled=False, source=_source(profile), _status_thread_metadata=None,
         progress_queue=None, event_message_id=None, _run_still_current=lambda: True,

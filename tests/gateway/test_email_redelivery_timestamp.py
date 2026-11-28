@@ -36,7 +36,8 @@ async def _fetch(adapter, mail):
 async def test_refetched_email_after_restart_is_its_committed_admission(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home
     from persistence.core.errors import AuthorityRefusal

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import importlib
 import json
 from pathlib import Path
 import logging
@@ -26,14 +25,14 @@ from agent.display import (
     build_tool_preview as _build_tool_preview,
     build_tool_label as _build_tool_label,
     get_cute_tool_message as _get_cute_tool_message_impl,
-    get_tool_emoji as _get_tool_emoji,
+    get_tool_emoji as _get_tool_emoji,  # noqa: F401
     tool_row_emoji as _tool_row_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
-from session_rules.turns import coalesce_tool_call_id
+from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent.lsp import deferred as lsp_deferred
 from agent.prompt_cache_scope import conversation_id
@@ -49,10 +48,15 @@ from agent.inline_tool_executors import (
 from agent.message_metadata import stamp_data_use
 from agent.session_persistence import sync_rewritten_tool_rows
 from agent.tool_dispatch_helpers import (
-    _NEVER_PARALLEL_TOOLS, _is_destructive_command, _append_subdir_hint_to_multimodal,
-    _context_pruned_argument_paths, _plan_tool_batch_segments, make_tool_result_message,
+    _NEVER_PARALLEL_TOOLS,
+    _is_destructive_command,
+    _is_multimodal_tool_result,
+    _multimodal_text_summary,
+    _append_subdir_hint_to_multimodal,
+    _context_pruned_argument_paths,
+    _plan_tool_batch_segments,
+    make_tool_result_message,
 )
-from session_rules.turns import _is_multimodal_tool_result, _multimodal_text_summary
 from tools.terminal_tool_lifecycle import get_active_env
 from agent.tool_result_destination import result_destination_batch, remember_result_environment, result_environment
 from tools.thread_context import propagate_context_to_thread
@@ -63,16 +67,6 @@ from tools.tool_result_storage import (
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 from hermes_cli.observability.shared_metrics_efficiency import note_tool_result, record_tool_batch
-
-
-def _noop_release_skill_view(*_args: Any, **_kwargs: Any) -> None:
-    return None
-
-
-# v0.23.3 and earlier gateways cache tools.skills_tool_dedup at boot without these helpers.
-_skills_tool_dedup = importlib.import_module("tools.skills_tool_dedup")
-release_replaced_skill_view = getattr(_skills_tool_dedup, "release_replaced_skill_view", _noop_release_skill_view)
-release_replaced_skill_views = getattr(_skills_tool_dedup, "release_replaced_skill_views", _noop_release_skill_view)
 
 # A tool result this large (raw stdout, file dumps) is the biggest allocation a turn ever drops.
 # The commit only flags it: the string is still referenced by the publish frames here, so the
@@ -85,9 +79,7 @@ logger = logging.getLogger(__name__)
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
 
 
-def _tc_name(tool_call: Any) -> str:
-    return getattr(getattr(tool_call, "function", None), "name", "") or "tool"
-
+from .names import _tc_name
 
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""
@@ -152,25 +144,15 @@ _AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
 
 
 def _authorization_gate_lock_timeout() -> float:
-    """Authorization-lock bound = ``tools.approval_human_wait.human_wait_ceiling`` (approval timeout +
-    margin, capped so it can't overflow Lock.acquire): never break serialization while a
-    prompt is answerable, never let a wedged holder park workers forever. Deliberately NOT
-    min()'d with the fallback so the gate never gives up early.
+    """Resolve the lock bound once per batch from the same ceiling as human-wait deadlines.
 
-    Delegates to ``tools.approval_human_wait.human_wait_ceiling`` — the same bound that clamps a human-wait window's
-    deadline contribution — so the two can't drift. Long enough that serialization is never broken while a
-    legitimate approval prompt is still answerable; short enough that a wedged holder (hanging
-    ``pre_tool_call`` plugin, dead approval client) cannot park other workers forever (#79719). Resolved
-    once per gate (per batch), so a mid-process ``approvals.timeout`` change applies from the next batch.
+    The ceiling protects ``Lock.acquire`` from overflow (#83220) and bounds how long a wedged
+    holder can park workers. The fallback is not a cap: serialization must outlast a still
+    answerable approval prompt even when the configured timeout exceeds 360s (#79719).
     """
     try:
         from tools.approval_human_wait import human_wait_ceiling
 
-        # human_wait_ceiling is platform-safety-capped (agent/deadline.py MAX_SAFE_TIMEOUT_S): a huge
-        # approvals.timeout can no longer overflow Lock.acquire's time_t on macOS (#83220). Deliberately NOT
-        # min()'d with _AUTHORIZATION_GATE_LOCK_TIMEOUT_S — the gate must never give up while a legitimate
-        # approval prompt is still answerable (#79719), so a configured approvals.timeout above 360s must
-        # extend the gate.
         return human_wait_ceiling()
     except Exception:
         return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
@@ -227,7 +209,7 @@ def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) 
         return persisted
     except Exception as exc:
         agent._incremental_persistence_failed = True
-        from storage_errors import classify_persistence_error
+        from hermes_state import classify_persistence_error
         agent._last_persistence_error_cause = classify_persistence_error(exc)
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
         return False
@@ -767,7 +749,8 @@ def _dispatch_authorized_once(
     from tools.node_execution import collect_result_environment
     from tools.mcp_elicitation_form import bound_form_asker  # MCP elicitation asks on this turn's clarify surface
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use, \
-            collect_result_environment() as destination, bound_form_asker(getattr(agent, "clarify_callback", None)):
+            collect_result_environment() as destination, \
+            bound_form_asker(getattr(agent, "clarify_callback", None)):
         try:
             return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
         finally:
@@ -1169,7 +1152,6 @@ def _commit_tool_result(
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
     note_tool_result(agent, function_name, tool_call_id, function_result, persisted_result)
-    release_replaced_skill_view(effective_task_id, tool_call_id, persisted_result)
 
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
     if subdir_hints:
@@ -1256,7 +1238,6 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget, env_for_message=result_environment)
     sync_rewritten_tool_rows(agent, batch, contents_before)
     record_tool_batch(agent, batch, contents_before)
-    release_replaced_skill_views(effective_task_id, batch, contents_before)
 
 
 def _tool_progress_enabled(agent) -> bool:

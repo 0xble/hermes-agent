@@ -321,13 +321,13 @@ async def test_a_tick_whose_replaced_tick_starts_first_is_admitted_with_only_its
     assert await _drain_one(messaging.runner, tick(1)) == 0
     admit = authority.admit_automation
 
-    async def claimed_first(adapter, event, identity, replaces=None):
+    async def claimed_first(adapter, event, identity, replaces=None, **kwargs):
         if replaces is not None:  # the drain claims the waiting tick between the check and the write
             # (The fixture's human message still heads the FIFO, so the claim is stamped directly.)
             raw_holder(authority.persistence)._execute_write(lambda conn: conn.execute(
                 "UPDATE session_admissions SET status='started',owner_epoch=?,generation=1 "
                 "WHERE admission_id=?", (authority.epoch, replaces)))
-        return await admit(adapter, event, identity, replaces)
+        return await admit(adapter, event, identity, replaces, **kwargs)
     monkeypatch.setattr(authority, 'admit_automation', claimed_first)
 
     assert await _drain_one(messaging.runner, tick(2)) == 0

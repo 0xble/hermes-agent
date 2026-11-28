@@ -19,7 +19,7 @@ async def door(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from persistence_assembly import close_stores_under
     from tests.fixtures.storage_seed import seed_session
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

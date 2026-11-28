@@ -12,6 +12,7 @@ import re
 import shlex
 import tempfile
 import unicodedata
+from typing import cast
 
 from agent.file_safety import SHELL_RC_FILES
 from tools import approval_parser_budget as _parser_budget
@@ -1132,9 +1133,26 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return None
 
 
+_SEGMENT_SYNTAX_RE = re.compile(r"""['"\\#]""")
+_SEGMENT_SEPARATOR_RE = re.compile(r"[;&|\n]")
+
+
 def _iter_top_level_shell_segments(command: str):
     """Yield top-level command segments in one left-to-right pass."""
     start = 0
+    if not _SEGMENT_SYNTAX_RE.search(command):
+        # With no quotes, escapes or comments, every separator is top-level. Still charge
+        # through each separator before yielding: callers can stop or spend budget mid-scan.
+        for separator in _SEGMENT_SEPARATOR_RE.finditer(command):
+            end = separator.start()
+            _parser_budget.charge_lexed_chars(end + 1 - start)
+            if start < end:
+                yield command[start:end]
+            start = end + 1
+        _parser_budget.charge_lexed_chars(len(command) - start)
+        if start < len(command):
+            yield command[start:]
+        return
     for kind, i, j, quote in _scan_shell(command, comments=True):
         if kind == "comment" or (kind == "char" and quote is None and command[i] in ";&|\n"):
             if start < i:
@@ -1261,9 +1279,11 @@ def _execution_flag_findings(command: str):
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
-            tokens = _shell_segment_tokens(segment, start)
             executable_name = os.path.basename(executable).lower()
             family = _interpreter_family(executable)
+            if family is None and executable_name not in _SHELL_NAMES and executable_name not in _READ_TOOL_EXEC_FLAGS:
+                continue  # no branch examines this executable's arguments, even on a shlex error
+            tokens = _shell_segment_tokens(segment, start)
             if tokens is None:
                 if family is not None or executable_name in _READ_TOOL_EXEC_FLAGS:
                     yield (_MALFORMED_EXEC_DESCRIPTION, None)
@@ -1331,9 +1351,18 @@ def _skip_shell_whitespace(command: str, pos: int) -> int:
     return pos
 
 
+_PLAIN_WORD_RE = re.compile(r"""[^\s;&|<>()'"\\`$]*""")
+
+
 def _read_shell_word(command: str, pos: int) -> tuple[int, int, str]:
     """Read one shell word without executing expansions."""
     start = end = _skip_shell_whitespace(command, pos)
+    if plain := _PLAIN_WORD_RE.match(command, start):
+        plain_end = plain.end()
+        if plain_end == len(command) or command[plain_end].isspace() or command[plain_end] in ";&|<>()":
+            # The generic lexer also charges for looking at the closing delimiter, when present.
+            _parser_budget.charge_lexed_chars(plain_end - start + (plain_end < len(command)))
+            return start, plain_end, command[start:plain_end]
     for kind, i, j, quote in _scan_shell(command, start, subst="u", brace=True):
         if kind == "char" and quote is None and (command[i].isspace() or command[i] in ";&|<>()"):
             break
@@ -1414,7 +1443,8 @@ def _deobfuscate_shell_word(word: str) -> str:
     return word
 
 
-def _iter_shell_command_starts(command: str):
+def _shell_command_starts(command: str) -> tuple[int, ...]:
+    """Return command starts in scanner order (transition words can append earlier offsets)."""
     starts = [0]
 
     def scan(start: int, end: int) -> None:
@@ -1441,7 +1471,11 @@ def _iter_shell_command_starts(command: str):
     scan(0, len(command))
     seen = set()
     run_from = run_to = -1
-    for start in starts:
+    result = []
+    index = 0
+    while index < len(starts):
+        start = starts[index]
+        index += 1
         # Each newline of a blank-line run is a start that skips to the same word: reuse the last skip
         # when the start falls inside the run it covered instead of rescanning the run per newline.
         if not run_from <= start <= run_to:
@@ -1450,10 +1484,34 @@ def _iter_shell_command_starts(command: str):
         if start >= len(command) or start in seen or _is_shell_comment_start(command, start):
             continue
         seen.add(start)
-        yield start
+        result.append(start)
         _, end, word = _read_shell_word(command, start)
         if word in _SHELL_COMMAND_TRANSITIONS:
             starts.append(end)
+    return tuple(result)
+
+
+_SUBSTITUTION_START_RE = re.compile(r"`|\$[({]")
+
+
+def _iter_shell_command_starts(command: str):
+    budget = _parser_budget.active()
+    if budget is None or _SUBSTITUTION_START_RE.search(command):
+        # Substitution end finders have their own memoization, so the cost of scanning
+        # these sources depends on what earlier projections have already parsed.
+        yield from _shell_command_starts(command)
+        return
+    key = (_shell_command_starts, command)
+    cached = budget.memo.get(key)
+    if cached is None:
+        before = budget.remaining
+        starts = _shell_command_starts(command)
+        budget.memo[key] = starts, before - budget.remaining
+    else:
+        starts, cost = cast(tuple[tuple[int, ...], int], cached)
+        # Same budget boundary as the uncached lexer, not the cheap repeat in memo().
+        _parser_budget.charge_lexed_chars(cost)
+    yield from starts
 
 
 def _mark_command_starts(command: str, marker: str = "\n", skip=()) -> str:
@@ -1738,6 +1796,7 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=16)
 def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     """Catch gateway-lifecycle verbs spelled with quote splicing.
     Backslash splicing (``kick\\start``) is undone by normalization, but quote splicing is not:

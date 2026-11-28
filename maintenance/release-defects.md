@@ -1239,6 +1239,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Upstream-added `tests/ci` files that only check upstream's hosted workflows or
   `scripts/ci/classify_changes.py`, which the fork deleted in #62, stay deleted with them.
 - Fork patch identity for the hosted-CI repair of the merged candidate (PR #396): `release-sync`.
+- The published revert `e7f4a793a01e` of the one-shot exhaustion replay (`d2717ae9089`)
+  landed without a trailer; it is backfilled by stable patch id instead of rewriting the
+  pushed release branch:
+Fork-Patch-Backfill: d5c27cacec1af29ca931b6995ac55af59da13305; release-sync
 - In that repair, each test that failed only on the candidate passed on the parent
   that owns it, so each fix restores that parent's lost lines and keeps the other's
   additions: memory prefetch fan-out redaction, the cron `progress_at` column

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- this PR must retain the cross-session command admission and strict wake-fence paths in this facade; the moved helper boundary is tracked for follow-up extraction.
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
@@ -31,18 +32,13 @@ from agent.file_safety import is_project_env_basename
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.copy_blocks import (
+    restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
+
+from gateway.outbound_reply import reply_uid_for_final
+from gateway.platforms.reaction_lifecycle import reaction_operation
 
 logger = logging.getLogger(__name__)
-
-
-def _consume_detached_handler_exception(task: asyncio.Task) -> None:
-    """Done-callback for a detached fatal-error handler task (carrier cancelled in
-    ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
 
 
 # Audio exts for native audio delivery; Telegram's narrower sets stay separate (.m2a is audio to
@@ -59,6 +55,14 @@ _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 
 
+def _consume_detached_handler_exception(task: asyncio.Task) -> None:
+    """Done-callback for a detached fatal-error handler task (carrier cancelled in
+    ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
 def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
                           output_path: str | None = None) -> str | None:
     """Best-effort ffmpeg transcode to Ogg/Opus (voip-tuned) for native voice bubbles: the written
@@ -137,6 +141,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     thread_id = getattr(source, "thread_id", None)
     platform = _platform_name(getattr(source, "platform", None))
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if platform == "slack" and reply_to_message_id:
+        metadata["message_id"] = reply_to_message_id
     # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
     # gateway never falls back to its primary WebClient.
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
@@ -161,7 +167,42 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    from gateway.checkin_delivery import delivery_metadata
+    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
+
+
+def _schedule_outbound_platform_stamp(store, session_key: str, platform_message_id: str, message_uid: str | None) -> None:
+    """Stamp a delivered platform id after ledger settlement, without awaiting the DB write.
+
+    The exact assistant row is selected by ``message_uid``. For split sends ``message_id`` is the
+    last chunk, the completed reply users react to; auxiliary sends pass no transcript uid.
+    The stamp is independent of the delivering task: cancelling that task must not cancel the write.
+    """
+    record = getattr(store, "record_outbound_platform_message", None)
+    if not callable(record) or not session_key or not platform_message_id or not message_uid:
+        return
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(record, session_key, str(platform_message_id), "", str(message_uid))
+        except Exception:
+            logger.debug("outbound platform message id persistence failed", exc_info=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_run(), name="outbound-platform-stamp")
+    except RuntimeError:
+        return
+    tasks = getattr(store, "_outbound_stamp_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        try:
+            store._outbound_stamp_tasks = tasks
+        except (AttributeError, TypeError):
+            tasks = None
+    if tasks is not None:
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -173,15 +214,25 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics."""
-    override = getattr(event, "reply_anchor_override", None)
-    if override is not None:
-        return override  # the turn was redirected onto another message (#115001)
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
+    override = getattr(event, "reply_anchor_override", None)
+    if override is not None:
+        if platform == "telegram":
+            return _telegram_reply_anchor(override, getattr(source, "message_id", None))
+        return override  # the turn was redirected onto another message (#115001)
     thread_id = getattr(source, "thread_id", None)
     raw_message = getattr(event, "raw_message", None)
     if getattr(event, "internal", False) or (platform == "slack" and isinstance(raw_message, dict)
                                              and raw_message.get("_hermes_no_thread_response")):
+        # Synthetic producer identities are not platform ids, but a numeric Telegram event id remains
+        # a valid DM-topic reply anchor.
+        if getattr(event, "internal", False) and platform == "telegram" and thread_id \
+                and getattr(source, "chat_type", None) == "dm":
+            return _telegram_reply_anchor(
+                getattr(event, "message_id", None), getattr(event, "reply_to_message_id", None),
+                getattr(source, "message_id", None),
+            )
         # A synthetic wake's message_id is its producer identity, not a platform id (Telegram int()s
         # it; #52694). A Slack reaction handoff is a new top-level message, not a thread reply.
         return None
@@ -190,8 +241,14 @@ def _reply_anchor_for_event(event) -> str | None:
         # message — replying to the topic seed/anchor can render outside the active lane.
         if getattr(source, "chat_type", None) != "dm":
             return None
-        return _telegram_reply_anchor(getattr(event, "message_id", None),
-                                      getattr(event, "reply_to_message_id", None))
+        if not getattr(event, "internal", False) and getattr(event, "message_id", None) is not None:
+            return event.message_id
+        return _telegram_reply_anchor(
+            getattr(event, "message_id", None), getattr(event, "reply_to_message_id", None),
+            getattr(source, "message_id", None),
+        )
+    if platform == "telegram":
+        return _telegram_reply_anchor(getattr(event, "message_id", None))
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
@@ -441,14 +498,18 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+import contextvars as _contextvars
 
 if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
     sys.path.append(_checkout_root)  # append, never prepend: never shadow same-named installed packages
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, sender_may_see_activity, typing_pause_key, typing_refresh_wanted
+from gateway.platforms.helpers import (
+    consume_detached_handler_exception, fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn,
+    sender_may_see_activity, typing_pause_key, typing_refresh_wanted,
+)
 from gateway.platforms.base_post_delivery import run_post_delivery_callback
 from gateway.platforms.base_delivery_ledger import (
     finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation)
@@ -458,6 +519,9 @@ from gateway.platforms.base_exec_approval import (
     card_shows_whole_command, render_exec_approval)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
+from gateway.platforms.typing_state import (
+    TypingStateMixin, call_typing_with_metadata, forget_typing_prompt_surface, typing_metadata_for_event,
+)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
@@ -644,10 +708,27 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     """Save raw image bytes to the cache and return the absolute path; raises
     ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
     validate_inbound_media_size(len(data), media_type="image")
-    if not _looks_like_image(data):
-        snippet = data[:80].decode("utf-8", errors="replace")
-        raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+    if data[4:8] == b"ftyp" or not _looks_like_image(data):
+        # iPhone and macOS screenshots arrive as HEIC, Chromium ones as AVIF. Store them as PNG so
+        # every consumer (vision tools, re-sends, model input) gets a format it can read.
+        png = _transcode_raster_to_png(data)
+        if png is None:
+            snippet = data[:80].decode("utf-8", errors="replace")
+            raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
+        validate_inbound_media_size(len(png), media_type="image")  # PNG can be several times larger
+        data, ext = png, ".png"
     return _write_cache_file(get_image_cache_dir(), "img", ext, data)
+
+
+def _transcode_raster_to_png(data: bytes) -> Optional[bytes]:
+    """PNG bytes for a recognised raster image outside ``_looks_like_image`` (HEIC/HEIF, AVIF,
+    TIFF, ICO), else None. SVG and unrecognised bytes stay refused."""
+    from agent.image_routing import _sniff_mime_from_bytes, _transcode_to_png
+
+    mime = _sniff_mime_from_bytes(data)
+    if mime is None or mime == "image/svg+xml":
+        return None
+    return _transcode_to_png(data)
 
 
 async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
@@ -1358,6 +1439,8 @@ def _real_media_tag_spans(masked: str) -> list:
 
 _FENCED_CODE_RE = re.compile(r'```[^\n]*\n.*?```', re.DOTALL)
 _INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+# A tool preview that is exactly one http(s) URL stays plain text so platform auto-linking keeps it tappable.
+_BARE_HTTP_URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 
 
 def _code_spans(content: str) -> list:
@@ -1532,6 +1615,7 @@ class _ExtractedResponse:
     local_files: list
     force_document_attachments: bool
     pre_extract: str
+    copy_blocks: list[str] = field(default_factory=list)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -1606,6 +1690,67 @@ def current_outbound_class() -> Optional[str]:
     return _OUTBOUND_CLASS.get()
 
 
+# The task currently running a platform's serial update consumer (PTB's update fetcher awaits each
+# handler before taking the next update, and Telegram's controlled poller does not poll again until
+# that batch drains). Ingress handlers check it so they never await outbound pacing on that task.
+_INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
+    "gateway_ingress_consumer", default=None)
+
+# Only this invocation's adapter lifecycle promises to fire delivery callbacks.
+post_delivery_owner: _contextvars.ContextVar[Optional[tuple]] = _contextvars.ContextVar(
+    "gateway_post_delivery_owner", default=None)
+
+
+# (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
+# one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
+# a cancel is delivered at the return, before the ledger write.
+_PENDING_LEDGER_SETTLEMENT: "_contextvars.ContextVar[Optional[tuple]]" = _contextvars.ContextVar(
+    "gateway_pending_ledger_settlement", default=None)
+
+
+def ingress_consumer_scope() -> "_contextvars.Token":
+    """Mark the current task as the update consumer; reset with :func:`leave_ingress_consumer`."""
+    return _INGRESS_CONSUMER.set(asyncio.current_task())
+
+
+def leave_ingress_consumer(token: "_contextvars.Token") -> None:
+    _INGRESS_CONSUMER.reset(token)
+
+
+def in_ingress_consumer() -> bool:
+    """True only on the consumer task itself; tasks spawned from it inherit the variable, not the role."""
+    consumer = _INGRESS_CONSUMER.get()
+    return consumer is not None and consumer is asyncio.current_task()
+
+
+# Outbound class of the sends made in the current context. Unlabelled sends are finals, which a
+# platform's volume budget never sheds. Non-final notices and progress bubbles are labelled at their
+# call sites so a platform near a quota can spend its remaining volume on answers.
+OUTBOUND_FINAL = "final"
+# ``SendResult.error`` for a notice or progress send a platform's volume budget dropped on purpose:
+# final, so no retry, plain-text fallback or delivery-failure notice may spend the budget again.
+SEND_SHED_BY_BUDGET = "daily_budget_shed"
+OUTBOUND_NOTICE = "notice"
+OUTBOUND_PROGRESS = "progress"
+OUTBOUND_TOOL_PROGRESS = "tool_progress"
+_OUTBOUND_CLASS: "_contextvars.ContextVar[Optional[str]]" = _contextvars.ContextVar(
+    "gateway_outbound_class", default=None)
+
+
+@contextlib.contextmanager
+def outbound_class(kind: str):
+    """Label sends and edits as notices, tool progress, or expendable cosmetic progress."""
+    token = _OUTBOUND_CLASS.set(kind)
+    try:
+        yield
+    finally:
+        _OUTBOUND_CLASS.reset(token)
+
+
+def current_outbound_class() -> Optional[str]:
+    return _OUTBOUND_CLASS.get()
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -1623,6 +1768,13 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    deferred: bool = False  # accepted by a durable outbox, not yet acknowledged by transport
+    # Refused before any transport request (disconnected or degraded send path): provably unsent,
+    # so the durable outbox may dispatch the same payload again.
+    pre_send: bool = False
+    # The durable outbox refused to dispatch because an earlier attempt may already have landed.
+    # Final: neither a retry nor the plain-text fallback may re-send it.
+    held: bool = False
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -1689,7 +1841,25 @@ def is_chat_level_not_found(exc: Optional[BaseException] = None, error_text: str
             and _any_in(blob, *_CHAT_LEVEL_NOT_FOUND_SUBSTRINGS))
 
 
-class EphemeralReply(str):
+class CommandReply(str):
+    """Gateway-authored reply (slash-command output), not agent output. Bare local paths in it
+    stay text: a goal or title that names ``~/plan.md`` must not upload that file. Explicit
+    ``MEDIA:`` tags still deliver."""
+    notice_style: Optional[str] = None
+
+
+def as_command_reply(value: Any) -> Any:
+    """Mark a plain-string handler result as :class:`CommandReply`; other values pass through."""
+    if isinstance(value, CommandReply):
+        return value
+    if type(value) is str or (isinstance(value, str) and getattr(value, "notice_style", None) == "context"):
+        reply = CommandReply(value)
+        reply.notice_style = getattr(value, "notice_style", None)
+        return reply
+    return value
+
+
+class EphemeralReply(CommandReply):
     """System-notice reply that auto-deletes after ``ttl_seconds`` on platforms implementing
     ``delete_message`` (others leave it). ``None`` ttl uses ``display.ephemeral_system_ttl``
     (``0`` disables globally). Subclassing ``str`` keeps it transparent to everything that
@@ -1699,12 +1869,40 @@ class EphemeralReply(str):
     def __new__(cls, text: str, ttl_seconds: Optional[int] = None):
         instance = super().__new__(cls, text)
         instance.ttl_seconds = ttl_seconds
+        instance.notice_style = getattr(text, "notice_style", None)
         return instance
 
     @property
     def text(self) -> str:
         """The underlying text (explicit form of ``str(reply)``)."""
         return str.__str__(self)
+
+
+def _task_event_covers_recovered_event(task_event, event) -> bool:
+    """Return whether a completed session task actually consumed the recovered event."""
+    return task_event is event or any(
+        absorbed is event for absorbed in getattr(task_event, "_hermes_absorbed_events", ())
+    )
+
+
+def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) -> None:
+    """Keep a transitive identity trail when a pending slot merges another event."""
+    absorbed = getattr(existing, "_hermes_absorbed_events", None)
+    if not isinstance(absorbed, list):
+        absorbed = []
+        existing._hermes_absorbed_events = absorbed
+    for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
+        if candidate is not existing and not any(item is candidate for item in absorbed):
+            absorbed.append(candidate)
+        if candidate is not existing:
+            # Recovery may be watching an absorbed event while the successor persists the
+            # merged slot. Keep the live successor reachable for its durability probe.
+            candidate._hermes_absorbed_into = existing
+    recovery_id = getattr(event, "_hermes_recovery_id", None)
+    if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
+        # A recovered event may be consumed by this pending successor. Carry only the
+        # persistence/durability key; event.message_id and source.message_id remain transport ids.
+        existing._hermes_recovery_id = recovery_id
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -1733,13 +1931,14 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             existing.absorb_turn_input(event)
+            _record_absorbed_pending_event(existing, event)
             if existing_is_photo or incoming_is_photo:
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
                 existing.message_type = event.message_type
             # Drop the *derived* STT cache (event changed); the echo ledger must survive or
             # notes echo twice.
-            for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
+            for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts", "_gateway_pending_stt_task"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
             return
@@ -1748,6 +1947,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_turn_input(event)
+            _record_absorbed_pending_event(existing, event)
             return
     pending_messages[session_key] = event
 
@@ -1798,6 +1998,58 @@ def resolve_channel_skills(
     return None
 
 
+def track_temporary_notice(event: Any, adapter: Any, result: Any) -> None:
+    """Remember a status notice sent about ``event`` (a busy ack) for deletion once the event's own
+    turn has delivered its reply. A receipt that arrives after that is deleted right away."""
+    message_id = getattr(result, "message_id", None) if getattr(result, "success", False) else None
+    if not message_id:
+        return
+    notice = (adapter, event.source.chat_id, str(message_id))
+    if getattr(event, "_temporary_notices_released", False):
+        task = asyncio.get_running_loop().create_task(_delete_temporary_notices([notice]))
+        _TEMPORARY_NOTICE_TASKS.add(task)
+        task.add_done_callback(_TEMPORARY_NOTICE_TASKS.discard)
+        return
+    notices = getattr(event, "_temporary_notices", None)
+    if notices is None:
+        notices = event._temporary_notices = []
+    notices.append(notice)
+
+
+async def release_temporary_notices(event: Any) -> None:
+    """Delete the status notices sent about ``event``: its own turn is over and its reply delivered."""
+    event._temporary_notices_released = True
+    notices = getattr(event, "_temporary_notices", None) or []
+    event._temporary_notices = []
+    await _delete_temporary_notices(notices)
+
+
+_TEMPORARY_NOTICE_TASKS: set = set()
+
+
+async def _delete_temporary_notices(notices) -> None:
+    for adapter, chat_id, message_id in notices:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(adapter.delete_message(chat_id, message_id), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+
+def temporary_cleanups(callback: Any) -> list:
+    """The parts of a (possibly chained or wrapped) post-delivery callback that only delete a turn's
+    temporary messages (marked ``_temporary_cleanup``). A superseded turn runs these and drops the
+    rest: its deferred notices describe a result nobody will see, but its cards must still go."""
+    if not callable(callback):
+        return []
+    if getattr(callback, "_temporary_cleanup", False):
+        return [callback]
+    parts = getattr(callback, "_post_delivery_parts", None)
+    if parts is not None:
+        return [found for part in parts for found in temporary_cleanups(part)]
+    wrapped = getattr(callback, "__wrapped__", None)
+    if wrapped is not None and getattr(wrapped, "_temporary_cleanup", False):
+        return [callback]  # keep the wrapper: it restores the context the cleanup runs under
+    return temporary_cleanups(wrapped)
+
+
 def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
     generation."""
@@ -1817,24 +2069,21 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
+class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
+    # Reaction exposure is derived from this adapter class without constructing an adapter. ``None``
+    # means ``PlatformRegistry`` checks whether ``add_reaction`` is overridden; adapters may set an
+    # explicit bool when their transport capability differs from the method implementation.
+    SUPPORTS_REACTIONS: Optional[bool] = None
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
     supports_code_blocks: bool = False
     # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
-
-    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
-        """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
-        next typing refresh renders it; a no-op store on adapters that never read
-        ``_status_text``."""
-        store = _lazy_attr(self, "_status_text", dict)
-        if text:
-            store[str(chat_id)] = text
-        else:
-            store.pop(str(chat_id), None)
+    # Platform adapters may override the regular typing heartbeat cadence. Telegram narrows this
+    # from its own Bot API expiry window; every other adapter keeps the historical 2s default.
+    typing_refresh_interval: float = 2.0
 
     # Can wake a fresh turn AFTER a turn ends (detached-subagent completions); False for stateless
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
@@ -1891,6 +2140,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # could drop a newer guard.
         self._active_sessions: dict[str, asyncio.Event] = {}
         self._pending_messages: dict[str, MessageEvent] = {}
+        # Commands accepted while a turn is active but requiring a committed session boundary.
+        # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
+        # or displaced by the one-slot prompt queue.
+        self._deferred_commands: dict[str, list[tuple[str, int, MessageEvent]]] = {}
+        # Monotonic identity for the committed session represented by each session key. A
+        # deferred event from an older incarnation must never run after /new, /reset, /stop,
+        # shutdown, or any other teardown/replacement path reuses the key.
+        self._session_generations: dict[str, int] = {}
+
         # Consecutive in-band drains per session of the just-dispatched event bouncing straight
         # back into the queue (session busy elsewhere); drives the drain back-off (#123229).
         self._requeue_counts: dict[str, int] = {}
@@ -1913,6 +2171,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
+        self._post_delivery_callbacks_by_generation: dict[tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -1936,6 +2195,134 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
         self._status_text: dict[str, str] = {}
 
+    _MAX_DEFERRED_COMMANDS_PER_SESSION = 8
+
+    def defer_command_until_idle(self, session_key: str, event: MessageEvent) -> Optional[int]:
+        """Record a command for execution after the active session turn commits.
+
+        Returns the 1-based queue depth. Deferred commands are deliberately separate from
+        ``_pending_messages``: ordinary follow-up text is a prompt, while a deferred command
+        must retain its command identity and execute before that prompt.
+        """
+        queue = self._deferred_commands.setdefault(session_key, [])
+        if len(queue) >= self._MAX_DEFERRED_COMMANDS_PER_SESSION:
+            return None
+        generation = self._session_generations.setdefault(session_key, 0)
+        event._deferred_session_key = session_key
+        event._deferred_generation = generation
+        queue.append((session_key, generation, event))
+        self._unresolved_deferred_map()[id(event)] = event
+        return len(queue)
+
+    def _unresolved_deferred_map(self) -> dict[int, MessageEvent]:
+        """Acknowledged deferred commands without a visible outcome yet, keyed by ``id(event)``.
+
+        Teardown reports each one left here, so a command acked with "scheduled after the current
+        turn commits" never ends silently. Created lazily: adapter doubles skip ``__init__``.
+        """
+        pending = getattr(self, "_unresolved_deferred", None)
+        if pending is None:
+            pending = self._unresolved_deferred = {}
+        return pending
+
+    def _pop_deferred_command(self, session_key: str) -> Optional[MessageEvent]:
+        queue = self._deferred_commands.get(session_key)
+        while queue:
+            queued_session, queued_generation, event = queue[0]
+            current_generation = self._session_generations.get(session_key, 0)
+            if not (queued_session == session_key
+                    and getattr(event, "_deferred_session_key", None) == session_key
+                    and queued_generation == current_generation
+                    and getattr(event, "_deferred_generation", None) == current_generation):
+                queue.pop(0)
+                continue
+            if getattr(event, "_deferred_parked", False):
+                # Parked by the runner: its turn is still running. Only resume_deferred_commands,
+                # called when that turn releases, may run it; draining here would spin.
+                return None
+            queue.pop(0)
+            if not queue:
+                self._deferred_commands.pop(session_key, None)
+            return event
+        self._deferred_commands.pop(session_key, None)
+        return None
+
+    def park_deferred_command(self, session_key: str, event: MessageEvent) -> None:
+        """Return a replayed deferred command to the head of its queue without re-acknowledging it.
+
+        The adapter drains deferred commands when its own task ends, but the runner can still own a
+        turn the adapter never saw (an internal wake admitted after ``/stop``). The replay then finds
+        the session busy; re-deferring it as a new command re-acks and re-drains it immediately, in
+        a loop. A parked command waits for ``resume_deferred_commands`` instead.
+        """
+        generation = self._session_generations.get(session_key, 0)
+        if (getattr(event, "_deferred_session_key", None) != session_key
+                or getattr(event, "_deferred_generation", None) != generation):
+            return
+        event._deferred_parked = True
+        self._deferred_commands.setdefault(session_key, []).insert(0, (session_key, generation, event))
+
+    def resume_deferred_commands(self, session_key: str) -> None:
+        """Called by the runner when a turn releases: unpark queued commands and, if no adapter task
+        owns the session, start the next one. An owning task drains them when it finishes."""
+        queue = self._deferred_commands.get(session_key)
+        if not queue:
+            return
+        for _session, _generation, event in queue:
+            if getattr(event, "_deferred_parked", False):
+                event._deferred_parked = False
+        if session_key in self._active_sessions:
+            return
+        deferred = self._pop_deferred_command(session_key)
+        if deferred is not None:
+            self._start_session_processing(deferred, session_key)
+
+    def _invalidate_deferred_commands(self, session_key: str, *, forget_unresolved: bool = True) -> None:
+        """Advance the session incarnation and discard commands from the old one.
+
+        A per-session invalidation follows the user's own /stop, /new or /reset, so the dropped
+        commands are forgotten silently. Teardown passes ``forget_unresolved=False`` and reports them.
+        """
+        self._session_generations[session_key] = self._session_generations.get(session_key, 0) + 1
+        self._deferred_commands.pop(session_key, None)
+        if forget_unresolved:
+            self._unresolved_deferred = {
+                key: event for key, event in self._unresolved_deferred_map().items()
+                if getattr(event, "_deferred_session_key", None) != session_key
+            }
+
+    def _invalidate_all_deferred_commands(self) -> None:
+        """Fence every queued command during adapter shutdown/replacement."""
+        for session_key in set(self._session_generations) | set(self._deferred_commands):
+            self._invalidate_deferred_commands(session_key, forget_unresolved=False)
+
+    def _resolve_deferred_command(self, event: MessageEvent, *, outcome_visible: bool = True) -> None:
+        """The deferred command's handler returned: its own reply (or a park) is the outcome.
+        Any other event is absent from the map, so this is a no-op for it."""
+        if outcome_visible and not getattr(event, "_deferred_parked", False):
+            self._unresolved_deferred_map().pop(id(event), None)
+
+    async def _report_unrun_deferred_commands(self) -> None:
+        """Tell each chat which acknowledged deferred command will not run (teardown only).
+
+        The deferred queue is in-memory and a restart cannot replay it; without this the earlier
+        "scheduled after the current turn commits" ack is the last word. Bounded and best-effort:
+        a wedged transport must not stall shutdown.
+        """
+        events, self._unresolved_deferred = list(self._unresolved_deferred_map().values()), {}
+        if not events:
+            return
+
+        async def _report(event: MessageEvent) -> None:
+            text = t("gateway.busy.deferred_dropped", command=event.get_command() or "command")
+            await self.send(event.source.chat_id, text, metadata=_thread_metadata_for_event(event))
+
+        results = await asyncio.wait_for(
+            asyncio.gather(*(_report(e) for e in events), return_exceptions=True), timeout=5.0,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("[%s] Could not report an unrun deferred command: %s", self.name, result)
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         """Length function for message size; override where the platform counts
@@ -2020,15 +2407,23 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         from gateway.stream_events import ToolCallChunk
         if not isinstance(event, ToolCallChunk):
             return None
-        from agent.display import get_tool_emoji, prepare_tool_preview, verbose_tool_args_text
-        emoji, tool = get_tool_emoji(event.tool_name, default='⚙️'), event.tool_name
+        from agent.display import prepare_tool_preview, progress_tool_label, verbose_tool_args_text
+        emoji, label = progress_tool_label(event.tool_name, default='⚙️')
+        literal = self.format_progress_literal
+        tool = literal(label)
         if mode == "verbose" and event.args:
-            args_str = verbose_tool_args_text(event.args, preview_max_len, self.supports_code_blocks)
-            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool, keys=list(event.args.keys()), args=args_str)
+            _code_blocks = (
+                self.supports_code_blocks
+                and type(self).format_progress_literal is BasePlatformAdapter.format_progress_literal
+            )
+            args_str = verbose_tool_args_text(event.args, preview_max_len, _code_blocks)
+            rendered_args = args_str if args_str.startswith("```") else literal(args_str)
+            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                     keys=literal(str(list(event.args.keys()))), args=rendered_args)
         if not event.preview:
             return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         if mode == "verbose":
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=event.preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(event.preview))
         # "all" / "new": short capped preview (default 40; progress bubbles persist as messages).
         cap = preview_max_len if preview_max_len > 0 else 40
         prepared = prepare_tool_preview(
@@ -2036,10 +2431,19 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=self.format_tool_preview(prepared))
 
 
+    def format_progress_literal(self, text: str) -> str:
+        """Markup that shows ``text`` (a tool name, argument preview or args dump) verbatim in a
+        tool-progress line. Identity here; adapters that parse progress text as Markdown override it
+        so ``mcp__a__b``, ``**/*.md`` or ``\\s+`` are not read as formatting."""
+        return text
+
     def format_tool_preview(self, preview: "ToolPreview") -> str:
         """Platform-native formatting of a compact tool preview; rich-text adapters may use
-        the preview's metadata (e.g. a URL shortened for display)."""
-        return preview.text
+        the preview's metadata (e.g. a URL shortened for display). A URL preview stays plain text so
+        platform auto-linking keeps it tappable; anything else goes through ``format_progress_literal``."""
+        if preview.url or _BARE_HTTP_URL_RE.fullmatch(preview.text):
+            return preview.text
+        return self.format_progress_literal(preview.text)
 
     has_fatal_error = property(lambda self: self._fatal_error_message is not None)
     fatal_error_message = property(lambda self: self._fatal_error_message)
@@ -2144,7 +2548,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             except asyncio.CancelledError:
                 # Carrier cancelled (our own teardown inside the handler): let it finish detached.
                 if not task.done():
-                    task.add_done_callback(_consume_detached_handler_exception)
+                    task.add_done_callback(consume_detached_handler_exception)
                 raise
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
@@ -2153,8 +2557,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         ``--replace`` connect (the status module validates ownership and terminates)."""
         from gateway.status import acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder
         from gateway.status_lock_dir import ScopedLockDirUnusable
-        self._platform_lock_scope, self._platform_lock_identity = scope, identity
-        lock_meta = {"platform": self.platform.value}
+        self._platform_lock_scope, self._platform_lock_identity, self._platform_lock_nonce = scope, identity, uuid.uuid4().hex
+        lock_meta = {"platform": self.platform.value, "nonce": self._platform_lock_nonce}
         try:
             acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
         except ScopedLockDirUnusable as exc:
@@ -2479,6 +2883,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event) + dm_thread_batch_suffix(event.source, self.config.extra)
 
+    from gateway.incognito import private_ingress as _private_text_ingress
+
+    @_private_text_ingress
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
@@ -2647,6 +3054,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
     REQUIRES_EDIT_FINALIZE: bool = False
+    # Minimum seconds between progress-bubble edits for this platform; None keeps the runner's default.
+    PROGRESS_EDIT_INTERVAL: Optional[float] = None
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a CLI→platform session handoff; its id
@@ -2662,6 +3071,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         when content is unchanged."""
         return SendResult(success=False, error="Not supported")
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        """Add an explicit reaction, returning False if unsupported or delivery fails.
+
+        ``routing`` carries platform context such as team_id, thread_id and user_id
+        (the target author on Signal). Explicit reactions are independent of the
+        automatic processing-status reaction setting and do not mark a turn answered.
+        """
+        return False
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a sent message; True on success (platforms without a deletion API return False and
         callers leave it). Used by the stream consumer's fresh-final cleanup to remove stale
@@ -2672,6 +3090,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         visible timestamp reflects completion time.
         """
         return False
+
+    async def delete_messages(self, chat_id: str, message_ids: list[str]) -> dict[str, bool]:
+        """Delete several sent messages; ``{message_id: deleted}``. The default deletes one by one;
+        platforms with a batch API override it so cleanup spends one request instead of N."""
+        results: dict[str, bool] = {}
+        for message_id in message_ids:
+            results[str(message_id)] = await self.delete_message(chat_id, message_id)
+        return results
 
     def _get_ephemeral_system_ttl_default(self) -> int:
         """Default :class:`EphemeralReply` TTL from ``display.ephemeral_system_ttl``
@@ -2820,6 +3246,17 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         meta: dict[str, Any] = {"page": page, "total_pages": total_pages, "start": start,
                    "end": end, "total": total, "page_info": page_info}
         return options[start:end], meta
+
+    async def send_control_request(
+        self, chat_id: str, text: str, request_id: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a session-control approval request; non-button adapters use text fallback."""
+        return await self.send(
+            chat_id=chat_id,
+            content=f"{text}\n\nRequest: {request_id} (approval requires the Telegram buttons; this adapter cannot render them.)",
+            metadata=metadata,
+        )
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
@@ -3002,7 +3439,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """
         if not self.warning_notifications_enabled(logical_platform, chat_id=chat_id, metadata=metadata):
             return None
-        return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await self.send(
+            chat_id, content, reply_to=reply_to, metadata=metadata)
 
     async def emit_media_warning(
         self, chat_id: str, notice: str, *, caption=None, reply_to=None, metadata=None,
@@ -3286,29 +3724,63 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _typing_tick_retry_delay(self, result: Any, *, timed_out: bool, failed: bool) -> Optional[float]:
+        """Seconds before retrying one ``_keep_typing`` tick, or ``None`` to wait for the next tick.
+        The 2s default cadence already re-covers a missed tick, so the base adapter never retries."""
+        return None
+
+    def _typing_tick_anchor_before_send(self) -> bool:
+        """Whether a typing tick's deadline starts before its send request."""
+        return False
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
         """Refresh the typing indicator every ``interval`` seconds until cancelled (platform typing
         state expires after ~5s). Chats in ``_typing_paused`` are skipped (approval waits — Slack's
         setStatus disables the compose box). Each ``send_typing`` is bounded by a sub-interval timeout."""
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        loop = asyncio.get_running_loop()
+        scope = self._typing_scope_key(chat_id, metadata)
+        # Discord and Signal own _typing_tasks for their transport-level loops.
+        tasks = self.__dict__.setdefault("_typing_refresh_owners", {})
+        tasks[scope] = asyncio.current_task()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused and typing_pause_key(chat_id, metadata) not in self._typing_paused:
-                    try:  # asyncio.timeout: 3.11's wait_for swallows a same-tick cancel (stuck "typing")
-                        async with asyncio.timeout(_send_typing_timeout):
-                            await self.send_typing(chat_id, metadata=metadata)
-                    except TimeoutError:
-                        pass  # Slow network — abandon this tick, stay on schedule.
-                    except Exception as typing_err:
-                        logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                deadline = loop.time() + interval if self._typing_tick_anchor_before_send() else None
+                if not self._typing_is_paused(chat_id, metadata):
+                    retry_used = False
+                    while True:
+                        timed_out = failed = False
+                        result = None
+                        try:
+                            result = await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
+                                                           timeout=_send_typing_timeout)
+                        except TimeoutError:
+                            timed_out = True
+                        except Exception as typing_err:
+                            failed = True
+                            logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                        if deadline is None:
+                            deadline = loop.time() + interval
+                        retry_delay = self._typing_tick_retry_delay(
+                            result, timed_out=timed_out, failed=failed)
+                        # Retry only if the sleep plus a full bounded send still ends before the
+                        # next regular tick; otherwise low intervals send two actions back to back.
+                        remaining = deadline - loop.time()
+                        if (retry_used or retry_delay is None
+                                or remaining <= retry_delay + _send_typing_timeout):
+                            break
+                        retry_used = True
+                        await asyncio.sleep(retry_delay)
+                        if (stop_event is not None and stop_event.is_set()) or self._typing_is_paused(chat_id, metadata):
+                            break
+                if deadline is None:
+                    deadline = loop.time() + interval
                 if stop_event is None:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + interval
                 while not stop_event.is_set():
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -3319,18 +3791,36 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
-            # A send_typing after an outer stop_typing() may have recreated the platform loop.
-            await self._stop_typing_quietly(chat_id, metadata)
-            self._typing_paused.difference_update((chat_id, typing_pause_key(chat_id, metadata)))
-            # getattr-guard: tests build adapters via object.__new__ without _status_text.
-            getattr(self, "_status_text", {}).pop(str(chat_id), None)
+            # A retired owner leaves its live successor's status, pause, phrase and prompt intact.
+            if not self._typing_owner_retired(chat_id, metadata, asyncio.current_task()):
+                cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+                if cancel_retrigger is not None:
+                    with contextlib.suppress(Exception):
+                        cancel_retrigger(chat_id, metadata)
+                # A send_typing after an outer stop_typing() may have recreated the platform loop.
+                await self._stop_typing_quietly(chat_id, metadata)
+                self._typing_paused.discard(scope)
+                if tasks.get(scope) is asyncio.current_task():
+                    tasks.pop(scope, None)
+                getattr(self, "_status_text", {}).pop(scope, None)
+                forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_refresh(
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2, event: Optional[MessageEvent] = None) -> None:
         """Stop the refresh task and platform typing state as one operation; a sender ``event`` may not
         see activity got no typing, so no platform stop goes out to it either (#149024)."""
-        self._typing_paused.add(chat_id)
+        if self._typing_owner_retired(chat_id, metadata, typing_task):
+            # Only retire the stale task: the surface now belongs to a live successor.
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+            return
+        cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+        if cancel_retrigger is not None:
+            with contextlib.suppress(Exception):
+                cancel_retrigger(chat_id, metadata)
+        call_typing_with_metadata(self.pause_typing_for_chat, chat_id, metadata=metadata)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -3342,20 +3832,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     await asyncio.sleep(0)
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
-            self._typing_paused.difference_update((chat_id, typing_pause_key(chat_id, metadata)))
+            call_typing_with_metadata(self.resume_typing_for_chat, chat_id, metadata=metadata)
+            forget_typing_prompt_surface(self, chat_id, metadata)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""
         with contextlib.suppress(Exception):
             await self._stop_typing_with_metadata(chat_id, metadata)
-
-    def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing for a chat (approval waits); GIL-safe from the sync agent thread."""
-        self._typing_paused.add(chat_id)
-
-    def resume_typing_for_chat(self, chat_id: str) -> None:
-        """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -3364,24 +3847,43 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         await self._stop_typing_quietly(chat_id, metadata)
 
     def register_post_delivery_callback(
-        self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
+        self, session_key: str, callback: Callable, *, generation: int | None = None,
+        first: bool = False) -> bool:
         """Register a deferred callback to fire after the main response. Same-key registrations are
         chained (both fire in order, per-callback exception isolation) so independent features
         coexist; ``generation`` ties it to a gateway run — stale generations never overwrite a
-        fresher slot."""
+        fresher slot. ``first`` runs an instant signal ahead of slower cosmetic callbacks, so their
+        bounded timeout cannot swallow it. Return whether this caller's callback was registered."""
         if not session_key or not callable(callback):
-            return
-        existing = self._post_delivery_callbacks.get(session_key)
+            return False
+        owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+        if generation is None:
+            existing = self._post_delivery_callbacks.get(session_key)
+        else:
+            generation = int(generation)
+            existing = owned.get((session_key, generation))
+            # An older turn can extend its existing lane while it unwinds, but cannot
+            # register a new stale callback after a newer generation owns the session.
+            if existing is None and any(
+                key == session_key and gen > generation for key, gen in owned
+            ):
+                return False
         if existing is not None:
-            existing_gen, existing_cb = _split_post_delivery_entry(existing)
-            if existing_gen is not None and generation is not None and int(generation) < int(existing_gen):
-                return
-            # Same-or-newer generation: chain so both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None or generation is None or int(existing_gen) == int(generation)):
-                callback = self._chain_callbacks(existing_cb, callback)
-        self._post_delivery_callbacks[session_key] = (
-            callback if generation is None else (int(generation), callback))
+            _, existing_cb = _split_post_delivery_entry(existing)
+            if callable(existing_cb):
+                callback = (self._chain_callbacks(callback, existing_cb) if first
+                            else self._chain_callbacks(existing_cb, callback))
+        if generation is None:
+            self._post_delivery_callbacks[session_key] = callback
+        else:
+            owned[(session_key, generation)] = callback
+        return True
+
+    def claim_post_delivery(self, session_key: str, generation: int | None) -> None:
+        """A deliverer will fire this generation's callback once its reply is sent, so a newer
+        generation's stale sweep must leave it alone until then."""
+        if session_key and generation is not None:
+            _lazy_attr(self, "_post_delivery_claims", set).add((session_key, int(generation)))
 
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
@@ -3395,13 +3897,26 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                         await _result
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        _chained._post_delivery_parts = callbacks
         return _chained
 
     def pop_post_delivery_callback(
         self, session_key: str, *, generation: int | None = None) -> Callable | None:
         """Pop a deferred callback, optionally requiring generation ownership."""
-        entry = self._post_delivery_callbacks.get(session_key) if session_key else None
+        if not session_key:
+            return None
+        owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+        if generation is not None:
+            callback = owned.pop((session_key, int(generation)), None)
+            if callback is not None:
+                return callback if callable(callback) else None
+        entry = self._post_delivery_callbacks.get(session_key)
         if entry is None:
+            if generation is None:
+                keys = [key for key in owned if key[0] == session_key]
+                if len(keys) == 1:
+                    callback = owned.pop(keys[0])
+                    return callback if callable(callback) else None
             return None
         entry_generation, callback = _split_post_delivery_entry(entry)
         if generation is not None and (entry_generation is None or int(entry_generation) != int(generation)):
@@ -3426,19 +3941,27 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
         if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
             return
-        add: Any = getattr(self, "_add_reaction", None)
-        remove: Any = getattr(self, "_remove_reaction", None)
-        enabled = getattr(self, "_reactions_enabled", None)
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
+        if not (chat_id and message_id):
             return
-        await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
-        if emoji:
-            await add(chat_id, message_id, emoji)
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
+            if state.explicit:
+                return
+            add: Any = getattr(self, "_add_reaction", None)
+            remove: Any = getattr(self, "_remove_reaction", None)
+            enabled = getattr(self, "_reactions_enabled", None)
+            if not callable(add) or not callable(remove) or (callable(enabled) and not enabled()):
+                return
+            await remove(chat_id, message_id)
+            emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
+                     ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
+            if emoji:
+                await add(chat_id, message_id, emoji)
+
+    def _shared_burst_pending(self, event: MessageEvent, session_key: str) -> bool:
+        from gateway.session_ingress_burst import holds_busy_burst
+        return self._shared_runtime_owns_input(event) and holds_busy_burst(self, session_key)
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
@@ -3485,24 +4008,67 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             ttl = _or_default(lambda: int(self._get_ephemeral_system_ttl_default()), 0, Exception)
         if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
             ttl = 0
-        return response.text, int(ttl or 0)
+        text = response.text
+        if response.notice_style is not None:
+            text = as_command_reply(text)
+            text.notice_style = response.notice_style
+        return text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+        ephemeral deletion — no session lifecycle (active-session bypass paths).
+
+        Called from a platform's update consumer, the command runs here but its reply is handed
+        to a background task: the send waits for the chat's outbound budget, and a serial consumer
+        awaiting it holds every later update (and the next poll) behind that wait."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
-        text, eph_ttl = self._unwrap_ephemeral(response)
-        if not text:
-            return
-        if log_cmd is not None:
-            logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
-                        len(text), event.source.chat_id)
-        result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
-        if eph_ttl > 0 and result.success and result.message_id:
-            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        # The handler ran the command: that is this event's admission, whatever the reply's fate.
+        # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
+        event._gateway_inline_command_handled = True
+        event._gateway_accepted = True
+        from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
+        token = bind_event_turn(event)
+        try:
+            text, eph_ttl = self._unwrap_ephemeral(response)
+            if not text:
+                return
+            if log_cmd is not None:
+                logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
+                            len(text), event.source.chat_id)
+
+            async def deliver() -> None:
+                result = await self._send_with_retry(
+                    chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                    metadata=_mark_notify_metadata(thread_meta))
+                if eph_ttl > 0 and result.success and result.message_id:
+                    self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+            if in_ingress_consumer():
+                self.spawn_ingress_reply(run_turn_child(deliver(), active_turn()), label="command reply")
+            else:
+                await deliver()
+        finally:
+            restore_turn(token)
+
+    def spawn_ingress_reply(self, coro: Awaitable[Any], *, label: str) -> "asyncio.Task":
+        """Run an ingress-path reply (command reply, busy ack, retry notice) off the update consumer.
+
+        The task is tracked with the adapter's background tasks and its failure is logged, matching
+        the best-effort contract these replies already had when awaited inline."""
+        async def run() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[%s] Offloaded %s failed", self.name, label, exc_info=True)
+
+        task = asyncio.get_running_loop().create_task(run(), name=f"{self.name}-ingress-{label.replace(' ', '-')}")
+        tasks = self.__dict__.setdefault("_background_tasks", set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
@@ -3538,6 +4104,23 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        from agent.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=self.platform, style=getattr(content, "notice_style", None))
+        result = await self._send_with_retry_body(
+            chat_id, content, reply_to=reply_to, metadata=metadata,
+            max_retries=max_retries, base_delay=base_delay)
+        task = asyncio.current_task()
+        pending = _PENDING_LEDGER_SETTLEMENT.get()
+        if pending is not None and task is not None and task.cancelling():
+            if getattr(result, "success", False):
+                self._settle_delivered_obligation_sync(pending[0], result)
+        return result
+
+    async def _send_with_retry_body(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
+        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        """Send with exponential-backoff retry on transient network errors; permanent
+        failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> SendResult:
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
         tried, as_file = await try_reply_file(self, chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -3550,10 +4133,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             caller then keeps the partial failure rather than re-sending the already-visible head."""
             if not self._is_partial_delivery(previous):
                 return await _send(content)
-            return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            return await self._resume_partial_send(
+                chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if result.success or self._send_held(result) or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: back off (honoring the server's retry_after) rather
@@ -3602,7 +4186,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
-                if self._send_retry_is_final(result):
+                if self._send_held(result) or self._send_retry_is_final(result):
                     return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -3642,6 +4226,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+        from gateway.platforms.base_topic_recovery import recover_deleted_topic_final
+        recovered = await recover_deleted_topic_final(self, chat_id, content, metadata, result, error_str)
+        if recovered is not None:
+            return recovered
+
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
@@ -3649,16 +4238,33 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
+        if isinstance(metadata, dict) and metadata.get("copy_block"):
+            # A copy block already went out as plain text, so formatting is not the cause, and a
+            # banner-prefixed resend would no longer be the exact text to copy. The failure stands
+            # and the delivery ledger owns the retry.
+            logger.warning("[%s] Copy block send failed: %s — not re-sending with a fallback banner", self.name, error_str)
+            return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
 
+    def _send_held(self, result: "SendResult") -> bool:
+        """True when the durable outbox refused a re-dispatch. The earlier attempt may already be on
+        screen, so a retry or a banner-prefixed plain-text copy would bypass the duplicate guard."""
+        if not result.held:
+            return False
+        logger.warning("[%s] Send held by the durable outbox (earlier dispatch uncertain): %s; "
+                       "not retrying or falling back to plain text", self.name, result.error)
+        return True
+
     def _send_retry_is_final(self, result: SendResult) -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
-        fallback can fix it (a structured auth/target refusal). Default: never."""
-        return False
+        fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
+        volume budget shed on purpose)."""
+        from gateway.checkin_delivery import DISARMED
+        return getattr(result, "error", None) in {SEND_SHED_BY_BUDGET, DISARMED}
 
     @staticmethod
     def _is_partial_delivery(result: SendResult) -> bool:
@@ -3694,7 +4300,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             return new_text
         if new_text.strip() in [c.strip() for c in existing_text.split("\n\n")]:
             return existing_text
-        return f"{existing_text}\n\n{new_text}".strip()
+        # Stripping is for comparison only: trailing whitespace can belong to
+        # a counted document body and must survive media batching verbatim.
+        return f"{existing_text}\n\n{new_text}"
 
     def _text_debounce_store(self) -> dict[str, TextDebounceState]:
         return _lazy_attr(self, "_text_debounce", dict)
@@ -3711,7 +4319,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Batch only unadmitted human text from the same sender."""
+        from gateway.platforms.event import _is_human_event
+
+        if not all(_is_human_event(candidate) and not candidate.is_command()
+                   and not getattr(candidate, "_gateway_compression_deferred", False)
+                   for candidate in (existing, event)):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3831,10 +4445,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task done/absent)", self.name, session_key)
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        self._invalidate_deferred_commands(session_key)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
+
+    def _on_session_handoff(self, event: MessageEvent) -> None:
+        """Hook called immediately before ``event`` is handed to session processing."""
 
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
                                   interrupt_event: Optional[asyncio.Event] = None) -> bool:
@@ -3869,11 +4487,19 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """Cancel in-flight processing for one session. ``release_guard=False`` keeps the guard so
         reset-like commands finish atomically; the await is bounded (5s) so a wedged finally can't
         stall."""
+        # Cancellation is a teardown boundary: commands captured for the old turn must not
+        # cross it, even when the caller keeps the guard to finish /new or /reset atomically.
+        self._invalidate_deferred_commands(session_key)
         self._requeue_counts.pop(session_key, None)
         task = self._session_tasks.pop(session_key, None)
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
             self._expected_cancelled_tasks.add(task)
+            if discard_pending:
+                task._hermes_pending_owner = "discard"
+            elif not release_guard:
+                # The accepted command keeps the guard and drains the retained FIFO itself.
+                task._hermes_pending_owner = "command_tail"
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
@@ -3903,10 +4529,12 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             self._start_session_processing(pending_event, session_key)
 
     async def _dispatch_active_session_command(self, event: MessageEvent, session_key: str, cmd: str) -> None:
-        """/stop, /new, /reset on a busy session: cancel only on the runner's verdict (#136759)."""
+        """Cancel a busy session only after the runner accepts the interrupt."""
         from gateway.platforms.base_session_command import dispatch_active_session_command
         await dispatch_active_session_command(self, event, session_key, cmd)
+    from gateway.incognito import private_ingress as _private_ingress
 
+    @_private_ingress
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
@@ -3923,9 +4551,30 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
+        from gateway.incognito import slash_refusal
+        refusal = slash_refusal(event)
+        if refusal is not None:
+            await self.send(event.source.chat_id, refusal, reply_to=event.message_id,
+                            metadata={"thread_id": event.source.thread_id})
+            return
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
+        # An already-admitted Telegram update must not enter the busy queue: the
+        # runner would see it only after the original turn completed and could
+        # otherwise turn a transport redelivery into another user turn.
+        if (self.platform == Platform.TELEGRAM and not event.internal
+                and getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)):
+            from gateway.outbox import store_for, event_kind, transport_id, local_admission_turn
+            event_id = transport_id(event)
+            if event_id:
+                home = self.gateway_runner._resolve_profile_home_for_source(event.source)
+                original = await asyncio.to_thread(
+                    store_for(home).lookup, str(event.source.profile or "default"),
+                    "telegram", event_id, event_kind(event))
+                if original and local_admission_turn(event, self.gateway_runner, home) is None:
+                    event._gateway_accepted = True
+                    return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
@@ -3937,15 +4586,33 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        from gateway.session_ingress_burst import burst_gate
-        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
-        # On-entry self-heal: clear a guard whose owner task already exited.
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
-        if session_key in self._active_sessions or behind_burst:
-            await self._handle_message_while_active(event, session_key)
-            return
+        # Retirement admission precedes busy/debounce queues. The runner repeats
+        # this check when draining prompts queued before retirement was requested.
+        runner = self.gateway_runner
+        if runner is not None and self.platform == Platform.TELEGRAM:
+            from gateway.telegram_retire import intercept
+            if self._is_sender_authorized(event.source.user_id, event.source.chat_type,
+                                          event.source.chat_id, thread_id=event.source.thread_id) is True:
+                notice = await intercept(runner, event)
+                if notice is not None:
+                    if notice:
+                        await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
+                    event._gateway_accepted = True
+                    from gateway.telegram_retire import advance
+                    await advance(runner, event.source)
+                    return
+        from gateway.session_ingress_burst import burst_gate, hold_burst_for_control
+        async with hold_burst_for_control(self, event, session_key) as held_for_control:
+            behind_burst = held_for_control or await burst_gate(self, event, session_key)  # a serial reader's command waits too
+            # On-entry self-heal: clear a guard whose owner task already exited.
+            if session_key in self._active_sessions:
+                self._heal_stale_session_lock(session_key)
+            if session_key in self._active_sessions or behind_burst:
+                await self._handle_message_while_active(event, session_key)
+                return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
+        # Entering session processing is the handoff: a failure after this point must not replay.
+        self._on_session_handoff(event)
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
@@ -3973,6 +4640,19 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
+        # Busy admission bypasses the normal inbound path, so apply the same relay-origin contract
+        # before any branch can queue, debounce, or merge the event. Once each complete event carries
+        # ``reply_expected=False``, MessageEvent.absorb_reply_expected preserves it only when every
+        # merged event is likewise unaddressed; a typed human event restores the visible fallback.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            # A hidden cron review must never queue behind a live turn: a queued event is
+            # later drained in-band without its capture and would post its reply. The
+            # scheduler sends the original report on time instead.
+            event._gateway_accepted = True  # handled: the busy cause reaches the caller
+            return
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
             from gateway.session_ingress_burst import dispatch_busy_burst
@@ -3983,8 +4663,22 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         src = event.source
         self._canonicalize(src)  # identity FIRST (direct callers may skip handle_message)
         cmd = event.get_command()
+        # Resolve a configured quick-command alias BEFORE the bypass test: an alias for /steer is
+        # otherwise unrecognised here and queued as ordinary user text (fork patch).
+        is_quick_alias = False
+        resolve_quick_alias = getattr(self.gateway_runner, "_quick_command_alias_text", None)
+        if callable(resolve_quick_alias):
+            alias_text = resolve_quick_alias(event, profile_name=getattr(self, "_owner_profile", None))
+            alias_parts = alias_text.lstrip("/").split(maxsplit=1) if isinstance(alias_text, str) else []
+            if alias_parts:
+                cmd = alias_parts[0]
+                is_quick_alias = True
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
-        if should_bypass_active_session(cmd):
+        # An alias targeting /stop, /new or /reset stays on ordinary busy semantics: the handoff
+        # path below is not authorization-aware for aliases, so it must not run the cancellation
+        # lifecycle.
+        alias_requires_lifecycle_handoff = bool(is_quick_alias and cmd and is_interrupt_then_dispatch(cmd))
+        if should_bypass_active_session(cmd) and not alias_requires_lifecycle_handoff:
             try:
                 # /stop, /new, /reset: response, then cancel + drain only if the runner accepted it.
                 if cmd and is_interrupt_then_dispatch(cmd):
@@ -4001,8 +4695,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # Otherwise it lands in _pending_messages as a follow-up turn and the answer is
         # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
         # blocked on Event.wait, message must reach the resolver before being a new turn.
-        # See #4926.
-        if not cmd and event.allow_gateway_control:
+        # See #4926. Gateway-authored synthetic events (internal) never answer a human prompt;
+        # they take the normal busy-session queue below.
+        if not cmd and event.allow_gateway_control and not event.internal:
             try:
                 from tools import clarify_gateway as _clarify_mod
                 _has_text_clarify = _clarify_mod.get_pending_for_session(
@@ -4077,6 +4772,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         lo, hi = bounds
         return random.uniform(lo / 1000.0, hi / 1000.0)
 
+    def _spoken_reply_text(self, extracted: "_ExtractedResponse") -> str:
+        """The reply as auto-TTS speaks it: paste-ready copy bodies are read, never spoken."""
+        raw = extracted.pre_extract or ""
+        without_copy = strip_copy_blocks(raw)
+        if without_copy == raw:
+            return extracted.text_content
+        _, spoken = self.extract_images(self.extract_media(without_copy)[1])
+        return _strip_media_directives(spoken).strip()
+
     async def _synthesize_auto_tts(self, text_content: str, source: Optional[SessionSource] = None,
                                    ) -> tuple[list[str], Optional[str]]:
         """``(existing_paths, requested_path)``, synthesized in ``source``'s profile scope (the turn's
@@ -4096,28 +4800,140 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
-        metadata: dict[str, Any], record_delivery: Callable) -> bool:
+        metadata: dict[str, Any], record_delivery: Callable, session_key: Optional[str] = None) -> bool:
         """Play one synthesized TTS file. Returns True when the ORIGINAL reply text rode
         along as a Telegram caption (first file, ≤1024 chars) so the text send is skipped."""
         caption = None
         if first and self.platform == Platform.TELEGRAM and text_content and text_content[:1024] == text_content:
             caption = text_content
+        obligation_id = None
+        if caption and session_key:
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, self, False, metadata=metadata)
         tts_result = await self.play_tts(
             chat_id=event.source.chat_id, audio_path=tts_path, caption=caption, metadata=metadata)
+        if obligation_id is not None:
+            await self._finalize_delivery_obligation(obligation_id, tts_result, event, self)
         record_delivery(tts_result)
-        return bool(caption and getattr(tts_result, "success", False))
+        caption_delivered = bool(caption and getattr(tts_result, "success", False))
+        if caption_delivered and session_key and getattr(tts_result, "message_id", None):
+            _schedule_outbound_platform_stamp(
+                getattr(self, "_session_store", None), session_key,
+                str(tts_result.message_id), getattr(event, "_transcript_message_uid", None))
+        return caption_delivered
+
+    def _outbox_covers_final(self, event: MessageEvent, delivery_adapter: "BasePlatformAdapter") -> bool:
+        """Whether the durable outbox, not the ledger, owns this final's crash recovery."""
+        from gateway.outbox import active_turn
+        outbox_turn = (getattr(event, "_outbox_home", None), getattr(event, "_outbox_turn_id", None))
+        return bool(
+            getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
+            and delivery_adapter.platform == Platform.TELEGRAM
+            and getattr(type(delivery_adapter).send, "_durable_outbox", False)
+            and active_turn() == outbox_turn
+        )
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
-        """Ledger a final before its send (``base_delivery_ledger.record_final_obligation``); the per-adapter seam."""
-        return await record_final_obligation(self, event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
+        metadata: Optional[dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
+        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
+        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
+        or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
+        before sending: the outbox never replays a proven-unsent row, the ledger's reconnect sweep does."""
+        if (is_ephemeral_response or (not outbox_refused and self._outbox_covers_final(event, delivery_adapter)) or
+                str(event.text or "").lstrip().startswith(
+                    ("/", self.typed_command_prefix or "!"))):
+            return None
+        try:
+            from gateway.delivery_ledger import (
+                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
+            if not await asyncio.to_thread(ledger_enabled):
+                return None
+            source = event.source
+            # The ledger identity for the ordinary reply stays unchanged for compatibility. Copy
+            # blocks derive a per-part message ref below, so identical bodies never overwrite each
+            # other's obligations (and a block equal to the reply remains distinct).
+            _ledger_message_ref = getattr(event, "ledger_message_id", None)
+            if _ledger_message_ref is None:
+                _ledger_message_ref = getattr(event, "message_id", "")
+            _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
+            if _copy_index is not None:
+                _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
+            from gateway.checkin_delivery import is_supervisor_checkin
+            obligation_id = compute_obligation_id(
+                session_key, str(_ledger_message_ref or ""), text_content)
+            from gateway.copy_blocks import wrap_copy_block
+            ledger_content = (
+                wrap_copy_block(text_content) if (metadata or {}).get("copy_block") else text_content
+            )
+            await asyncio.to_thread(
+                record_obligation, obligation_id=obligation_id, session_key=session_key,
+                platform=str(getattr(source.platform, "value", source.platform)),
+                chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                content=ledger_content,
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                resume_marker=getattr(event, "_restart_note_expected_marker", None),
+                resume_turn_id=getattr(event, "_gateway_active_turn_token", None),
+                supervisor_checkin=is_supervisor_checkin(event, metadata))
+            await asyncio.to_thread(mark_attempting, obligation_id)
+            return obligation_id
+        except Exception:
+            logger.debug("delivery ledger record failed", exc_info=True)
+            return None
+
+    def _settle_delivered_obligation_sync(self, obligation_id: str, result: Any = None) -> None:
+        """Mark delivered a send that already landed when this task was cancelled.
+
+        Another await would itself raise CancelledError and skip the write, which is how a
+        queued-lane interrupt left a landed Telegram message 'attempting' with attempts=0.
+        Only success settles here. A failed result needs the async finalizer's refusal,
+        follow-up and redelivery handling, which a cancelled turn cannot run, so that row
+        stays 'attempting' for the existing ambiguous-send recovery.
+        """
+        try:
+            from gateway.delivery_ledger import mark_delivered
+            mark_delivered(obligation_id, result)
+        except Exception:
+            logger.debug("delivery ledger update failed", exc_info=True)
 
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
-        """Settle a ledgered final from its send result (``base_delivery_ledger.finalize_final_obligation``)."""
-        await finalize_final_obligation(self, obligation_id, result, event, delivery_adapter)
+        """Mark the ledger row delivered/failed (best-effort). A degraded refusal
+        persisted after either a replacement or an in-place recovery needs another sweep:
+        the health sweep can run before this failure write. Other rejections use the
+        runner's timed redelivery, preserving flood and permanent-error policy."""
+        try:
+            from gateway.dead_targets import classify_dead_error
+            from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
+            from gateway.checkin_delivery import DISARMED
+            if getattr(result, "error", None) == DISARMED:
+                from gateway.delivery_ledger import abandon_obligation
+                await asyncio.to_thread(abandon_obligation, obligation_id, DISARMED)
+                return
+            if getattr(result, "success", False):
+                await asyncio.to_thread(mark_delivered, obligation_id, result)
+                return
+            error = str(getattr(result, "error", "") or "")
+            await asyncio.to_thread(mark_failed, obligation_id, error)
+            if is_reconnect_only(error):
+                redeliver = getattr(
+                    self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
+                live = self._final_delivery_adapter(event.source)
+                if callable(redeliver) and (
+                    live is not delivery_adapter
+                    or (live.is_connected and not live.send_path_degraded)
+                ):
+                    await redeliver(event.source.platform,
+                                    profile=getattr(delivery_adapter, "_owner_profile", None))
+            elif classify_dead_error(error) is None:  # a dead chat is never retried: no timer to wake
+                schedule = getattr(self.gateway_runner, "_schedule_flood_redelivery", None)
+                if callable(schedule):
+                    schedule(event.source.platform,
+                             profile=getattr(delivery_adapter, "_owner_profile", None))
+        except Exception:
+            logger.debug("delivery ledger update failed", exc_info=True)
 
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
@@ -4129,32 +4945,35 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
         from urllib.parse import quote as _quote
 
+        adapter_meta = metadata or {}
+
         def _as_image(path: str) -> bool:
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
         _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
         _image_paths += [p for p in local_files if _as_image(p)]
         if _image_paths:
             await self._send_image_batch(
-                event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
+                event, [(f"file://{_quote(p)}", "") for p in _image_paths], adapter_meta, human_delay,
                 record_delivery)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
             """MEDIA tags may route to send_voice (bare files never); an adapter's own failure notice is not repeated."""
             ext = Path(path).suffix.lower()
+            adapter_meta = metadata or {}
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=adapter_meta, is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
-                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=adapter_meta)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=adapter_meta)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
                 if not (isinstance(result.raw_response, dict) and result.raw_response.get("failure_notice_sent")):
-                    await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+                    await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=adapter_meta)
             return result
         queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
         if queue:
@@ -4175,10 +4994,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: dict[str, Any], human_delay: float,
         record_delivery: Callable) -> None:
-        """Batch-send images; a failure is logged (never raised) and recorded, so other attachments still go."""
+        """Batch-send images and record the result; a failure is logged, never raised."""
         try:
             result = await self.send_multiple_images(
-                chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
+                chat_id=event.source.chat_id, images=images,
+                metadata=metadata, human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             result = SendResult(success=False, error=str(batch_err))
@@ -4189,7 +5009,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
-        reply_to: Optional[str], is_ephemeral_response: bool = False,
+        reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
+        on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4198,22 +5019,61 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        async def _send(delivery_adapter: "BasePlatformAdapter", obligation_id: Optional[str]) -> SendResult:
-            logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
-                        len(text_content), event.source.chat_id)
-            if obligation_id is not None:
-                await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-            result = await delivery_adapter._send_with_retry(
-                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-            stop_reply_clock(delivery_adapter, event.source.chat_id, result)
-            return result
-        return await ledger_bracket(self, event, session_key, text_content, _send,
-                                    is_ephemeral_response=is_ephemeral_response)
+        delivery_adapter = self._final_delivery_adapter(event.source)
+        logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+                    len(text_content), event.source.chat_id)
+        obligation_id = await self._record_delivery_obligation(
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            metadata=metadata)
+        if obligation_id is not None and release_marker:
+            # The ledger now owns the crash recovery. It carries text only, so a caller with
+            # attachments still to send keeps the marker until they are delivered.
+            await self._release_turn_marker(event)
+        # A turn can be cancelled after transport success but before finalization. The send
+        # wrapper settles that success synchronously so recovery cannot resend it. A cancelled
+        # transport produces no result and stays attempting.
+        settlement = _PENDING_LEDGER_SETTLEMENT.set(
+            (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
+        outbound_stamp = None
+        try:
+            from gateway.reply_latency import delivery_scope, record_final_reply
+            from gateway.outbound_reply import reply_uid_for_final
+            receipt = getattr(event, "_terminal_reply_latency_receipt",
+                              getattr(event, "_reply_latency_receipt", None))
+            with delivery_scope(receipt, "text_send"):
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            record_final_reply(receipt, text_content, result)
+            # Read the exact row UID from the private gateway event, never adapter metadata.
+            reply_uid = reply_uid_for_final(event, metadata)
+            if result.success and result.message_id and reply_uid:
+                outbound_stamp = (session_key, str(result.message_id), str(reply_uid))
+        finally:
+            _PENDING_LEDGER_SETTLEMENT.reset(settlement)
+        # Let records_delivery count the captured result before cancellation propagates,
+        # but suspend before refusal callbacks or a failure write can run.
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            await asyncio.sleep(0)
+        if (obligation_id is None and not result.success and result.pre_send
+                and self._outbox_covers_final(event, delivery_adapter)):
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+                metadata=metadata, outbox_refused=True)
+        stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if on_refused is not None and not getattr(result, "success", False):
+            # Ledger whatever must follow this message BEFORE finalizing it: finalizing can run a
+            # recovery sweep right away, and that sweep must see the followers too.
+            await on_refused(result, delivery_adapter)
+        if obligation_id is not None:
+            await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        if outbound_stamp is not None:
+            _schedule_outbound_platform_stamp(getattr(self, "_session_store", None), *outbound_stamp)
+        return result, delivery_adapter
 
     async def ledger_attempted_final(self, event: MessageEvent, session_key: str, response: str, *,
                                      error: str) -> bool:
-        """A final already sent once whose outcome is unknown: ledger it as a failed row so the timed
-        redelivery sends it WITH the may-be-a-duplicate marker. True only when a row was saved."""
+        """Record an already attempted, uncertain final for marked redelivery."""
         text = (await self._extract_response_content(
             response, event, session_key, is_ephemeral_response=False)).text_content
         return bool(text) and await ledger_attempted(self, event, session_key, text, error)
@@ -4226,33 +5086,105 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             await self.gateway_runner._clear_durable_active_turn(event)
         getattr(event, "_gateway_marker_released", asyncio.Event()).set()
 
+    async def _capture_restart_note_marker(self, event: MessageEvent, session_key: str) -> None:
+        """Capture the resume marker for lanes that synthesize their delivery event.
+
+        Older lightweight runners may not expose the marker API; those lanes retain their historical
+        fail-open reconciliation behavior.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        reader = getattr(store, "get_resume_pending_marker", None)
+        if not callable(reader):
+            event._restart_note_marker_api_available = False
+            return
+        try:
+            marker = reader(session_key)
+            event._restart_note_expected_marker = (
+                await marker if inspect.isawaitable(marker) else marker
+            )
+            get_note = getattr(store, "get_restart_note", None)
+            if callable(get_note):
+                note_result = get_note(session_key)
+                event._restart_note_expected = (
+                    await note_result if inspect.isawaitable(note_result) else note_result
+                )
+            event._restart_note_marker_api_available = True
+        except Exception:
+            event._restart_note_marker_api_available = False
+
+    async def _reconcile_restart_note(self, event: MessageEvent, session_key: str) -> None:
+        """Compatibility entry point for callers that already confirmed delivery."""
+        await self._reconcile_restart_note_after_delivery(event, session_key)
+
+    async def _reconcile_restart_note_after_delivery(self, event: MessageEvent, session_key: str) -> None:
+        """Compatibility no-op: interrupted-turn notes are append-only and remain visible."""
+        return
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
+        attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
+            release_marker=not attachments_pending)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
-    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
+    async def _send_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: dict[str, Any],
+        record_delivery: Callable, *, attachments_pending: bool = False,
+        is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
+    ) -> None:
+        from gateway.platforms.base_copy_delivery import _send_copy_blocks
+        await _send_copy_blocks(
+            self, event, session_key, copy_blocks, metadata, record_delivery,
+            attachments_pending=attachments_pending,
+            is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=ephemeral_ttl)
+
+    async def _defer_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
+        metadata: dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        *, is_ephemeral_response: bool,
+    ) -> list:
+        """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
+        from gateway.delivery_ledger import mark_failed
+        held: list = []
+        for index in range(start, len(copy_blocks)):
+            block_metadata = {**metadata, "copy_block_index": index}
+            # Never sent, so the durable outbox will not replay it: the ledger must own it.
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, copy_blocks[index], delivery_adapter, is_ephemeral_response,
+                metadata=block_metadata, outbox_refused=True)
+            if obligation_id is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mark_failed, obligation_id, error)
+            held.append(SendResult(
+                success=False, error=f"copy block {index + 1} held behind an undelivered earlier block"))
+        return held
+
+    async def _notify_turn_error(
+        self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
+    ) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
             _thread_metadata = _thread_metadata_for_event(event)
-            # Only the policy reads bind the routed profile; the send stays in the launch scope
-            # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
             with self._media_delivery_scope(event.source):
                 content = None if diagnostic_wake_muted(event) else self.warning_text(
-                    t("gateway.errors.generic_failed"),  # raw exception text can carry credentials (logged above)
+                    t("gateway.errors.generic_failed"),
                     t("gateway.notify.turn_error"),
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            send_result = await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            if (getattr(send_result, "success", False) and session_key and not event.is_command()
+                    and hasattr(self, "_reconcile_restart_note_after_delivery")):
+                await self._reconcile_restart_note_after_delivery(event, session_key)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
@@ -4260,19 +5192,29 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: _ExtractedResponse,
                                    metadata: dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable, session_key: Optional[str] = None,
+                                   is_ephemeral_response: bool = False) -> None:
         """Send image URLs, MEDIA files and bare local files (human-paced) on the CURRENT transport,
         like the final text: a reconnect can retire this adapter mid-turn. Results feed ``record_delivery``."""
         live = self._final_delivery_adapter(event.source)
         human_delay = live._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
+        attachment_delivered = False
+
+        def _record_attachment(result):
+            nonlocal attachment_delivered
+            record_delivery(result)
+            attachment_delivered = attachment_delivered or bool(getattr(result, "success", False))
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-            await live._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            await live._send_image_batch(event, images, metadata, human_delay, _record_attachment)
         await live._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+            human_delay=human_delay, metadata=metadata, record_delivery=_record_attachment)
+        if (attachment_delivered and session_key and not is_ephemeral_response and not event.is_command()
+                and hasattr(self, "_reconcile_restart_note_after_delivery")):
+            await self._reconcile_restart_note_after_delivery(event, session_key)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -4285,20 +5227,28 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         ``stop_event`` is passed only when the (possibly overridden) ``_keep_typing`` accepts it."""
         if not typing_refresh_wanted(self, event):  # heartbeats, and senders admission will drop (#149024)
             return None
-        kwargs: dict[str, Any] = {"metadata": metadata}
+        kwargs: dict[str, Any] = {"interval": self.typing_refresh_interval, "metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event
         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> _ExtractedResponse:
-        """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
-        paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
-        # Captured before extract_media strips it: images then go via send_document (no recompression).
-        force_document = "[[as_document]]" in response
+        """Split a handler response into deliverable text, copy blocks and attachments. Order matters:
+        copy blocks are removed first so MEDIA/image/file directives inside a block remain literal body text.
+        Remaining text then follows the existing MEDIA → image → residual directive → bare local path
+        pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
+        recovered."""
         pre_extract = response
+        # All inline bodies stay opaque through directive extraction. Telegram keeps
+        # display markers for literal quotes; interrupted blocks never become copy sends.
+        response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
+        if getattr(event, "_copy_blocks_inline_only", False):
+            copy_blocks = []
+        # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
+        force_document = "[[as_document]]" in response
+        # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
+        skip_bare_paths = is_ephemeral_response or isinstance(response, CommandReply)
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
@@ -4312,7 +5262,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             if images:
                 logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
             local_files = []
-            if not is_ephemeral_response:
+            if not skip_bare_paths:
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
             from gateway.platforms.docker_media_paths import hand_back_unreadable_media
@@ -4330,7 +5280,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # A2 (#29346): extraction can reduce a non-empty response to empty text with no attachment, and the
         # `if text_content` guard below then drops it silently. Recover on every platform (#33842 was
         # Discord-only); the guard avoids duplicating an attachment.
-        if not (text_content or images or local_files or media_files):
+        if not (text_content or copy_blocks or images or local_files or media_files):
             _recovered = _strip_media_directives(response).strip()
             if _recovered:
                 logger.warning("[%s] response_delivery_recovered: extract pipeline "
@@ -4338,23 +5288,78 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                                "no attachment; delivering recovered original to %s", self.name,
                                len(pre_extract), event.source.chat_id)
                 text_content = _recovered
-        return footer_onto_photo_caption(self, _ExtractedResponse(text_content=text_content, images=images, media_files=media_files,
-            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract), _IMAGE_EXTS)  # #74547
+        if inline_bodies:
+            # Same outer trim as text without blocks; bodies inside stay byte-exact.
+            text_content = restore_inline_copy_bodies(text_content, inline_bodies).strip()
+        return footer_onto_photo_caption(self, _ExtractedResponse(
+            text_content=text_content, copy_blocks=copy_blocks, images=images, media_files=media_files,
+            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract), _IMAGE_EXTS)
 
-    async def _fire_post_delivery_callback(self, session_key: str, generation: int | None) -> None:
-        """Run the turn's post-delivery slot; ``generation`` is read as its handler returns (#100061)."""
-        await run_post_delivery_callback(self.pop_post_delivery_callback(
-            session_key, generation=generation), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+    async def _fire_post_delivery_callback(
+        self, session_key: str, generation: int | None,
+    ) -> None:
+        """Run the one-shot callback for the generation captured after this handler returned, after
+        any older generation's callback for the session that nothing fired: that turn is over, and its
+        callback (temporary progress cleanup above all) would otherwise be held forever. An older
+        generation a deliverer has claimed (``claim_post_delivery``) is not over: its reply may still
+        be sending, and its own deliverer fires it after that send."""
+        callbacks = []
+        if generation is not None:
+            claims = _lazy_attr(self, "_post_delivery_claims", set)
+            claims.discard((session_key, int(generation)))
+            owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+            stale = sorted(k for k in owned
+                           if k[0] == session_key and k[1] < int(generation) and k not in claims)
+            callbacks.extend(owned.pop(k) for k in stale)
+        callbacks.append(self.pop_post_delivery_callback(session_key, generation=generation))
+        for _post_cb in callbacks:
+            await run_post_delivery_callback(_post_cb, _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
         drain task and leave it the guard. Nothing pending: release the guard only if we still own
         it."""
-        late_pending = self._pending_messages.pop(session_key, None)
+        # Deferred control commands run before ordinary queued text, against the committed
+        # transcript/context produced by this turn. Keep any ordinary follow-up in its slot.
         current_task = asyncio.current_task()
+        existing_task = self._session_tasks.get(session_key)
+        if existing_task is not None and existing_task is not current_task and not existing_task.done():
+            # The in-band drain (or an earlier late-arrival drain) already handed the session to a
+            # successor task; it drains deferred commands and queued text in order. Spawning here would
+            # run two tasks on one session.
+            return
+        if interrupt_event.is_set():
+            self._invalidate_deferred_commands(session_key)
+        # Fence only when the canceller explicitly owns the pending slot (replay,
+        # spool, or discard). Retire-now retains work for this finalizer to drain.
+        if (current_task is not None and current_task.cancelling()
+                and getattr(current_task, "_hermes_pending_owner", None) is not None):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
+        if deferred is not None:
+            if not self._spawn_drain_task(deferred, session_key):
+                if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                    self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        pending = self._pending_messages.get(session_key)
+        # Preserve the compression waiter's existing self-requeue cancellation fence.
+        if (current_task is not None and current_task.cancelling()
+                and pending is getattr(current_task, "_hermes_event", None)
+                and getattr(pending, "_gateway_compression_deferred", False)):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        # A drain-deferred turn belongs to the shutdown spool, not this adapter's
+        # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
+        runner = getattr(self, "gateway_runner", None)
+        if (getattr(pending, "_drain_deferred", False)
+                and (runner is None or getattr(runner, "_draining", False))):
+            if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        late_pending = self._pending_messages.pop(session_key, None)
         if late_pending is not None:
-            existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
                 # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
                 # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
@@ -4370,12 +5375,65 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
+    async def _handle_compression_retries(
+        self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
+    ) -> Optional[Union[str, "EphemeralReply"]]:
+        """Keep one processing lifecycle while the same input waits for compression.
+
+        The pending slot stays visible during backoff for FIFO admission and shutdown.
+        Controls retain the existing task cancellation and guard ownership boundaries.
+        """
+        while True:
+            handler = self._message_handler
+            if handler is None:
+                # Hard drain can withdraw ingress after this task took ownership of the event.
+                # Return it to shutdown recovery rather than failing a turn that never ran.
+                runner = self.gateway_runner
+                if runner is not None and runner._draining and runner._preserve_drain_event(session_key, event):
+                    return None
+                raise RuntimeError("Gateway message handler is unavailable")
+            token = post_delivery_owner.set((self, event))
+            try:
+                response = await handler(event)
+            finally:
+                post_delivery_owner.reset(token)
+            if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
+                    or self._pending_messages.get(session_key) is not event):
+                return response
+            if getattr(event, "_drain_deferred", False):
+                return None
+            delay = self._requeue_backoff_delay(session_key, event, event)
+            await asyncio.sleep(delay)
+            if (self._active_sessions.get(session_key) is not interrupt_event
+                    or self._pending_messages.get(session_key) is not event):
+                return None
+            self._pending_messages.pop(session_key)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            # Restart recovery follows session-task successors. Keep the event that each shared
+            # background task actually consumes so a merged pending-slot event can report its
+            # terminal result back to the parked recovery observer.
+            current_task._hermes_event = event
+        deferred_session = getattr(event, "_deferred_session_key", None)
+        if deferred_session is not None:
+            current_generation = self._session_generations.get(session_key, 0)
+            if (deferred_session != session_key
+                    or getattr(event, "_deferred_generation", None) != current_generation):
+                logger.info("[%s] Dropping stale deferred command for session %s", self.name, session_key)
+                self._unresolved_deferred_map().pop(id(event), None)
+                current_task = asyncio.current_task()
+                if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                    self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
+                return
+        delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
+        from gateway.cron_review import ReviewCapture
+        review_capture = ReviewCapture(event)
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+        def _record_delivery(result, *, required: bool = False):
+            nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
@@ -4383,19 +5441,29 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         interrupt_event = guard_under_commands(self._active_sessions.get(session_key)) or asyncio.Event()
         self._active_sessions.setdefault(session_key, interrupt_event)  # an in-flight command keeps its own
         _thread_metadata = _thread_metadata_for_event(event)
-        _typing_metadata = typing_metadata_for_turn(  # fixed now: a later inbound must not move it
-            self, event.source.chat_id, _reply_anchor_for_event(event), _thread_metadata)
-        typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
-        generation = None
+        _typing_metadata = typing_metadata_for_turn(
+            self, event.source.chat_id, _reply_anchor_for_event(event), typing_metadata_for_event(event))
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
+        from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
+        turn_token = scoped_turn_entry()
+        delivery_generation = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
-            response = await self._message_handler(event)
-            generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            response = await self._handle_compression_retries(event, session_key, interrupt_event)
+            # The handler can recover source routing (for example, a missing thread id);
+            # build final transport metadata from that resolved event.
+            _thread_metadata = _thread_metadata_for_event(event)
+            if getattr(event, "_drain_deferred", False):
+                return  # Shutdown owns the retained input, not a completed delivery.
+            bind_event_turn(event)
+            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
+            # A cron review is always muted, but its reply is the scheduler's verdict, not a
+            # presentation: review_capture keeps it off every send path instead.
             with self._media_delivery_scope(event.source):
-                if diagnostic_wake_muted(event):
+                if review_capture.future is None and diagnostic_wake_muted(event):
                     response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
@@ -4405,6 +5473,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            response = review_capture.capture_reply(response, event)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -4412,18 +5481,22 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                from agent.notice_style import notice_metadata
+                _final_thread_metadata = notice_metadata(
+                    _mark_notify_metadata(_thread_metadata), platform=self.platform,
+                    style=getattr(response, "notice_style", None))
                 _tts_paths, _tts_requested_path = [], None
+                _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content, event.source)
+                        event, session_key, interrupt_event, _spoken_text, media_files):
+                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text, event.source)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
+                            _record_delivery, session_key)
                     finally:
                         with contextlib.suppress(OSError):
                             os.remove(_tts_path)
@@ -4439,19 +5512,30 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 # _stop_typing_refresh's finally discards it, so it cannot leak into the next
                 # turn. No new await on the delivery path (a fire-and-forget stop task was
                 # measured to have no effect).
-                if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
-                    self.pause_typing_for_chat(event.source.chat_id)
+                    call_typing_with_metadata(self.pause_typing_for_chat, event.source.chat_id, metadata=_typing_metadata)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl, _record_delivery,
+                        attachments_pending=bool(
+                            extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files))
+                if extracted.copy_blocks:
+                    await self._send_copy_blocks(
+                        event, session_key, extracted.copy_blocks, _final_thread_metadata,
+                        lambda result: _record_delivery(result, required=True),
+                        attachments_pending=bool(extracted.images or extracted.media_files or extracted.local_files),
+                        is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=_ephemeral_ttl)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                    record_delivery=_record_delivery, session_key=session_key,
+                    is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
+            # A deferred command's own reply was its outcome, unless that reply failed to deliver.
+            self._resolve_deferred_command(event, outcome_visible=delivery_succeeded or not delivery_attempted)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4462,41 +5546,66 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
-            if session_key in self._pending_messages:
+            # Deferred control mutations own the committed boundary before prompt text.
+            delay = 0.0
+            pending_event = self._pop_deferred_command(session_key)
+            if (pending_event is None and session_key in self._pending_messages
+                    and not (getattr(getattr(self, "gateway_runner", None), "_draining", False)
+                             and getattr(self._pending_messages[session_key], "_drain_deferred", False))):
                 pending_event = self._pending_messages[session_key]
                 delay = self._requeue_backoff_delay(session_key, pending_event, event)
-                if not delay:  # a backed-off event stays queued until the drain task wakes
+                if not delay:
                     self._pending_messages.pop(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata, event=event)
-                await self._fire_post_delivery_callback(session_key, generation)  # done before the follow-up starts
+                await self._fire_post_delivery_callback(session_key, delivery_generation)  # done before the follow-up starts
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            bind_event_turn(event)
+            self._resolve_deferred_command(event)  # a deferred command's turn-error notice is its outcome
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            await self._notify_turn_error(event, e)
+            await review_capture.notify_error(self, event, e, session_key)
             from hermes_cli.config_backend import ConfigBackendUnavailable as _outage  # this turn only
             if isinstance(e, (SystemExit, KeyboardInterrupt)) and not isinstance(e, _outage):  # rest contained
                 raise
         finally:
+            restore_turn(turn_token)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
-            # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.
+            # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
+            # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata, event=event)
-            await self._fire_post_delivery_callback(session_key, getattr(interrupt_event, "_hermes_run_generation", None) if generation is None else generation)
+            from gateway.session_ingress import settle_pause_notice
+            settle_pause_notice(event, delivery_succeeded)  # a pause notice is told only once delivered
+            if not (self._pending_messages.get(session_key) is event
+                    and getattr(event, "_gateway_compression_deferred", False)):
+                # A FIFO-run turn names its exact owner and generation; the interrupt event's
+                # generation is the fallback for in-process turns.
+                from gateway.session_ingress import fire_turn_post_delivery
+                if not await fire_turn_post_delivery(event):
+                    await self._fire_post_delivery_callback(session_key, delivery_generation)
+                await release_temporary_notices(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1, event=event)
+            from gateway.session_ingress import join_turn_bookkeeping
+            await join_turn_bookkeeping(event)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if self.gateway_runner is not None and self.platform == Platform.TELEGRAM:
+                from gateway.telegram_retire import advance
+                await advance(self.gateway_runner, event.source)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot
@@ -4534,13 +5643,17 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         return delay
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str,
-                          delay: float = 0.0) -> None:
+                          delay: float = 0.0) -> bool:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained
         follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
-        live for concurrent inbound; ownership moves so stale-lock detection works. With ``delay``
-        the event stays in ``_pending_messages`` and the new owner task pops the slot only after
-        sleeping, so a cancel/discard during the back-off needs no put-back and can't drop a
-        newer message."""
+        live for concurrent inbound; ownership moves so stale-lock detection works."""
+        deferred_session = getattr(pending_event, "_deferred_session_key", None)
+        if deferred_session is not None:
+            current_generation = self._session_generations.get(session_key, 0)
+            if (deferred_session != session_key
+                    or getattr(pending_event, "_deferred_generation", None) != current_generation):
+                logger.info("[%s] Not spawning stale deferred command for session %s", self.name, session_key)
+                return False
         self._clear_session_guard(session_key)
         # Capture the guard this drain owns now: a /stop//new guard swapped in during the
         # back-off must survive the slot-empty exit (#48300).
@@ -4548,6 +5661,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self._track_session_task(
             session_key,
             asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
+        return True
 
     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
                            guard: Optional[asyncio.Event]) -> None:
@@ -4588,6 +5702,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
+        # Fence deferred commands first: a cancelled owner's cleanup would otherwise drain one (task
+        # cancellation does not set its interrupt event) and mutate a transcript during teardown.
+        self._invalidate_all_deferred_commands()
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
         for _ in range(5):
@@ -4596,6 +5713,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 break
             for task in tasks:
                 self._expected_cancelled_tasks.add(task)
+                task._hermes_pending_owner = "shutdown_spool"
                 task.cancel()
             try:
                 await asyncio.wait_for(
@@ -4606,14 +5724,28 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        self._invalidate_all_deferred_commands()
+        try:
+            await self._report_unrun_deferred_commands()
+        except Exception as exc:  # incl. the 5s bound: reporting never blocks teardown
+            logger.warning("[%s] Reporting unrun deferred commands failed: %r", self.name, exc, exc_info=True)
+        # The gateway knows each key's runtime profile even when a shared primary bot received it.
+        # Its first shutdown pass normally emptied these slots; retry leftovers through the same
+        # owner-scoped writer rather than silently depositing them in the launch home's spool.
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and hasattr(runner, "_flush_owned_pending"):
+            for key, value in list(self._pending_messages.items()):
+                with contextlib.suppress(Exception):
+                    runner._flush_owned_pending(key, value, reason="adapter_shutdown")
+        else:
+            with contextlib.suppress(Exception):
+                from gateway.shutdown_flush import flush_pending_to_file
+                flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._requeue_counts,
-                       self._text_debounce_store()):
+                       self._pending_messages, self._deferred_commands, self._active_sessions,
+                       self._requeue_counts, self._text_debounce_store()):
             bucket.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
@@ -4685,9 +5817,77 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
-                         len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
-        """Split a long message into Markdown-safe chunks with ``(1/3)`` indicators: fences
-        close/reopen, inline code and links stay whole, pipe tables repeat their header.
-        ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram). See ``base_chunking``."""
-        from gateway.platforms.base_chunking import chunk_markdown_message
-        return chunk_markdown_message(content, max_length, len_fn)
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
+        """Split a long message into chunks preserving code blocks: a split inside a fence closes it
+        at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
+        ``indicator_overhead`` reserves additional length units for caller-side suffix encoding."""
+        from gateway.platforms.base_chunking import safe_markdown_split
+        from gateway.platforms.helpers import table_header_to_repeat, table_rollback_point, table_row_start
+        _len = len_fn or len
+        if _len(content) <= max_length:
+            return [content]
+        # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
+        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})") + indicator_overhead
+        FENCE_CLOSE = "\n```"
+        chunks: list[str] = []
+        remaining = content
+        carry_lang: Optional[str] = None  # language tag ("" ok) when previous chunk ended mid-fence
+        carry_header: Optional[str] = None
+        while remaining:
+            prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+            if carry_header:
+                prefix = f"{carry_header}\n"
+            # Body budget after prefix/fence/indicator; floored so a tiny max_length can't stall.
+            headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
+            if headroom < 1:
+                headroom = max(1, max_length // 2)
+            # Remainder can only be final if it fits before any synthesized closing fence;
+            # avoid rescanning the entire remainder on every non-final iteration.
+            final_budget = max_length - INDICATOR_RESERVE
+            if _len(prefix) + _len(remaining) <= final_budget:
+                # Reserve a close only for a reopened fence that remains open at the end.
+                final_close = ""
+                if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
+                    final_close = FENCE_CLOSE
+                if _len(prefix) + _len(remaining) + _len(final_close) <= final_budget:
+                    chunks.append(prefix + remaining + final_close)
+                    break
+            # Natural split (newline, then space); a custom _len budget maps to a codepoint offset.
+            _cp_limit = (
+                _custom_unit_to_cp(remaining, headroom, _len) if _len is not len else headroom)
+            region = remaining[:_cp_limit]
+            split_at = region.rfind("\n")
+            if split_at < _cp_limit // 2:
+                split_at = region.rfind(" ")
+            if split_at < 1:
+                # Floor at one codepoint: a zero _cp_limit (max_length 0/1, or a surrogate pair
+                # wider than the utf16 budget) would never shrink ``remaining``; overshooting beats
+                # a hang.
+                split_at = max(1, _cp_limit)
+            split_at = safe_markdown_split(remaining, split_at, _cp_limit)
+            # Pipe tables: move a split that lands mid-table to before the header when the
+            # whole table fits a fresh chunk; a larger table splits between rows and the next
+            # chunk repeats its header (``carry_header``). Fenced pipes are not tables.
+            if not fence_state_after(remaining[:split_at], carry_lang is not None, carry_lang or "")[0]:
+                # A continuation chunk's header lives only in ``prefix``; let the row check see it.
+                if carry_header:
+                    row_start = table_row_start(prefix + remaining, len(prefix) + split_at) - len(prefix)
+                    split_at = row_start if row_start >= 1 else split_at  # first row of remaining: oversized
+                else:
+                    split_at = table_row_start(remaining, split_at)
+                split_at = table_rollback_point(
+                    remaining, split_at, lambda t: _len(t) <= max_length - INDICATOR_RESERVE)
+            chunk_body = remaining[:split_at]
+            remaining = remaining[split_at:].lstrip()
+            full_chunk = prefix + chunk_body
+            # Walk only chunk_body (not the prepended prefix) for the fence state.
+            in_code, lang = fence_state_after(chunk_body, carry_lang is not None, carry_lang or "")
+            carry_lang = lang if in_code else None
+            carry_header = None if in_code else table_header_to_repeat(full_chunk, remaining, max_length // 4, _len)
+            # Close the orphaned fence so the chunk stands alone.
+            chunks.append(full_chunk + FENCE_CLOSE if in_code else full_chunk)
+        if len(chunks) > 1:
+            chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
+        return chunks

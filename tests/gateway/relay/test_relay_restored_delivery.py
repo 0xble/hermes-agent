@@ -91,7 +91,9 @@ def _record_dispatch(adapter, dispatched):
     async def handle_message(event):
         dispatched.append((adapter, event))
         # The turn's final reply leaves through the adapter that runs it.
-        await adapter.send(event.source.chat_id, "resumed")
+        result = await adapter.send(event.source.chat_id, "resumed")
+        # The stub replaces the model turn, which reports its terminal result to recovery.
+        event._agent_turn_succeeded = result.success
     adapter.handle_message = handle_message
 
 

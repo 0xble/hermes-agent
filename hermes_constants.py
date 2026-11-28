@@ -44,7 +44,11 @@ def set_hermes_home_override(path: str | Path | None):
         switched = legacy_switch(path)
         if switched is not None:
             return switched
-    return push_state(home=None if path is None else str(path))
+    # Normalize shell/user syntax before the test isolation and profile-scope
+    # readers classify relative authority ids. Otherwise ``$HOME/foo`` and
+    # ``~/foo`` are mistaken for symbolic profile names by those readers.
+    normalized = None if path is None else str(_expand_hermes_home(str(path)))
+    return push_state(home=normalized)
 
 
 def reset_hermes_home_override(token) -> None:

@@ -284,6 +284,7 @@ def test_contended_rpc_fixture_shuts_down_and_exits(tmp_path):
         from tools import mcp_tool_loop
 
         with contextmanager(source["session"].__wrapped__)():
+            source["_register"](source["COSTED"])  # registration records a trust tier for every server
             class ContendedLock(asyncio.Lock):
                 def __init__(self):
                     super().__init__()

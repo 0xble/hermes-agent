@@ -141,10 +141,22 @@ def interrupt_subagent(subagent_id: str) -> bool:
         return False
     agent._delegate_stop_requested = True  # read where a run that never started settles its record
     try:
-        return bool(request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"))
+        try:
+            agent._delegation_interrupt_reason = "stop_command"
+        except (AttributeError, TypeError):
+            pass  # a legacy immutable facade must still receive the stop request
+        accepted = bool(request_hard_interrupt(
+            agent, f"Interrupted via TUI ({subagent_id})", delegation_reason="stop_command"))
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
+    if accepted and record.get("delegation_id"):
+        # Persist the stop now: if the owner dies before the child reports interrupt_reason, orphan
+        # recovery must not reschedule work the user explicitly stopped.
+        from tools.async_delegation import _cancel_pending_retries_safely
+        _cancel_pending_retries_safely("interrupt_subagent", reason="stop_command",
+                                       delegation_id=str(record["delegation_id"]))
+    return accepted
 
 def _subagent_transport_matches(record, transport) -> bool:
     """Authority follows the owning session's LIVE transport slot, read at check time.
@@ -193,7 +205,10 @@ def steer_subagent(
         if agent is None:
             return False
         try:
-            return bool(agent.steer(text))
+            try:
+                return bool(agent.steer(text, human=False))
+            except TypeError:
+                return bool(agent.steer(text))
         except Exception as exc:
             logger.debug("steer_subagent(%s) failed: %s", subagent_id, exc)
             return False
@@ -279,6 +294,11 @@ def _owns_subagent_record(record: dict[str, Any], parent_agent: Any) -> bool:
     tips = {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
     return any(_resolve_session_lineage(owner_sid, parent_agent) in tips for owner_sid in owners)
 
+def _now() -> float:
+    """Wall clock for list observations; a module seam so tests never patch the time module."""
+    return time.time()
+
+
 def _list_payload(parent_agent: Any) -> dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -292,11 +312,50 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
             "model": r.get("model"),
-            "status": r.get("status"),
-            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+            "status": r.get("status"), "tool_count": r.get("tool_count", 0),
+            "running_seconds": round(_now() - started, 1) if isinstance(started, (int, float)) else None,
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
+    # A queued background unit has no child-agent record yet, but it is still
+    # controllable by its delegation handle and must remain visible to its owner.
+    try:
+        from tools.async_delegation import list_async_delegations
+        parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+        for r in list_async_delegations():
+            if r.get("status") != "queued":
+                continue
+            if not _owns_durable_delegation(r, parent_agent):
+                continue
+            entries.append({
+                "subagent_id": r.get("delegation_id"),
+                "delegation_id": r.get("delegation_id"),
+                "parent_id": parent_sid,
+                "goal": r.get("goal"),
+                "model": r.get("model"),
+                "status": "queued",
+                "running_seconds": round(_now() - (r.get("queued_at") or r.get("dispatched_at") or _now()), 1),
+                "accepting_steer": False,
+                "live_transcript": None,
+                "queue_reason": r.get("queue_reason", "async pool capacity"),
+            })
+    except Exception:
+        logger.debug("Could not list queued async delegations", exc_info=True)
+    # Retry-pending units are not live but are still Hermes's job: show them so the parent does not
+    # dispatch a duplicate (the notice will arrive when the retry is due).
+    try:
+        from tools.delegation_resume import list_retry_pending
+        for r in list_retry_pending():
+            if not _owns_durable_delegation(r, parent_agent):
+                continue
+            entries.append({
+                "subagent_id": r["delegation_id"], "delegation_id": r["delegation_id"],
+                "goal": (r.get("task") or {}).get("goal"), "status": f"retry_{r['retry_state']}",
+                "retry_reason": r["retry_reason"], "retry_due_at": r["retry_due_at"],
+                "retry_attempt": r["retry_attempt"] + 1, "accepting_steer": False,
+            })
+    except Exception:
+        logger.debug("Could not list retry-pending delegations", exc_info=True)
     from tools.delegate_tool_auto_resume import waiting_entries
     live = {e["subagent_id"] for e in entries}
     entries += [w for w in waiting_entries(parent_agent) if w["subagent_id"] not in live]
@@ -443,10 +502,10 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
 
 
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
-    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+    """In-turn list/steer/stop/resume, scoped to the conversation's spawn tree."""
     if action == "list":
-        return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+        from tools.delegate_tool_progress import _list_observation
+        return json.dumps(_list_observation(parent_agent, _list_payload(parent_agent)), ensure_ascii=False)
     if action == "resume":
         return _handle_resume_action(subagent_id, parent_agent)
 
@@ -457,13 +516,22 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
     if record is None and action == "stop":
-        from tools.delegation_resume import cancel_pending_retries, retry_status
+        try:
+            from tools.async_delegation import interrupt_delegation, list_async_delegations
+            from tools.delegation_resume import retry_status
+            candidates = list_async_delegations()
+            if durable := retry_status(sid):
+                candidates.append(durable)
+            owned = next((r for r in candidates
+                          if r.get("delegation_id") == sid
+                          and _owns_durable_delegation(r, parent_agent)), None)
+            if owned is not None and interrupt_delegation(sid, reason="stop_command"):
+                return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",
+                                   "note": "Stop requested; pending automatic recovery is cancelled."}, ensure_ascii=False)
+        except Exception:
+            logger.debug("Could not stop queued async delegation %s", sid, exc_info=True)
 
-        retry = retry_status(sid)
-        if (retry is not None and _owns_durable_delegation(retry, parent_agent)
-                and cancel_pending_retries(delegation_id=sid)):
-            return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",
-                               "note": "The pending recovery was stopped."})
+    if record is None and action == "stop":
         from tools.delegate_tool_auto_resume import dismiss
         dismissed = dismiss(parent_agent, sid)
         if dismissed == "dismissed":  # not running, waiting to resume: it never resumes, its pin is released

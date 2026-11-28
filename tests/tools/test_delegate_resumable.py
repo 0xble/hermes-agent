@@ -82,10 +82,10 @@ def test_a_limit_stopped_child_is_continued_after_a_restart_on_its_own_transcrip
 
 
 @pytest.mark.parametrize("cause", ["gateway", "user"])
-def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(cause):
+def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(cause, monkeypatch):
     import threading
 
-    from tools.async_delegation import interrupt_all
+    from gateway.run_shutdown import GatewayShutdownMixin
     from tools.delegate_tool import delegate_task
     from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock, interrupt_subagent
 
@@ -110,7 +110,14 @@ def test_a_gateway_shutdown_leaves_a_resumable_record_and_a_user_stop_does_not(c
         sid = out["subagent_ids"][0]
         assert started.wait(10)
         if cause == "gateway":
-            interrupt_all(reason="gateway shutdown (test)", resumable=True)  # gateway/run_shutdown.py's call
+            # The real restart sweep, with its unrelated process/cron/env/browser teardown stubbed out.
+            import tools.process_registry as _pr
+            monkeypatch.setattr(_pr.process_registry, "kill_all", lambda *a, **k: 0)
+            monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
+            monkeypatch.setattr("tools.environments.base.kill_live_foreground_processes", lambda **k: None)
+            monkeypatch.setattr("tools.terminal_tool_lifecycle.cleanup_all_environments", lambda: None)
+            monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+            GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt", restart=True)
         else:
             with _active_subagents_lock:
                 assert sid in _active_subagents

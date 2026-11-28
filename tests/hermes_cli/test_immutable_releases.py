@@ -1004,13 +1004,13 @@ def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_pat
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "generate_launchd_plist", lambda **kwargs: "candidate")
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist.read_bytes() == b"candidate")
-    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: False)
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path, **_: False)
     assert not update_cmd._activate_immutable_release()
     assert (home / "current").resolve() == b
     assert (home / "previous").resolve() == a
     assert plist.read_bytes() == b"candidate"
     assert (home / "release-txn.json").exists()
-    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: True)
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path, **_: True)
     monkeypatch.setattr(update_cmd, "_await_release_acknowledgement", lambda path: False)
     assert not update_cmd._activate_immutable_release()
     assert (home / "current").resolve() == b

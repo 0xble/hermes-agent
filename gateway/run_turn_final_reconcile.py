@@ -12,6 +12,7 @@ import inspect
 import logging
 from typing import Any, Callable, Optional
 
+from gateway.copy_blocks import copy_free_text_for
 from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
 from gateway.platforms.base import _SEND_RETRY_INLINE_WAIT_CAP_SECS
 
@@ -133,7 +134,8 @@ async def edit_streamed_message(consumer: Any, source: Any, response: dict, cont
     ``already_sent`` stays unset so the normal final send delivers the content."""
     try:
         result = await edit_preview_to_final(
-            consumer.adapter, source.chat_id, consumer.message_id, content, getattr(consumer, "metadata", None),
+            consumer.adapter, source.chat_id, consumer.message_id, copy_free_text_for(consumer.adapter, content),
+            getattr(consumer, "metadata", None),
             still_current=getattr(consumer, "_run_still_current", None))
     except Exception as edit_err:  # health: allow BLE001 -- any edit failure falls back to the normal final send
         logger.warning(fail_exc, sk, edit_err)

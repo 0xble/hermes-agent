@@ -487,9 +487,11 @@ def _stop_gateways(token: dict, entries: list[dict]) -> None:
     """Drain every gateway (bare ones SIGTERMed when they do not answer), then wait for all of them
     within one drain budget. A supervised gateway that exited through the drain is stopped through
     its supervisor at once: its exit 75 asks for a restart, which systemd honours after
-    ``RestartSec=5`` and launchd immediately, still on the old tree. Past the budget a survivor still
-    doing live work is left running with its restart pending (``_leave_running``) and the pause rolls
-    back: the budget bounds this wait, never the gateway's work."""
+    ``RestartSec=5`` and launchd immediately, still on the old tree. Past the budget a drained
+    survivor that still names live work is left running with its restart pending
+    (``_leave_running``) and the pause rolls back: the budget bounds this wait, never work the
+    gateway can name. A survivor that names none has outlived its own bounded restart wait, so it
+    gets the bounded escalation: its supervisor's stop, or SIGKILL for a bare one."""
     from hermes_cli import update_pause_record as pause_record
     from hermes_cli.update_cmd_drain_report import drain_progress_reporter
     if token.get("force"):
@@ -517,13 +519,21 @@ def _stop_gateways(token: dict, entries: list[dict]) -> None:
         for tick in ticks if waiting else ():
             tick()
         time.sleep(0.2)
-    killed = [e for e in waiting if e["pid"] not in drained]  # SIGTERMed (no drain verb): already stopping
-    for entry in killed:
-        with suppress(ProcessLookupError, PermissionError):
-            os.kill(entry["pid"], getattr(signal, "SIGKILL", signal.SIGTERM))
-    if left := _wait_gone([e["pid"] for e in killed], 10.0, {e["pid"]: e.get("ct") for e in killed}):
+    from hermes_cli.update_cmd_drain_report import read_active_work
+    # A drained survivor that still names live work is left running. One that names none has
+    # outlived its own bounded restart wait and is stopped like a gateway that never drained.
+    live = [e for e in waiting if e["pid"] in drained and read_active_work(Path(e["home"]))]
+    stopping = [e for e in waiting if e not in live]
+    for entry in stopping:
+        if entry.get("kind"):
+            _stop_at_once(entry)
+        else:
+            with suppress(ProcessLookupError, PermissionError):
+                os.kill(entry["pid"], getattr(signal, "SIGKILL", signal.SIGTERM))
+    bare = [e for e in stopping if not e.get("kind")]
+    if left := _wait_gone([e["pid"] for e in bare], 10.0, {e["pid"]: e.get("ct") for e in bare}):
         raise PauseRefused("gateway PID(s) " + ", ".join(map(str, sorted(left))) + " did not stop")
-    if live := [e for e in waiting if e["pid"] in drained]:
+    if live:
         _leave_running(token, live)
         raise PauseRefused(f"{_names(live)} still running live work past the {budget:.0f}s wait")
 

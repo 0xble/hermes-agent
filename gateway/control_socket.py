@@ -597,11 +597,11 @@ def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
 def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
                              force: bool = False) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` to restart for an update. Returns the ACK ``{"pausing",
-    "already_stopping", "pid", "drain_timeout", "force", "waiting_on"}`` or None when no gateway
-    answers (old gateway without the verb, no/dead socket) — the caller then uses the legacy
-    signal/tree-kill pause path.
+    "already_stopping", "pid", "drain_timeout"}`` (plus ``"force": true`` for a forced stop and
+    ``"waiting_on"`` when live work holds the restart) or None when no gateway answers (old gateway
+    without the verb, no/dead socket) — the caller then uses the legacy signal/tree-kill pause path.
 
-    Default: restart when idle (the gateway keeps serving and never interrupts live work). ``force``
+    Default: restart when idle (the gateway keeps serving inside its restart wait budgets). ``force``
     stops live work now; a gateway that predates it answers without ``"force": true``.
     Step 2 of the socket migration (#92091).
     """

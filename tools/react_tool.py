@@ -27,8 +27,8 @@ def _gateway_platform():
 def _react_gateway(platform, emoji: str) -> str:
     from gateway.session_context import acknowledge_current_message_reaction
     from model_tools import _run_async
-    from tools.send_message_senders import _live_adapter
-    from tools.send_message_tool import _dispatch_on_gateway_loop
+    from gateway.outbound.senders import _live_adapter
+    from gateway.outbound.send import _dispatch_on_gateway_loop
 
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID")

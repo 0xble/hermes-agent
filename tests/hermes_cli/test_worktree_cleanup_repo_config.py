@@ -74,7 +74,8 @@ def test_cleanup_deletes_the_session_branch_without_running_repository_hooks(
 def test_worktree_removal_steps_still_run_under_the_inherited_environment(session_worktree, monkeypatch, tmp_path):
     repo, worktree, _markers = session_worktree
     monkeypatch.setenv("HOME", str(tmp_path))
-    _git(repo, "worktree", "lock", str(worktree))
+    # A Hermes session lock: exit cleanup releases its own lock and keeps a tree another tool locked.
+    _git(repo, "worktree", "lock", "--reason", f"hermes pid={os.getpid()}", str(worktree))
     seen: list[tuple[list[str], object]] = []
     real_run = subprocess.run
 
@@ -87,6 +88,8 @@ def test_worktree_removal_steps_still_run_under_the_inherited_environment(sessio
     _cleanup(monkeypatch, repo, worktree)
 
     removal = [env for argv, env in seen if argv[:3] in (["git", "worktree", "unlock"], ["git", "worktree", "remove"])]
-    assert len(removal) == 2 and all(env is None for env in removal)
+    # `git worktree` calls pin the message locale; every other variable is the inherited environment.
+    inherited = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"}
+    assert len(removal) == 2 and all(env == inherited for env in removal)
     assert not worktree.exists()
     assert os.path.isdir(repo)

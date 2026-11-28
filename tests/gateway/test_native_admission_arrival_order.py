@@ -207,18 +207,60 @@ async def test_stop_owner_session_probe_runs_off_gateway_loop(tmp_path, monkeypa
     runner = authority.runner
     loop_thread = threading.get_ident()
     probed_on: list[int] = []
-    real_probe = runner._hm_mounted_owner
+    real_probe = runner._hm_mounted_owner_probe
 
     def probe(*args):
         probed_on.append(threading.get_ident())
         return real_probe(*args)
 
-    runner._hm_mounted_owner = probe
+    runner._hm_mounted_owner_probe = probe
     try:
         await admit(X, 'x0-text')
         await runner._hm_stop_owner_turn(route(X))
         assert probed_on and loop_thread not in probed_on
     finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_reprobes_after_fence_when_first_owner_commits_during_probe(tmp_path, monkeypatch):
+    """A first-message admission released during the empty probe is cancelled after the fence."""
+    authority, _entered, release_capture, admit, route = await _held_owner(tmp_path, monkeypatch)
+    release_capture.set()
+    runner = authority.runner
+    before = authority.route_epoch(route(X))
+    probe_started, release_probe = threading.Event(), threading.Event()
+    real_probe = runner._hm_mounted_owner_probe
+    calls = 0
+
+    def probe(*args):
+        nonlocal calls
+        calls += 1
+        result = real_probe(*args)
+        if calls == 1:
+            probe_started.set()
+            assert release_probe.wait(5.0)
+        return result
+
+    runner._hm_mounted_owner_probe = probe
+    stop = None
+    try:
+        stop = asyncio.create_task(runner._hm_stop_owner_turn(route(X)))
+        assert await asyncio.to_thread(probe_started.wait, 5.0)
+        await admit(X, 'x0-text')
+        release_probe.set()
+        await stop
+        assert authority.route_epoch(route(X)) == before + 1
+        rows = list_session_admissions(authority.db, session_id=runner.session_store.peek_session_id(route(X)),
+                                       pending_only=False)
+        assert calls == 2
+        assert [(row['request_id'], row['status'], row['outcome']) for row in rows] == [
+            ('x0-text', 'terminal', 'cancelled')]
+    finally:
+        release_probe.set()
+        if stop is not None:
+            stop.cancel()
+            await asyncio.gather(stop, return_exceptions=True)
         authority.db.close()
 
 

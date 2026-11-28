@@ -170,11 +170,13 @@ def step_state_db_guard() -> dict:
     search. Read-only, idempotent.
     """
     from hermes_constants import get_hermes_home
-    from hermes_cli.backup import verify_sqlite_integrity
 
     state_path = get_hermes_home() / "state.db"
     if not state_path.exists():
         return {"ok": True, "skipped": "no-state-db"}
+
+    # A fresh home has nothing to verify; don't load the backup stack on first boot.
+    from hermes_cli.backup import verify_sqlite_integrity
     result = verify_sqlite_integrity(state_path, check_header=True, run_pragma=True)
     if result.get("valid"):
         return {"ok": True}

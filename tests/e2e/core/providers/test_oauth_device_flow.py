@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pytest
 
 from tests.e2e.core._pending_fixes import known_gate
+from tests.e2e.core.providers._anthropic_helpers import become_subreaper, reap_adopted
 from tests.e2e.core.providers._oauth_helpers import kill_tagged, make_home, run_hermes
 from tests.fakes.providers.oauth_token_server import OAuthTokenServer, unsigned_jwt
 
@@ -75,12 +76,15 @@ def test_device_code_login_poll_cadence(name: str, tmp_path) -> None:
     srv = OAuthTokenServer(access_token_factory=lambda n: unsigned_jwt(
         {"scope": "inference:invoke", "exp": int(time.time()) + 3600, "sub": f"user-{n}"})).start()
     flow = srv.start_device_flow(interval=case.interval, script=list(case.script))
+    # The child's first connect can spawn a detached gateway daemon (reparented to init); as subreaper it
+    # stays in this test's tree, so ``kill_tagged`` passes the live-system guard and ``reap_adopted`` collects it.
+    become_subreaper()
     try:
         proc = run_hermes(fh, ["auth", "add", "nous", "--type", "oauth", "--no-browser",
                                "--portal-url", srv.base_url, "--inference-url", f"{srv.base_url}/v1"],
                           timeout=90)
     finally:
-        kill_tagged(fh.tag)
+        reap_adopted(kill_tagged(fh.tag))
         srv.stop()
     out = f"exit={proc.returncode}\nstdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}"
 

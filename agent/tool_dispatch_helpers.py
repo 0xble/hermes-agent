@@ -462,7 +462,7 @@ def make_tool_result_message(
     shown = _maybe_strip_unicode_tags(name, content)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
-    content = _redact_secret_source_content(content)
+    shown = _redact_secret_source_content(shown)
     wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, shown))
     message = stamp_message_timestamp({
         "role": "tool",

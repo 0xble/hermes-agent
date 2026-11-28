@@ -5,6 +5,7 @@ lived in memory only, so the next process fired straight into the penalty. These
 ``TelegramAdapter.send`` on two adapter instances sharing one profile home (old process / new process).
 """
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -54,7 +55,7 @@ async def test_a_restart_inside_a_flood_window_keeps_the_chat_quiet(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_persisted_windows_are_scoped_to_their_bot_and_expire(tmp_path):
+async def test_persisted_windows_are_scoped_to_their_bot_and_expire(tmp_path, monkeypatch):
     old = _adapter(tmp_path)
     old._bot.send_message = AsyncMock(side_effect=_FloodError(200.0))
     await old.send("4242", "hello")
@@ -65,6 +66,9 @@ async def test_persisted_windows_are_scoped_to_their_bot_and_expire(tmp_path):
 
     # An expired entry (the penalty ran out while the gateway was down) is not re-armed, and a
     # deadline far in the future (wall-clock jump, restored copy) is clamped to the window cap.
+    # The merged gateway also persists deadlines in SQLite for standalone senders.
+    after_expiry = time.time() + 201.0
+    monkeypatch.setattr(time, "time", lambda: after_expiry)
     store = tmp_path / "telegram_flood_cooldown_7001.json"
     store.write_text(json.dumps({"until": {"4242": 1.0, "555": 4.0e12}}), encoding="utf-8")
     fresh = _adapter(tmp_path)

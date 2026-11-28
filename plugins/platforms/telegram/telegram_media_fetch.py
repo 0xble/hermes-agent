@@ -120,17 +120,22 @@ async def cache_replied_media(adapter: Any, msg: Any, event: Any) -> None:
             note += " [Any transcript quoted above is that replied-to voice note, not this message.]"
         adapter._attach_cached(event, cached, note, "[Telegram] Cached replied-to %s at %s", retype=not spoken)
         return
+    from plugins.platforms.telegram.private_ingress import PRIVATE_ATTACHMENT_NOTE
+    failure_notes = {
+        "private": PRIVATE_ATTACHMENT_NOTE,
+        "failed": "[Replied-to Telegram attachment could not be downloaded, not cached.]",
+        "unreadable": "[Replied-to Telegram attachment could not be read, not cached.]",
+    }
     if status == "oversized":
         limit_mb = getattr(adapter, "_max_doc_bytes", 20 * 1024 * 1024) // (1024 * 1024)
         note = f"[Replied-to Telegram attachment too large or unverifiable, not cached. Maximum: {limit_mb} MB.]"
         logger.info("[Telegram] Replied-to attachment skipped (size=%s)", cached)
-    elif status == "failed":
-        note = "[Replied-to Telegram attachment could not be downloaded, not cached.]"
-    elif status == "unreadable":
-        note = "[Replied-to Telegram attachment could not be read, not cached.]"
-        logger.info("[Telegram] Replied-to attachment unreadable, not cached")
     else:
-        return
+        note = failure_notes.get(status)
+        if note is None:
+            return
+        if status == "unreadable":
+            logger.info("[Telegram] Replied-to attachment unreadable, not cached")
     event.text = adapter._append_observed_note(event.text, note)
 
 

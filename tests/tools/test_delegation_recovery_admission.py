@@ -115,7 +115,7 @@ def _legacy_batch(monkeypatch, *, shape="tasks"):
     brief = task.pop("context") if shape == "legacy" else None
     batch = dispatch._Batch(
         max_children=1, origin_owner_transport=None, origin_owner_session_record=None,
-                            overall_start=time.monotonic(), task_list=[task], context=brief, children=[(0, task, object())],
+                            overall_start=time.monotonic(), task_list=[task], context=brief, children=[(0, task, SimpleNamespace())],
         parent_agent=_Parent(), creds={"model": "m"}, top_role="leaf", live_writers=[],
         live_paths=[], live_deleg_id="deleg_legacy_storage_replacement", origin_wake_sid="wake",
         origin_session_history_delivery=True, origin_ui_session_id="tui-tab",

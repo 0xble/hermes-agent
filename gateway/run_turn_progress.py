@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import queue
 import re
 import threading
 import time
@@ -18,6 +17,8 @@ from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
+from gateway.run_turn_runner_progress import _ToolProgressLine, edit_progress_message, send_progress_text
 from gateway.platforms.helpers import typing_metadata_for_turn
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
@@ -43,28 +44,22 @@ def _append_progress_repeat_count(message: str, occurrences: int) -> str:
 
 
 def _note_flood(st, result) -> bool:
-    """True when a failed progress edit was refused by flood control; arms ``st.flood_until`` from
-    the result's ``retry_after``, else the wait stated in its error text (default 30s), so no
-    progress call fires into the open window. The edit is owed: ``st.flood_pending`` is set."""
+    """True when a failed progress call was refused by flood control; arms ``st.flood_until``
+    from ``retry_after``, else the wait stated in the error text (30s default), so no progress call fires into the open window. The update stays owed."""
     from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
     error = getattr(result, "error", "") or ""
-    if not (is_flood_error(error) or "flood" in error.lower() or "retry after" in error.lower()):
+    if not (is_flood_error(error) or "flood" in error.lower() or "retry after" in error.lower()
+            or getattr(result, "retry_after", None) is not None):
         return False
     try:
         wait = float(getattr(result, "retry_after", None) or 0.0)
     except (TypeError, ValueError):
         wait = 0.0
     if wait <= 0:
-        # Raw platform wording (the Telegram overflow-split path forwards the exception text with
-        # no retry_after): honour the stated wait, or a 185 s penalty becomes a 30 s window.
         wait = flood_wait_seconds(error, default=30.0)
-    st.flood_until = time.monotonic() + wait
-    st.flood_pending = True
+    st.retry_wait = 0.0
+    st.flood_until = max(st.flood_until, time.monotonic() + wait)
     return True
-
-
-def _in_flood_window(st) -> bool:
-    return time.monotonic() < st.flood_until
 
 
 # Attempts a carried remainder (lines a content reset rolled out of a flood-held bubble, never
@@ -73,25 +68,17 @@ _OWED_SEND_ATTEMPTS = 5
 
 
 def _owed_send_failed(st) -> bool:
-    """True when a failed send of a carried remainder should stay owed for a later tick: unlike a
-    fresh tool line, those lines exist nowhere else on screen, so a permission or network failure
-    is retried (bounded) instead of dropped. Arms ``flood_pending`` so the idle tick retries."""
+    """True when a failed send of a carried remainder should stay owed for a later tick: those lines
+    exist nowhere else on screen, so a permission or network failure is retried (bounded) instead of
+    dropped. The idle tick retries it (``_next_progress_line`` wakes for ``st.owed_fresh``)."""
     st.owed_send_failures += 1
     if st.owed_send_failures >= _OWED_SEND_ATTEMPTS:
         logger.warning("Progress: gave up on carried tool-progress lines after %d failed sends",
                        _OWED_SEND_ATTEMPTS)
         st.owed_send_failures, st.owed_fresh = 0, False
         return False
-    st.flood_pending = True
+    st.owed_fresh = True
     return True
-
-
-def _settle_progress_send(st, result) -> None:
-    """A fresh progress send retires the owed update unless flood control refused it: a 429 is a
-    confirmed non-delivery (the window reopens, the update stays owed), while any other failure
-    may have landed (timeout) or never will (permission), so re-sending would duplicate or spin."""
-    if result.success or not _note_flood(st, result):
-        st.flood_pending = False
 
 
 def _tool_lifecycle_payload(call_id, tool_name, args) -> dict:
@@ -186,7 +173,7 @@ class GatewayTurnProgressMixin:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            ctx.track_cleanup_id(str(result.message_id))
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -262,11 +249,21 @@ class GatewayTurnProgressMixin:
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
+        if ctx.persist_user_display_kind == "supervisor_checkin":
+            return
         from gateway.warning_notifications import render_notification
         status = kwargs.get("status")
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
-            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
+            from tools.delegate_tool_progress import subagent_failure_notice_claimed
+            claimed = kwargs.get("failure_notice_claimed")
+            if claimed is None and status in SUBAGENT_FAILURE_STATUSES:
+                # Only events that bypassed the delegation relay reach here without a decision.
+                claimed = subagent_failure_notice_claimed(
+                    child_session_id=kwargs.get("child_session_id"), child_goal=kwargs.get("goal"),
+                    child_status=status, error=kwargs.get("summary") or preview,
+                    failure_reason=kwargs.get("failure_reason"))
+            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current() and not claimed:
                 line = format_subagent_failure_line(
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
                     duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
@@ -287,10 +284,10 @@ class GatewayTurnProgressMixin:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None), metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
-                adapter.set_status_text(ctx.source.chat_id, None)
+                call_typing_with_metadata(adapter.set_status_text, ctx.source.chat_id, None, metadata=typing_metadata_for_source(ctx.source, ctx.event_message_id))
         except Exception as err:
             logger.debug("live status update failed: %s", err)
 
@@ -342,14 +339,20 @@ class GatewayTurnProgressMixin:
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
     def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
-        """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
+        """Render the progress line. Verbose mode queues directly (no dedup) and returns None.
+
+        Every interpolated tool label, preview and args dump passes through the delivery adapter's
+        ``format_progress_literal`` (via ``format_tool_preview`` for compact previews), so a
+        Markdown-parsing platform shows ``mcp__x__y``, ``**/*.md`` or ``\\s+`` verbatim."""
         ctx = self._ctx
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚙️")
+        from agent.display import progress_tool_label
+        emoji, label = progress_tool_label(tool_name, default="⚙️")
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
             adapter = None
+        literal = getattr(adapter, "format_progress_literal", None) or (lambda text: text)
+        tool = literal(label)
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
         code = code_full if verbose else code_short
@@ -357,20 +360,26 @@ class GatewayTurnProgressMixin:
         if verbose:
             if code is None and args:
                 from agent.display import get_tool_preview_max_len, verbose_tool_args_text
-                # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
-                # for full detail and platform message-length limits handle the rest.
-                args_str = verbose_tool_args_text(args, get_tool_preview_max_len(),
-                                                  getattr(adapter, "supports_code_blocks", False))
-                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
+                pl = get_tool_preview_max_len() if getattr(ctx, "user_config", None) is not None else 0
+                _code_blocks = (
+                    getattr(adapter, "supports_code_blocks", False)
+                    and getattr(type(adapter) if adapter is not None else BasePlatformAdapter,
+                                "format_progress_literal", None) is BasePlatformAdapter.format_progress_literal
+                )
+                args_str = verbose_tool_args_text(args, pl, _code_blocks)
+                if not args_str.startswith("```") and adapter is not None:
+                    args_str = adapter.format_progress_literal(args_str)
+                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                         keys=literal(str(list(args.keys()))), args=args_str)
             elif code is None:
-                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview) if preview
-                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name))
+                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(preview)) if preview
+                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool))
             ctx.progress_queue.put(code)
             return None
         if code is not None:
             return code
         if not preview:
-            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)
+            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
         prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
         preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
@@ -378,12 +387,13 @@ class GatewayTurnProgressMixin:
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=preview)
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
+        msg = _ToolProgressLine(msg)
         ctx = self._ctx
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
@@ -400,219 +410,44 @@ class GatewayTurnProgressMixin:
         else:
             ctx.progress_queue.put(msg)
 
-    # ── Slack-native task cards (progress-queue drain) ──────────────────────────────────────
-
-    @dataclasses.dataclass
-    class _TaskCardState:
-        """Task-card rail state for ``_send_native_task_card_progress``."""
-        adapter: Any
-        tasks: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
-        task_order: list[str] = dataclasses.field(default_factory=list)
-        fallback_msg_id: Optional[str] = None
-        native_failed: bool = False
-        # TERMINAL for the turn, distinct from native_failed: no later publication
-        # in this turn may deliver task text through the native lane OR the text
-        # fallback. Two causes, both properties of the destination rather than of
-        # one attempt: the connector's egress guard refused the chat, or the chat
-        # cannot host a card (no thread anchor). Declared rather than set
-        # dynamically so the state is visible where it lives.
-        publication_suppressed: bool = False
-        anonymous_seq: int = 0
-
-        @staticmethod
-        def _compact(value: Any, limit: int = 120) -> str:
-            text = re.sub(r"\s+", " ", str(value or "")).strip()
-            return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
-
-        def visible_tasks(self) -> list[dict[str, str]]:
-            return [self.tasks[task_id] for task_id in self.task_order[-8:]]
-
-        def fallback_text(self) -> str:
-            labels = {"in_progress": t("gateway.progress.task_status_running"),
-                      "complete": t("gateway.progress.task_status_complete"),
-                      "error": t("gateway.progress.task_status_error")}
-            lines = [t("gateway.progress.task_line", title=task["title"], status=labels.get(task["status"], task["status"]))
-                     for task in self.visible_tasks()]
-            return t("gateway.progress.task_card_title") + "\n" + "\n".join(lines)
-
-        def _upsert(self, call_id: str, title: str) -> dict[str, str]:
-            if call_id not in self.tasks:
-                self.task_order.append(call_id)
-            self.tasks[call_id] = {"id": call_id, "title": self._compact(title), "status": "in_progress"}
-            return self.tasks[call_id]
-
-        def apply_event(self, raw: Any) -> bool:
-            event_type = raw.get("type") if isinstance(raw, dict) else None
-            if event_type not in {"tool.started", "tool.completed"}:
-                return False
-            call_id = str(raw.get("tool_call_id") or "")
-            if not call_id:
-                self.anonymous_seq += 1
-                call_id = f"anonymous_{self.anonymous_seq}"
-            tool_name = str(raw.get("tool_name") or "tool")
-            if event_type == "tool.started":
-                preview = self._compact(raw.get("preview"), 64)
-                self._upsert(call_id, f"{tool_name} - {preview}" if preview else tool_name)
-                return True
-            # Completion-only events are rare but valid on some runtimes; keep their real ID instead
-            # of guessing a same-name pending call.
-            task = self.tasks.get(call_id) or self._upsert(call_id, tool_name)
-            task["status"] = "error" if raw.get("is_error") else "complete"
-            return True
-
-    async def _task_card_send_or_edit_fallback(self, st) -> None:
-        ctx = self._ctx
-        text = st.fallback_text()
-        from gateway.relay.egress import declined_send
-
-        if st.publication_suppressed:
-            return
-        if st.fallback_msg_id:
-            result = await st.adapter.edit_message(
-                chat_id=ctx.source.chat_id, message_id=st.fallback_msg_id, content=text, metadata=ctx._progress_metadata,
-            )
-            if getattr(result, "success", False):
-                return
-            # P5(b): R5-4 made a declined native CARD terminal but left this
-            # editable-text fallback: a declined edit fell through to
-            # _send_progress_text and re-sent the same task text to the refused
-            # chat. The decline must set the terminal state here too.
-            if declined_send(result):
-                logger.warning(
-                    "Task-card fallback edit DECLINED by the connector's egress "
-                    "guard; suppressing progress delivery for the rest of this "
-                    "turn (the destination is not approved)"
-                )
-                st.publication_suppressed = True
-                return
-        result = await self._send_progress_text(st, text)
-        if getattr(result, "success", False) and getattr(result, "message_id", None):
-            st.fallback_msg_id = str(result.message_id)
-
-    async def _task_card_publish(self, st) -> None:
-        ctx = self._ctx
-        if not st.tasks:
-            return
-        if st.publication_suppressed:
-            # Publication was suppressed earlier in the turn (egress refusal or a chat
-            # that cannot host a card); every later publication would re-deliver the
-            # same task text there.
-            return
-        # Resolve eligibility in the owning adapter BEFORE transport I/O: a first
-        # timeout/disconnect must not turn an un-cardable chat into text fallback.
-        # Optional for older adapters; only an explicit False refuses publication.
-        destination_supported = getattr(st.adapter, "native_task_card_destination_supported", None)
-        if callable(destination_supported) and destination_supported(
-            ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        ) is False:
-            self._task_card_uncardable_destination(st)
-            if st.publication_suppressed:
-                return
-        if not st.native_failed:
-            result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title=t("gateway.progress.task_card_title"),
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
-            )
-            if getattr(result, "success", False):
-                return
-            # P5(b): an AUTHORIZATION decline is not a broken card lane. The
-            # fallback below sends the same task text to the same chat, which
-            # turns a refused card into delivered plain text. Stop the lane
-            # without re-delivering; the refusal is already logged.
-            from gateway.relay.egress import declined_send
-
-            if declined_send(result):
-                # TERMINAL, and stored SEPARATELY from native_failed. Reusing
-                # native_failed suppressed exactly ONE update: the next progress
-                # event skipped this branch (the lane is already "failed") and
-                # went straight to the text fallback. A refusal does not expire
-                # after one tick.
-                st.publication_suppressed = True
-                st.native_failed = True
-                logger.warning(
-                    "Slack native task-card progress DECLINED by the connector's "
-                    "egress guard — suppressing the text fallback for the rest "
-                    "of this turn (the destination is not approved)"
-                )
-                return
-            st.native_failed = True
-            from gateway.run_turn_runner import _CARD_DESTINATION_REFUSALS
-            if getattr(result, "error", None) in _CARD_DESTINATION_REFUSALS:
-                self._task_card_uncardable_destination(st, getattr(result, "error", "unknown error"))
-                if st.publication_suppressed:
-                    return
-            else:
-                logger.warning(
-                    "Slack native task-card progress failed; falling back "
-                    "to an editable text update: %s", getattr(result, "error", "unknown error"),
-                )
-        # Once the native rail fails, every later lifecycle event edits the same fallback message.
-        await self._task_card_send_or_edit_fallback(st)
-
-    def _task_card_uncardable_destination(self, st, reason: str = "no thread anchor") -> None:
-        """The chat cannot host a card (flat DM: no thread anchor) — a property of the destination,
-        not a transient outage. The text fallback exists to keep a WORKING card lane live through a
-        transient failure, not to invent text bubbles the operator never asked for: with Slack's tier
-        default (``tool_progress: off``) the lane goes silent for the turn. An operator who WROTE
-        ``new``/``all`` asked for text progress, so the editable fallback carries it instead."""
-        if self._ctx.tool_progress_enabled:
-            st.native_failed = True
-            logger.info(
-                "Slack native task cards are unsupported for this destination (%s); "
-                "tool progress continues as an editable text update", reason,
-            )
-            return
-        st.publication_suppressed = True
-        logger.info(
-            "Slack native task cards are unsupported for this destination (%s); "
-            "tool progress stays off for this turn", reason,
-        )
-
-    def _task_card_drain(self, st) -> bool:
-        changed = False
-        try:
-            while True:
-                changed = st.apply_event(self._ctx.progress_queue.get_nowait()) or changed
-        except queue.Empty:
-            pass
-        except Exception:
-            logger.debug("Slack native progress queue drain failed", exc_info=True)
-        return changed
-
-    async def _send_native_task_card_progress(self, adapter) -> None:
-        """Drain progress into native cards; supported destinations retain editable fallback.
-        Unsupported destinations and egress refusals suppress publication, never finalization.
-
-        See #29483.
-        """
-        ctx = self._ctx
-        st = self._TaskCardState(adapter)
-        try:
-            while ctx._run_still_current():
-                try:
-                    raw = ctx.progress_queue.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.1)
-                    continue
-                if not self._agent_interrupted() and st.apply_event(raw):
-                    await self._task_card_publish(st)
-        except asyncio.CancelledError:
-            if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
-                await self._task_card_publish(st)
-        finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
-                # Best-effort on the turn-cleanup path: an escaping transport exception would skip
-                # final-delivery logic (cleanup awaits catch only CancelledError).
-                try:
-                    await adapter.stop_native_task_card_progress(
-                        ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug("task-card stop failed during turn cleanup", exc_info=True)
+    # Slack-native task-card publication lives in ``gateway.run_task_card_progress``.
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
+
+    # Default minimum seconds between progress edits. An adapter may raise it with
+    # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
+    # plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
+    # transport delivers no extra updates, it only parks edits inside the chat's send lock.
+    _PROGRESS_EDIT_INTERVAL = 3.0
+
+    @classmethod
+    def _progress_edit_interval(cls, adapter) -> float:
+        try:
+            value = float(getattr(adapter, "PROGRESS_EDIT_INTERVAL", None) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return max(cls._PROGRESS_EDIT_INTERVAL, value)
+
+    @staticmethod
+    def _is_flood_refusal(result) -> bool:
+        error = (getattr(result, "error", "") or "").lower()
+        return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
+
+    @staticmethod
+    def _progress_deferred(st) -> bool:
+        return time.monotonic() < max(st.defer_until, st.flood_until)
+
+    @staticmethod
+    def _abandon_progress_bubble(st) -> bool:
+        """After a permanent edit failure, continue in a fresh bubble (True) unless the previous
+        fresh bubble also failed, which means editing itself is unusable (False, can_edit off)."""
+        if st.reanchored:
+            st.can_edit = False
+            return False
+        logger.info("[%s] Progress bubble no longer editable, starting a fresh one", st.adapter.name)
+        st.reanchored = True
+        st.progress_msg_id = None
+        return True
 
     @dataclasses.dataclass
     class _ProgressEditState:
@@ -624,20 +459,21 @@ class GatewayTurnProgressMixin:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
-        # monotonic() until which a flood-refused edit's retry_after runs: no progress call fires
-        # into that window, the buffer just keeps absorbing lines (#76494).
+        # A second failure before the fresh bubble edits successfully means edits are unusable.
+        reanchored: bool = False
+        # Buffer until the monotonic flood deadline, without editing, splitting or sending.
+        defer_until: float = 0.0
+        retry_wait: float = 0.0
         flood_until: float = 0.0
-        # A progress update held back by that window: delivered once it closes, even when no
-        # further tool event arrives (a long-running last tool must not leave the bubble stale).
-        flood_pending: bool = False
+        # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
+        tool_progress_sent: bool = False
+        skipped_edits: int = 0
+        progress_pause_logged: bool = False
+        dirty: bool = False
         # (message_id, text) of bubbles a content reset closed while their update was flood-held.
-        owed_bubbles: list = dataclasses.field(default_factory=list)
-        # The buffer (no bubble id yet) holds a remainder a reset carried out of a flood-held
-        # bubble: owed as a fresh bubble, so a further reset carries it on instead of clearing it.
+        owed_bubbles: list[tuple[Any, str]] = dataclasses.field(default_factory=list)
         owed_fresh: bool = False
         owed_send_failures: int = 0
-        # A split send/edit the adapter delivered only partly, with its certain-undelivered tail
-        # (``raw_response["undelivered_chunks"]``): only that tail is retried, ahead of newer lines.
         owed_tail: Any = None
         owed_tail_failures: int = 0
 
@@ -666,17 +502,12 @@ class GatewayTurnProgressMixin:
         )
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
-        ctx = self._ctx
-        kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
-        if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
-            kwargs["finalize"] = True
-        if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        return await edit_progress_message(st, self._ctx, message_id, content)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
-        return "\n".join(str(line) for line in lines)
+        text = "\n".join(str(line) for line in lines)
+        return _ToolProgressLine(text) if any(isinstance(line, _ToolProgressLine) for line in lines) else text
 
     @staticmethod
     def _cap_sized_pieces(st, line) -> list:
@@ -687,7 +518,7 @@ class GatewayTurnProgressMixin:
         if st._progress_len_fn(text) <= st._PROGRESS_TEXT_LIMIT:
             return [line]
         chunks = BasePlatformAdapter.truncate_message(text, st._PROGRESS_TEXT_LIMIT, len_fn=st._progress_len_fn)
-        return [re.sub(r" \(\d+/\d+\)$", "", chunk) for chunk in chunks]
+        return [type(line)(re.sub(r" \(\d+/\d+\)$", "", chunk)) for chunk in chunks]
 
     def _split_progress_groups(self, st, lines: list) -> list[list]:
         """Partition progress lines into platform-sized editable bubbles."""
@@ -702,10 +533,7 @@ class GatewayTurnProgressMixin:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
-        ctx = self._ctx
-        result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        )
+        result = await send_progress_text(st, self._ctx, text)
         self._track_progress_result(result)
         return result
 
@@ -727,7 +555,7 @@ class GatewayTurnProgressMixin:
             return False
         _note_flood(st, result)
         st.progress_msg_id, st.progress_lines = None, rest
-        st.owed_fresh = st.flood_pending = bool(rest)
+        st.owed_fresh = bool(rest)
         return True
 
     async def _owed_tail_blocks(self, st) -> bool:
@@ -761,41 +589,43 @@ class GatewayTurnProgressMixin:
         Returns True when it delivered/split the buffer or a transient edit failure left it
         intact for retry — either way the caller skips the normal send/edit path this tick.
         """
-        if not st.progress_lines or not st.can_edit or _in_flood_window(st):
+        if not st.progress_lines or not st.can_edit:
             return False
         groups = self._split_progress_groups(st, st.progress_lines)
         if len(groups) <= 1:
             return False
+        if self._progress_deferred(st):
+            return True
         if await self._owed_tail_blocks(st):
             return True  # newer bubbles wait behind the owed tail of an earlier split
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
             if self._settle_partial_progress(st, result, [line for g in groups[1:] for line in g]):
                 return True
-            if not result.success:
-                if getattr(result, "retryable", False) or _note_flood(st, result):
-                    logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
-                    return True
-                st.can_edit = False
-                # Fall back to the existing non-edit behavior.
+            if (result.raw_response or {}).get("skipped"):
+                return True
+            if result.success:
+                st.reanchored = False
+                groups = groups[1:]
+            elif self._edit_failure_is_deferrable(st, result):
+                # Keep the buffer intact; the next tick retries the same split.
+                return True
+            elif not self._abandon_progress_bubble(st):
                 return False
-            groups = groups[1:]
+            # An abandoned bubble never received groups[0], so it is re-sent below in a fresh one.
         for i, group in enumerate(groups):
             result = await self._send_progress_text(st, self._progress_text(group))
             if self._settle_partial_progress(st, result, [line for g in groups[i + 1:] for line in g]):
                 return True
-            if not result.success and _note_flood(st, result):
-                # Confirmed non-delivery: stop sending into the window; the unsent continuations stay
-                # owed and go out as a fresh bubble rather than overwriting the last one.
+            if not result.success and (_note_flood(st, result) or (st.owed_fresh and _owed_send_failed(st))):
                 st.progress_msg_id, st.progress_lines = None, [line for g in groups[i:] for line in g]
-                return True
-            if st.owed_fresh and not result.success and _owed_send_failed(st):
-                st.progress_msg_id, st.progress_lines = None, [line for g in groups[i:] for line in g]
+                st.owed_fresh = st.dirty = True
                 return True
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
                 st.owed_send_failures = 0
-        st.flood_pending = st.owed_fresh = False
+        st.owed_fresh = False
+        st.dirty = not result.success
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
         st.progress_lines = groups[-1]
@@ -809,18 +639,15 @@ class GatewayTurnProgressMixin:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         carried: list = []
-        if st.flood_pending and st.can_edit and st.progress_msg_id is not None and st.progress_lines:
-            # The window kept the overflow roll from running, so the bubble may hold more than one
-            # message: owe the closed bubble one cap-sized edit and carry the rest into the next
-            # bubble, where the roll sends it and stops at a flood refusal. A whole-buffer edit makes
-            # the adapter split it and re-post its continuations on every retry (#151789).
+        if st.dirty and st.can_edit and st.progress_msg_id is not None and st.progress_lines:
             first, *rest = self._split_progress_groups(st, st.progress_lines)
             st.owed_bubbles.append((st.progress_msg_id, self._progress_text(first)))
             carried = [line for group in rest for line in group]
         elif st.owed_fresh and st.progress_msg_id is None:
-            carried = st.progress_lines  # a carried remainder still unsent: it rides on to the next bubble
+            carried = st.progress_lines
         st.owed_fresh = bool(carried)
         st.progress_msg_id, st.progress_lines = None, carried
+        st.dirty = bool(carried)
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     def _progress_absorb(self, st, raw) -> Any:
@@ -829,21 +656,48 @@ class GatewayTurnProgressMixin:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
-            st.progress_lines[-1] = _append_progress_repeat_count(base_msg, count + 1)
+            st.progress_lines[-1] = type(base_msg)(_append_progress_repeat_count(base_msg, count + 1))
+            st.dirty = True
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
+        st.dirty = True
         return raw
 
+    async def _flush_owed_progress(self, st) -> bool:
+        """Retry the original bubble after a reset, without sending into its refusal window."""
+        if not st.owed_bubbles or self._progress_deferred(st):
+            return False
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return False
+        result = await self._edit_progress_message(st, *st.owed_bubbles[0])
+        if not (result.raw_response or {}).get("skipped"):
+            partial = self._hold_partial_tail(st, result)
+            deferred = not result.success and self._edit_failure_is_deferrable(st, result)
+            if result.success or partial or not deferred:
+                st.owed_bubbles.pop(0)
+        return True
+
     async def _flush_progress_edit(self, st) -> None:
-        if st.can_edit and st.progress_lines and st.progress_msg_id and not _in_flood_window(st):
+        await self._flush_owed_progress(st)
+        # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
+        if st.dirty and st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                if result.success and not (result.raw_response or {}).get("skipped"):
+                    st.dirty = False
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        if self._agent_interrupted():
+            self._drain_progress_queue()
+            return
+        deferred_on_entry = self._progress_deferred(st)
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
+                if self._agent_interrupted():
+                    self._drain_progress_queue()
+                    return
                 if self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
@@ -853,6 +707,13 @@ class GatewayTurnProgressMixin:
                 else:
                     self._progress_absorb(st, raw)
                     await self._roll_progress_overflow_if_needed(st)
+        # Preserve overflow recovery when its first transient refusal happens during drain.
+        # Retry once at its deadline, without waiting out an already deferred or flooded card.
+        if not deferred_on_entry and st.retry_wait and self._progress_deferred(st):
+            await asyncio.sleep(max(0.0, max(st.defer_until, st.flood_until) - time.monotonic()))
+            if self._agent_interrupted():
+                self._drain_progress_queue()
+                return
         # Final edit with all remaining tools (only if editing works)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
@@ -869,126 +730,158 @@ class GatewayTurnProgressMixin:
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
 
-        Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
-        failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
+        Transient and flood failures keep the bubble and its lines for a later edit. A permanent
+        failure (not found, permissions) moves progress to a fresh bubble; only a second one in a
+        row sets can_edit=False.
         """
-        if _in_flood_window(st):
-            st.flood_pending = True
-            return False
-        if await self._owed_tail_blocks(st):
-            st.flood_pending = True  # this tick's lines follow the owed tail of an earlier split
+        if self._progress_deferred(st) or await self._owed_tail_blocks(st):
             return False
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
+            if (result.raw_response or {}).get("skipped"):
+                return True
             if result.success:
-                st.flood_pending = False
+                st.reanchored = False
+                st.dirty = False
                 return True
             if self._settle_partial_progress(st, result, []):
                 return True
-            if getattr(result, "retryable", False):
-                logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
-                return False
-            if _note_flood(st, result):
-                # Never answer a flood-refused edit with a fresh send into the same chat: Telegram
-                # bills every call against the open penalty and escalates it (#76494). The buffer
-                # stays intact; a later tick (or the final flush) edits the same bubble.
-                logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
-                return False
-            st.can_edit = False
-            result = await self._send_progress_text(st, msg)
-            if not self._settle_partial_progress(st, result, []):
-                _settle_progress_send(st, result)
-            return True
+            if self._edit_failure_is_deferrable(st, result):
+                # The shared failure handler retains a bounded retry deadline.
+                return self._is_flood_refusal(result)
+            if self._abandon_progress_bubble(st):
+                # The fresh bubble starts at the newest line; the dead one keeps what it shows.
+                st.progress_lines = st.progress_lines[-1:]
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
+        result = await self._send_progress_text(st, self._progress_text(st.progress_lines) if st.can_edit else msg)
         if self._settle_partial_progress(st, result, []):
             return True
-        if st.owed_fresh and not result.success and not _note_flood(st, result) and _owed_send_failed(st):
+        if not result.success and (_note_flood(st, result) or (st.owed_fresh and _owed_send_failed(st))):
+            st.owed_fresh = st.dirty = True
             return True
-        _settle_progress_send(st, result)
         if result.success and result.message_id:
             st.progress_msg_id = result.message_id
             st.owed_fresh, st.owed_send_failures = False, 0
+        if result.success:
+            st.dirty = False
         return True
+
+    def _progress_interval_for_chat(self, adapter) -> float:
+        """An adapter may tighten its normal progress floor for a particular chat."""
+        floor = self._progress_edit_interval(adapter)
+        hook = getattr(type(adapter), "progress_edit_interval_for_chat", None)
+        return max(floor, hook(adapter, self._ctx.source.chat_id)) if hook is not None else floor
+
+    @classmethod
+    def _edit_failure_is_deferrable(cls, st, result) -> bool:
+        """Keep refused edits buffered without spending calls on every consumer tick."""
+        floor = cls._progress_edit_interval(st.adapter)
+        if cls._is_flood_refusal(result):
+            from gateway.delivery_ledger import flood_wait_seconds
+            st.retry_wait = 0.0
+            stated = flood_wait_seconds(str(getattr(result, "error", "") or ""), default=floor)
+            wait = max(float(getattr(result, "retry_after", None) or stated), floor)
+            st.defer_until = time.monotonic() + wait
+            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
+            return True
+        if getattr(result, "retryable", False):
+            st.retry_wait = min(max(floor, st.retry_wait * 2), max(floor, 60.0))
+            st.defer_until = time.monotonic() + st.retry_wait
+            logger.debug("[%s] Transient progress edit failure, retrying in %.1fs", st.adapter.name, st.retry_wait)
+            return True
+        return False
+
+    async def _collect_progress_batch(self, st) -> None:
+        """Include arrivals during the wait without erasing a buffer at a content reset."""
+        while not self._ctx.progress_queue.empty():
+            raw = self._ctx.progress_queue.get_nowait()
+            if self._agent_interrupted():
+                continue
+            if self._is_reset_marker(raw):
+                await self._roll_progress_overflow_if_needed(st)
+                await self._flush_progress_edit(st)
+                self._reset_progress_bubble(st)
+            else:
+                self._progress_absorb(st, raw)
+
+    async def _wait_for_progress_batch(self, st, last_edit_ts: float) -> None:
+        while last_edit_ts or st.defer_until or st.flood_until:
+            now = time.monotonic()
+            # Initial sends retain the adapter's normal floor even without an anchor
+            # (failed or outbox-deferred sends). Pressure only widens existing-card edits.
+            interval = (self._progress_interval_for_chat(st.adapter) if st.can_edit and st.progress_msg_id is not None
+                        else self._progress_edit_interval(st.adapter))
+            remaining = max(max(st.defer_until, st.flood_until) - now,
+                            interval - (now - last_edit_ts))
+            if remaining <= 0:
+                st.defer_until = st.flood_until = 0.0
+                break
+            await asyncio.sleep(remaining)
+        # The first event is visible immediately, even if later events are already queued.
+        if st.can_edit and (last_edit_ts or st.defer_until):
+            await self._collect_progress_batch(st)
+
+    async def _next_progress_line(self, st):
+        while self._ctx.progress_queue.empty():
+            if not self._ctx._run_still_current():
+                return None
+            if (st.owed_bubbles or st.owed_tail or st.owed_fresh or ((st.defer_until or st.flood_until) and st.dirty and st.progress_lines)) and not self._agent_interrupted():
+                return None  # Retry a refused batch even if no further tool event arrives.
+            await asyncio.sleep(0.3)
+        return self._ctx.progress_queue.get_nowait()
 
     async def _deliver_flood_pending_progress(self, st) -> bool:
-        """Idle tick: push the update a flood window held back once the window has closed.
-
-        Returns True when it attempted delivery, so the caller spaces retries by the edit interval.
-        The update stays owed until a send/edit lands (the delivery paths retire it), so a transient
-        failure is retried on a later tick instead of being dropped.
-        """
-        if _in_flood_window(st) or not ((st.flood_pending and st.progress_lines) or st.owed_bubbles or st.owed_tail):
+        """Advance one delivery tick, including a retry with no new tool event."""
+        if self._progress_deferred(st) or not self._ctx._run_still_current() or self._agent_interrupted():
             return False
-        if not self._ctx._run_still_current() or self._agent_interrupted():
+        if await self._flush_owed_progress(st) or await self._owed_tail_blocks(st):
+            return True
+        if not st.progress_lines or not st.dirty:
             return False
-        if st.owed_bubbles:
-            result = await self._edit_progress_message(st, *st.owed_bubbles[0])
-            # A partial split already put its head on screen: replaying it re-posts those
-            # continuations, so it is settled once (a flood refusal still opens the window) and
-            # only the tail the adapter reports certain-undelivered stays owed.
-            partial = self._hold_partial_tail(st, result)
-            flooded = not result.success and _note_flood(st, result)
-            if result.success or partial or not (getattr(result, "retryable", False) or flooded):
-                st.owed_bubbles.pop(0)
-            return True
-        if st.owed_tail is not None and (await self._owed_tail_blocks(st) or not (st.flood_pending and st.progress_lines)):
-            return True
-        if not await self._roll_progress_overflow_if_needed(st):
-            await self._progress_send_or_edit(st, st.progress_lines[-1])
-        return True
+        return (await self._roll_progress_overflow_if_needed(st)
+                or await self._progress_send_or_edit(st, st.progress_lines[-1]))
 
     async def send_progress_messages(self):
+        from gateway.run_turn_progress_admission import editable_progress_adapter
+        adapter = await editable_progress_adapter(self)
+        if adapter is None:
+            return
         ctx = self._ctx
-        adapter = self._runner._delivery_adapter_for(ctx.source) if ctx.progress_queue else None
-        if not adapter:
-            return
-        if ctx._native_slack_task_cards and hasattr(adapter, "send_native_task_card_progress"):
-            await self._send_native_task_card_progress(adapter)
-            return
-        # Skip tool progress for platforms that can't edit messages (e.g. iMessage/BlueBubbles):
-        # each update would be a separate bubble. getattr, not attribute access: duck-typed
-        # adapters (test fakes, minimal plugins) may lack edit_message — treated as "can't edit".
-        adapter_edit = getattr(type(adapter), "edit_message", None)
-        if adapter_edit is None or adapter_edit is BasePlatformAdapter.edit_message:
-            self._drain_progress_queue()
-            return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
             try:
                 if not ctx._run_still_current():
                     self._drain_progress_queue()
                     return
-                raw = ctx.progress_queue.get_nowait()
+                raw = await self._next_progress_line(st)
                 # Drain silently when interrupted: events queued in the window between tool parse
                 # and interrupt processing should not render as bubbles.
                 if self._agent_interrupted():
                     await asyncio.sleep(0)
                     continue
                 if self._is_reset_marker(raw):
+                    await self._roll_progress_overflow_if_needed(st)
+                    await self._flush_progress_edit(st)
                     self._reset_progress_bubble(st)
                     continue
-                msg = self._progress_absorb(st, raw)
-                if not await self._roll_progress_overflow_if_needed(st):
-                    # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
-                    # proactively rate-limit rather than react to 429s). Loop back to drain further
-                    # queued messages before sending a single batched edit.
-                    remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        continue
-                    if not ctx._run_still_current():
-                        return
-                    if not await self._progress_send_or_edit(st, msg):
-                        continue
-                last_edit_ts = time.monotonic()
-                await self._progress_restore_typing(st)
-            except queue.Empty:
-                if time.monotonic() - last_edit_ts >= EDIT_INTERVAL and await self._deliver_flood_pending_progress(st):
+                if raw is not None:
+                    self._progress_absorb(st, raw)
+                await self._wait_for_progress_batch(st, last_edit_ts)
+                if not ctx._run_still_current():
+                    return
+                if self._agent_interrupted():
+                    continue
+                had_owed_delivery = bool(st.owed_bubbles or st.owed_tail)
+                if not await self._deliver_flood_pending_progress(st):
+                    continue
+                if had_owed_delivery:
                     last_edit_ts = time.monotonic()
-                await asyncio.sleep(0.3)
+                    continue
+                last_edit_ts = time.monotonic()
+                if not self._progress_deferred(st):
+                    st.defer_until = 0.0
+                await self._progress_restore_typing(st)
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return
@@ -1133,8 +1026,10 @@ class GatewayTurnProgressMixin:
             self._publish_execution("notification.clear", {"key": str(key)})
 
     def _status_live(self) -> bool:
-        """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+        """Engine chrome cannot precede a supervisor's roster-validated final."""
+        ctx = self._ctx
+        return (ctx.persist_user_display_kind != "supervisor_checkin"
+                and bool(ctx._status_adapter) and ctx._run_still_current())
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         from gateway.bot_peer_notices import automatic_notices_allowed
@@ -1143,52 +1038,9 @@ class GatewayTurnProgressMixin:
             return
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
-    def _attach_session_title_callback(self, agent, ctx) -> None:
-        """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
-
-        The titler runs in the turn prologue, so attach before the run, not after it.
-        """
-        try:
-            # Gateway auto-title failures are not user-actionable, so never surface them as messages;
-            # overriding the failure sink keeps CLI on _emit_auxiliary_failure while gateway logs debug.
-            agent._title_failure_callback = lambda task, exc: logger.debug(
-                "Gateway auto-title failure suppressed (not user-visible): %s: %s", task, exc,
-            )
-            session_id = getattr(agent, "session_id", None)
-            if local_viewer_turn(self):
-                # Main's CLI repainted its status-bar title when the auto-title landed.
-                authority, canonical_id, _generation = self._approval_owner
-
-                def republish(title, title_source):
-                    from gateway.session_contract import SessionRef
-                    from gateway.session_local import local_session_info
-                    ref = SessionRef(getattr(authority, "profile_id", ""), canonical_id)
-                    authority.sessions[canonical_id].event_stream.publish(
-                        canonical_id, local_session_info(authority, ref), event_type="session.info")
-                agent._on_session_title = republish
-                return
-            runner = self._runner
-            source = runner._recover_discord_auto_thread_source(ctx.source, ctx.session_key)
-            # Both lanes spend a rate-limited platform call per title, so they use the model's title
-            # only (TitleCallback); renaming twice burns Discord's 2-per-10-min budget on a throwaway.
-            # Relay Discord predicate is shape-only: whether the connector auto-threaded our reply is
-            # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
-            # cache at fire time — gating registration on the cache read meant it never registered.
-            if runner._is_telegram_topic_lane(source):
-                lane = "_schedule_telegram_topic_title_rename"
-            elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
-                lane = "_schedule_discord_semantic_thread_rename"
-            else:
-                return
-            agent._on_session_title = lambda title, title_source: (
-                title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-            )
-        except Exception:
-            logger.debug("Failed to attach session title callback", exc_info=True)
-
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
-        from gateway.run_status_filter import status_chat_type
+        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
+        from gateway.status_delivery import send_scoped_status
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
@@ -1199,7 +1051,8 @@ class GatewayTurnProgressMixin:
         if not automatic_notices_allowed(ctx.source):
             logger.debug("status_callback suppressed for bot-authored message: %s", event_type)
             return
-        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message, status_chat_type(ctx.source))
+        prepared = _prepare_gateway_status_message(
+            ctx.source.platform, event_type, message, getattr(ctx.source, "chat_type", "dm"))
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",
@@ -1207,11 +1060,6 @@ class GatewayTurnProgressMixin:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
-        # Session keys identify lanes; generations distinguish turns in each lane.
-        status_key = event_type
-        if ctx.session_key and ctx.run_generation is not None:
-            status_key = f"{ctx.session_key}:run:{ctx.run_generation}:{event_type}"
-
         def present():
             if local_viewer_turn(self):
                 from agent.conversation_compression import compaction_status_kind
@@ -1219,13 +1067,20 @@ class GatewayTurnProgressMixin:
                                                           "text": prepared})
                 return
             fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, status_key, prepared, ctx._status_thread_metadata),
+                send_scoped_status(getattr(ctx, "_reply_latency_receipt", None), ctx._status_adapter,
+                                   ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
             if fut is not None and ctx._cleanup_progress:
                 fut.add_done_callback(self._track_future_cleanup_id)
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
                             diagnostic=is_warning_status(event_type, message))
+
+
+def _viewer_status_kind(kind, text):
+    """The TUI's ``status.update`` kind: auto-compaction progress is re-tagged ``compacting``."""
+    from agent.conversation_compression import is_compaction_progress_status
+    return "compacting" if kind == "lifecycle" and is_compaction_progress_status(text) else str(kind)
 
 
 def local_viewer_turn(runner) -> bool:

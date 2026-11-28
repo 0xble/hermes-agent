@@ -1,6 +1,7 @@
 """Ledger admission for payloads safely unsent by cron's standalone fallback."""
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING
 
@@ -8,6 +9,7 @@ if TYPE_CHECKING:
     from cron.scheduler_delivery import _TargetDelivery
 
 logger = logging.getLogger("cron.scheduler")
+_PRE_SEND_LIVE_REJECTIONS = frozenset({"Not connected"})
 
 
 def queue_for_live_reconnect(
@@ -44,13 +46,29 @@ def queue_for_live_reconnect(
                 chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
                 adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
             mark_failed(obligation_id, str(t.live_error))
+        # Cron runs off the gateway loop, so wake the in-process drain when available. The
+        # durable ledger remains the backstop when no runner is attached.
+        adapter = getattr(t.transport, "adapter", None)
+        schedule = getattr(getattr(adapter, "gateway_runner", None), "_schedule_flood_redelivery", None)
+        loop = getattr(t, "loop", None)
+        if callable(schedule) and loop is not None:
+            loop.call_soon_threadsafe(
+                functools.partial(schedule, t.platform_name,
+                                  profile=getattr(adapter, "_owner_profile", None)))
     except Exception:
         logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
                        t.job.get("id"), t.where, exc_info=True)
         return
     row_count = len(rows)
-    row_label = "row" if row_count == 1 else "rows"
-    note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
+    from gateway.delivery_ledger import is_reconnect_only
+    if is_reconnect_only(t.live_error):
+        row_label = "row" if row_count == 1 else "rows"
+        note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
+    elif row_count == 1 and content:
+        note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    else:
+        row_label = "row" if row_count == 1 else "rows"
+        note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
     if media_files:
         note += f" ({len(media_files)} attachment(s) not queued)"
     logger.warning("Job '%s': %s", t.job.get("id"), note)

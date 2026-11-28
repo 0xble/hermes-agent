@@ -78,6 +78,13 @@ def charge(units: int) -> None:
         budget.spend(units)
 
 
+def charge_lexed_chars(count: int) -> None:
+    """Charge a span the lexer would read one unit at a time, including on exhaustion."""
+    budget = _active.get()
+    if budget is not None and count:
+        budget.spend(min(count, max(1, budget.remaining + 1)))
+
+
 def memo(fn, *args):
     """``fn(*args)`` for a pure *fn*, memoized for the active detection call (a plain call outside
     one). A repeat costs one unit; the work of a fresh call is charged by the scanners it runs."""
@@ -238,6 +245,7 @@ def _scan_shell(text: str, start: int = 0, end: int | None = None, *, subst: str
     quote: str | None = None
     i = start
     budget = active()
+    unquoted_subst, quoted_subst = "u" in subst, "q" in subst
     while i < n:
         if budget is not None:  # one unit per lexed char; inline, this loop is the hot path
             budget.remaining -= 1
@@ -245,7 +253,7 @@ def _scan_shell(text: str, start: int = 0, end: int | None = None, *, subst: str
                 raise ParserBudgetExceeded
         ch = text[i]
         kind, j = "char", i + 1
-        if comments and quote is None and _is_shell_comment_start(text, i):
+        if ch == "#" and comments and quote is None and _is_shell_comment_start(text, i):
             kind, j = "comment", text.find("\n", i, n)
             if j < 0:
                 j = n
@@ -253,9 +261,9 @@ def _scan_shell(text: str, start: int = 0, end: int | None = None, *, subst: str
             kind, j = "esc", i + 2
         elif ch == quote or (quote is None and ch in "'\""):
             kind = "quote"
-        elif quote != "'" and ("q" if quote else "u") in subst and (
-            ch == "`" or text.startswith("$(", i) or (brace and not quote and text.startswith("${", i))
-        ):
+        elif (ch == "`" or (ch == "$" and (
+                text.startswith("$(", i) or (brace and quote is None and text.startswith("${", i))
+        ))) and (unquoted_subst if quote is None else quote == '"' and quoted_subst):
             if ch == "`":
                 close = text.find("`", i + 1) + 1 or None if naive_backtick else _scan_backtick_end(text, i)
             elif text[i + 1] == "(":
