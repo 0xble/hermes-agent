@@ -8,7 +8,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 
 from __future__ import annotations
 from hermes_cli.goals_relay_receipts import (
-    _relay_sender, _relay_receipt_id
+    _relay_sender, _relay_receipt_id, _relay_ledger_receipts
 )
 
 
@@ -2436,34 +2436,6 @@ _ANY_RELAY_HEADER_RE = re.compile(
 )
 _USER_MESSAGES_MAX = 20
 _USER_MESSAGES_MAX_CHARS = 8000
-
-
-def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
-    """Newest receipt row per wanted id from relay's own ledger, read once.
-
-    The header in a transcript is plain text any agent can write; the ledger is written by the relay
-    transport at send time and records sender, target and the delivered transcript row."""
-    wanted = {rid for rid in receipt_ids if rid}
-    if not wanted:
-        return {}
-    state_dir = os.environ.get("RELAY_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".local/state/relay")
-    path = os.path.join(state_dir, "receipts.jsonl")
-    found: dict[str, dict[str, Any]] = {}
-    try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-            for line in handle:
-                if '"id"' not in line or not any(rid in line for rid in wanted):
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict) and row.get("id") in wanted:
-                    found[row["id"]] = row
-    except OSError:
-        return {}
-    return found
-
 
 # Sessions whose user rows are written by agents or schedulers, never typed by a person.
 _NON_HUMAN_SESSION_SOURCES = frozenset({"subagent", "cron", "tool", "kanban", "oneshot", "dryrun"})

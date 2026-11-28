@@ -39,11 +39,15 @@ _SKILLS_CACHE: dict = {}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 # Deepest directory the signature descends to below a root (a skill sits at <cat>/<sub>/<skill>/).
 _SIGNATURE_MAX_DEPTH = 6
+# Lookup candidates are indexed per root. The directory signature is cheap compared with repeated
+# recursive globs, and invalidates the index when a skill is installed or removed.
+_SKILL_LOCATION_CACHE: dict[Path, tuple[tuple, dict[str, list[tuple[Optional[Path], Path]]], float]] = {}
 
 
 def clear_skills_cache() -> None:
-    """Drop the scanned catalog so the next listing re-scans (explicit reloads must not wait out the TTL)."""
+    """Drop the scanned catalog and location indexes so explicit reloads re-scan immediately."""
     _SKILLS_CACHE.clear()
+    _SKILL_LOCATION_CACHE.clear()
     _SCAN_POLL.clear()
 
 
@@ -465,19 +469,53 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     for search_dir in all_dirs:
         for direct in filter(None, (name, local_category_name)):  # "p:x" with no plugin p → "p/x"
             _record_direct(search_dir / direct, search_dir)
-        # Recursive by directory name plus frontmatter `name:` — skills_list()
-        # exposes the frontmatter name, so skill_view(name) must accept it too.
+        # Recursive by directory name, frontmatter `name:` and legacy flat <name>.md, served from a
+        # per-root index. Markdown owned by an ancestor directory skill loads through file_path and
+        # never shadows a real skill (filtered when the index is built).
+        if not any(ch in name for ch in "/\\*?["):
+            for skill_dir, found_md in _skill_location_index(search_dir).get(name, ()):
+                _record(skill_dir, found_md)
+            continue
+        # Path- or glob-shaped lookups keep the original scan: the index is keyed by bare name.
         for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
             if (found_skill_md.parent.name == name
                     or _safe_frontmatter(found_skill_md).get("name") == name):
                 _record(found_skill_md.parent, found_skill_md)
-        # Legacy flat <name>.md anywhere under the dir. Markdown owned by an ancestor
-        # directory skill loads through file_path and must not shadow a real skill.
         for found_md in search_dir.rglob(f"{name}.md"):
             if (found_md.name != "SKILL.md" and not _is_skill_support_path(found_md)
                     and not _is_package_owned_markdown(found_md, search_dir)):
                 _record(None, found_md)
     return candidates
+
+
+def _skill_location_index(search_root: Path) -> dict[str, list[tuple[Optional[Path], Path]]]:
+    """Return all recursive lookup candidates under *search_root*, cached by directory signature."""
+    signature = _skills_scan_signature([search_root], set())
+    now = time.monotonic()
+    cached = _SKILL_LOCATION_CACHE.get(search_root)
+    # The TTL bounds staleness from in-place SKILL.md frontmatter edits, which no directory
+    # signature can see (same contract as _SKILLS_CACHE).
+    if cached is not None and cached[0] == signature and now - cached[2] < _SKILLS_CACHE_TTL_SECONDS:
+        return cached[1]
+    from agent.skill_utils import iter_skill_index_files
+    index: dict[str, list[tuple[Optional[Path], Path]]] = {}
+
+    def add(key: str, skill_dir: Optional[Path], skill_md: Path) -> None:
+        index.setdefault(key, []).append((skill_dir, skill_md))
+
+    for skill_md in iter_skill_index_files(search_root, "SKILL.md"):
+        add(skill_md.parent.name, skill_md.parent, skill_md)
+        frontmatter = _safe_frontmatter(skill_md)
+        if isinstance(frontmatter.get("name"), str):
+            add(frontmatter["name"], skill_md.parent, skill_md)
+    # Flat legacy skills are also recursive; index by stem so locate_skill never has to rglob.
+    for skill_md in search_root.rglob("*.md"):
+        if (skill_md.name == "SKILL.md" or _is_skill_support_path(skill_md)
+                or _is_package_owned_markdown(skill_md, search_root)):
+            continue
+        add(skill_md.stem, None, skill_md)
+    _SKILL_LOCATION_CACHE[search_root] = (signature, index, now)
+    return index
 
 
 # (support dir, globs, recursive, files only) — order is the linked_files key order.
