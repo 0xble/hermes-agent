@@ -112,9 +112,10 @@ class _Edge:
                           if method == b"getMe" else
                           {"message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"}, "text": "x"})
                 payload = json.dumps({"ok": True, "result": result}).encode()
+                # Count before sending: the client can consume the reply before sendall returns.
+                self.served += 1
                 tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
                             % len(payload) + payload)
-                self.served += 1
         except OSError:
             pass  # idle timeout or reset: closing the socket below is the edge's FIN
         finally:

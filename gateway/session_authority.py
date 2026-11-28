@@ -1450,6 +1450,8 @@ class SessionAuthority:
                     continue
                 from gateway.session_retirement import retire_at_idle
                 await retire_at_idle(self, ref, live)
+                if live.rescan:
+                    continue  # a wake during retirement belongs to this still-running drain
                 return
             admission_id = row['admission_id']
             from gateway.run_plugin_injection import admission_turn_scope

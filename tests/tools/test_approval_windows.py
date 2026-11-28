@@ -9,6 +9,7 @@ must match regardless of host OS (a Linux-hosted Hermes can still drive a
 Windows box over SSH).
 """
 
+import sys
 import time
 
 import pytest
@@ -219,16 +220,34 @@ class TestPowerShellPositionalScriptAndAbbreviatedSwitches:
         assert not _is_dangerous(cmd), cmd
 
 
-    @pytest.mark.parametrize("command", [
-        'echo "' + "wmic shadowcopy " * 2000 + 'list"; echo ok',
-        'echo "' + "ssh -x " * 2000 + 'cat"; echo ok',
-        "; ssh -x" * 3000,
-        "\n ssh -x" * 3000,
-    ])
-    def test_repeated_launcher_words_scan_in_linear_time(self, command):
-        start = time.perf_counter()
-        assert not _is_dangerous(command)
-        assert time.perf_counter() - start < 2, command[:30]
+    @pytest.mark.parametrize("prefix, fragment, suffix, count", [
+        ('echo "', "wmic shadowcopy ", 'list"; echo ok', 500),
+        ('echo "', "ssh -x ", 'cat"; echo ok', 1000),
+        ("", "; ssh -x", "", 750),
+        ("", "\n ssh -x", "", 750),
+    ], ids=["quoted-wmic", "quoted-ssh", "semicolon-ssh", "newline-ssh"])
+    def test_repeated_launcher_words_scan_in_linear_time(self, prefix, fragment, suffix, count):
+        # Windows can account thread CPU in clock ticks; time a fixed batch there to average
+        # over that granularity. Every scan must still classify the command as benign.
+        scans = 6 if sys.platform == "win32" else 1
+
+        def scan_cpu_time(repetitions):
+            command = prefix + fragment * repetitions + suffix
+            samples = []
+            for _ in range(3):
+                start = time.thread_time()
+                for _ in range(scans):
+                    assert not _is_dangerous(command)
+                samples.append(time.thread_time() - start)
+            return sorted(samples)[1]
+
+        assert not _is_dangerous(prefix + fragment + suffix)  # warm up lazy initialization
+        small = scan_cpu_time(count)
+        large = scan_cpu_time(8 * count)
+        # Thread CPU time excludes preemption. Eight times the input should cost about 8x the
+        # work, not 64x as in a quadratic scan; keep the bound below the quadratic ratio while
+        # allowing ordinary interpreter and cache noise.
+        assert large < 16 * small, f"{small=:.6f}s, {large=:.6f}s"
 
 
 class TestDriveLetterRoots:

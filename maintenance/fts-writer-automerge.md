@@ -15,7 +15,12 @@
   checks both live indexes in a fresh store. The existing bounded-merge test
   continues to require explicit `usermerge` and `merge` commands and forbids
   `optimize`.
-- **Contract tests:** `tests/hermes_state/test_fts_automerge.py`.
+- Keep the retirement FIFO probe off the owner loop without losing a wake:
+  recheck live pins after the probe, and have the active drain rescan if an
+  admission scheduled while it was suspended. See
+  `tests/gateway/test_api_idle_retirement.py` for the forced interleaving.
+- **Contract tests:** `tests/hermes_state/test_fts_automerge.py`,
+  `tests/gateway/test_api_idle_retirement.py`.
 - **Rollback:** Revert this source and test change. No schema migration or
   state rewrite is needed. Existing indexes keep their current data.
 - **Retirement:** Remove the private setting when an upstream release prevents
