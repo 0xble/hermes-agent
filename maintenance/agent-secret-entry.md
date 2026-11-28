@@ -52,6 +52,10 @@ Unchanged boundaries:
 - Never repeat secrets in replies, files, commits, or shell arguments. The Link
   skill separately owns its approved one-time-card retrieval file and cleanup;
   it must use that Link credential, not substitute a password-manager card.
+- When a sign-in page offers 'Try another way' or a list of methods, an
+  authenticator/TOTP, SMS or email code option comes before any handoff, and
+  `no_code_field` says so first. A security-key or passkey default page is not a
+  human-only factor while a code option exists.
 - A stored 1Password passkey uses the canonical-origin browser/system prompt for
   the intended identity. App approvals try the issuer's web or desktop path,
   then email/SMS or 1Password TOTP/passkey alternatives. Never use iPhone

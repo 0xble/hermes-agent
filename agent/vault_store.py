@@ -217,6 +217,10 @@ class VaultItemMeta:
     identifier_type: Optional[str] = None
     identifier: Optional[str] = None
     has_otp: bool = False  # a TOTP seed is stored: 2FA codes can be minted without asking the user
+    # Non-secret provider routing metadata. External-manager items expose the
+    # selector and vault name used to resolve the handle; local items leave both unset.
+    account_selector: Optional[str] = None
+    vault_name: Optional[str] = None
     # Every origin the password manager bound to this item (manager backends only;
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
@@ -238,6 +242,10 @@ class VaultItemMeta:
             out["identifier_type"] = self.identifier_type
         if self.has_otp:
             out["has_otp"] = True
+        if self.account_selector is not None:
+            out["account_selector"] = self.account_selector
+        if self.vault_name is not None:
+            out["vault_name"] = self.vault_name
         if len(self.allowed_origins) > 1:
             out["allowed_origins"] = list(self.allowed_origins)
         if self.field_token is not None:

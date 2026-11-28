@@ -145,6 +145,7 @@ class OnePasswordLoginBackend(LoginBackend):
     def __init__(self, cfg: Optional[dict] = None, *, alias: str = ""):
         self.cfg = cfg or {}
         self.alias = alias
+        self.account_selector = str(self.cfg.get("account") or "").strip() or None
         if alias:
             # Instance attributes shadow the class defaults: a distinct name keeps unlock state
             # and diagnostics apart, and a distinct prefix routes handles without a lookup table.
@@ -292,13 +293,14 @@ class OnePasswordLoginBackend(LoginBackend):
                 continue
         return None
 
-    @staticmethod
-    def _connect_meta(item, vault_id):
+    def _connect_meta(self, item, vault_id, vault_name: Optional[str] = None):
         handle = f"op:connect:{vault_id}:{item.get('id')}"
         OnePasswordLoginBackend._connect_ids(handle)
         if item.get("category") == "CREDIT_CARD":
             return _card_meta(handle, item, str(item.get("createdAt") or ""),
-                              _card_last4(_card_secret(item.get("fields", [])).get("card_number", "")))
+                              _card_last4(_card_secret(item.get("fields", [])).get("card_number", "")),
+                              account_selector=self.account_selector,
+                              vault_name=str((item.get("vault") or {}).get("name") or vault_name or "") or None)
         origins = _all_origins([u.get("href", "") for u in item.get("urls", [])])
         if not origins:
             return None
@@ -306,6 +308,8 @@ class OnePasswordLoginBackend(LoginBackend):
         username = next((f.get("value") for f in item.get("fields", []) if f.get("purpose") == "USERNAME"), None)
         return VaultItemMeta(id=handle, kind="login", label=str(item.get("title") or origin),
                              has_otp=OnePasswordLoginBackend._connect_otp_seed(item) is not None,
+                             account_selector=self.account_selector,
+                             vault_name=str((item.get("vault") or {}).get("name") or vault_name or "") or None,
                              origin=origin, created_at=str(item.get("createdAt") or ""),
                              identifier_type="username" if username else None, identifier=username,
                              allowed_origins=_web_origins(origins))
@@ -402,8 +406,10 @@ class OnePasswordLoginBackend(LoginBackend):
     def otp_availability(self, handle: str, *, fetch: bool = False) -> Optional[bool]:
         """Display-only CLI field availability, cached with the existing listing TTL.
 
-        Callers may fetch only for an unambiguous origin-filtered login. Never
-        reveal fields or mint a code, and never use this hint to authorize a fill.
+        Callers may fetch only for a bounded set of origin-matched logins (one
+        ``op item get`` each, metadata only). Never reveal fields or mint a code,
+        and never use this hint to authorize a fill. A lookup that was not made or
+        failed is unknown (None), never False.
         """
         if self._connect_credentials()[1]:
             return None
@@ -433,10 +439,17 @@ class OnePasswordLoginBackend(LoginBackend):
                     or detail.get("category") != "LOGIN" or detail.get("state", "ACTIVE") != "ACTIVE"):
                 return None
             fields = detail.get("fields")
-            if not isinstance(fields, list) or any(not isinstance(f, dict) or not isinstance(f.get("type"), str)
-                                                   for f in fields):
+            if not isinstance(fields, list) or any(
+                    not isinstance(field, dict)
+                    or (not isinstance(field.get("type"), str)
+                        and not isinstance(field.get("purpose"), str))
+                    for field in fields):
                 return None
-            available = any(f["type"] == "OTP" for f in fields)
+            available = any(
+                str(field.get("type") or "").upper() == "OTP"
+                or str(field.get("purpose") or "").upper() in {"OTP", "ONE_TIME_PASSWORD"}
+                for field in fields
+            )
         except (RuntimeError, UnlockRequired, OSError, ValueError, TypeError, AttributeError):
             # A lookup failure is unknown, not evidence that the item has no OTP.
             return None
@@ -635,7 +648,7 @@ class OnePasswordLoginBackend(LoginBackend):
                 self._connect_ids(f"op:connect:{vault_id}:{vault_id}")
                 for item in self._connect_get(f"/v1/vaults/{vault_id}/items"):
                     if item.get("category") in ("LOGIN", "CREDIT_CARD") and item.get("state", "ACTIVE") == "ACTIVE":
-                        meta = self._connect_meta(item, vault_id)
+                        meta = self._connect_meta(item, vault_id, vault.get("name"))
                         if meta:
                             out.append(meta)
             return out + self.list_protected_fields()
@@ -646,7 +659,9 @@ class OnePasswordLoginBackend(LoginBackend):
             created = str(item.get("created_at") or "")
             if item.get("category") == "CREDIT_CARD":
                 # The listing exposes only the masked number ("3767 **** 2009"), never the PAN.
-                out.append(_card_meta(handle, item, created, _card_last4(str(item.get("additional_information") or ""))))
+                out.append(_card_meta(handle, item, created, _card_last4(str(item.get("additional_information") or "")),
+                                      account_selector=self.account_selector,
+                                      vault_name=str((item.get("vault") or {}).get("name") or "") or None))
                 continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
@@ -655,6 +670,8 @@ class OnePasswordLoginBackend(LoginBackend):
             username = str(item.get("additional_information") or "").strip() or None
             out.append(VaultItemMeta(
                 id=f"{self.prefix}{item.get('id')}", kind="login", label=str(item.get("title") or origins[0]),
+                account_selector=self.account_selector,
+                vault_name=str((item.get("vault") or {}).get("name") or "") or None,
                 origin=origins[0], created_at=str(item.get("created_at") or ""),
                 identifier_type="username" if username else None, identifier=username,
                 allowed_origins=_web_origins(origins)))
@@ -684,7 +701,8 @@ class OnePasswordLoginBackend(LoginBackend):
         category = item.get("category")
         if category == "CREDIT_CARD":
             return _card_meta(handle, item, str(item.get("created_at") or item.get("createdAt") or ""),
-                              _card_last4(str(item.get("additional_information") or "")))
+                              _card_last4(str(item.get("additional_information") or "")),
+                              account_selector=self.account_selector)
         if category != "LOGIN":
             return None
         urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
@@ -694,6 +712,8 @@ class OnePasswordLoginBackend(LoginBackend):
         username = str(item.get("additional_information") or "").strip() or None
         return VaultItemMeta(
             id=handle, kind="login", label=str(item.get("title") or origins[0]), origin=origins[0],
+            account_selector=self.account_selector,
+            vault_name=str((item.get("vault") or {}).get("name") or "") or None,
             created_at=str(item.get("created_at") or item.get("createdAt") or ""),
             identifier_type="username" if username else None, identifier=username,
             allowed_origins=_web_origins(origins))
@@ -890,10 +910,12 @@ def _card_last4(masked: str) -> Optional[str]:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-def _card_meta(handle: str, item, created_at: str, last4: Optional[str]) -> VaultItemMeta:
+def _card_meta(handle: str, item, created_at: str, last4: Optional[str], *,
+               account_selector: Optional[str] = None, vault_name: Optional[str] = None) -> VaultItemMeta:
     # No origin: the fill binds the card to the page it is on, and the user confirms that origin.
     return VaultItemMeta(id=handle, kind="payment", label=str(item.get("title") or "Card"), origin=None,
-                         created_at=created_at, identifier_type="card_last4" if last4 else None, identifier=last4)
+                         created_at=created_at, identifier_type="card_last4" if last4 else None, identifier=last4,
+                         account_selector=account_selector, vault_name=vault_name)
 
 
 def _web_origins(origins: list[str]) -> tuple:

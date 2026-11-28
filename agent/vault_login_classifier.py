@@ -156,6 +156,11 @@ def classify_login_control(control: LoginControl) -> Optional[ClassifiedLoginCon
     return None
 
 
+# Google names its single TOTP control ``totpPin`` and labels it only "Enter code".
+# Normalization turns the camel-case name into the single token ``totppin``, so the
+# qualifier-before-code expression alone cannot recognize it. Keep the compact
+# provider-specific token narrow rather than treating every ``*pin`` as an OTP.
+_RE_OTP_COMPACT = re.compile(r"\b(?:totp|otp|2fa|mfa)(?:pin|code|token)?\b")
 _RE_OTP = re.compile(
     r"\b(?:one[\s-]?time|verification|security|auth(?:entication|enticator)?|2fa|two[\s-]?factor|mfa|totp|otp|"
     r"passcode|sms)\b.*\b(?:code|pin|token)\b|\b(?:otp|totp|2fa|mfa|verification\s*code|passcode)\b"
@@ -164,8 +169,10 @@ _RE_OTP = re.compile(
 
 _RE_OTP_CONTEXT = re.compile(
     r"\b(?:verification|security\s+code|one\s+time\s+code|2fa|mfa|authenticator|"
-    r"two\s+factor|codigo\s+de\s+verificacion|code\s+de\s+verification|sicherheitscode)\b"
+    r"two\s+factor|\d+\s+step\s+verification|codigo\s+de\s+verificacion|"
+    r"code\s+de\s+verification|sicherheitscode)\b"
 )
+_RE_GENERIC_OTP_LABEL = re.compile(r"\b(?:enter\s+)?(?:code|pin|token)\b")
 _RE_OTP_DELIVERY_OR_LIFETIME = re.compile(
     r"\b(?:(?:sent|texted|delivered)\s+to\s+(?:your\s+)?(?:phone|mobile|telephone)|"
     r"expires?\s+in\s+\d+\s+(?:seconds?|minutes?))\b"
@@ -219,8 +226,17 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
             continue
         if c.type not in ("text", "tel", "number", "password", ""):
             continue
-        if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
-            out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
+        metadata = _normalize_text(" ".join(p for p in (c.name, c.label) if p))
+        context = _normalize_text(c.nearby_text)
+        # Google uses <input type="tel" name="totpPin" aria-label="Enter code">.
+        # NFKD/punctuation normalization makes the name ``totppin``; accept only
+        # this narrow provider-token family, not arbitrary ``*pin`` controls.
+        compact_otp = _RE_OTP_COMPACT.search(metadata)
+        contextual_otp = (_RE_GENERIC_OTP_LABEL.search(metadata)
+                          and _RE_OTP_CONTEXT.search(context)
+                          and not _RE_NOT_OTP_CONTEXT.search(context))
+        if _RE_OTP.search(metadata) or compact_otp or contextual_otp:
+            out.append(ClassifiedLoginControl(c, 75 if compact_otp else 70, "one-time-code"))
     if out:
         return out
     groups: dict[int, list[LoginControl]] = {}

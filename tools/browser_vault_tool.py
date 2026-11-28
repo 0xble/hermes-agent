@@ -351,8 +351,8 @@ _TAB_PROBES = {kind: build_form_probe_js(selector) for kind, selector in {
     "login": "input[type=password]",
     "payment": "input[autocomplete^=cc-], [name*=card i], [placeholder*=card i], [name*=cvc i], [name*=cvv i]",
     "address": "input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]",
-    "otp": "input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
-           "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]",
+    "otp": "input[autocomplete=one-time-code], input[name=totpPin i], input[id=totpPin i], "
+           "input[name*=otp i], input[name*=code i], input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]",
     "protected_field": "input[autocomplete^=bday], select[autocomplete^=bday], "
                        "input[name*=birth i], input[id*=birth i], input[name*=dob i], input[id*=dob i]",
 }.items()}
@@ -415,7 +415,11 @@ def _remember_login(task_id: str) -> bool:
 
 
 def _list_two_factor_metadata(backend, meta, origin: Optional[str], unambiguous: bool) -> dict:
-    """Availability is a display hint, never fill or OTP authorization."""
+    """Availability is a display hint, never fill or OTP authorization.
+
+    1Password can answer this from non-revealing item metadata. Fetch one
+    metadata-only item detail per login when needed; failures remain unknown.
+    """
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
 
     from agent.vault_store import origin_matches_lookup
@@ -445,9 +449,10 @@ def _list_two_factor_metadata(backend, meta, origin: Optional[str], unambiguous:
 def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None) -> str:
     """List filtered vault handles + metadata across enabled backends. Passwords are never included.
 
-    Login ``otp_available`` is true/false when known, null when unknown. One
-    unambiguous origin-filtered CLI login may lazily inspect field metadata;
-    unfiltered listings only reuse cached availability.
+    Login ``otp_available`` is true/false when the manager can answer from
+    metadata and null only when that metadata is unavailable. 1Password
+    handles also expose the non-secret ``onepass_account`` selector and
+    ``onepass_vault`` name used to resolve them.
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call browser_vault_fill (which prompts the user to unlock) or tell the user.
     """
@@ -510,6 +515,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                 entry["identifier_type"] = meta.identifier_type
             if meta.field_token:
                 entry["field"] = meta.field_token
+            if meta.account_selector is not None:
+                entry["onepass_account"] = meta.account_selector
+            if meta.vault_name is not None:
+                entry["onepass_vault"] = meta.vault_name
             pinned = getattr(backend, "browser_account", "")
             if isinstance(pinned, str) and pinned:
                 entry["browser_account"] = pinned
@@ -519,8 +528,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
-                       "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
-                       "1Password item, mailbox, or phone and type it with the browser input tool. Card number, expiry, "
+                       "user to save one. If the page offers 'Try another way' or a list of methods, choose an "
+                       "authenticator/TOTP, SMS, or email code option, then retry enter_code or read the code from the "
+                       "matching 1Password item. Only a hardware key, biometric sensor read, phone-only tap/approval, "
+                       "or a passkey not stored in 1Password is a human handoff. Card number, expiry, "
                        "and CVC read live from the routed 1Password Credit Card item may be typed on the verified merchant "
                        "origin for the approved exact charge in two cases: (1) after no_payment_fields, a partial fill, "
                        "missed fields, or a processor frame; or (2) after approval_unavailable (no prompt surface), "
@@ -693,12 +704,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, re
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
-                           "error": ("No one-time-code field on the current page. If the site wants a passkey, use a "
-                                     "stored 1Password passkey through the canonical-origin browser/system prompt for the "
-                                     "intended identity. For an approval, try the issuer's web or desktop path, then an "
-                                     "email/SMS code or a 1Password TOTP or passkey. Never use iPhone Mirroring. A phone-only "
-                                     "approval, a passkey not in 1Password, a Touch ID or Face ID sensor read, or a hardware "
-                                     "security key remains a physical handoff.")})
+                           "error": ("No one-time-code field was found. If the page offers 'Try another way' or a "
+                                     "list of methods, choose an authenticator/TOTP, SMS, or email code option, then "
+                                     "retry enter_code or read the code from the matching 1Password item. If the site "
+                                     "wants a passkey, use a stored 1Password passkey through the canonical-origin "
+                                     "browser/system prompt for the intended identity. For an approval, try the issuer's web or "
+                                     "desktop path first. Never use iPhone Mirroring. Only a "
+                                     "hardware key, biometric sensor read, phone-only tap/approval, or a passkey not "
+                                     "stored in 1Password is a human handoff.")})
 
     # Inspection and alias consent can race navigation. Refuse before minting
     # a code, and retain the checked origin in the atomic in-page write guard.
@@ -1247,10 +1260,12 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
-        "no_code_field means use a stored 1Password passkey through the canonical-origin browser/system prompt for "
-        "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
-        "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
-        "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
+        "if the page offers 'Try another way' or a list of methods, choose an authenticator/TOTP, SMS, or email code "
+        "option, then retry enter_code or read the code from the matching 1Password item; use a stored 1Password "
+        "passkey through the canonical-origin browser/system prompt for the intended identity; try the issuer's "
+        "web/desktop approval first; never use iPhone Mirroring; only a hardware key, "
+        "biometric sensor read, phone-only tap/approval, or a passkey not stored in 1Password is a human handoff; "
+        "unlock (backend: ask the user to unlock 1Password/Bitwarden). "
         "Passwords and one-time codes fetched from an authorized source for this service may be typed with the "
         "browser input tool. Prefer vault fill first. Card number, expiry, and CVC read live from the routed "
         "1Password Credit Card item may be typed on the verified merchant origin for the approved exact charge "

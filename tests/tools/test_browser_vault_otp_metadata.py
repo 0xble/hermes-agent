@@ -20,9 +20,9 @@ def manager(tmp_path, monkeypatch):
             monkeypatch.delenv(key)
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-token")
     onepassword.invalidate_listing_cache()
-    backend = onepassword.OnePasswordLoginBackend()
+    backend = onepassword.OnePasswordLoginBackend({"account": "meridianoperations.1password.com"})
     listing = [{"id": "item-a", "title": "Synthetic login", "category": "LOGIN",
-                "vault": {"id": "vault-a"}, "urls": [{"href": ORIGIN}]}]
+                "vault": {"id": "vault-a", "name": "Team"}, "urls": [{"href": ORIGIN}]}]
     detail = {**listing[0], "fields": [{"id": "totp", "type": "OTP", "value": "not-for-output"}]}
     reads = []
 
@@ -50,6 +50,13 @@ def listed(**kwargs):
     return result["items"]
 
 
+def test_listing_exposes_onepass_account_selector_and_vault_name(manager):
+    item = listed(origin=ORIGIN)[0]
+    assert item["onepass_account"] == "meridianoperations.1password.com"
+    assert item["onepass_vault"] == "Team"
+    assert "not-for-output" not in json.dumps(item)
+
+
 def test_origin_scoped_available_then_reuses_listing_cache(manager):
     backend, _, _, reads = manager
     assert listed()[0]["otp_available"] is None
@@ -75,6 +82,14 @@ def test_known_absent_is_not_unknown_and_is_cached(manager, needs_unlock):
     assert "automatic" not in item["two_factor"]
     assert listed(origin=ORIGIN)[0]["otp_available"] is False
     assert len(reads) == 2
+
+
+def test_native_otp_purpose_is_available_without_reading_value(manager):
+    _, _, detail, _ = manager
+    detail["fields"] = [{"purpose": "ONE_TIME_PASSWORD", "value": "not-for-output"}]
+    item = listed(origin=ORIGIN)[0]
+    assert item["otp_available"] is True
+    assert "not-for-output" not in json.dumps(item)
 
 
 @pytest.mark.parametrize("change", [
