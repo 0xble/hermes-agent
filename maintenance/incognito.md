@@ -1,6 +1,10 @@
 # Incognito Topics
 
 Fork patch identity: `incognito`.
+Fork-Patch-Backfill: 0da2bfc33ff6ac935bcb2d166e8f2f3f46f32457; incognito
+Fork-Patch-Backfill: c8a5f90aa94daa49a530d49f30916846c18a53b5; incognito
+Fork-Patch-Backfill: 6588f7a5e2e7dffafd4eab8db445e5cebb2f728c; incognito
+Fork-Patch-Backfill: eb10530b561c5c30228386c062d3679b8edac945; incognito
 
 This is a private fork implementation, not an upstream contribution. The upstream
 [temporary-chat request](https://github.com/NousResearch/hermes-agent/issues/52341)
