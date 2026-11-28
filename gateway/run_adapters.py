@@ -948,7 +948,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             await completion.wait()
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
-        candidates = self._resume_pending_candidates(record_boot=False)
+        # Session-store candidate enumeration can take the gateway lock. Keep it off the
+        # event loop during reconnect recovery just as the startup path does.
+        candidates = await self._resume_pending_candidates_async(record_boot=False)
         queued_before = len(getattr(self, "_startup_restore_queue", []))
         tasks = []
         keys = set()

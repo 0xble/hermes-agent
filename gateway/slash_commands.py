@@ -605,8 +605,6 @@ class GatewaySlashCommandsMixin(
             return t("gateway.platform.paused", name=name)
         if not queued:
             return t("gateway.platform.not_queued_resume", name=name)
-        if not paused:
-            return t("gateway.platform.already_retrying", name=name)
         self._resume_paused_platform(platform)
         return t("gateway.platform.resumed", name=name)
 

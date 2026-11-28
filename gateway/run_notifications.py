@@ -1885,7 +1885,7 @@ class GatewayNotificationsMixin(
         if not session_key:
             return False
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
-        adapter = self._resolve_injection_adapter(platform_name, source)
+        adapter = await asyncio.to_thread(self._resolve_injection_adapter, platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
     async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> bool:

@@ -68,8 +68,7 @@ def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_
 
 
 def finish_fallback_restore(agent, was_active, held_shared_record, previous_model, previous_provider):
-    """End the episode, retaining silence only for its pending successful-primary receipt."""
-    from agent.notice_style import ContextNotice
+    """End the episode and defer recovery notice until the primary actually succeeds."""
     from agent.turn_failure_routes import reset_routes_left
 
     reset_routes_left(agent)
@@ -88,7 +87,12 @@ def finish_fallback_restore(agent, was_active, held_shared_record, previous_mode
         # still waits for primary success; clearing the episode must not announce its recovery.
         agent._shared_primary_cooldown_record = {**record, "_silent_retry": silent_retry}
     if was_active and not held_shared_record and not silent_retry:
-        # Notification surfaces are best-effort and must not undo a successful restore.
-        with contextlib.suppress(Exception):
-            agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                f"fallback {previous_model} via {previous_provider} is no longer active."))
+        # Rebinding at turn start only makes the primary eligible. The next provider response
+        # must prove recovery before telling the user, otherwise a provider that fails again
+        # emits a false restore notice on every prompt.
+        agent._pending_primary_restore_notice = {
+            "model": str(agent.model),
+            "provider": str(agent.provider),
+            "previous_model": str(previous_model),
+            "previous_provider": str(previous_provider),
+        }

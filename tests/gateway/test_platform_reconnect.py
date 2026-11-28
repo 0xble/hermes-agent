@@ -317,6 +317,7 @@ class TestPlatformReconnectWatcher:
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
+        runner._resume_pending_candidates_async = AsyncMock(return_value=[])
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
 
         platform_config = PlatformConfig(enabled=True, token="test")
@@ -632,6 +633,20 @@ class TestPauseResume:
         assert info["attempts"] == 0
         assert info["next_retry"] != float("inf")
         assert "pause_reason" not in info
+
+    def test_resume_retries_an_already_retrying_platform_immediately(self):
+        runner = _make_runner()
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="t"),
+            "attempts": 4,
+            "next_retry": time.monotonic() + 300,
+        }
+        before = time.monotonic()
+        assert runner._resume_paused_platform(Platform.TELEGRAM) is True
+        info = runner._failed_platforms[Platform.TELEGRAM]
+        assert info["attempts"] == 4
+        assert info["retry_now"] is True
+        assert before <= info["next_retry"] <= time.monotonic()
 
 
 class TestPlatformSlashCommand:

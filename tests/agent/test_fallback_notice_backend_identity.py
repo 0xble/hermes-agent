@@ -61,6 +61,19 @@ def test_first_class_credential_switch_and_verified_recovery_both_notify(agent):
     assert len([message for message in emitted if "Primary model restored" in message]) == 1
 
 
+def test_local_restore_notice_waits_for_primary_success(agent):
+    """A turn-start rebind must not announce recovery before its primary request succeeds."""
+    emitted = []
+    agent._emit_diagnostic_status = emitted.append
+    _restore(agent)
+
+    assert emitted == []
+    assert isinstance(agent._pending_primary_restore_notice, dict)
+
+    assert complete_primary_recovery(agent) is True
+    assert len([message for message in emitted if "Primary model restored" in message]) == 1
+
+
 def _restore(agent):
     agent._fallback_activated = agent._provider_fallback_active = True
     with patch("agent.agent_runtime_helpers._rebuild_primary_client"):

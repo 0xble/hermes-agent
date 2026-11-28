@@ -5,8 +5,23 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+
+@pytest.mark.asyncio
+async def test_reconnect_recovery_reads_resume_candidates_off_gateway_loop():
+    """Reconnect recovery must use the worker-backed session-store snapshot."""
+    runner, _adapter = make_restart_runner()
+    runner._resume_pending_candidates = lambda **_kwargs: pytest.fail(
+        "reconnect recovery called the blocking candidate snapshot"
+    )
+    runner._resume_pending_candidates_async = AsyncMock(return_value=[])
+
+    await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+
+    runner._resume_pending_candidates_async.assert_awaited_once_with(record_boot=False)
 
 
 @pytest.mark.asyncio
@@ -22,6 +37,7 @@ async def test_live_input_during_reconnect_tail_drains_after_owner_release(monke
     accepted = []
     runner._normalize_source_for_session_key = lambda value: value
     runner._resume_pending_candidates = lambda **_kwargs: []
+    runner._resume_pending_candidates_async = AsyncMock(return_value=[])
     runner._schedule_resume_pending_sessions = lambda **_kwargs: None
     runner._queue_startup_restore_event(MessageEvent(text="Y-slow", source=slow_source))
 

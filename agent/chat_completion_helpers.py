@@ -2306,6 +2306,9 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            # A new fallback episode means the primary probe did not recover. Drop any
+            # deferred restore notice from the preceding turn before recording this switch.
+            agent._pending_primary_restore_notice = None
             if getattr(agent, "_shared_primary_probe_token", None):
                 from agent.shared_primary_cooldown import settle_primary_probe_on_exit
                 settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)

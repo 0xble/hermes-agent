@@ -796,14 +796,14 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         )
 
     def _resume_paused_platform(self, platform) -> bool:
-        """Unpause a platform (reset attempts, retry on the next watcher tick). True iff it was paused."""
+        """Resume a queued platform and force the watcher to retry on its next tick."""
         info = getattr(self, "_failed_platforms", {}).get(platform)
-        if info is None or not info.get("paused"):
+        if info is None:
             return False
-        info["paused"] = False
-        info.pop("pause_reason", None)
-        info["attempts"] = 0
-        info["next_retry"] = time.monotonic()  # retry on next watcher tick
+        if info.get("paused"):
+            info.update(paused=False, attempts=0)
+            info.pop("pause_reason", None)
+        info["retry_now"], info["next_retry"] = True, time.monotonic()
         self._update_platform_runtime_status(platform.value, platform_state="retrying")
         logger.info("%s resumed — retrying on next watcher tick", platform.value)
         return True
