@@ -372,3 +372,36 @@ def test_draining_owner_still_answers_status_and_cancel_of_admitted_cron_work(tm
         asyncio.run(probe())
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_delivery_builds_the_mount_plan_off_the_loop(monkeypatch):
+    """The plan reads state.db and takes the session-store lock, so it never runs on the loop."""
+    from gateway import session_cron
+    from gateway.config import Platform
+    from gateway.session_authority import LiveSession
+
+    sid = "chat"
+    source = SimpleNamespace(platform=Platform.TELEGRAM)
+    authority = SimpleNamespace(sessions={}, runner=SimpleNamespace(_adapter_for_source=lambda s: "adapter"))
+    loop_thread, plan_threads, restored = threading.get_ident(), [], []
+
+    def mount_plan(_authority, _sid):
+        plan_threads.append(threading.get_ident())
+        return {"sid": _sid}
+
+    def restore(_authority, _sid, *, plan=None):
+        restored.append(plan)
+        authority.sessions[_sid] = LiveSession(source, "route")
+
+    async def admit_route_wake(runner, adapter, wake_source, *args):
+        return adapter == "adapter" and wake_source is source
+
+    monkeypatch.setattr("gateway.session_route_recovery._mount_plan", mount_plan)
+    monkeypatch.setattr("gateway.session_route_recovery.restore_routed_session", restore)
+    monkeypatch.setattr("gateway.session_automation.admit_route_wake", admit_route_wake)
+    monkeypatch.setattr("gateway.session_authorities.owner_scope", lambda *_args, **_kwargs: nullcontext())
+
+    assert await session_cron._admit_local_delivery(authority, sid, "note", {}) is True
+    assert plan_threads and loop_thread not in plan_threads
+    assert restored == [{"sid": sid}]

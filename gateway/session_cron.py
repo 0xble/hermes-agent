@@ -49,13 +49,16 @@ async def _admit_local_delivery(authority, chat_id, text, metadata):
     from gateway.session_authorities import owner_scope
     from gateway.session_automation import admit_route_wake
     from gateway.session_local_recovery import local_adapter_map
-    from gateway.session_route_recovery import mountable, restore_routed_session
+    from gateway.session_route_recovery import _mount_plan, restore_routed_session
     with owner_scope(authority):
         live = authority.sessions.get(chat_id)
-        if live is None and mountable(authority, chat_id):
+        # The plan reads state.db and takes the session-store lock: build it off the loop.
+        plan = await asyncio.to_thread(_mount_plan, authority, chat_id) if live is None else None
+        live = authority.sessions.get(chat_id)
+        if live is None and plan is not None:
             # A messaging conversation a reminder set from the app names (gateway/session_detached.py),
             # not mounted (a restart): it mounts off the chat, or on it when the chat names it again.
-            restore_routed_session(authority, chat_id)
+            restore_routed_session(authority, chat_id, plan=plan)
         elif live is None or live.source is None or live.source.platform == Platform.LOCAL:
             await _restore_local_session_for_cron(authority, chat_id, admission_gate=True)
         source = authority.sessions[chat_id].source

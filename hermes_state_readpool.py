@@ -287,3 +287,61 @@ def note_read_pool_exhausted(db_path) -> None:
         f" ({suppressed} more reads since the last warning)" if last is not None else "",
         _POOL_EXHAUSTION_WARN_INTERVAL_S,
     )
+
+
+def checkout_loop_reader(db: "SessionDB"):
+    """The gateway event loop's reader when the pool is at capacity; None keeps the writer fallback.
+
+    The writer fallback would freeze every adapter behind in-flight writes. There is one loop thread,
+    so one connection per database that is never contended. It holds no permit: it is opened once and
+    reused, never one per read, so it cannot grow into EMFILE. Checkout and the in-use count change
+    under one lock, so close() never closes it mid-read.
+    """
+    if not db._wal_active or db.read_only:
+        return None
+    from hermes_state import _READ_BUSY_TIMEOUT_S, _READ_OPEN_RETRY_SECONDS
+    with db._read_conns_lock:
+        if db._read_conns_closed:
+            return None
+        if db._loop_reader is not None:
+            db._loop_reader_depth += 1
+            return db._loop_reader
+        failed_at = db._read_open_failed_at  # back off with the pool: an open may be what EMFILE refused
+        if failed_at and time.monotonic() - failed_at < _READ_OPEN_RETRY_SECONDS:
+            return None
+    import sqlite3
+    from hermes_state_wal import apply_database_pragmas
+    conn = None
+    try:
+        conn = db._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
+        apply_database_pragmas(conn, db_label="state.db")
+    except sqlite3.Error:
+        if conn is not None:
+            db._close_conn_logged(conn, "partially-opened loop reader")
+        with db._read_conns_lock:
+            db._read_open_failed_at = time.monotonic()
+        logger.debug("loop reader open failed for %s", db.db_path, exc_info=True)
+        return None
+    with db._read_conns_lock:
+        if not db._read_conns_closed and db._loop_reader is None:
+            db._loop_reader, db._loop_reader_depth = conn, db._loop_reader_depth + 1
+            return conn
+    db._close_conn_logged(conn, "surplus loop reader")
+    return None
+
+
+def return_loop_reader(db: "SessionDB") -> None:
+    with db._read_conns_lock:
+        db._loop_reader_depth -= 1
+    close_loop_reader_if_closed(db)
+
+
+def close_loop_reader_if_closed(db: "SessionDB") -> None:
+    """Close the loop reader once close() began and no loop read is using it."""
+    with db._read_conns_lock:
+        if not db._read_conns_closed or db._loop_reader_depth:
+            return
+        conn, db._loop_reader = db._loop_reader, None
+    if conn is not None:
+        db._close_conn_logged(conn, "loop reader")
+
