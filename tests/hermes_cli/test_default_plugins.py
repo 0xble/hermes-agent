@@ -275,3 +275,25 @@ def test_a_retry_that_removed_our_leftover_and_then_failed_stays_owed(tmp_path, 
     assert default_plugins.install_defaults(home, entries=entries)["owed"] == ["accent-picker"]
     assert attempts == ["accent-picker"] * 3, "a tree we removed was read as the user's removal"
 
+
+
+def test_a_test_spawned_child_neither_fetches_nor_spawns(tmp_path, monkeypatch):
+    """A child a test spawned with a rebuilt env (no bridge var, pytest ancestor, pytest not imported)
+    must not start the detached network install that outlives the test, with or without a home."""
+    import subprocess
+    import sys
+
+    import hermes_state_guard
+
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.delitem(sys.modules, "pytest")
+    monkeypatch.setattr(hermes_state_guard, "_has_pytest_ancestor", lambda: True)
+    children: list = []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: children.append(argv))
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert default_plugins.fetch_policy(home) == "denied"
+    assert default_plugins.spawn_install(home) is False
+    assert default_plugins.spawn_install() is False
+    assert children == []

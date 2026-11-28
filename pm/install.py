@@ -210,6 +210,21 @@ def _spawned_by_test() -> bool:
     return _has_pytest_ancestor()
 
 
+def lazy_installs_env_disabled() -> bool:
+    """The environment's half of the lazy-install policy, shared by every reader of the bridge var.
+
+    True when ``HERMES_DISABLE_LAZY_INSTALLS`` is 1/true/yes, or when it is unset in a child a test
+    spawned with a rebuilt environment (``_spawned_by_test``). Any other explicit value is the
+    caller's own choice and leaves the decision to config.
+    """
+    import os
+
+    bridge = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower()
+    if bridge in ("1", "true", "yes"):
+        return True
+    return not bridge and _spawned_by_test()
+
+
 def lazy_installs_allowed() -> bool:
     """Policy: may pm install things on demand right now?
 
@@ -221,10 +236,7 @@ def lazy_installs_allowed() -> bool:
     """
     import os
 
-    bridge = os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").strip().lower()
-    if bridge in ("1", "true", "yes"):
-        return False
-    if not bridge and _spawned_by_test():
+    if lazy_installs_env_disabled():
         return False
     try:
         from hermes_cli.config import cfg_get, load_config_readonly, require_readable_config_before_write
