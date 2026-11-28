@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import hermes_startup_watchdog as sw
-import hermes_state_compaction as compaction
+import persistence.sqlite.admin.compaction as compaction
 
 pytestmark = pytest.mark.platforms("posix")  # holder scan is unavailable on Windows
 
@@ -76,7 +76,7 @@ def test_request_is_honored_once_then_cleared(bloated_db, armed_watchdog, caplog
     assert free_before > pages_before // 4
     compaction.request_compaction(bloated_db)
 
-    with caplog.at_level(logging.INFO, logger="hermes_state_compaction"):
+    with caplog.at_level(logging.INFO, logger="persistence.sqlite.admin.compaction"):
         result = compaction.run_pending_compaction(bloated_db)
 
     assert result["status"] == "compacted"
@@ -98,7 +98,7 @@ def test_foreign_holder_defers_and_keeps_the_request(bloated_db, caplog):
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "ready"
-        with caplog.at_level(logging.WARNING, logger="hermes_state_compaction"):
+        with caplog.at_level(logging.WARNING, logger="persistence.sqlite.admin.compaction"):
             result = compaction.run_pending_compaction(bloated_db)
     finally:
         holder.stdin.close()
@@ -120,7 +120,7 @@ def test_low_disk_skips_and_keeps_the_request(bloated_db, monkeypatch, caplog):
     usage = namedtuple("usage", "total used free")
     monkeypatch.setattr(compaction.shutil, "disk_usage", lambda path: usage(10, 10, 1024))
 
-    with caplog.at_level(logging.WARNING, logger="hermes_state_compaction"):
+    with caplog.at_level(logging.WARNING, logger="persistence.sqlite.admin.compaction"):
         result = compaction.run_pending_compaction(bloated_db)
 
     assert result["status"] == "skipped_disk"
@@ -137,10 +137,10 @@ def test_pending_release_acknowledgement_defers(bloated_db):
 
 
 def test_failures_never_raise_and_are_bounded(bloated_db, monkeypatch):
-    from hermes_state import SessionDB
+    from persistence.sqlite.admin.store import SQLiteStoreAdmin
 
     compaction.request_compaction(bloated_db)
-    monkeypatch.setattr(SessionDB, "vacuum", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(SQLiteStoreAdmin, "vacuum", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
     for attempt in range(1, compaction.MAX_ATTEMPTS + 1):
         result = compaction.run_pending_compaction(bloated_db)
         assert result["status"] == "error"
@@ -150,7 +150,7 @@ def test_failures_never_raise_and_are_bounded(bloated_db, monkeypatch):
     assert not compaction.request_path(bloated_db).exists()
 
     compaction.request_compaction(bloated_db)
-    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders",
+    monkeypatch.setattr("persistence.sqlite._state.holders.foreign_state_db_holders",
                         lambda path: (_ for _ in ()).throw(OSError("scan failed")))
     assert compaction.run_pending_compaction(bloated_db)["status"] == "error"
     assert compaction.request_path(bloated_db).exists()

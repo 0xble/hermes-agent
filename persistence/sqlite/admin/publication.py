@@ -109,10 +109,10 @@ def state_lock(lock, *, db_path, deadline: float | None = None, db=None, site=No
     an acquired transaction. Under a prune budget, its deadline overrides the
     passed deadline and acquisition uses a 50 ms non-blocking spin.
     """
-    from hermes_state_prune_budget import current_budget
+    from persistence.sqlite.admin.prune_budget import current_budget
     if budget := current_budget():
         budget.check()
-        from hermes_state_prune_pacing import PrunePacer
+        from persistence.sqlite.admin.prune_pacing import PrunePacer
         pacer = PrunePacer(max_size=1)
         while not lock.acquire(blocking=False):
             pacer.pause(0)
@@ -128,7 +128,7 @@ def state_lock(lock, *, db_path, deadline: float | None = None, db=None, site=No
         # historical unbounded wait for an explicitly expired budget (used by callers/tests
         # that reserve patience for SQLite's cross-process retry loop).
         if patience_s is not None and patience_s > 0 and deadline is not None and deadline > time.monotonic():
-            from hermes_state_write import writer_mutex_until
+            from persistence.sqlite._state.write import writer_mutex_until
             with writer_mutex_until(lock, deadline, db=db, site=site):
                 yield
         else:
@@ -144,7 +144,7 @@ def state_lock(lock, *, db_path, deadline: float | None = None, db=None, site=No
     acquired = lock.acquire(timeout=patience_s)
     record_publication_write(wait_s=time.monotonic() - started)
     if not acquired:
-        from hermes_state_lockowners import log_write_lock_holders
+        from persistence.sqlite._state.lockowners import log_write_lock_holders
         _log_mutex_owner(snapshot, acquisitions_before, patience_s)
         log_write_lock_holders(db_path, patience_s)
         raise LocalStateLockTimeout("database is locked (local SessionDB connection mutex patience exhausted)")
@@ -193,6 +193,6 @@ def record_publication_attempt():
 
 def raise_if_nonretryable_contention(exc):
     """Expired patience and lost holders are terminal, not a live foreign writer."""
-    from hermes_state_errors import CompressionLeaseLostError
+    from persistence.sqlite._state.errors import CompressionLeaseLostError
     if isinstance(exc, (LocalStateLockTimeout, CompressionLeaseLostError)):
         raise exc

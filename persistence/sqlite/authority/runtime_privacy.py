@@ -5,6 +5,7 @@ families instead declare identity fields and resolve durable ownership on the
 writer connection before their handler may mutate anything.
 """
 import json
+import re
 
 
 # Adding a receipt verb requires declaring its ownership here as well as its handler.
@@ -36,8 +37,8 @@ _PROVENANCE_FIELDS = ('_branched_from', '_delegate_from', '_reset_from', '_compr
 
 
 def _refuse(reason='privacy_denied'):
-    from hermes_state_runtime import RuntimeStoreError
-    raise RuntimeStoreError(reason) from None
+    from persistence.core.errors import AuthorityRefusal
+    raise AuthorityRefusal(reason) from None
 
 
 def _identity(value):
@@ -82,7 +83,7 @@ def require_public(owners):
 
 
 def session_owners(conn, owners):
-    from hermes_state_runtime_workers import runtime_lineage
+    from persistence.sqlite.workers._runtime_workers import runtime_lineage
     found, expanded = set(owners), set()
     for sid in owners:
         if sid in expanded:
@@ -99,8 +100,7 @@ def session_owners(conn, owners):
 
 def resolve_worker_owners(conn, owners, operation, payload, execution_id):
     if operation == 'compression.lineage':
-        from hermes_state_worker_compression import CompressionSnapshot
-        owners += tuple(CompressionSnapshot(None, conn)._session_lineage_root_to_tip(owners[0]))
+        owners += tuple(_lineage_root_to_tip(conn, owners[0]))
     # A reserved child's authority belongs to its durable parent execution, whereas
     # an ordinary /branch is a separate conversation, not its parent's private work.
     parent = conn.execute("SELECT s.parent_session_id FROM worker_executions w JOIN sessions s ON s.id=w.session_id "
@@ -125,9 +125,9 @@ def resolve_worker_owners(conn, owners, operation, payload, execution_id):
 
 
 def _title_owners(conn, session_id, title, *, automatic=False):
-    from hermes_state_titles import SessionTitlesMixin, auto_title_holders
+    from persistence.sqlite.conversation._store.titles import sanitize_title
     try:
-        title = SessionTitlesMixin.sanitize_title(title)
+        title = sanitize_title(title)
     except ValueError:
         # An invalid title cannot clear another row. Preserve the handler's
         # existing validation/error receipt instead of changing its public API.
@@ -140,8 +140,41 @@ def _title_owners(conn, session_id, title, *, automatic=False):
     return tuple(row[0] for row in rows)
 
 
+_NUMBERED_TITLE_RE = re.compile(r'^(.*?) #(\d+)$')
+
+
+def _auto_title_matches(stored, candidate):
+    """Only a stored alias can lose its suffix, never the requested subject's number."""
+    return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
+
+
+def auto_title_holders(conn, title, exclude_session_id, columns='id'):
+    """Every other session holding *title* under the automatic-title equivalence rule (case, ``#N`` alias)."""
+    # SQLite's lower()/NOCASE do not implement Unicode casefolding.
+    conn.create_function('auto_title_matches', 2, _auto_title_matches, deterministic=True)
+    return conn.execute(
+        f'SELECT {columns} FROM sessions WHERE id != ? AND title IS NOT NULL AND auto_title_matches(title, ?)',
+        (exclude_session_id or '', title.casefold()),
+    )
+
+
+def _lineage_root_to_tip(conn, session_id):
+    """Parent chain root..tip on the writer connection (bounded, cycle-safe)."""
+    if not session_id:
+        return [session_id]
+    chain = []
+    current = session_id
+    while current and current not in chain and len(chain) < 100:
+        chain.append(current)
+        row = conn.execute('SELECT parent_session_id FROM sessions WHERE id = ?', (current,)).fetchone()
+        if row is None:
+            break
+        current = row[0]
+    return list(reversed(chain)) or [session_id]
+
+
 def _child_worker_owners(conn, execution_id):
-    from hermes_state_runtime_workers import descendant_range
+    from persistence.sqlite.workers._runtime_workers import descendant_range
     return tuple(row[0] for row in conn.execute('SELECT session_id FROM worker_executions '
         "WHERE execution_id>=? AND execution_id<? AND status!='terminal'", descendant_range(execution_id)))
 
@@ -175,10 +208,10 @@ def execute_owned_write(db, write, owners, *, resolve=None, **kwargs):
 
 
 def _require_resolved_public(resolve, conn):
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     try:
         owners = resolve(conn)
-    except RuntimeStoreError:
+    except AuthorityRefusal:
         raise
     except Exception:  # health: allow BLE001 -- deny every lookup failure; raw text/tracebacks may expose private data.
         # A failed ownership lookup cannot silently omit the inaccessible owner.
@@ -188,7 +221,7 @@ def _require_resolved_public(resolve, conn):
 
 
 def admission_owners(conn, admission_id, transfers=()):
-    from hermes_state_runtime import _admission
+    from persistence.sqlite.authority._runtime import _admission
     row = _admission(conn, admission_id)
     lineage = json.loads(row['lineage_json'])
     if not isinstance(lineage, list):
@@ -245,7 +278,7 @@ def mutation_owners(db, session_id, operation, payload, prepared=None):
 
 def resolve_mutation_owners(conn, owners, operation, payload):
     if operation == 'delete':
-        from hermes_state_mutation_guards import delete_targets
+        from persistence.sqlite.authority._runtime_guards import delete_targets
         owners += tuple(delete_targets(conn, owners[0]))
     if operation in {'rename', 'sidebar'} and payload.get('title'):
         owners += _title_owners(conn, owners[0], payload['title'])

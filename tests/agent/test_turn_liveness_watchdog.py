@@ -809,7 +809,7 @@ def test_waiting_on_a_contended_state_db_writer_is_not_a_stall():
     counts as activity up to its end (2026-10-11: turns aborted after 604s queued on the lock)."""
     from types import SimpleNamespace
 
-    import hermes_state
+    from persistence.sqlite._state import write as state_write
     from agent.turn_liveness import TurnLivenessWatchdog
 
     agent = SimpleNamespace(_turn_liveness_activity_generation=1, _last_activity_ts=time.time() - 900,
@@ -824,7 +824,7 @@ def test_waiting_on_a_contended_state_db_writer_is_not_a_stall():
 
     def turn():
         agent._execution_thread_id = threading.get_ident()
-        with hermes_state._storage_write_in_progress():
+        with state_write.storage_write_in_progress():
             inside.set()
             release.wait(10)
         done.set()

@@ -5300,10 +5300,10 @@ def _run_requested_state_db_compaction() -> None:
     rewrites it. The startup watchdog lease is renewed inside. Never raises.
     """
     try:
-        from hermes_state import _default_db_path
-        from hermes_state_compaction import request_path, run_pending_compaction
+        from hermes_constants import get_hermes_home
+        from persistence.sqlite.admin.compaction import request_path, run_pending_compaction
 
-        db_path = Path(_default_db_path())
+        db_path = get_hermes_home() / "state.db"
         if request_path(db_path).exists():
             run_pending_compaction(db_path)
     except Exception as exc:

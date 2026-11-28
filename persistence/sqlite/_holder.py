@@ -48,7 +48,9 @@ from persistence.sqlite._state.readpool import (
 from persistence.sqlite._state import holders as _state_holders
 from persistence.sqlite._state import lockguard as _lockguard
 from persistence.sqlite._state.lockowners import log_write_lock_holders
-from persistence.sqlite._state.write import WriterMutexTimeout, write_site, writer_mutex_until
+from persistence.sqlite._state.write import (
+    WriterMutexTimeout, storage_write_in_progress, write_site, writer_mutex_until,
+)
 from persistence.sqlite._state.dbfile import (
     _chmod_pinned_inode, _connect_tracked_db, _fd_is_truly_unlinked, _is_operator_store_link, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -817,7 +819,14 @@ class StoreHolder:
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
-    def _execute_write(  # health: allow CC -- lock retry, rollback and repair share one deadline
+    def _execute_write(
+        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+    ) -> T:
+        """Run *fn(conn)* as one write; time queued or retrying here counts as turn activity."""
+        with storage_write_in_progress():
+            return self._execute_write_unmarked(fn, patience_s)
+
+    def _execute_write_unmarked(  # health: allow CC -- lock retry, rollback and repair share one deadline
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit

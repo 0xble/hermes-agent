@@ -12,8 +12,8 @@ from typing import Any, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from agent.conversation_compression import _CompressionLease, _Attempt, _CommitOutcome, CompressionCommitFence
 
-from hermes_state_errors import is_sqlite_lock_error
-from hermes_state_publication import publication_metrics, record_publication_attempt, raise_if_nonretryable_contention
+from storage_errors import is_sqlite_lock_error
+from persistence.sqlite.admin.publication import publication_metrics, record_publication_attempt, raise_if_nonretryable_contention
 
 logger = logging.getLogger("agent.conversation_compression")
 

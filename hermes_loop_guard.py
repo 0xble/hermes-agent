@@ -34,7 +34,7 @@ _PLUMBING = ("hermes_loop_guard.py", "hermes_state", "session_persistence.py", "
              "gateway/session.py", "session_db_recovery.py", "threading.py", "contextlib.py")
 # Owner attribution skips only the acquisition wrappers themselves, so SessionDB operations
 # (hermes_state.py frames) stay visible as the holder.
-_OWNER_WRAPPERS = ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py", "threading.py")
+_OWNER_WRAPPERS = ("hermes_loop_guard.py", "persistence/sqlite/admin/publication.py", "contextlib.py", "threading.py")
 _OWNER_SITES = 3
 _OWNER_MAX_WALK = 12
 

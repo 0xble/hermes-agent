@@ -222,7 +222,7 @@ def _run_pending_compaction(db_path: Path) -> dict[str, Any]:
                        "acknowledgement; the request stays pending for the next start")
         return {"status": "deferred_release"}
 
-    from hermes_state_holders import foreign_state_db_holders, in_process_state_db_holders
+    from persistence.sqlite._state.holders import foreign_state_db_holders, in_process_state_db_holders
 
     holders = foreign_state_db_holders(db_path)
     if holders:
@@ -232,12 +232,14 @@ def _run_pending_compaction(db_path: Path) -> dict[str, Any]:
             ", ".join(f"{pid}:{target}" for pid, target in holders[:3]))
         return {"status": "deferred_holders", "holders": len(holders)}
 
-    from hermes_state import SessionDB
+    from persistence.sqlite import _registry
+    from persistence.sqlite.admin.store import SQLiteStoreAdmin
 
-    db = SessionDB(db_path=db_path)
+    admin = SQLiteStoreAdmin(db_path, read_only=False)
+    db = _registry.acquire(db_path)
     try:
-        pragmas = db._page_pragmas(("page_count", "freelist_count", "page_size"),
-                                   "state.db compaction: could not read page counts: %s")
+        pragmas = admin._page_pragmas(("page_count", "freelist_count", "page_size"),
+                                      "state.db compaction: could not read page counts: %s")
         if pragmas is None:
             raise RuntimeError("could not read page counts")
         page_count, freelist, page_size = pragmas
@@ -263,11 +265,13 @@ def _run_pending_compaction(db_path: Path) -> dict[str, Any]:
             request.get("requested_at") or "unknown time", before / 2**30,
             100.0 * freelist / page_count if page_count else 0.0)
         started = time.monotonic()
+        # The admin VACUUM runs on this same registry writer, so the lease watches its connection.
         with _ProgressLease(db_path, db._conn):
-            optimized = db.vacuum()
+            optimized = admin.vacuum()
         after = os.path.getsize(db_path)
     finally:
-        db.close()
+        _registry.release_or_close(db)
+
     cancel_request(db_path)
     elapsed = time.monotonic() - started
     logger.info(

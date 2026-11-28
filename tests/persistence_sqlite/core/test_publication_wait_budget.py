@@ -14,7 +14,7 @@ from hermes_state import SessionDB
 
 @pytest.mark.parametrize("operation", ["write", "degraded_read"])
 def test_publication_mutex_timeout_attributes_holders(tmp_path, operation, caplog):
-    from hermes_state_publication import LocalStateLockTimeout, publication_metrics
+    from persistence.sqlite.admin.publication import LocalStateLockTimeout, publication_metrics
 
     db = SessionDB(tmp_path / "wait.db")
     held = threading.Event()
@@ -62,7 +62,7 @@ def test_publication_mutex_timeout_attributes_holders(tmp_path, operation, caplo
 def test_publication_mutex_timeout_names_a_writer_holder_past_lock_plumbing(tmp_path, caplog):
     """A holder inside an ordinary SessionDB write (``state_lock``'s ``with lock:``) is named by
     its own operation, not by the loop-guard/state_lock/contextlib frames it acquired through."""
-    from hermes_state_publication import LocalStateLockTimeout, publication_metrics
+    from persistence.sqlite.admin.publication import LocalStateLockTimeout, publication_metrics
 
     db = SessionDB(tmp_path / "writer.db")
     held = threading.Event()
@@ -179,7 +179,7 @@ def test_lease_ttl_starts_after_writer_wait(tmp_path, operation):
 
 
 def test_lost_compaction_lease_is_not_retried(tmp_path):
-    from hermes_state_errors import SessionCompressionInProgressError
+    from persistence.sqlite._state.errors import SessionCompressionInProgressError
 
     db = SessionDB(tmp_path / "lost.db")
     try:
@@ -200,7 +200,7 @@ def test_publication_and_attempt_metrics_keep_separate_retry_scopes(
 ):
     import sqlite3
 
-    from hermes_state_publication import publication_metrics, record_publication_write
+    from persistence.sqlite.admin.publication import publication_metrics, record_publication_write
     from hermes_state_write_metrics import WriteMetrics, current_write_metrics
 
     db = SessionDB(tmp_path / "metrics.db")

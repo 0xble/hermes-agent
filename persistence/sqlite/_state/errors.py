@@ -68,6 +68,10 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     fail fast). Subclassing keeps every existing handler working."""
 
 
+class CompressionLeaseLostError(SessionCompressionInProgressError):
+    """This publication lost its holder; waiting cannot revive the old snapshot."""
+
+
 class PruneRowUnresolvedError(RuntimeError):
     """An in-place prune rewrite could not name the exact live row of a changed message. Raised before
     any write, so the caller commits through ``archive_and_compact`` instead."""

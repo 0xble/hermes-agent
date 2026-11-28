@@ -28,7 +28,7 @@ def open_public_outbox(store):
 def _require_public(scope, journal=None, operation=None, payload=None):
     from agent.runtime_session_store import WorkerPersistenceError
     from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
-    from hermes_state_runtime_privacy import require_public, worker_owners
+    from persistence.sqlite.authority.runtime_privacy import require_public, worker_owners
     try:
         owners = (scope['session_id'],)
         if operation is not None:

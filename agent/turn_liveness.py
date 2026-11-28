@@ -157,7 +157,7 @@ class TurnLivenessWatchdog:
         idle_seconds = 0.0 if activity_ts is None else max(0.0, now - activity_ts)
         # Waiting on a contended state.db writer is not a stall: the turn is queued behind other
         # writers, not wedged. Time inside a SessionDB write counts as activity up to its end.
-        from hermes_state import storage_write_activity
+        from persistence.sqlite._state.write import storage_write_activity
 
         writing, write_ended_at = storage_write_activity(getattr(self._agent, "_execution_thread_id", None))
         if writing:

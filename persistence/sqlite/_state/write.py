@@ -66,6 +66,31 @@ def describe_site(site) -> str:
 
 
 @contextmanager
+def storage_write_in_progress():
+    """Mark this thread as inside a state-store write (queued on the writer lock, retrying a busy
+    database, or committing). The turn-liveness watchdog does not count that time as a stalled
+    turn: under write contention a turn can queue behind dozens of writers for minutes."""
+    thread = threading.current_thread()
+    depth = getattr(thread, "_hermes_storage_write_depth", 0)
+    setattr(thread, "_hermes_storage_write_depth", depth + 1)
+    try:
+        yield
+    finally:
+        setattr(thread, "_hermes_storage_write_depth", depth)
+        setattr(thread, "_hermes_storage_write_ended_at", time.time())
+
+
+def storage_write_activity(thread_id):
+    """``(in_progress, last_ended_at)`` of state-store writes on thread *thread_id*."""
+    active = getattr(threading, "_active", {})
+    thread = active.get(thread_id) if thread_id is not None else None
+    if thread is None:
+        return False, None
+    return (getattr(thread, "_hermes_storage_write_depth", 0) > 0,
+            getattr(thread, "_hermes_storage_write_ended_at", None))
+
+
+@contextmanager
 def writer_mutex_until(lock, deadline, *, db=None, site=None):
     """Do not let an observation or lease renewal queue forever behind another writer.
 

@@ -78,7 +78,7 @@ class PruneBudget:
         if math.isfinite(self.deadline) or now < self.next_contention_warning:
             return
         self.next_contention_warning = now + 30
-        from hermes_state_lockowners import state_db_write_lock_holders
+        from persistence.sqlite._state.lockowners import state_db_write_lock_holders
         holders = state_db_write_lock_holders(self.db_path) if self.db_path is not None else []
         logger.warning("Session prune %r continues retrying a foreign SQLite writer: %s",
                        label, " | ".join(holders) or "write-lock holder unavailable")
@@ -117,7 +117,7 @@ def run_prune_write(attempt, *, shrink=None, minimum_seconds=None, defer=None, l
     budget = current_budget()
     if budget is None or _UNIT_SECONDS.get() is not None:
         return attempt()
-    from hermes_state_prune_pacing import PrunePacer
+    from persistence.sqlite.admin.prune_pacing import PrunePacer
     pacer = PrunePacer(max_size=1)
     seconds = budget.TRANSACTION_SECONDS
     while True:
@@ -197,7 +197,7 @@ def prune_sql(conn, *, write=False):
     try:
         yield
     except sqlite3.OperationalError as exc:
-        from hermes_state_errors import is_sqlite_lock_error
+        from storage_errors import is_sqlite_lock_error
         if write and is_sqlite_lock_error(exc):
             raise PruneWriteContended("session prune yielded to a foreground SQLite writer") from exc
         if time.monotonic() >= deadline or "interrupted" in str(exc).lower():
