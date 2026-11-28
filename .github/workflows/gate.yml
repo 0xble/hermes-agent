@@ -85,6 +85,7 @@ jobs:
     outputs:
       profile: ${{ steps.pick.outputs.profile }}
       shards: ${{ steps.pick.outputs.shards }}
+      macos: ${{ steps.macos.outputs.macos }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,6 +109,20 @@ jobs:
           echo "Quick shards: $shards"
           echo 'profile=quick' >> "$GITHUB_OUTPUT"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
+      - name: Decide whether this ready PR needs the macOS job
+        id: macos
+        env:
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$DRAFT_PR" == true ]]; then
+            echo 'macos=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
+            echo 'No comparison history; the macOS job runs to be safe.'
+          echo "macos=$(python3 scripts/ci/macos_scope.py "$HEAD_REF" origin/main)" >> "$GITHUB_OUTPUT"
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)
     needs: select
@@ -175,6 +190,112 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci quick origin/main --shard '${{ matrix.shard }}/10'
+  native-macos:
+    # Pre-merge macOS for fork-sync candidates and macOS-touching ready PRs
+    # (scripts/ci/macos_scope.py). Other PRs get macOS from the nightly run.
+    name: Native OS (macos-26)
+    needs: select
+    if: needs.select.outputs.macos == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      OPENROUTER_API_KEY: ''
+      OPENAI_API_KEY: ''
+      NOUS_API_KEY: ''
+      # rustup's default in the runner HOME is not visible to the isolated CI HOME.
+      # Keep the pinned toolchain in checkout-owned ignored state across both steps.
+      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Assert checked-out PR head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          # Launcher only: uv installs the exact checkout interpreter below.
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26.8.2'
+      - name: Cache pinned uv archive
+        uses: ./.github/actions/cache-pinned-tool
+        with:
+          source: uv
+          tool: uv
+          version: '0.12.13'
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: '0.12.13'
+      - name: Install pinned checkout Python
+        shell: bash
+        run: uv python install 3.14.7
+      - name: Install pinned Rust for ripgrep provisioning
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup default 1.96.1
+      - name: Provision case-sensitive macOS scratch
+        shell: bash
+        env:
+          CI_SCRATCH: ${{ runner.temp }}/hermes-ci-case-sensitive
+        run: |
+          ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh "$CI_SCRATCH")
+          echo "TMPDIR=$ci_tmp" >> "$GITHUB_ENV"
+      - name: Provision isolated macOS keychain
+        timeout-minutes: 3
+        shell: bash
+        env:
+          CI_KEYCHAIN: ${{ runner.temp }}/hermes-ci.keychain-db
+        run: |
+          CI_KEYCHAIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export CI_KEYCHAIN_PASSWORD
+          security list-keychains -d user </dev/null > "$RUNNER_TEMP/hermes-ci-keychains.before"
+          security default-keychain -d user </dev/null > "$RUNNER_TEMP/hermes-ci-default.before"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security set-keychain-settings "$CI_KEYCHAIN" </dev/null
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security list-keychains -d user -s "$CI_KEYCHAIN" </dev/null
+          security default-keychain -s "$CI_KEYCHAIN" </dev/null
+      - name: Qualify native macOS at the exact PR head
+        shell: bash
+        run: ./bin/ci nightly-native '${{ github.event.pull_request.head.sha }}' --workers 4
+      - name: Clean up isolated macOS keychain
+        if: always()
+        shell: bash
+        env:
+          CI_KEYCHAIN: ${{ runner.temp }}/hermes-ci.keychain-db
+        run: |
+          if [ -f "$RUNNER_TEMP/hermes-ci-default.before" ]; then
+            default_keychain=$(sed -n 's/^ *"\(.*\)" *$/\1/p' "$RUNNER_TEMP/hermes-ci-default.before")
+            [ -n "$default_keychain" ] && security default-keychain -d user -s "$default_keychain" </dev/null || true
+          fi
+          if [ -f "$RUNNER_TEMP/hermes-ci-keychains.before" ]; then
+            keychains=()
+            while IFS= read -r keychain; do
+              [ -n "$keychain" ] && keychains+=("$keychain")
+            done < <(sed -n 's/^ *"\(.*\)" *$/\1/p' "$RUNNER_TEMP/hermes-ci-keychains.before")
+            [ "${#keychains[@]}" -gt 0 ] && security list-keychains -d user -s "${keychains[@]}" || true
+          fi
+          security delete-keychain "$CI_KEYCHAIN" || true
+      - name: Clean up case-sensitive macOS scratch
+        if: always()
+        shell: bash
+        env:
+          CI_SCRATCH: ${{ runner.temp }}/hermes-ci-case-sensitive
+        run: |
+          if mount | grep -F " on $CI_SCRATCH/mnt (" > /dev/null; then
+            hdiutil detach "$CI_SCRATCH/mnt"
+          fi
+          rm -f "$CI_SCRATCH/scratch.sparseimage"
+          if [ -d "$CI_SCRATCH/mnt" ]; then
+            rmdir "$CI_SCRATCH/mnt"
+          fi
+          if [ -d "$CI_SCRATCH" ]; then
+            rmdir "$CI_SCRATCH"
+          fi
   prompt-surface:
     name: Prompt surface diff
     uses: ./.github/workflows/prompt-surface-diff.yml
@@ -182,17 +303,21 @@ jobs:
       contents: read
   qualification:
     if: always()
-    needs: [linux, select, python-shard, prompt-surface, repository-guards]
+    needs: [linux, select, python-shard, native-macos, prompt-surface, repository-guards]
     runs-on: ubuntu-latest
     steps:
       - name: Require every gate job
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           DRAFT_PR: ${{ github.event.pull_request.draft }}
+          MACOS_REQUIRED: ${{ needs.select.outputs.macos }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
+          # The macOS job is required only when select asked for it.
+          if os.environ.get('MACOS_REQUIRED') != 'true' and results.get('native-macos') == 'skipped':
+              results.pop('native-macos')
           print(results)
           draft = os.environ.get('DRAFT_PR') == 'true'
           if not draft and results and all(result == 'success' for result in results.values()):
