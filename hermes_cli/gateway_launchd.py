@@ -1072,18 +1072,37 @@ def _launchd_stop_locked():
     set_intent(_gw().get_hermes_home(), stopped=True)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
+    # Decide before bootout whether launchd runs this home's gateway (directly or under a wrapper):
+    # only then does bootout SIGTERM it. A loaded-but-parked job beside a detached owner does not.
+    supervised = _launchctl_supervised_pid(get_launchd_label())
+    launchd_owned = {supervised} | _gw()._gateway_descendants_of(supervised) if supervised else set()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
+    booted_out = False
     try:
         # Captured: an already-unloaded job (3/113/125) is handled below, so launchctl's own
         # "Boot-out failed: 3" must not print around the ✓ line; e.stderr stays on the raised error.
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90, **_gw()._CAPTURE_TEXT)
+        booted_out = True
     except subprocess.CalledProcessError as e:
         # Job already unloaded (3/113/125), or the domain can't be managed at all (5/125, macOS 26+
         # detached-fallback process, issue #23387) — in both cases just fall through to the PID-based kill
         # below.
         if not (_launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(e.returncode)):
             raise
-    _gw()._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if booted_out:
+        # A SIGTERMed gateway drains (notify, then cron and delegation waits) and launchd SIGKILLs a
+        # job it owns at ExitTimeOut anyway. A 5s CLI SIGKILL cut that drain short, so interrupted
+        # turns were never marked for resume and the next boot paid unclean recovery.
+        from gateway.status import get_running_pid, terminate_pid
+        pid = get_running_pid()
+        if pid is not None and pid not in launchd_owned:
+            # bootout signalled nothing this home runs: give the detached owner the same SIGTERM.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                terminate_pid(pid, force=False)
+        budget = _launchd_old_gateway_exit_budget()
+        _gw()._wait_for_gateway_exit(timeout=budget + 5.0, force_after=budget)
+    else:
+        _gw()._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
     print("✓ Service stopped")
 
 
