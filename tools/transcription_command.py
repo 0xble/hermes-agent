@@ -112,7 +112,10 @@ def _transcribe_command_stt(
     language = (language_override or config.get("language")
                 or _resolve_stt_language(provider_name, stt_config) or DEFAULT_COMMAND_STT_LANGUAGE)
     try:
-        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-") as tmpdir:
+        from agent.incognito_private_dir import disposable_path_for_current_session
+        private_root = disposable_path_for_current_session()
+        temp_parent = str(private_root) if private_root is not None else None
+        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-", dir=temp_parent) as tmpdir:
             input_path, normalize_error = _normalize_command_stt_input(audio, tmpdir, provider_name, config)
             if normalize_error:
                 return fail(normalize_error)

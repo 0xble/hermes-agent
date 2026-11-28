@@ -109,9 +109,10 @@ def test_import_and_startup_exclude_each_other_before_publication(tmp_path, monk
     home = tmp_path / 'state'
     home.mkdir(mode=0o700)
     archive = tmp_path / 'restore.zip'
-    with sqlite3.connect(tmp_path / 'donor.db') as db:
+    with closing(sqlite3.connect(tmp_path / 'donor.db')) as db:
         db.execute('CREATE TABLE marker(value TEXT)')
         db.execute("INSERT INTO marker VALUES('restored')")
+        db.commit()
     with zipfile.ZipFile(archive, 'w') as zf:
         zf.writestr('config.yaml', 'gateway: {multiplex_profiles: false}\n')
         zf.write(tmp_path / 'donor.db', 'state.db')
@@ -170,7 +171,7 @@ def test_import_and_startup_exclude_each_other_before_publication(tmp_path, monk
     damaged = home / 'projects.db'
     damaged.write_bytes(b'not a SQLite database')
     assert backup._safe_restore_db(tmp_path / 'donor.db', damaged)
-    with sqlite3.connect(damaged) as db:
+    with closing(sqlite3.connect(damaged)) as db:
         assert db.execute('SELECT value FROM marker').fetchall() == [('restored',)]
 
 
@@ -203,7 +204,7 @@ def test_recovery_output_exemption_excludes_canonical_activation(tmp_path):
         report = recover_session_database(source, target_home / 'recovered.db')
         assert report['verified'] and report['source_unchanged'], report
         assert report['runtime_state']['excluded_tables']['session_admissions']['rows'] == 1
-        with sqlite3.connect(target_home / 'recovered.db') as db:
+        with closing(sqlite3.connect(target_home / 'recovered.db')) as db:
             assert db.execute('SELECT content FROM messages').fetchall() == [('retained content',)]
             assert db.execute('SELECT COUNT(*) FROM session_admissions').fetchone()[0] == 0
             assert db.execute('SELECT COUNT(*) FROM runtime_epoch').fetchone()[0] == 0

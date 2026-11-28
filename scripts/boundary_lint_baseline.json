@@ -659,6 +659,8 @@
     "plugins/platforms/telegram/rich_delivery.py gateway.copy_blocks.restore_inline_copy_bodies": 1,
     "plugins/platforms/telegram/rich_parts.py gateway.copy_blocks._has_copy_markers": 1,
     "plugins/platforms/telegram/telegram_ids.py gateway.platforms.send_targets.parse_nonempty": 1,
+    "plugins/platforms/telegram/telegram_media_flood.py agent.incognito.is_incognito": 1,
+    "plugins/platforms/telegram/telegram_media_flood.py agent.incognito_private_dir.private_subdir_for_current_session": 1,
     "plugins/platforms/telegram/telegram_ids.py gateway.platforms.send_targets.regex_groups_parser": 1,
     "plugins/platforms/telegram/telegram_media_download.py utils.env_float": 1,
     "plugins/platforms/telegram/telegram_network.py agent.ssl_verify.platform_ssl_context": 1,

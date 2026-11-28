@@ -73,7 +73,17 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
     if not ffmpeg:
         return None
     if output_path is None:
-        fd, ogg_path = tempfile.mkstemp(prefix="voice_transcode_", suffix=".ogg")
+        from agent.incognito import is_incognito
+        from agent.incognito_private_dir import disposable_path_for_current_session
+
+        private = is_incognito()
+        parent = disposable_path_for_current_session() if private else None
+        if private and parent is None:
+            logger.warning("Refusing voice transcode: private interval is unresolved")
+            return None
+        fd, ogg_path = tempfile.mkstemp(
+            prefix="voice_transcode_", suffix=".ogg",
+            dir=str(parent) if parent is not None else None)
         os.close(fd)
     else:
         ogg_path = output_path
@@ -289,9 +299,11 @@ def build_auto_tts_output_path(platform) -> str:
     backends like Edge TTS. Everything else keeps the MP3 default. See #36685, #57049.
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
+    from agent.incognito_private_dir import private_path_for_current_session
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(), "hermes_voice", f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
+    private_root = private_path_for_current_session()
+    temp_root = private_root if private_root is not None else Path(tempfile.gettempdir())
+    audio_path = str(temp_root / "hermes_voice" / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)
     return audio_path
 
@@ -920,8 +932,17 @@ def _media_delivery_allowed_roots() -> list[Path]:
         root for chunk in media_delivery_allow_dirs().split(os.pathsep)
         for raw_root in chunk.split(",")
         if (root := Path(os.path.expanduser(raw_root.strip()))).is_absolute())
-    return [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
-            *_kanban_attachment_roots(), *operator_roots]
+    # Private turns may only deliver files created in their own interval. Besides
+    # enforcing the boundary, returning early avoids probing public profile/kanban roots.
+    from agent.incognito import is_incognito
+    from agent.incognito_private_dir import private_path_for_current_session
+    private_root = private_path_for_current_session()
+    if is_incognito():
+        return [private_root / "cache"] if private_root is not None else []
+
+    roots = [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
+             *_kanban_attachment_roots(), *operator_roots]
+    return roots
 
 
 def _media_delivery_recency_seconds() -> float:
@@ -2992,7 +3013,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             finally:
                 admission.release()
         try:
-            threading.Thread(target=_worker, name="media-history-lookup", daemon=True).start()
+            from agent.memory_provider import spawn_context_thread
+            spawn_context_thread(_worker, name="media-history-lookup", daemon=True).start()
         except Exception:
             # start() failed (thread exhaustion): the worker never ran, so release the permit here.
             admission.release()

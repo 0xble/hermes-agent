@@ -85,7 +85,7 @@ def fetch_remote_media(path: str) -> Optional[str]:
     env = _active_remote_env()
     if env is None:
         return None
-    from gateway.platforms.base import DOCUMENT_CACHE_DIR, _normalize_media_tag_path, validate_media_delivery_path
+    from gateway.platforms.base import DOCUMENT_CACHE_DIR, _normalize_media_tag_path, get_document_cache_dir, validate_media_delivery_path
     from gateway.platforms.base_log_safety import _log_safe_path
     from tools.environments.base import FileFetchError
 
@@ -106,7 +106,7 @@ def fetch_remote_media(path: str) -> Optional[str]:
                 or is_project_env_basename(posixpath.basename(resolved))):
             return None
         basename = re.sub(r"[^\w.\-]", "_", posixpath.basename(resolved)) or "file"
-        dest = Path(DOCUMENT_CACHE_DIR) / f"remote_{uuid.uuid4().hex[:12]}_{basename}"
+        dest = get_document_cache_dir() / f"remote_{uuid.uuid4().hex[:12]}_{basename}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         env.fetch_file(resolved, dest, max_bytes=_FETCH_MAX_BYTES)
     except FileFetchError as exc:
