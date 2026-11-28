@@ -247,7 +247,7 @@ def _state_db_is_wal(home: Optional[Path]) -> bool:
     pre-writer path.
     """
     try:
-        from hermes_state_dbfile import _pread_db_header
+        from persistence.sqlite._state.dbfile import _pread_db_header
         head = _pread_db_header(_home_path(home, "state.db"), 20)
         return bool(head) and len(head) >= 20 and head[:16] == b"SQLite format 3\x00" and head[18] == head[19] == 2
     except Exception:

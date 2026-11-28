@@ -82,7 +82,7 @@ def _already_told(db, session_id) -> bool:
 def _record_told(authority, session_id) -> None:
     """Mark the current episode told. Markers of earlier episodes, whose lost turn is no longer
     unknown, are dropped in the same write, so at most one per paused session remains."""
-    from hermes_state_runtime import _epoch
+    from persistence.sqlite.authority._runtime import _epoch
 
     def write(conn):
         _epoch(conn, authority.epoch)
@@ -120,7 +120,7 @@ async def announce_pause(authority, ref, reason) -> bool:
     from gateway.bot_peer_notices import automatic_notices_allowed
     from gateway.config import Platform
     from gateway.session_ingress import pause_notice
-    from hermes_state_runtime import list_session_admissions
+    from persistence.sqlite.authority._admission_store import list_session_admissions
     runner = authority.runner
     live = authority.sessions.get(ref.session_id)
     if live is None or live.pause_notified or getattr(runner, '_draining', False):

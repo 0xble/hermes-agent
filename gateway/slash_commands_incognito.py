@@ -98,7 +98,7 @@ class GatewayIncognitoCommandsMixin:
             await asyncio.to_thread(shared_worker_context().run, flush)
         # The durable flag must land before any private input can be admitted. On failure
         # propagate the exception, never acknowledge privacy that was not persisted.
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
         try:
             await asyncio.to_thread(self.session_store.set_incognito, key, True)
         except RuntimeStoreError as exc:

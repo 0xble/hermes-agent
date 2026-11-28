@@ -4,7 +4,7 @@ import json
 import logging
 from time import monotonic, time
 
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 logger = logging.getLogger(__name__)
 # Strong references for fenced admissions whose observer was cancelled.
@@ -238,7 +238,7 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
         # not for a failed attempt, while the stable identity prevents another row.
         if authority is not None:
             import asyncio
-            from hermes_state_runtime import find_session_admission
+            from persistence.sqlite.authority._admission_store import find_session_admission
             try:
                 row = await asyncio.to_thread(lambda: find_session_admission(authority.db,
                     principal_id='automation:' + key, session_id=authority.logical_owner(sid), request_id=identity))

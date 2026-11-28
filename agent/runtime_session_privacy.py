@@ -27,7 +27,7 @@ def open_public_outbox(store):
 
 def _require_public(scope, journal=None, operation=None, payload=None):
     from agent.runtime_session_store import WorkerPersistenceError
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     from hermes_state_runtime_privacy import require_public, worker_owners
     try:
         owners = (scope['session_id'],)
@@ -63,7 +63,7 @@ def private_convenience(scope):
 
 def authoritative_privacy_denial(exc):
     from agent.runtime_session_store import WorkerPersistenceError
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     return isinstance(exc, (WorkerPersistenceError, RuntimeStoreError)) and str(exc) == 'privacy_denied'
 
 def discard_refused_entry(store, entry):

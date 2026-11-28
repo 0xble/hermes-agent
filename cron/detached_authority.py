@@ -14,7 +14,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 PREFIX = 'cron-worker:'
 logger = logging.getLogger(__name__)
@@ -170,14 +170,14 @@ def recover_detached(db, epoch, row):
     result = detached_result(row)
     if result is None:
         return False
-    from hermes_state_runtime import _admission, _epoch, _session, _retire_admission_workers
+    from persistence.sqlite.authority._runtime import _admission, _epoch, _session, _retire_admission_workers
     from gateway.session_results import finish_result, _redacted
 
     def capture(conn):
         _epoch(conn, epoch)
         current = _admission(conn, row['admission_id'])
         if current['status'] == 'terminal':
-            from hermes_state_terminal import RESULT_PREFIX, load_result
+            from persistence.sqlite.conversation._store.terminal import RESULT_PREFIX, load_result
             saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                                  (RESULT_PREFIX + row['admission_id'],)).fetchone()
             if saved is None or load_result(saved[0])['result'].get('cron_result') != _redacted(result['result']):
@@ -215,7 +215,7 @@ def recover_detached(db, epoch, row):
 
 async def register_detached(connection, ref, params, claim):
     """Only the durable detached PID can attach to its already-started cron admission."""
-    from hermes_state_runtime import register_worker_execution
+    from persistence.sqlite.workers._executions import register_worker_execution
     from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID, cron_request_id
     from cron.executions import get_execution
     authority = connection.authority

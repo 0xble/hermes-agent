@@ -20,7 +20,7 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from agent.error_classifier import FailoverReason
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_cli.runtime_provider_custom import LocalRuntimeUnavailableError
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     auth_permanent = FailoverReason.auth_permanent.value
     if isinstance(exc, LocalRuntimeUnavailableError):
         # The chosen model is configured; its local server is down. Not a credential verdict, so

@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import threading
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -68,8 +69,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | None = None) -> None:
-    from hermes_state_repair import apply_durability_barriers
-    from hermes_state_schema import reconcile_state_schema
+    from persistence.sqlite._schema import reconcile_state_schema
+    from sqlite_support import apply_durability_barriers
     # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
     # every short-lived connection collides with live transcript/FTS writers.
     apply_durability_barriers(conn)
@@ -92,7 +93,8 @@ def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | 
         with _SCHEMA_READY_LOCK:
             if _SCHEMA_READY.get(path) == state:
                 return
-    reconcile_state_schema(conn)
+    # The declared schema resolves profile-scoped defaults from the store's own home, as admin reconcile does.
+    reconcile_state_schema(conn, Path(path).parent if path is not None else _db_path().parent)
     path, state = _schema_state(conn)
     if path is not None and state is not None and (identity is None or state[:2] == identity):
         with _SCHEMA_READY_LOCK:

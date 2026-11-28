@@ -6,7 +6,7 @@ owner-issued secret). Same-user socket access or a creator PID is not this grant
 from pathlib import Path
 
 from gateway.session_worker import _SCOPE, worker_identity_claim, verify_worker_identity_claim
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 
 def worker_discovery_handler(runner, identify):

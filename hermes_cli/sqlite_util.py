@@ -86,12 +86,11 @@ def open_shared_state_db(
     refuse damaged bytes rather than replacing forensic evidence.
     """
     from hermes_constants import mkdir_under_hermes_home
-    from hermes_state import (
-        _connect_tracked_db, _secure_state_db_files,
-        has_invalid_sqlite_header_preopen, quarantine_cross_process_lock,
+    from persistence.sqlite._holder import _secure_state_db_files
+    from persistence.sqlite._state.dbfile import (
+        _connect_tracked_db, has_invalid_sqlite_header_preopen, quarantine_cross_process_lock,
     )
-
-    from hermes_state_repair import preflight_db_writability
+    from persistence.sqlite._state.repair import preflight_db_writability
 
     path = Path(path)
     mkdir_under_hermes_home(path.parent)

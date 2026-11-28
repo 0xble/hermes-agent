@@ -322,7 +322,7 @@ def assert_runtime_epoch_owner(db_path):
             if owner.owns(home):
                 yield
                 return
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     raise RuntimeStoreError('not_owner')
 
 

@@ -3,7 +3,7 @@ from copy import copy
 from pathlib import Path
 
 from gateway.platforms.event import MessageEvent
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 
 def revalidate_legacy_route(authority, entry, adapter):

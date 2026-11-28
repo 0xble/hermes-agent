@@ -40,7 +40,7 @@ def refusal_evidence(source: str, identity: str | None = None) -> Iterator[None]
     The codec is also reused by automation, so counting at its individual raise
     sites either misses ledger/gate refusals or double-counts producer failures.
     """
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
     # Producer preparation can wrap the authority call. Only the outer scope
     # counts, but a newly scheduled task owns its own admission even when it
     # inherited this context from the task that accepted its predecessor.

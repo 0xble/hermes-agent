@@ -13,7 +13,8 @@ import logging
 import sqlite3
 import time
 
-from hermes_state_runtime import RuntimeStoreError, _admission, _epoch
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
+from persistence.sqlite.authority._runtime import _admission, _epoch
 
 _PREFIX = 'automation_refusal:'
 _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.25, 5.0

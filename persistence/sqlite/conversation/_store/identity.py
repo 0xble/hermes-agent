@@ -3,10 +3,28 @@
 
 from __future__ import annotations
 import json
-from typing import Any, Mapping, MutableMapping, Optional
+from typing import Any, Mapping, MutableMapping, Optional, Sequence
 from session_rules.turns import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UIDS, uid_list, coalesce_tool_call_id
 from persistence.sqlite._state.common import _json_or
 from persistence.sqlite.conversation._store.rules import TOOL_CALL_UID
+
+
+def _newest_message_uid_rows(rows: Sequence[Any]) -> list[Any]:
+    """Keep the last position of each durable uid. Unidentified legacy rows remain distinct.
+
+    Input order is transcript order (stored rows are ordered by id), not timestamp order.
+    This is logical identity only, never content or platform-message-id deduplication.
+    """
+    seen: set[str] = set()
+    kept = []
+    for row in reversed(rows):
+        uid = row[MESSAGE_UID] if MESSAGE_UID in row.keys() else None
+        if isinstance(uid, str) and uid:
+            if uid in seen:
+                continue
+            seen.add(uid)
+        kept.append(row)
+    return kept[::-1]
 
 
 def _live_or_column(msg: Mapping[str, Any], live_key: str, column: str) -> Any:

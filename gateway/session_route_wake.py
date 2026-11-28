@@ -5,7 +5,7 @@ import uuid
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
-from hermes_state_runtime import RuntimeStoreError
+from persistence.core.errors import AuthorityRefusal as RuntimeStoreError
 
 
 async def admit_route_wake_receipt(runner, adapter, source, text, producer, metadata=None, *,

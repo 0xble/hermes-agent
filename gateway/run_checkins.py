@@ -130,7 +130,7 @@ async def _poll_profile_watches(runner, profile_key, config, scope_key):
     """Observe this profile's armed roster under its poll's single scope/config snapshot."""
     from gateway.session_authorities import active_authority
     from gateway.platforms.event import MessageEvent
-    from hermes_state_runtime import list_session_admissions
+    from persistence.sqlite.authority._admission_store import list_session_admissions
     for route, (source, expected) in list(getattr(runner, "_checkin_watch", {}).items()):
         if scope_key(source) != profile_key:
             continue
@@ -201,7 +201,7 @@ async def prepare_checkin(runner, event, entry, *, start=False):
     if tick is None:
         return True
     from gateway.session_authorities import active_authority
-    from hermes_state_runtime import list_session_admissions
+    from persistence.sqlite.authority._admission_store import list_session_admissions
 
     route = entry.session_key
     adapter = runner._delivery_adapter_for(event.source)

@@ -655,7 +655,8 @@ def _wake_session_matches(stamped_sid: str, session_id: str, *, cursor=None) -> 
     """
     if not session_id or stamped_sid == session_id:
         return True
-    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+    from persistence.sqlite._schema_ddl import _COMPRESSION_CHILD_SQL
+    from persistence.sqlite.conversation._store.sql_common import _non_continuation_child_sql
 
     db = _db() if cursor is None else None
     if cursor is None and db is None:
@@ -684,7 +685,8 @@ def compression_successor(session_id: str, *, cursor=None) -> Optional[str]:
     one candidate child, a cycle, or a lineage deeper than the walk bound fails closed (None)."""
     if not session_id:
         return None
-    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+    from persistence.sqlite._schema_ddl import _COMPRESSION_CHILD_SQL
+    from persistence.sqlite.conversation._store.sql_common import _non_continuation_child_sql
 
     db = _db() if cursor is None else None
     if cursor is None and db is None:
