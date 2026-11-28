@@ -905,12 +905,15 @@ try {
                 stack.enter_context(patch.object(ci, 'setup'))
                 stack.enter_context(patch.object(ci, 'environment', return_value={}))
                 stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
-                stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'gate', 'a' * 40]))
+                argv = ['bin/ci', 'gate', 'a' * 40]
+                if hosted:
+                    argv += ['--lane', 'static', '--lane', 'node-gate']
+                stack.enter_context(patch.object(sys, 'argv', argv))
                 seen = []
-                for name in ('static', 'node', 'node_gate', 'docs', 'rust', 'container_lint', 'python_tests', 'e2e_tests'):
+                for name in ('static', 'node_gate', 'python_gate', 'node', 'docs', 'rust', 'container_lint', 'python_tests', 'e2e_tests'):
                     stack.enter_context(patch.object(ci, name, side_effect=lambda *args, name=name: seen.append(name)))
                 self.assertEqual(ci.main(), 0)
-                self.assertEqual(seen, ['static', 'node_gate'])
+                self.assertEqual(seen, ['static', 'node_gate'] if hosted else ['static', 'node_gate', 'python_gate'])
 
     def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
         calls = []

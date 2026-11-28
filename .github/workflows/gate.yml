@@ -1,6 +1,7 @@
 name: Repository gate
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 permissions:
   contents: read
 concurrency:
@@ -72,7 +73,7 @@ jobs:
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci setup
           bash ci/prepare-electron-sandbox.sh
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
+          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --lane static --lane node-gate
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
@@ -111,6 +112,12 @@ jobs:
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
+      - name: Fetch comparison history for draft feedback
+        if: github.event.pull_request.draft && github.event.pull_request.base.ref == 'main'
+        shell: bash
+        run: |
+          git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main' ||
+            printf '%s\n' 'Comparison history unavailable; ready will fall back to full shards.'
       - name: Verify tmux for e2e coverage
         shell: bash
         run: tmux -V
@@ -118,10 +125,15 @@ jobs:
         shell: bash
         env:
           HERMES_E2E_REQUIRE_TUI: "1"
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+          profile=gate
+          if [[ "$DRAFT_PR" == true && "$BASE_REF" == main ]]; then profile=ready; fi
+          runuser -u ci -- env HOME="$HOME" ./bin/ci "$profile" "$PR_HEAD" --shard '${{ matrix.shard }}/10'
   prompt-surface:
     name: Prompt surface diff
     uses: ./.github/workflows/prompt-surface-diff.yml
@@ -141,12 +153,10 @@ jobs:
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          if results and all(result == 'success' for result in results.values()):
+          draft = os.environ.get('DRAFT_PR') == 'true'
+          if not draft and results and all(result == 'success' for result in results.values()):
               sys.exit(0)
-          not_run = [name for name, result in results.items() if result != 'success']
-          only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
-          draft_skip = os.environ.get('DRAFT_PR') == 'true' and only_skipped
-          message = 'draft: gate not run' if draft_skip else 'gate not qualified'
+          message = 'draft: feedback only; full gate required' if draft else 'gate not qualified'
           print(message, file=sys.stderr)
           sys.exit(1)
           PY

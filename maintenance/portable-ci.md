@@ -423,13 +423,69 @@ Host-specific cases use one native `platforms` marker. Real profile and adapter 
 
 The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.
 
-Exact-SHA `bin/ci gate` runs the same bounded static/Node partition locally and
-hosted. Full Python and E2E coverage comes from the hosted shard matrix, which
-`qualification` requires, and landing requires both that check and the local
-receipt, so a receipt never stands in for the matrix. Running every source lane
-locally cannot finish inside the heavy slot's 5400-second hold on this host, so it
-would block every exact-head receipt. Complete local coverage stays available
-through `bin/ci full` and `bin/ci nightly`.
+### Affected PR feedback pilot
+
+Run `git fetch origin main` and `./bin/ci ready "$(git rev-parse HEAD)"` from a
+clean PR checkout. `ready` compares the exact head with its merge base against
+`origin/main`. It keeps the existing static and Node gate (including lint and
+type checks) and runs selected Python/E2E files through `scripts/run_tests.sh`.
+Test-only narrowing is confined to existing test bodies in the explicit
+leaf-test allowlist. The pilot admits `tests/gateway/test_response_filters.py`:
+its assertions run in isolation, it does not provide fixtures or pytest plugins,
+and no other tracked code imports it. Re-audit the allowlist before adding paths
+or sharing an existing entry. A `test_*.py` name or presence in the test inventory
+does not prove isolation. Both revisions must match the audited Git blob's
+module structure outside existing test bodies. Changes to imports, test
+signatures, decorators or other module-level code run the full inventory,
+including when those changes have already landed on the base branch.
+
+The production pilot recognizes edits to local string/tuple normalization in
+`gateway/response_filters.py::_canonical_silence_candidates`, optionally with
+declarative regression tests in the existing `test_gateway_silence_tokens.py`.
+Both sides must match the audited structure outside that scope. It subtracts
+eight exact tooling probes from the canonical inventory, keeping every other
+file in its original shard. It does not map production modules to test
+directories: indirect consumers such as ACP's `test_gateway_event_mapping.py`
+and every PR E2E file stay selected.
+
+The omitted tests exercise cache-log parsing, marker and shebang lint, case
+collisions, instruction-size rules, lockfile reporting, release job groups,
+and the pytest runner with miniature suites. Reading the real tree in the
+case-collision and lockfile probes checks path names and dependency locks, not
+response behavior. The audit pins the probe files, their tools and fixtures,
+and shared test entry points in Git; new or changed inputs (including changes
+already on `main`) disable the omission until re-audited. Do not extend the
+list by path prefix or treat the scope check as a general dependency analyzer.
+
+All other production diffs, shared test code outside the audited scope, pytest
+plugins, fixtures, CI/config, additions, deletions, mode changes, renames, and
+unreadable Git or Python inputs select the full inventory. CI fails if the
+canonical inventory cannot be built. Nightly-only coverage is unchanged.
+
+Replay of the same three first-parent PR commits against their pre-merge
+parents with the pilot's ten-shard canonical inventory (Python/E2E **files**,
+not test cases or a runtime estimate):
+
+| PR | Base → head | Selected / full | Reason |
+| --- | --- | ---: | --- |
+| #1408 | `fbd104cd903` → `06b13de1c77` | 8,418 / 8,418 | Shared automation fixture |
+| #1363 | `5d5341e88b3` → `fbd104cd903` | 8,410 / 8,418 | Local marker normalization; only the eight tooling probes omitted |
+| #1399 | `ea6a1c6b44c` → `5d5341e88b3` | 8,418 / 8,418 | Production edits and a new test file |
+
+Draft PRs against `main` use `ready --shard` for Python/E2E feedback only. A
+draft cannot pass `qualification`, even on full fallback. Marking a PR ready
+starts the unchanged full Python/E2E matrix and static/Node gate at its exact
+head. Unsharded `bin/ci gate <sha>` runs static, Node, and every PR Python/E2E
+shard locally. The hosted static/Node job requests those two lanes explicitly
+so that it does not repeat the ten hosted Python/E2E shard jobs. `gate`, `nightly`,
+and `full` do not use selection or consume its manifest. Landing still requires
+the full hosted `qualification` and applicable local proof. To roll back hosted
+narrowing, use `gate` for every PR shard again.
+
+If `CI_AFFECTED_MANIFEST` names a nonexistent absolute path with an existing
+parent, an unsharded `ready` writes the selected files, head, merge base, mode,
+and reason to JSON only after success. This is feedback evidence, never a
+landing receipt, even when the mode is `full`.
 
 The v0.23.1 reusable `repo-guards.yml` had no caller after the fork replaced upstream `ci.yaml`. The fork gate calls it on the exact PR head with every guard lane enabled, and qualification requires its success. It uses the same standard Ubuntu runner and pinned checkout action as the fork gate, without an external runner service. The reusable-workflow caller regression remains. Static also invokes upstream's lazy-dependency-import and blob-size guards. Two tests of lane orchestration isolate bootstrap-tool lookup while preserving real lane aggregation/retry assertions; dedicated resolver tests still exercise exact, missing and mismatched pins. PM docs generations sit under `.ci/environments/docs`, keeping PM's stable parent lock inside ignored checkout state instead of creating `.locks/.ci.lock` in source.
 
