@@ -49,10 +49,9 @@ def build_kanban_policy(connection, params, config):
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
-    params_policy = {'source': 'cli', 'cwd': cwd}
-    for name, value in (('model', task.model_override), ('provider', task.provider_override), ('reasoning', task.reasoning_effort)):
-        if value:
-            params_policy[name] = value
+    from hermes_cli.model_alias_runtime import card_launch_route
+    params_policy = {'source': 'cli', 'cwd': cwd, **card_launch_route(
+        task.model_override, task.provider_override, task.reasoning_effort, config)}
     private = {}
     policy = build_policy(params_policy, config, private_secrets=private)
     if policy.model is None:

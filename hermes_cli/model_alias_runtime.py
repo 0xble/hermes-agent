@@ -42,6 +42,51 @@ def alias_name(value: Any, config: Mapping[str, Any] | None = None) -> str | Non
     return key if key in _load_direct_aliases(dict(config or {})) else None
 
 
+def alias_names(config: Mapping[str, Any] | None) -> list[str]:
+    """The aliases ``/model`` resolves (``model_aliases`` plus ``model.aliases``), from the same loader."""
+    from hermes_cli.model_switch import _load_direct_aliases
+    return sorted(_load_direct_aliases(dict(config or {})))
+
+
+def unknown_alias_message(value: Any, names: list[str]) -> str:
+    known = f"Use one of: {', '.join(names)}" if names else "No model aliases are configured"
+    return f"unknown model alias {value!r}. {known} (model_aliases in config.yaml)."
+
+
+def card_model_alias(value: str, config: Mapping[str, Any] | None = None) -> str | None:
+    """The alias key a Kanban card's model pin names, or None for a raw model id.
+
+    A configured alias name (case-insensitive) is an alias; a leading ``@`` marks the value as an
+    alias, so an unconfigured ``@name`` is refused instead of being sent as a model id.
+    """
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+    names = alias_names(config)
+    key = value.strip().lower()
+    if key.removeprefix("@") in names:
+        return key.removeprefix("@")
+    if key.startswith("@"):
+        raise ModelAliasError(unknown_alias_message(value, names))
+    return None
+
+
+def card_launch_route(model: str | None, provider: str | None, reasoning: str | None,
+                      config: Mapping[str, Any]) -> dict[str, str]:
+    """Session create fields for a card's pin, resolved from the owner's current config.
+
+    A card pinned to an alias (no ``provider_override``) runs the alias's live model, provider,
+    endpoint and default reasoning effort; the card's own effort wins. A raw id passes through.
+    """
+    fields = {"model": model, "provider": provider, "reasoning": reasoning}
+    if model and not provider and alias_name(model, config):
+        route = resolve_model_alias(model, config, required=True)
+        fields.update(model=route.model, provider=route.provider, base_url=route.base_url)
+        if not reasoning and isinstance(route.reasoning_effort, str):
+            fields["reasoning"] = route.reasoning_effort
+    return {name: value for name, value in fields.items() if value}
+
+
 def resolve_model_alias(value: Any, config: Mapping[str, Any] | None = None, *, required: bool = False) -> AliasRoute:
     """Resolve from the request's current config snapshot without expanding saved config."""
     cfg = dict(config or {})

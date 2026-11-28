@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
+def _claimed_card(tmp_path, monkeypatch, **task_fields):
+    """A claimed card on board ``owned`` assigned to the default profile, its workspace, and the
+    owner connection and params ``build_kanban_policy`` takes."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
     from gateway.session_contract import SessionActor
-    from hermes_state_runtime import RuntimeStoreError
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))
@@ -24,13 +25,20 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     kb.create_board('owned')  # explicit creation; connect() never creates a board (#43243)
     with closing(connect(board='owned')) as conn:
         task_id = kb.create_task(conn, title='Owned acceptance', body='Goal criteria', assignee='default',
-            workspace_kind='dir', workspace_path=str(workspace), skills=['owned-skill'], goal_mode=True,
-            goal_max_turns=3, model_override='loop-model', provider_override='custom')
+            workspace_kind='dir', workspace_path=str(workspace), **task_fields)
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
     params = dict(board='owned', task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    return task, workspace, connection, params
+
+
+def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
+    from hermes_state_runtime import RuntimeStoreError
+    task, workspace, connection, params = _claimed_card(
+        tmp_path, monkeypatch, skills=['owned-skill'], goal_mode=True, goal_max_turns=3,
+        model_override='loop-model', provider_override='custom')
     from gateway.session_kanban import build_kanban_policy
     config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal', 'file']},
               'agent': {'coding_context': 'focus'}}  # the worktree must not collapse a worker into the coding posture
@@ -52,6 +60,27 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     from gateway.session_policy import build_policy
     with pytest.raises(RuntimeStoreError, match='invalid_params'):
         build_policy({'source': 'kanban', 'cwd': str(workspace)}, config)
+
+
+def test_alias_pinned_card_runs_the_aliases_route(tmp_path, monkeypatch):
+    """A card pinned to a model alias runs the alias's model, provider and effort, resolved from the
+    owner's config at dispatch; the card's own effort still wins."""
+    aliases = {'model_aliases': {'opus': {'model': 'claude-opus-5-5', 'provider': 'custom:claude-proxy',
+                                          'reasoning_effort': 'high'}}}
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda *a, **k: aliases)
+    config = {'model': {'default': 'loop-model', 'provider': 'custom'},
+              'platform_toolsets': {'cli': ['terminal', 'file']}, **aliases}
+    from gateway.session_kanban import build_kanban_policy
+    task, _workspace, connection, params = _claimed_card(tmp_path, monkeypatch, model_override='opus')
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    assert (policy.model, policy.provider) == ('claude-opus-5-5', 'custom:claude-proxy')
+    assert policy.config()['agent']['reasoning_effort'] == 'high'
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing(board='owned') as conn:
+        kb.set_reasoning_effort(conn, task.id, 'low')
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    assert policy.model == 'claude-opus-5-5' and policy.config()['agent']['reasoning_effort'] == 'low'
 
 
 @pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash'])

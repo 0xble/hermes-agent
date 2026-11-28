@@ -1009,14 +1009,14 @@ def _host_prefix() -> str:
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Strip both; a provider without a model is rejected (a bare ``--provider``
-    would re-resolve the profile's model against another backend — exactly
-    the mismatch the override exists to kill)."""
-    model = (model or "").strip() or None
-    provider = (provider or "").strip() or None
+    """Strip both; a provider without a model is rejected (a bare ``--provider`` re-resolves the
+    profile's model on another backend). A model alone may name a model alias: stored as its key and
+    expanded at dispatch (``card_launch_route``); an unknown ``@alias`` is refused here."""
+    model, provider = (model or "").strip() or None, (provider or "").strip() or None
     if provider and not model:
         raise ValueError("provider_override requires a model_override")
-    return model, provider
+    from hermes_cli.model_alias_runtime import card_model_alias
+    return (card_model_alias(model) or model) if model and not provider else model, provider
 
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:

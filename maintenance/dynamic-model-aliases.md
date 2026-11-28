@@ -46,4 +46,14 @@ Gateway model confirmation and reasoning status use the same `AliasRoute` value 
 
 Preset-local cron fallback metadata and its unused route field are retired. Cron retains its existing explicit `cron.fallback_providers` and pinned-job fallback policy. Named delegation options use the official plugin fallback schema.
 
+## Required behavior
+
+- A Kanban card's `--model` (`model_override`) without `--provider` may name a configured alias
+  (a `model_aliases` / `model.aliases` name, case-insensitive, or `@name`). The card stores the
+  alias key, and the owner resolves it at dispatch (`card_launch_route`) to the alias's live model,
+  provider, endpoint and default reasoning effort. The card's own `reasoning_effort` wins. An
+  unconfigured `@name` is refused at create and `set-model` with the configured alias names. A
+  raw model id with `--provider` is stored and run exactly as given.
+
 Contract tests: `tests/hermes_cli/test_model_alias_migration.py`, `tests/tools/test_dynamic_model_aliases.py`.
+Contract tests: `tests/plugins/test_kanban_model_override.py`, `tests/gateway/test_session_kanban.py`.
