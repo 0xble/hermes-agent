@@ -242,4 +242,3 @@ If you save logins and install plugins you have not reviewed, run them out of
 process with [`plugins.isolation: host`](plugins.md#running-plugins-out-of-process-pluginsisolation).
 A plugin host still runs as your user and can read files you can read, so for
 a hard boundary give it a sandbox with `plugins.host.launcher`.
-

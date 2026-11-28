@@ -40,4 +40,3 @@ capabilities:
   provides_middleware: []
   requires_env:
     - TRIPO_API_KEY
-

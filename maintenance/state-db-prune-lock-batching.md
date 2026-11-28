@@ -140,7 +140,7 @@ GIL, scheduling or index bottleneck, and do not claim a latency improvement.
 ## Focused regression
 
 ```text
-scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
+scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/persistence_sqlite/core/test_write_lock_owner_attribution.py tests/persistence_sqlite/core/test_compaction_write_metrics.py tests/persistence_sqlite/core/test_compaction_prepare_snapshot.py tests/persistence_sqlite/core/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
 ```
 
 ## Retirement

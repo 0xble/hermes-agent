@@ -186,4 +186,3 @@ def test_a_loaded_idle_launch_agent_for_this_home_is_a_second_owner(home, plist,
 
     assert host.calls == [] and "Another old backend also serves this home: launchd local.hermes-serve" in \
         capsys.readouterr().out
-
