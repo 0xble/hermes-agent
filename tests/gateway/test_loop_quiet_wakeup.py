@@ -149,6 +149,63 @@ async def test_active_goal_keeps_initial_loop_deferral(goal_loop, interval_secon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interval_seconds", "grace_seconds"), [(86_400, 900), (300, 300)], ids=["daily", "five-minute"],
+)
+async def test_active_idle_goal_yields_at_grace_boundary(goal_loop, interval_seconds, grace_seconds):
+    from hermes_cli import loops
+
+    env = goal_loop(interval_seconds)
+    due_at = env.loop.state.next_due_at
+    assert env.goal.is_active() and not env.goal.is_waiting()
+
+    env.clock.now = due_at + grace_seconds - 1
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    assert env.adapter.events == []
+    stored = loops.load_loop(env.sid)
+    assert stored is not None and stored.ticks_fired == 0 and not stored.awaiting_response
+    assert stored.next_due_at == due_at
+
+    env.clock.now = due_at + grace_seconds
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    assert len(env.adapter.events) == 1
+    stored = loops.load_loop(env.sid)
+    assert stored is not None and stored.ticks_fired == 1 and stored.awaiting_response
+
+
+@pytest.mark.asyncio
+async def test_daily_loop_at_grace_still_defers_to_goal_turn_claim_during_due_read(goal_loop, monkeypatch):
+    from hermes_cli import loops
+
+    env = goal_loop(86_400)
+    due_at = env.loop.state.next_due_at
+    env.clock.now = due_at + 900
+    key = env.runner._session_key_for_source(None)
+    real_executor = env.runner._run_in_executor_with_context
+
+    async def claim_after_due_read(func, *args):
+        result = await real_executor(func, *args)
+        env.runner._running_agents[key] = SimpleNamespace(goal_continuation=True)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.runner, "_run_in_executor_with_context", claim_after_due_read)
+        await env.runner._loop_wakeup_fire_one(env.sid, env.loop.state, env.clock.now, set())
+    assert key in env.runner._running_agents
+    assert env.adapter.events == []
+    stored = loops.load_loop(env.sid)
+    assert stored is not None and stored.ticks_fired == 0 and not stored.awaiting_response
+    assert stored.next_due_at == due_at
+
+    env.runner._running_agents.pop(key)
+    await env.runner._loop_wakeup_fire_one(env.sid, stored, env.clock.now, set())
+    assert len(env.adapter.events) == 1
+    fired = loops.load_loop(env.sid)
+    assert fired is not None and fired.ticks_fired == 1
+
+
+@pytest.mark.asyncio
 async def test_overdue_loop_still_defers_to_inflight_goal_turn(goal_loop):
     from hermes_cli import loops
 

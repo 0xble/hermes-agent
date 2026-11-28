@@ -42,6 +42,9 @@ _post_turn_delivered = ContextVar("gateway_post_turn_delivered", default=False)
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
 _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 
+# A long loop cadence should not give a runnable but idle goal hours of priority.
+_IDLE_GOAL_LOOP_GRACE_SECONDS = 15 * 60
+
 # The retry runs as a tracked background task so post-delivery callbacks and the next turn do not
 # wait on Telegram's flood window. The shared short-wait helper owns the 15s budget and 0.5s slack;
 # this attempt cap bounds additional traffic when Telegram keeps extending the penalty.
@@ -1460,9 +1463,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 logged_at[log_key] = now
                 logger.info("loop wakeup: session %s deferred by %s", sid, reason)
 
-        # A runnable goal gets the first interval, not indefinite ownership of an idle session.
+        # Preserve the full head start for short cadences without starving longer loops.
         # Live goal turns and continuations still win the turn-owner fences below, at any age.
-        if goal_blocks and now - mgr.state.next_due_at < interval:
+        goal_grace = min(interval, _IDLE_GOAL_LOOP_GRACE_SECONDS)
+        if goal_blocks and now - mgr.state.next_due_at < goal_grace:
             _log_deferral("active goal")
             return
 
