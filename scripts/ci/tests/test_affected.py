@@ -105,3 +105,12 @@ def test_missing_base_runs_everything(repo: Path) -> None:
     mode, _, reason = affected.choose(repo, 'no-such-ref')
     assert mode == 'full'
     assert 'no merge base' in reason
+
+
+def test_path_map_selects_node_ids_for_globbed_inputs(repo: Path, tmp_path_factory: pytest.TempPathFactory,
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    rules = tmp_path_factory.mktemp('map') / 'affected-map'
+    rules.write_text('# comment\n^cases/([^/]+)/ tests/test_unrelated.py::test_case[\\1]\n')
+    monkeypatch.setattr(affected, 'PATH_MAP_FILE', rules)
+    _, tests, _ = change(repo, 'cases/alpha/case.yaml', 'x: 1\n')
+    assert tests == ['tests/test_unrelated.py::test_case[alpha]']
