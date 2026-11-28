@@ -1,5 +1,6 @@
 """Ordinary daemon, real terminal child, loopback-only relay/provider peers."""
 import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import functools
 import json
@@ -232,7 +233,43 @@ async def _kill_and_reap(proc, phase):
         raise TimeoutError(f'{phase}: PID {proc.pid} exit not reaped within 10s of kill') from exc
 
 
-async def probe(root, base, mode):
+class ProbeBudget:
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.completed = []
+
+    def remaining(self):
+        return max(0, self.deadline - time.monotonic())
+
+    @asynccontextmanager
+    async def phase(self, name):
+        started = time.monotonic()
+        overall = asyncio.timeout(self.remaining())
+        try:
+            async with overall:
+                yield
+        except TimeoutError as exc:
+            if not overall.expired():
+                raise  # Preserve an earlier phase-local timeout and its diagnostic.
+            raise self.exhausted(name, started) from exc
+        if self.remaining() == 0:
+            raise self.exhausted(name, started)
+        self.completed.append((name, time.monotonic() - started))
+
+    def exhausted(self, name, started):
+        completed = ', '.join(f'{phase}={elapsed:.3f}s' for phase, elapsed in self.completed)
+        message = (f'{name}: overall budget exhausted after {time.monotonic() - started:.3f}s '
+                   f'in this phase; completed phases: {completed or "none"}')
+        print(message, file=sys.stderr, flush=True)  # Before diagnostics and best-effort teardown.
+        return TimeoutError(message)
+
+    async def wait(self, name, awaitable):
+        async with self.phase(name):
+            return await awaitable
+
+
+async def probe(root, base, mode, *, deadline):
+    budget = ProbeBudget(deadline)
     home, user = base / 'state', base / 'user'
     home.mkdir(); user.mkdir()
     model, peer_checkin, race, spawn_terminal, status_marker = _model_for(home, mode)
@@ -302,13 +339,20 @@ async def probe(root, base, mode):
             db.row_factory = sqlite3.Row
             return [dict(r) for r in db.execute('SELECT * FROM session_admissions ORDER BY seq')]
 
-    async def wait_for(predicate, seconds=35):
-        await async_wait_until(predicate, timeout=seconds)
+    async def wait_for(phase, predicate, seconds=35):
+        await budget.wait(phase, async_wait_until(predicate, timeout=seconds, what=phase))
+
+    async def wait_for_model(phase, event, seconds):
+        # Don't leave the executor waiting out the full phase after overall expiry.
+        async with budget.phase(phase):
+            return await asyncio.to_thread(event.wait, min(seconds, budget.remaining()))
 
     proc = old_proc = None
     old_pid = None
     try:
-        async with websockets.serve(connector, '127.0.0.1', 0) as relay:
+        async with AsyncExitStack() as relay_stack:
+            relay = await budget.wait('relay startup', relay_stack.enter_async_context(
+                websockets.serve(connector, '127.0.0.1', 0)))
             url = f'http://127.0.0.1:{model.server_port}/v1'
             cfg = {'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0,
                                'restart_resume_policy': 'continue'},
@@ -330,27 +374,29 @@ async def probe(root, base, mode):
             with (home / 'daemon.log').open('w+') as log:
                 launch = ([sys.executable, str(root / 'tests/gateway/fixtures/supervisor_boundary_daemon.py')]
                           if race else [sys.executable, '-m', 'gateway.run'])
-                proc = await asyncio.create_subprocess_exec(*launch, cwd=root, env=env,
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
                 try:
-                    ws = await asyncio.wait_for(ready.get(), 35)
-                    desc = await _identify_until_ready(home, 35)
+                    async with budget.phase('initial owner launch'):
+                        proc = await asyncio.create_subprocess_exec(*launch, cwd=root, env=env,
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                    ws = await budget.wait('initial relay ready', asyncio.wait_for(ready.get(), 35))
+                    desc = await budget.wait('initial owner ready', _identify_until_ready(home, 35))
                     assert desc.get('state') == 'ready', desc
                     async def send(identity, text):
-                        await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
-                            'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
+                        await budget.wait(f'send {identity}', ws.send(json.dumps({'type': 'inbound', 'event': {
+                            'text': text, 'message_id': identity,
+                            'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
                             'chat_type': 'dm', 'user_id': 'fixture-user',
-                            **({'thread_id': '103'} if model.checkin else {})}}}) + '\n')
+                            **({'thread_id': '103'} if model.checkin else {})}}}) + '\n'))
                     await send('spawn', 'SPAWN_AUTOMATION' if spawn_terminal else 'WARM_AUTOMATION')
-                    await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
+                    await wait_for('warm-up admission settled', lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
                     if spawn_terminal:
                         assert 'REAL_TERMINAL_COMPLETION' in json.dumps(model.requests), 'model did not request real terminal'
                     elif mode == 'heartbeat':
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
-                        await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
+                        await wait_for('heartbeat configuration reply', lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
                     if peer_checkin:
-                        instance = await _arm_peer_goal_wait(root, env, home, desc, sid)
+                        instance = await budget.wait('peer goal wait armed', _arm_peer_goal_wait(root, env, home, desc, sid))
                     if model.checkin:
                         def state():
                             with sqlite3.connect(home / 'state.db') as db:
@@ -358,7 +404,7 @@ async def probe(root, base, mode):
                                 return json.loads(row[0]) if row and row[0] else None
                         # Native execution settles before transport final delivery. Wait for
                         # the acknowledged initial reply's timer reset before advancing it.
-                        await wait_for(lambda: state() is not None and 'initial' in outbound_at
+                        await wait_for('check-in timer armed', lambda: state() is not None and 'initial' in outbound_at
                                        and state()['last_visible_at'] >= outbound_at['initial'])
                         armed = state()
                         # Advance only this test timer, not the daemon's clock or production config.
@@ -366,13 +412,15 @@ async def probe(root, base, mode):
                         with sqlite3.connect(home / 'state.db') as db:
                             db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(armed), 'checkin:' + sid))
                         if race:
-                            await wait_for((home / 'boundary-ready').exists)
+                            await wait_for('check-in race barrier', (home / 'boundary-ready').exists)
                             await send('human-race', 'HUMAN_FIFO_FOLLOWER')
-                            await wait_for((home / 'human-seen').exists)
+                            await wait_for('check-in race human seen', (home / 'human-seen').exists)
                             if mode == 'checkin-race-execution':
-                                await wait_for(lambda: any(r['request_id'] == 'human-race' for r in rows()))
+                                await wait_for('check-in race human admitted',
+                                               lambda: any(r['request_id'] == 'human-race' for r in rows()))
                             (home / 'boundary-release').touch()
-                            await wait_for(lambda: any(r['request_id'] == 'human-race' and r['status'] == 'terminal'
+                            await wait_for('check-in race human settled',
+                                           lambda: any(r['request_id'] == 'human-race' and r['status'] == 'terminal'
                                                       for r in rows()))
                             automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
                             assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
@@ -382,13 +430,14 @@ async def probe(root, base, mode):
                             assert automatic[0]['outcome'] == 'completed', automatic
                             assert not any('SUPERVISOR_STATUS' in json.dumps(f) for f in outgoing), outgoing
                             await send('after-race', 'AFTER_RACE')
-                            await wait_for(lambda: any(r['request_id'] == 'after-race' and r['status'] == 'terminal'
+                            await wait_for('after-race turn settled',
+                                           lambda: any(r['request_id'] == 'after-race' and r['status'] == 'terminal'
                                                       for r in rows()))
                             print(json.dumps({'boundary': mode, 'ledger': rows(), 'model_checkin_turns': 0,
                                               'human_follower_drained': True, 'successor_drained': True}))
                             return
                         try:
-                            await wait_for(lambda: status_marker in json.dumps(outgoing))
+                            await wait_for('supervisor status reply', lambda: status_marker in json.dumps(outgoing))
                         except AssertionError as exc:
                             raise AssertionError(json.dumps({
                                 'outgoing': outgoing,
@@ -409,7 +458,8 @@ async def probe(root, base, mode):
                         assert before_ack['last_visible_at'] == armed['last_visible_at'], before_ack
                         assert before_ack['next_attempt_at'] > time.time() + 1700, before_ack
                         status_ack.set()
-                        await wait_for(lambda: state()['last_visible_at'] >= outbound_at['supervisor'])
+                        await wait_for('supervisor status acknowledged',
+                                       lambda: state()['last_visible_at'] >= outbound_at['supervisor'])
                         assert state()['due_at'] > time.time() + 1700
                         status_frame = next(f for f in outgoing if status_marker in json.dumps(f))
                         assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
@@ -427,7 +477,7 @@ async def probe(root, base, mode):
                             assert 'No reply:' not in json.dumps(status_frame), status_frame
                             assert 'Send it again' not in json.dumps(status_frame), status_frame
                         if peer_checkin:
-                            async with websocket(home, desc) as parent:
+                            async with budget.phase('peer goal cleared'), websocket(home, desc) as parent:
                                 await rpc(parent, 'session.resume', session_id=sid)
                                 goal = functools.partial(_goal_call, parent, sid)
                                 unchanged = await goal('state')
@@ -437,25 +487,25 @@ async def probe(root, base, mode):
                                 assert not refused['value']['ok'], refused
                                 assert state() is not None
                                 await goal('clear')
-                            await wait_for(lambda: state() is None)
+                            await wait_for('check-in disarmed', lambda: state() is None)
                             print(json.dumps({'peer_only': True, 'unverified_idle_still_pending': True,
                                 'supervisor_turns': model.checkin_turns, 'status_delivered': True,
                                 'explicit_user_clear_disarmed': True, 'topic': '103'}))
                             return
                         model.gate.touch()
-                        await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
-                        await wait_for(lambda: state() is None)
+                        await wait_for('terminal completion status reply', lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
+                        await wait_for('check-in disarmed', lambda: state() is None)
                         assert model.checkin_turns == 1
                         print(json.dumps({'supervisor_turns': model.checkin_turns, 'status_delivered': True,
                                           'completion_disarmed': True, 'topic': '103'}))
                         return
-                    async with websocket(home, desc) as observer:
+                    async with budget.phase('observer resumed'), websocket(home, desc) as observer:
                         assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
                     if mode.startswith('restart-'):
                         # Do not let a late reply to the warm-up turn count as the recovered reply.
-                        await wait_for(lambda: 'initial' in outbound_at)
+                        await wait_for('warm-up reply', lambda: 'initial' in outbound_at)
                         model.gate.touch()
-                        assert await asyncio.to_thread(model.completion_blocked.wait, 20)
+                        assert await wait_for_model('terminal completion entered model', model.completion_blocked, 20)
                         automatic = [r for r in rows() if r['principal_id'].startswith('automation:')]
                         assert len(automatic) == 1 and automatic[0]['status'] == 'started', rows()
                         await send('human-follower', 'HUMAN_FIFO_FOLLOWER')
@@ -463,12 +513,13 @@ async def probe(root, base, mode):
                             return any(r['request_id'] == 'human-follower' and r['status'] == 'queued'
                                        and r['target_session_id'] == sid for r in rows())
 
-                        await wait_for(follower_queued)
+                        await wait_for('human follower queued', follower_queued)
                         old_pid, old_epoch = proc.pid, desc['authority_epoch']
                         old_ws = ws
                         sent_before_restart = len(outgoing)
                         old_proc, proc = proc, None  # Teardown may signal it, but never waits again.
-                        returncode = await _kill_and_reap(old_proc, 'old owner')
+                        returncode = await budget.wait(f'old owner PID {old_pid} exit reap',
+                                                       _kill_and_reap(old_proc, 'old owner'))
                         old_proc = None
                         if os.name == 'nt':
                             assert returncode == 1, returncode  # TerminateProcess exit code.
@@ -483,11 +534,12 @@ async def probe(root, base, mode):
                         model.completion_release.set()
                         if mode == 'restart-denied':
                             env['GATEWAY_RELAY_SECRET'] = 'changed-fixture-secret'
-                        proc = await asyncio.create_subprocess_exec(
-                            sys.executable, '-m', 'gateway.run', cwd=root, env=env,
-                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-                        ws = successor_ws = await asyncio.wait_for(ready.get(), 35)
-                        desc = await _identify_until_ready(home, 35)
+                        async with budget.phase('successor owner launch'):
+                            proc = await asyncio.create_subprocess_exec(
+                                sys.executable, '-m', 'gateway.run', cwd=root, env=env,
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+                        ws = successor_ws = await budget.wait('successor relay ready', asyncio.wait_for(ready.get(), 35))
+                        desc = await budget.wait('successor owner ready', _identify_until_ready(home, 35))
                         assert desc.get('state') == 'ready', desc
                         assert proc.pid != old_pid and desc['authority_epoch'] > old_epoch
                         if mode == 'restart-denied':
@@ -505,7 +557,7 @@ async def probe(root, base, mode):
                             assert not any('HUMAN_FIFO_FOLLOWER' in str(t) for t in texts), texts
                             print(json.dumps({'ledger': ledger, 'model_inputs': texts, 'recovery_verdicts': verdicts}))
                             return
-                        await wait_for(lambda: all(r['status'] == 'terminal' for r in rows()))
+                        await wait_for('successor ledger settled', lambda: all(r['status'] == 'terminal' for r in rows()))
                         recovered = [r for r in rows() if r['principal_id'].startswith('automation:')]
                         assert len(recovered) == 1 and recovered[0]['outcome'] == 'interrupted', rows()
                         assert recovered[0]['admission_id'] == automatic[0]['admission_id']
@@ -526,16 +578,16 @@ async def probe(root, base, mode):
                             delayed_replies.clear()
 
                         asyncio.get_running_loop().call_soon(expose_replies)
-                        await wait_for(lambda: replies(_FOLLOWER_ACK))
+                        await wait_for('successor follower reply', lambda: replies(_FOLLOWER_ACK))
                         await send('after-recovery', 'AFTER_RECOVERY')
                         # A terminal row can precede delivery. Observe both within the later
                         # turn's own allowance, separate from the follower reply.
-                        async with asyncio.timeout(35):
-                            await wait_for(lambda: any(r['request_id'] == 'after-recovery'
+                        async with budget.phase('after-recovery turn'), asyncio.timeout(35):
+                            await async_wait_until(lambda: any(r['request_id'] == 'after-recovery'
                                 and r['status'] == 'terminal' and r['outcome'] == 'completed'
-                                and r['seq'] > follower['seq'] for r in rows()))
-                            await wait_for(lambda: any(reply_sources[id(action)] is successor_ws
-                                                       for action in replies(_AFTER_RECOVERY_ACK)))
+                                and r['seq'] > follower['seq'] for r in rows()), timeout=35)
+                            await async_wait_until(lambda: any(reply_sources[id(action)] is successor_ws
+                                                               for action in replies(_AFTER_RECOVERY_ACK)), timeout=35)
                         from gateway.status import write_planned_stop_marker
 
                         new_pid = proc.pid
@@ -544,9 +596,10 @@ async def probe(root, base, mode):
                         assert stop_requested, new_pid
                         # Once idle is acknowledged, the relay reader only has to consume
                         # already-buffered frames, so the shutdown drain needs no turn budget.
-                        await asyncio.wait_for(successor_relay_drained.wait(), 10)
+                        await budget.wait('successor relay drained', asyncio.wait_for(successor_relay_drained.wait(), 10))
                         assert successor_idle_ack.is_set(), outgoing[sent_before_restart:]
-                        returncode = await asyncio.wait_for(proc.wait(), 10)
+                        returncode = await budget.wait(f'successor owner PID {new_pid} exit reap',
+                                                       asyncio.wait_for(proc.wait(), 10))
                         proc = None
                         assert returncode == 0, returncode
                         replayed_sends = replies(_AUTOMATION_ACK)
@@ -569,16 +622,17 @@ async def probe(root, base, mode):
                                           'model_inputs': texts, 'interruption_notices': notices}))
                         return
                     await send('held', 'HOLD_AUTOMATION')
-                    assert await asyncio.to_thread(model.blocked.wait, 15)
+                    assert await wait_for_model('held turn entered model', model.blocked, 15)
                     await send('human-follower', 'HUMAN_FIFO_FOLLOWER')
-                    await wait_for(lambda: any(r['request_id'] == 'human-follower' for r in rows()))
+                    await wait_for('human follower admitted', lambda: any(r['request_id'] == 'human-follower' for r in rows()))
                     model.gate.touch()
                     # Real cadence: process polls every five seconds; heartbeat interval is one minute.
                     # Poll for the producer's commit instead of sleeping out the whole bound.
-                    deadline = time.monotonic() + (8 if mode == 'terminal' else 70)
-                    while (time.monotonic() < deadline
-                           and not any(r['principal_id'].startswith('automation:') for r in rows())):
-                        await asyncio.sleep(.1)
+                    async with budget.phase('automation producer committed'):
+                        producer_deadline = time.monotonic() + (8 if mode == 'terminal' else 70)
+                        while (time.monotonic() < producer_deadline
+                               and not any(r['principal_id'].startswith('automation:') for r in rows())):
+                            await asyncio.sleep(.1)
                     ledger = rows()
                     automatic = [r for r in ledger if r['principal_id'].startswith('automation:')]
                     assert automatic, {'failure': 'producer ACK bypassed canonical durable FIFO', 'ledger': ledger,
@@ -587,7 +641,7 @@ async def probe(root, base, mode):
                     assert next(r for r in ledger if r['request_id'] == 'held')['status'] == 'started'
                     assert automatic[0]['seq'] > next(r for r in ledger if r['request_id'] == 'human-follower')['seq']
                     model.release.set()
-                    await wait_for(lambda: all(r['status'] == 'terminal' for r in rows()))
+                    await wait_for('ledger settled', lambda: all(r['status'] == 'terminal' for r in rows()))
                     assert all(r['outcome'] == 'completed' for r in rows()), rows()
                     texts = [next((m.get('content', '') for m in reversed(r['messages']) if m['role'] == 'user'), '')
                              for r in model.requests if r.get('messages')]
@@ -644,4 +698,5 @@ async def probe(root, base, mode):
 
 
 if __name__ == '__main__':
-    asyncio.run(probe(Path(__file__).resolve().parents[3], Path(sys.argv[1]), sys.argv[2]))
+    asyncio.run(probe(Path(__file__).resolve().parents[3], Path(sys.argv[1]), sys.argv[2],
+                      deadline=float(sys.argv[3])))
