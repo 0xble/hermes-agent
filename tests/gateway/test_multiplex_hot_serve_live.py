@@ -290,7 +290,7 @@ def test_invalid_hot_profile_config_is_parked_and_unserved(mux):
         added = root / 'profiles' / 'invalid-hot'
         added.mkdir(parents=True, mode=0o700)
         (added / 'config.yaml').write_text(json.dumps(invalid), encoding='utf-8')
-        result = control(root, 'rescan-profiles')
+        result = rescan(root)
         desc = control(root, 'identify')
         assert result['parked'] == ['invalid-hot'], (result, tail(mux))
         assert added.resolve() not in served_homes(desc), desc
@@ -301,7 +301,7 @@ def test_invalid_hot_profile_config_is_parked_and_unserved(mux):
         # into an invalid configuration.
         assert mux['boot'].resolve() in served_homes(desc)
         (mux['boot'] / 'config.yaml').write_text(json.dumps(invalid), encoding='utf-8')
-        result = control(root, 'rescan-profiles')
+        result = rescan(root)
         desc = control(root, 'identify')
         # An explicit control-socket rescan retries parked profiles by design, so the still-invalid
         # 'invalid-hot' is re-parked alongside 'boot' (never served in between).
@@ -435,6 +435,16 @@ def hot_profile(mux, name):
     (staging / 'config.yaml').write_text(json.dumps(mux['config']), encoding='utf-8')
     (staging / 'gateway.parked').touch()
     return staging.rename(mux['root'] / 'profiles' / name)
+
+
+def rescan(root):
+    """``rescan-profiles``. Past 5s the verb answers ``pending`` (no verdict lists) and keeps
+    reconciling. An explicit rescan retries parked profiles, so ask again, bounded, until one
+    reconcile answers within the verb's window."""
+    def settled():
+        reply = control(root, 'rescan-profiles')
+        return None if reply.get('pending') else reply
+    return wait_until(settled, timeout=60, interval=.2, what='rescan-profiles after pending')
 
 
 def lifecycle(root, verb, home):
