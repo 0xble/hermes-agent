@@ -2701,10 +2701,9 @@ def run_job(
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
             if agent is None:
-                from hermes_state_registry import release_or_close
-                _run_cron_cleanup_with_timeout(
-                    lambda: release_or_close(_session_db), job_id=job_id,
-                    label="unused session store release")
+                from cron.scheduler_unused_session import release_unused_session
+                release_unused_session(_session_db, job_id, owner_execution and _cron_session_id,
+                                       _run_cron_cleanup_with_timeout)
             else:
                 # Finalization is best-effort bookkeeping: it must never replace the run's
                 # result or skip the agent teardown below.
