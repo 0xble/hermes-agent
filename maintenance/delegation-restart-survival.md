@@ -60,6 +60,10 @@ result/transcript evidence for conservative recovery through the durable retry e
   INSERT transaction, not just when the parent claims a brief.
 - Non-cut retries use the existing bounded retry notices and grace windows.
   Fan-out notices instruct the parent to spawn the returned `tasks` list.
+  Due retries and stale retry claims for sealed executions are cancelled in a
+  separate bounded batch so they cannot crowd out eligible retries. The sweep
+  refills its batches if a seal commits between discovery and writer admission.
+  The original completion and any already-owed terminal report remain deliverable.
 - A lifecycle cut lists unfinished indexes from goals/task_indexes, including
   children whose result is missing. It gives the exact `action='resume'` command
   only while the same durable scalar/fan-out/retry admission gates would allow it;
