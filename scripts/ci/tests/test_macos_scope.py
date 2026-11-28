@@ -48,6 +48,7 @@ def test_fork_sync_candidates_always_run(repo: Path) -> None:
     ('agent/core.py', 'import sys\nIS_MAC = sys.platform == "darwin"\n'),
     ('agent/core.py', 'import platform\nif platform.system() != "Darwin":\n    pass\n'),
     ('agent/core.py', 'import sys\nMAC = sys.platform.startswith("darwin")\n'),
+    ('agent/core.py', 'import sys\nPOSIX = sys.platform in ("darwin", "linux")\n'),
     ('tests/test_tray.py', '@pytest.mark.platforms("macos")\ndef test_tray():\n    pass\n'),
     ('.github/workflows/gate.yml', 'name: gate\n'),
     ('uv.lock', 'version = 1\n'),
@@ -67,3 +68,10 @@ def test_unreadable_diff_runs_to_be_safe(repo: Path) -> None:
     run, reason = macos_scope.decide('feat/x', 'no-such-ref')
     assert run is True
     assert 'running to be safe' in reason
+
+
+def test_deleted_python_runs_to_be_safe(repo: Path) -> None:
+    git(repo, 'rm', '-q', 'agent/core.py')
+    git(repo, 'commit', '-qm', 'delete')
+    run, reason = macos_scope.decide('feat/x', 'main')
+    assert run is True, reason

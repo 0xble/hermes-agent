@@ -29,7 +29,8 @@ SHARED_SETUP = re.compile(
 MACOS_SOURCE = re.compile(
     r'platforms\([^)]*["\'](macos|posix)["\']'
     r'|sys\.platform\s*[!=]=\s*["\']darwin|sys\.platform\.startswith\(\s*["\']darwin'
-    r'|platform\.system\(\)\s*[!=]=\s*["\']Darwin|platform\.mac_ver\(|\bIS_MACOS\b|\bis_macos\b')
+    r'|platform\.system\(\)\s*[!=]=\s*["\']Darwin|platform\.mac_ver\(|\bIS_MACOS\b|\bis_macos\b'
+    r'|["\'](darwin|Darwin|macos|macOS)["\']')
 GIT_TIMEOUT_SECONDS = 120
 
 
@@ -50,7 +51,8 @@ def reason_to_run(changed: list[str]) -> str | None:
         try:
             source = Path(path).read_text(encoding='utf-8-sig', errors='replace')
         except OSError:
-            continue  # deleted files are covered by their importers' own markers
+            # A deleted or unreadable file might have held macOS code: run to be safe.
+            return f'changed Python not readable at head: {path}'
         if MACOS_SOURCE.search(source):
             return f'macOS-marked or darwin-specific Python: {path}'
     return None
