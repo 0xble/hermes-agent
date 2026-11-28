@@ -112,8 +112,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 ### `agent/fallback_notice.py`
 
 - (module)
-  - `agent/fallback_notice.py@-0,0 +1,94` UNMARKED (56 lines): """Notice policy for a bound fallback route and its backend credential surface."""
-  - `agent/fallback_notice.py@-0,0 +1,94#moved` moved: `CONTRIBUTING.es.md`, `CONTRIBUTING.md`, `acp_adapter/auth.py`, `acp_adapter/catalog.py` (+11783 more)
+  - `agent/fallback_notice.py@-0,0 +1,94` UNMARKED (4 lines): """Notice policy for a bound fallback route and its backend credential surface."""
 
 ### `agent/memory_context.py`
 
@@ -369,6 +368,8 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `gateway/run.py@-4412,7 +4818,7` UNMARKED (2 lines): watch_delivery_queue = adapters is not None or runner is not None
   - `gateway/run.py@-4441 +4850,2` UNMARKED (1 lines): ), watch_delivery_queue), # Bootstrap maintenance follows the first delivery watch window.
   - `gateway/run.py@-4455 +4869` UNMARKED (1 lines): if watch_delivery_queue:
+- def _start_gateway_make_restart_signal_handler(runner):
+  - `gateway/run.py@-4754,0 +5251,46` UNMARKED (2 lines): from hermes_state import _default_db_path
 
 ### `gateway/run_busy.py`
 
@@ -719,8 +720,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 - def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
   - `gateway/session.py@-491,0 +496,4` UNMARKED (3 lines): deadline = model_pick_deadline(override)
   - `gateway/session.py@-491,0 +496,4#moved` moved: `gateway/run_agent_cache.py`, `gateway/run_session_readback.py`, `gateway/run_turn/__init__.py`, `gateway/run_turn/run_turn_attended.py`
-  - `gateway/session.py@-494,0 +503,9` UNMARKED (4 lines): def sanitize_reasoning_override(override: Optional[dict[str, Any]]) -> Optional[dict[str,
-  - `gateway/session.py@-494,0 +503,9#moved` moved: `agent/auxiliary_client.py`, `agent/moa_loop.py`, `agent/voice_turn_route.py`, `cron/jobs.py` (+30 more)
+  - `gateway/session.py@-494,0 +503,9` UNMARKED (2 lines): """Canonical ''/reasoning'' session pick (''{"enabled": False}'' or ''{"enabled": True, "e
 - class SessionEntry:
   - `gateway/session.py@-538,0 +556,13` UNMARKED (13 lines): resume_marker_token: Optional[str] = None
   - `gateway/session.py@-544 +574,5` UNMARKED (5 lines): active_turn_human: bool = True
@@ -960,14 +960,13 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `gateway/session_envelope.py@-259 +366,4#moved` moved: `gateway/shutdown_goal_wakes.py`
   - `gateway/session_envelope.py@-260,0 +371,2` UNMARKED (2 lines): if hasattr(event, "_native_absorbed_synthetic'):
   - `gateway/session_envelope.py@-272 +384,4` UNMARKED (2 lines): return {"text': event.text, "native_text_v1': envelope}
-  - `gateway/session_envelope.py@-275,11 +390,16` UNMARKED (9 lines): legacy["native_text_v1'].pop("attended_activity', None)
+  - `gateway/session_envelope.py@-275,11 +390,16` UNMARKED (10 lines): from hermes_state_runtime import list_session_admissions
   - `gateway/session_envelope.py@-275,11 +390,16#moved` moved: `agent/account_usage.py`, `agent/agent_runtime_helpers.py`, `agent/auxiliary_client.py`, `agent/credential_pool.py` (+117 more)
   - `gateway/session_envelope.py@-288,0 +409,20` UNMARKED (12 lines): """Build a sync snapshot; sync callers may acquire the SessionStore lock."""
 - _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_exp
   - `gateway/session_envelope.py@-30,2 +30` UNMARKED (1 lines): # Closed metadata contracts for ordinary adapter inputs. Unknown keys refuse admission.
 - def restore_native_source(payload, runner=None):
-  - `gateway/session_envelope.py@-301 +441,15` UNMARKED (13 lines): provenance = dict(envelope["provenance'])
-  - `gateway/session_envelope.py@-301 +441,15#moved` moved: `gateway/authz_mixin.py`
+  - `gateway/session_envelope.py@-301 +441,15` UNMARKED (14 lines): provenance = dict(envelope["provenance'])
 - def restore_native(payload, runner=None):
   - `gateway/session_envelope.py@-316,0 +471,4` UNMARKED (4 lines): if activity := envelope.get("attended_activity'):
   - `gateway/session_envelope.py@-318,0 +477,2` UNMARKED (1 lines): if recovery_id := envelope.get("recovery_id'):
@@ -1331,7 +1330,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `gateway/slash_commands_session.py@-307,0 +334,21#moved` moved: `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/credential_pool_errors.py`, `agent/memory_manager.py` (+53 more)
   - `gateway/slash_commands_session.py@-346,0 +389` UNMARKED (1 lines): paused_count = await paused_followers(self, _old_sid) if _old_sid else 0
   - `gateway/slash_commands_session.py@-550 +593` UNMARKED (1 lines): history_before_user_originated_turn, split_user_originated_turn,
-  - `gateway/slash_commands_session.py@-551,0 +595#moved` moved: `hermes_state_rewind.py`, `tests/agent/test_reference_handoff_active_turn.py`, `tui_gateway/session_workdir.py`
+  - `gateway/slash_commands_session.py@-551,0 +595` UNMARKED (1 lines): from agent.context_compressor_retry import retryable_user_text
   - `gateway/slash_commands_session.py@-782,0 +827#moved` moved: `gateway/pairing.py`, `gateway/run_shutdown.py`, `gateway/slash_commands_incognito.py`, `gateway/slash_commands_model.py` (+8 more)
   - `gateway/slash_commands_session.py@-784,0 +830#moved` moved: `gateway/run_turn.py`, `gateway/run_turn_mcp.py`, `gateway/slash_commands_incognito.py`, `gateway/slash_commands_model.py`
   - `gateway/slash_commands_session.py@-786,2 +832,2` UNMARKED (1 lines): return await self._handle_compress_command_inner(event, profile_home=profile_home)
@@ -1384,7 +1383,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `hermes_cli/cli_session_mixin.py@-68,4 +68,9` UNMARKED (3 lines): logger.debug("Config default is unavailable during /new", exc_info=True)
   - `hermes_cli/cli_session_mixin.py@-68,4 +68,9#moved` moved: `acp_adapter/session.py`, `gateway/run.py`, `gateway/run_config_loaders.py`, `gateway/run_inbound.py` (+9 more)
 - class CLISessionMixin:
-  - `hermes_cli/cli_session_mixin.py@-782,2 +792,2#moved` moved: `hermes_state_rewind.py`, `tests/agent/test_reference_handoff_active_turn.py`, `tui_gateway/session_workdir.py`
+  - `hermes_cli/cli_session_mixin.py@-782,2 +792,2` UNMARKED (1 lines): from agent.context_compressor_retry import retryable_user_text
 
 ### `hermes_cli/config_migrations.py`
 
@@ -1550,7 +1549,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 ### `hermes_cli/sessions_cmd.py`
 
 - def _cmd_optimize(db, args):
-  - `hermes_cli/sessions_cmd.py@-1001,0 +1035,24` UNMARKED (16 lines): def _cmd_optimize_next_start(args):
+  - `hermes_cli/sessions_cmd.py@-1001,0 +1035,24` UNMARKED (17 lines): def _cmd_optimize_next_start(args):
   - `hermes_cli/sessions_cmd.py@-1001,0 +1035,24#moved` moved: `gateway/run.py`, `hermes_cli/console_engine.py`, `hermes_cli/kanban_transfer.py`, `hermes_cli/web_routers/profiles.py` (+9 more)
 - def _cmd_repair_prompts(db, args):
   - `hermes_cli/sessions_cmd.py@-1205,0 +1263` UNMARKED (1 lines): snapshots = {}
@@ -1576,6 +1575,11 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `hermes_cli/sessions_cmd.py@-846 +870,2` UNMARKED (2 lines): pruned = owner_prune(args.owner_endpoint, filters=filters, **_now_param(args))
   - `hermes_cli/sessions_cmd.py@-850 +875,9` UNMARKED (6 lines): from hermes_state_prune_pacing import DeletionWindowClosedError
 
+### `hermes_cli/sqlite_util.py`
+
+- def open_db(
+  - `hermes_cli/sqlite_util.py@-69,0 +75,82` UNMARKED (3 lines): from hermes_state import (
+
 ### `hermes_cli/web_routers/models.py`
 
 - def get_model_info(profile: Optional[str] = None):
@@ -1593,6 +1597,11 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 - async def prune_sessions_endpoint(body: SessionPrune):
   - `hermes_cli/web_routers/sessions.py@-988,0 +993,3` UNMARKED (2 lines): from hermes_cli.maintenance_window import deletion_window_refusal
   - `hermes_cli/web_routers/sessions.py@-988,0 +993,3#moved` moved: `hermes_cli/web_routers/ops.py`
+
+### `hermes_loop_guard.py`
+
+- (module)
+  - `hermes_loop_guard.py@-0,0 +1,146` UNMARKED (1 lines): _OWNER_WRAPPERS = ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py",
 
 ### `hermes_state.py`
 
@@ -1650,7 +1659,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 - def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
   - `hermes_state.py@-315 +322,5#moved` moved: `acp_adapter/catalog.py`, `acp_adapter/content.py`, `acp_adapter/events.py`, `acp_adapter/gateway_media.py` (+2110 more)
 - def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
-  - `hermes_state.py@-475,0 +487,24` UNMARKED (13 lines): def _storage_write_in_progress():
+  - `hermes_state.py@-475,0 +487,24` UNMARKED (8 lines): def _storage_write_in_progress():
   - `hermes_state.py@-475,0 +487,24#moved` moved: `agent/auxiliary_client.py`, `agent/auxiliary_health.py`, `agent/auxiliary_task_config.py`, `agent/background_review.py` (+1128 more)
 - class SessionDB(
   - `hermes_state.py@-481 +516` UNMARKED (1 lines): SessionPromptRefreshMixin, SessionStoredReadsMixin, SessionMissedInboundMixin,
@@ -1696,17 +1705,23 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 - from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
   - `hermes_state_common.py@-15 +15,2` UNMARKED (2 lines): from hermes_state_keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
 
+### `hermes_state_compaction.py`
+
+- (module)
+  - `hermes_state_compaction.py@-0,0 +1,277` UNMARKED (4 lines): from hermes_state_holders import foreign_state_db_holders, in_process_state_db_holders
+  - `hermes_state_compaction.py@-0,0 +1,277#moved` moved: `.github/workflows/prompt-surface-diff.yml`, `acp_adapter/auth.py`, `acp_adapter/catalog.py`, `acp_adapter/commands.py` (+3816 more)
+
 ### `hermes_state_errors.py` → `persistence/sqlite/_state/errors.py`
 
 - PERSISTENCE_ERROR_CAUSES = (
   - `hermes_state_errors.py@-101 +116` UNMARKED (1 lines): "replaced", "deleted_wal", "disk", "session_row_missing", "owner_restart", "unknown",
 - class SessionCompressionInProgressError(CompressionSessionBusyError):
-  - `hermes_state_errors.py@-168,0 +184,4` UNMARKED (2 lines): class CompressionLeaseLostError(SessionCompressionInProgressError):
+  - `hermes_state_errors.py@-168,0 +184,4` UNMARKED (1 lines): """This publication lost its holder. Waiting cannot revive the old snapshot."""
 - _MALFORMED_DB_MARKERS = (*_MALFORMED_SCHEMA_MARKERS, "database disk image is mal
-  - `hermes_state_errors.py@-18,0 +19,15` UNMARKED (8 lines): def is_fts_query_syntax_error(exc: BaseException) -> bool:
-  - `hermes_state_errors.py@-18,0 +19,15#moved` moved: `acp_adapter/edit_approval.py`, `acp_adapter/elicitation.py`, `acp_adapter/gateway_server.py`, `acp_adapter/permissions.py` (+2057 more)
+  - `hermes_state_errors.py@-18,0 +19,15` UNMARKED (4 lines): def is_fts_query_syntax_error(exc: BaseException) -> bool:
 - class SessionActiveWriteGuardError(RuntimeError):
-  - `hermes_state_errors.py@-199,0 +219,6` UNMARKED (3 lines): class GatewayOwnerRestartError(RuntimeError):
+  - `hermes_state_errors.py@-199,0 +219,6` UNMARKED (1 lines): phase = "owner_transition'
+  - `hermes_state_errors.py@-199,0 +219,6#moved` moved: `persistence/core/errors.py`
 - _PERSISTENCE_CAUSE_BY_TYPE = (
   - `hermes_state_errors.py@-269,0 +295` UNMARKED (1 lines): (GatewayOwnerRestartError, "owner_restart"),
 - _PERSISTENCE_CAUSE_BY_PHRASE = (
@@ -1727,7 +1742,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `hermes_state_identity.py@-111,0 +172,18` UNMARKED (11 lines): # hashlib releases the GIL for inputs of 2,048 bytes or more; display_identity stays below
   - `hermes_state_identity.py@-111,0 +172,18#moved` moved: `acp_adapter/edit_approval.py`, `acp_adapter/elicitation.py`, `acp_adapter/entry.py`, `acp_adapter/events.py` (+9396 more)
 - from agent.message_sanitization import coalesce_tool_call_id
-  - `hermes_state_identity.py@-12 +14,59` UNMARKED (34 lines): _MessageRow = TypeVar("_MessageRow", dict[str, Any], sqlite3.Row)
+  - `hermes_state_identity.py@-12 +14,59` UNMARKED (26 lines): _MessageRow = TypeVar("_MessageRow", dict[str, Any], sqlite3.Row)
   - `hermes_state_identity.py@-12 +14,59#moved` moved: `acp_adapter/catalog.py`, `acp_adapter/content.py`, `acp_adapter/edit_approval.py`, `acp_adapter/elicitation.py` (+10066 more)
 - from __future__ import annotations
   - `hermes_state_identity.py@-6,0 +7#moved` moved: `acp_adapter/gateway_media.py`, `agent/account_usage_cache.py`, `agent/anthropic_credentials.py`, `agent/anthropic_thinking_replay.py` (+508 more)
@@ -1751,6 +1766,29 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `hermes_state_profile_repair.py@-327 +327` UNMARKED (1 lines): return self._execute_write(_do, session_ids=(rows,), skip_result=0)
   - `hermes_state_profile_repair.py@-340 +340` UNMARKED (1 lines): return self._execute_write(_do, session_ids=(rows,), skip_result=0)
   - `hermes_state_profile_repair.py@-378 +378` UNMARKED (1 lines): return self._execute_write(_do, session_ids=(rows,), skip_result={})
+
+### `hermes_state_prune_budget.py`
+
+- (module)
+  - `hermes_state_prune_budget.py@-0,0 +1,208` UNMARKED (1 lines): from hermes_state_lockowners import state_db_write_lock_holders
+  - `hermes_state_prune_budget.py@-0,0 +1,208#moved` moved: `.github/actions/setup-pm/prune/index.mjs`, `acp_adapter/auth.py`, `acp_adapter/catalog.py`, `acp_adapter/commands.py` (+4511 more)
+
+### `hermes_state_prune_pacing.py`
+
+- (module)
+  - `hermes_state_prune_pacing.py@-0,0 +1,71#moved` moved: `acp_adapter/auth.py`, `acp_adapter/commands.py`, `acp_adapter/content.py`, `acp_adapter/edit_approval.py` (+3192 more)
+
+### `hermes_state_publication.py`
+
+- (module)
+  - `hermes_state_publication.py@-0,0 +1,198` UNMARKED (2 lines): from hermes_state_write import writer_mutex_until
+  - `hermes_state_publication.py@-0,0 +1,198#moved` moved: `.github/actions/setup-pm/prune/index.mjs`, `acp_adapter/auth.py`, `acp_adapter/commands.py`, `acp_adapter/content.py` (+4240 more)
+
+### `hermes_state_runtime_privacy.py`
+
+- (module)
+  - `hermes_state_runtime_privacy.py@-0,0 +1,252` UNMARKED (8 lines): raise RuntimeStoreError(reason) from None
+  - `hermes_state_runtime_privacy.py@-0,0 +1,252#moved` moved: `acp_adapter/auth.py`, `acp_adapter/catalog.py`, `acp_adapter/commands.py`, `acp_adapter/content.py` (+3695 more)
 
 ### `hermes_state_telegram.py`
 
@@ -2125,6 +2163,12 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `tests/agent/test_turn_facade_lease.py@-239,3 +251,16` UNMARKED (8 lines): # Near and past expiry with the lock held throughout: a busy database is not a successor,
   - `tests/agent/test_turn_facade_lease.py@-248,4 +273,31` UNMARKED (16 lines): assert [msg for _, msg in events] == ["Session turn lease lost; stopping to protect the tr
   - `tests/agent/test_turn_facade_lease.py@-248,4 +273,31#moved` moved: `agent/conversation_compression.py`, `apps/desktop/e2e/core/harness.ts`, `apps/desktop/e2e/core/interrupted-reply.spec.ts`, `apps/desktop/e2e/core/lineage-compaction-prompt.spec.ts` (+428 more)
+
+### `tests/agent/test_turn_liveness_watchdog.py`
+
+- def test_host_sleep_is_not_a_stalled_turn(monkeypatch, during_sample):
+  - `tests/agent/test_turn_liveness_watchdog.py@-804,0 +805,40` UNMARKED (1 lines): with hermes_state._storage_write_in_progress():
+  - `tests/agent/test_turn_liveness_watchdog.py@-804,0 +805,40#moved` moved: `agent/conversation_compression.py`, `tests/agent/test_context_engine_plugin_session_db.py`, `tests/e2e/core/dashboard/_helpers.py`, `tests/gateway/test_agent_update_profile_scope.py` (+28 more)
 
 ### `tests/agent/test_vault_backend_browser.py`
 
@@ -3418,6 +3462,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 ### `tests/hermes_state/test_compact_at_next_start.py`
 
 - (module)
+  - `tests/hermes_state/test_compact_at_next_start.py@-0,0 +1,278` UNMARKED (6 lines): import hermes_state_compaction as compaction
   - `tests/hermes_state/test_compact_at_next_start.py@-0,0 +1,278#moved` moved: `CONTRIBUTING.es.md`, `CONTRIBUTING.md`, `acp_adapter/auth.py`, `acp_adapter/catalog.py` (+16928 more)
 
 ### `tests/hermes_state/test_compaction_active_uid.py`
@@ -3591,6 +3636,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 ### `tests/hermes_state/test_publication_wait_budget.py`
 
 - (module)
+  - `tests/hermes_state/test_publication_wait_budget.py@-0,0 +1,250` UNMARKED (4 lines): from hermes_state_publication import LocalStateLockTimeout, publication_metrics
   - `tests/hermes_state/test_publication_wait_budget.py@-0,0 +1,250#moved` moved: `CONTRIBUTING.md`, `acp_adapter/auth.py`, `acp_adapter/commands.py`, `acp_adapter/content.py` (+12604 more)
 
 ### `tests/hermes_state/test_restart_recovery_bounded.py`
@@ -4309,6 +4355,11 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
   - `tools/async_delegation.py@-983,0 +785,5` UNMARKED (4 lines): child_sessions: Optional[dict[str, str]] = None,
   - `tools/async_delegation.py@-985,6 +791,6` UNMARKED (4 lines): """Register and submit one async unit without ever running its runner inline.
 
+### `tools/async_delegation_ledger.py`
+
+- (module)
+  - `tools/async_delegation_ledger.py@-0,0 +1,662` UNMARKED (1 lines): reconcile_state_schema(conn)
+
 ### `tools/browser_vault_tool.py`
 
 - paid per request) and available wherever a browser is. Its actions:
@@ -4715,7 +4766,7 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 - Helper names must not collide with server.py's own (``_cmd_`` / ``_toolset_`` /
   - `tui_gateway/methods_tools.py@-7,0 +8,4` UNMARKED (2 lines): from tui_gateway.methods_tools_plugin_settings import (
 - def _cmd_retry(rid, params, session, name, arg):
-  - `tui_gateway/methods_tools.py@-736,0 +759#moved` moved: `hermes_state_rewind.py`, `tests/agent/test_reference_handoff_active_turn.py`, `tui_gateway/session_workdir.py`
+  - `tui_gateway/methods_tools.py@-736,0 +759` UNMARKED (1 lines): from agent.context_compressor_retry import retryable_user_text
   - `tui_gateway/methods_tools.py@-747 +770` UNMARKED (1 lines): content = retryable_user_text(live_view.get("content"))
   - `tui_gateway/methods_tools.py@-754 +777,2` UNMARKED (2 lines): assert rewound is not None
 - def _cmd_goal(rid, params, session, name, arg):
