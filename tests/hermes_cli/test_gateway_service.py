@@ -2802,6 +2802,61 @@ class TestLaunchdUnloadedJobStderrStaysOffTerminal:
         assert capfd.readouterr().err == ""
 
 
+class TestLaunchdStopWaitsOutTheDrain:
+    """A booted-out gateway drains (notify, then cron and delegation waits, about 34s on a busy host)
+    and launchd SIGKILLs it at ExitTimeOut anyway. The CLI used to SIGKILL after 5s, cutting the drain
+    short: interrupted turns were never marked for resume and the next boot paid unclean recovery."""
+
+    @pytest.fixture
+    def stop_env(self, tmp_path, monkeypatch):
+        import hermes_cli.gateway_launchd as gateway_launchd
+        state = {"bootout_rc": 0, "kills": [], "exit_at": 34.0, "now": 0.0}
+
+        def fake_run(argv, *a, **k):
+            if argv[:2] == ["launchctl", "bootout"] and state["bootout_rc"]:
+                raise subprocess.CalledProcessError(state["bootout_rc"], argv, stderr="Boot-out failed: 3")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def fake_monotonic():
+            return state["now"]
+
+        def fake_sleep(seconds):
+            state["now"] += max(seconds, 0.5)
+
+        monkeypatch.setattr(gateway_launchd.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_mark_planned_stop", lambda *a, **k: None)
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
+        monkeypatch.setattr("time.sleep", fake_sleep)
+        monkeypatch.setattr("gateway.status.get_running_pid",
+                            lambda *a, **k: None if state["now"] >= state["exit_at"] or state["kills"] else 4242)
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 1.0)
+        monkeypatch.setattr(gateway_cli, "terminate_pid",
+                            lambda pid, force=False, **k: state["kills"].append((pid, force)))
+        return state
+
+    def test_booted_out_gateway_finishes_its_drain_without_a_cli_sigkill(self, stop_env, capfd):
+        gateway_cli.launchd_stop()
+        assert stop_env["kills"] == []
+        assert stop_env["now"] >= 34.0
+        assert "did not exit gracefully" not in capfd.readouterr().out
+
+    def test_cli_sigkill_is_only_a_backstop_past_launchd_exit_timeout(self, stop_env):
+        stop_env["exit_at"] = 10_000.0  # a wedged gateway that ignores SIGTERM
+        gateway_cli.launchd_stop()
+        assert stop_env["kills"] == [(4242, True)]
+        assert stop_env["now"] >= 60.0  # never before launchd's own ExitTimeOut clamp
+
+    def test_unloaded_job_keeps_the_short_pid_fallback(self, stop_env):
+        stop_env["bootout_rc"] = 3  # already unloaded: nothing SIGTERMed it, keep the old fallback
+        stop_env["exit_at"] = 10_000.0
+        gateway_cli.launchd_stop()
+        assert stop_env["kills"] == [(4242, True)]
+        assert stop_env["now"] < 15.0
+
+
 class TestRetryLaunchctlBootstrapUntilRegistered:
     """`_retry_launchctl_bootstrap_until_registered` — salvage of #53277.
 

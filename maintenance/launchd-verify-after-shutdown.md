@@ -107,6 +107,10 @@ Regressions: `tests/gateway/test_planned_restart_signal.py`,
 Retire with the bootout path itself, or when upstream distinguishes a planned
 launchd reload from an external kill.
 
+## Stop path
+
+`launchd_stop` uses the same principle. Once `launchctl bootout` succeeds, launchd has already SIGTERMed the gateway and enforces `ExitTimeOut` itself. The CLI waits `_launchd_old_gateway_exit_budget()` before its SIGKILL backstop, instead of 5 seconds. A 5-second kill cut a busy gateway's drain short (notify, then the cron and delegation waits, about 34 seconds), which skipped resume marking and forced unclean native recovery at the next boot (2026-11-28). The short PID fallback remains only when bootout failed because the job was already unloaded or the domain is unsupported, since nothing SIGTERMed the gateway then. `TestLaunchdStopWaitsOutTheDrain` covers both branches.
+
 ## Verification and retirement
 
 Commit `d389ff3baa` (a sync regression-batch repair that landed with the v0.22.5 sync, #776, on 2026-10-26) restored upstream's

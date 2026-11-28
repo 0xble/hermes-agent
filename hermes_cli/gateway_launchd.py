@@ -1073,17 +1073,26 @@ def _launchd_stop_locked():
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
+    booted_out = False
     try:
         # Captured: an already-unloaded job (3/113/125) is handled below, so launchctl's own
         # "Boot-out failed: 3" must not print around the ✓ line; e.stderr stays on the raised error.
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90, **_gw()._CAPTURE_TEXT)
+        booted_out = True
     except subprocess.CalledProcessError as e:
         # Job already unloaded (3/113/125), or the domain can't be managed at all (5/125, macOS 26+
         # detached-fallback process, issue #23387) — in both cases just fall through to the PID-based kill
         # below.
         if not (_launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(e.returncode)):
             raise
-    _gw()._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if booted_out:
+        # bootout SIGTERMed the gateway, which now drains (notify, then cron and delegation waits)
+        # and launchd SIGKILLs it at ExitTimeOut anyway. A 5s CLI SIGKILL cut that drain short, so
+        # interrupted turns were never marked for resume and the next boot paid unclean recovery.
+        budget = _launchd_old_gateway_exit_budget()
+        _gw()._wait_for_gateway_exit(timeout=budget + 5.0, force_after=budget)
+    else:
+        _gw()._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
     print("✓ Service stopped")
 
 
