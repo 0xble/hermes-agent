@@ -386,11 +386,13 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
-        "Create a kanban task, optionally a child of the current one (via ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a kanban task, optionally a child of the current one (via ``parents``). Any session "
+        "starts durable work here instead of a background delegate: work that changes the world, runs "
+        "over about 20 minutes, or must not be dropped gets a card keyed to its task (idempotency_key "
+        "\"task:<id>\", goal_mode=true) and a body with `Done when:` and `Proof:` lines. "
+        "Orchestrator workers also use it to fan out — decompose work into child tasks with specific "
+        "assignees, link them into a pipeline, then complete your own task. The dispatcher picks up "
+        "the new tasks on its next tick and spawns the assigned profiles."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
