@@ -3,16 +3,11 @@ automatically — no extra user message required (#47699).
 
 Issue #47699 reported that a Slack ``/goal`` continuation could be enqueued by
 ``_post_turn_goal_continuation`` → ``_enqueue_fifo`` (adapter pending slot) but
-never consumed until the next real inbound message woke the session.
-
-On the current tree the continuation is enqueued while the adapter's
-``_process_message_background`` frame is still live (the runner hook runs
-inside ``self._message_handler(event)``), so the adapter's in-band pending
-drain — and, for late arrivals, the finally-block late-arrival drain — spawns
-the follow-up turn without user input.  These tests pin that contract from the
-adapter dispatch layer down, so a future refactor that moves the goal hook
-after the drain (or changes FIFO key derivation) fails loudly instead of
-silently stalling goal loops on messaging gateways.
+never consumed until the next real inbound message woke the session. The
+post-delivery judge can outlive the adapter's bounded bookkeeping join, so the
+adapter may already be idle when the continuation is enqueued. These tests pin
+that contract from the runner hook down: an idle enqueue must start the normal
+adapter drain without duplicating a real in-flight turn.
 """
 
 from __future__ import annotations
@@ -203,6 +198,159 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_idle_post_turn_goal_continuation_starts_a_new_fifo_drain(hermes_home):
+    """A deferred judge can finish after the original adapter task releases its guard.
+
+    The continuation must kick an idle adapter itself; otherwise it sits in the pending
+    slot until an unrelated human message arrives (the incident's strand shape).
+    """
+    from datetime import datetime
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from gateway.config import GatewayConfig
+    from gateway.platforms.base import post_delivery_owner
+    from gateway.run import GatewayRunner
+    from gateway.session import AsyncSessionStore, SessionEntry
+    from gateway.session_results import execution_result
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    entry = SessionEntry(
+        session_key=key, session_id=f"idle-drain-{uuid.uuid4().hex[:8]}", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    runner._async_session_store = AsyncSessionStore(runner.session_store)
+    setattr(runner._async_session_store, "lookup_by_session_key", AsyncMock(return_value=entry))
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "reply"
+
+    adapter.set_message_handler(handler)
+    guard = asyncio.Event()
+    adapter._active_sessions[key] = guard
+    event = MessageEvent(text="delivered question", message_type=MessageType.TEXT, source=src)
+    GoalManager(entry.session_id).set("ship it")
+    captured = {"post_delivery_owned": True}
+    token = execution_result.set(captured)
+    owner_token = post_delivery_owner.set((adapter, event))
+    try:
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "still needs work", False, None, False),
+        ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+                patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
+            await runner._defer_post_turn_hooks(
+                agent_result={"final_response": "partial progress"}, source=src, is_internal=False,
+                event=event, session_key=key, generation=None,
+            )
+    finally:
+        post_delivery_owner.reset(owner_token)
+        execution_result.reset(token)
+
+    # Ensure the deferred bookkeeping task registered its delivery callback before firing it.
+    for _ in range(40):
+        if key in adapter._post_delivery_callbacks:
+            break
+        await asyncio.sleep(0.01)
+    assert key in adapter._post_delivery_callbacks
+
+    # Model the real race: the adapter turn releases its guard before delivery fires.
+    adapter._release_session_guard(key, guard=guard)
+    await adapter._fire_post_delivery_callback(key, None)
+    await getattr(event, "_post_turn_bookkeeping_task")
+    for _ in range(80):
+        if handled:
+            break
+        await asyncio.sleep(0.05)
+
+    assert len(handled) == 1 and handled[0].startswith(CONTINUATION_TEXT), handled
+    assert key not in adapter._pending_messages
+    for _ in range(80):
+        if key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.05)
+    assert key not in adapter._active_sessions
+
+
+@pytest.mark.asyncio
+async def test_deferred_goal_continuation_does_not_duplicate_a_running_successor(hermes_home):
+    """Deferred bookkeeping leaves a pending head for the successor that owns the guard."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from gateway.config import GatewayConfig
+    from gateway.platforms.base import post_delivery_owner
+    from gateway.run import GatewayRunner
+    from gateway.session import AsyncSessionStore, SessionEntry
+    from gateway.session_results import execution_result
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    entry = SessionEntry(
+        session_key=key, session_id=f"successor-{uuid.uuid4().hex[:8]}", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    runner._async_session_store = AsyncSessionStore(runner.session_store)
+    setattr(runner._async_session_store, "lookup_by_session_key", AsyncMock(return_value=entry))
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    event = MessageEvent(text="delivered question", message_type=MessageType.TEXT, source=src)
+    guard = asyncio.Event()
+    adapter._active_sessions[key] = guard
+    successor_hold = asyncio.Event()
+    successor = asyncio.create_task(successor_hold.wait())
+    adapter._session_tasks[key] = successor
+    GoalManager(entry.session_id).set("ship it")
+    captured = {"post_delivery_owned": True}
+    token = execution_result.set(captured)
+    owner_token = post_delivery_owner.set((adapter, event))
+    try:
+        with patch(
+            "hermes_cli.goals.judge_goal",
+            return_value=("continue", "still needs work", False, None, False),
+        ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+                patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex), \
+                patch.object(adapter, "_start_session_processing", wraps=adapter._start_session_processing) as start:
+            await runner._defer_post_turn_hooks(
+                agent_result={"final_response": "partial progress"}, source=src, is_internal=False,
+                event=event, session_key=key, generation=None,
+            )
+            for _ in range(40):
+                if key in adapter._post_delivery_callbacks:
+                    break
+                await asyncio.sleep(0.01)
+            await adapter._fire_post_delivery_callback(key, None)
+            await getattr(event, "_post_turn_bookkeeping_task")
+            start.assert_not_called()
+    finally:
+        post_delivery_owner.reset(owner_token)
+        execution_result.reset(token)
+        successor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await successor
+
+    assert key in adapter._pending_messages
 
 
 @pytest.mark.asyncio

@@ -855,6 +855,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             except Exception:
                 logger.warning("Post-delivery goal/loop bookkeeping failed", exc_info=True)
             finally:
+                if deferred:
+                    # Deferred bookkeeping can outlive the adapter task's session guard. The
+                    # normal transport drain has already run by then, so kick the same FIFO head
+                    # here; the idle check prevents duplicating a successor that won the guard.
+                    try:
+                        self._start_compression_deferred_drain(session_key, adapter)
+                    except Exception:
+                        logger.warning("Post-delivery FIFO drain failed for %s", session_key, exc_info=True)
                 _post_turn_delivered.reset(delivered_token)
                 execution_result.reset(token)
 
