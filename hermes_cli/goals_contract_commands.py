@@ -90,7 +90,11 @@ class GoalContractCommandsMixin:
     @staticmethod
     def _revise_state(state: GoalState, *, reason: str, actor: str, goal: Optional[str],
                       contract: Optional[dict[str, str]], subgoals: Optional[list[str]],
-                      evidence: str, evidence_error: Optional[dict[str, str]]) -> dict[str, Any]:
+                      evidence: str, evidence_error: Optional[dict[str, str]],
+                      due: Optional[str] = None, next_check: Optional[str] = None,
+                      done_when: Optional[str] = None, log_path: Optional[str] = None,
+                      plan_path: Optional[str] = None, baseline: Optional[list[dict[str, Any]]] = None,
+                      ownership: Optional[bool] = None) -> dict[str, Any]:
         """Validate and apply an additive revision to the live row (pure; no I/O)."""
         from hermes_cli.goals import (
             GoalContract, _CONTRACT_FIELDS, _REVISION_EVIDENCE_MIN_CHARS, _requirement_diff,
@@ -108,8 +112,35 @@ class GoalContractCommandsMixin:
             after[key] = str(value or "").strip()
         if subgoals is not None:
             after["subgoals"] = contract_items("subgoals", subgoals)
+        prospective_due = state.due if due is None else str(due or "").strip()
+        prospective_done_when = state.done_when if done_when is None else str(done_when or "").strip()
+        prospective_log_path = state.log_path if log_path is None else str(log_path or "").strip()
+        prospective_plan_path = state.plan_path if plan_path is None else str(plan_path or "").strip()
+        prospective_ownership = state.ownership if ownership is None else bool(ownership)
+        if prospective_ownership or any(value is not None for value in (due, next_check, done_when, log_path, plan_path, baseline)):
+            from hermes_cli.goal_lints import GoalLintError, due_change_findings, enforce_ownership
+            try:
+                enforce_ownership(due=prospective_due, done_when=prospective_done_when,
+                                  verification=after["verification"], plan_path=prospective_plan_path,
+                                  log_path=prospective_log_path, constraints=after["constraints"],
+                                  stop_when=after["stop_when"], ownership=prospective_ownership,
+                                  existing=state)
+                findings = due_change_findings(state.due, prospective_due, user_quote="", reason=reason)
+                if findings:
+                    raise GoalLintError(findings)
+            except GoalLintError as exc:
+                return {"ok": False, "error_code": exc.findings[0].code, "error": str(exc)}
         changed = [key for key in after if after[key] != before[key]]
-        if not changed:
+        metadata_changed = any([
+            due is not None and prospective_due != state.due,
+            next_check is not None and str(next_check or "").strip() != state.next_check,
+            done_when is not None and prospective_done_when != state.done_when,
+            log_path is not None and prospective_log_path != state.log_path,
+            plan_path is not None and prospective_plan_path != state.plan_path,
+            baseline is not None and baseline != state.baseline,
+            ownership is not None and prospective_ownership != state.ownership,
+        ])
+        if not changed and not metadata_changed:
             return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
 
         if "goal" in changed:
@@ -167,6 +198,18 @@ class GoalContractCommandsMixin:
         state.goal = after["goal"]
         state.contract = GoalContract.from_dict({key: after[key] for key in _CONTRACT_FIELDS})
         state.subgoals = contract_items("subgoals", after["subgoals"])
+        old_due = state.due
+        state.due = prospective_due
+        state.next_check = state.next_check if next_check is None else str(next_check or "").strip()
+        state.done_when = prospective_done_when
+        state.log_path = prospective_log_path
+        state.plan_path = prospective_plan_path
+        state.baseline = [dict(row) for row in (baseline if baseline is not None else state.baseline) if isinstance(row, dict)]
+        if due is not None and prospective_due != old_due:
+            from hermes_cli.goal_lints import append_due_baseline
+            state.baseline = append_due_baseline(state.baseline, old_due=old_due,
+                                                 new_due=prospective_due, reason=reason, at=time.time())
+        state.ownership = prospective_ownership
         state.revisions.append(revision)
         return {"ok": True, "revision": revision,
                 "version": sum(1 for item in state.revisions if item.get("kind") != "replace") + 1}

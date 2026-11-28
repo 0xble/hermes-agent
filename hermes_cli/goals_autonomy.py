@@ -160,7 +160,8 @@ def current_removal_quote(session_id, quote, *, requirements=(), cursor=None):
 
 
 def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
-                    max_turns=None, user_quote="", kind="revise"):
+                    max_turns=None, user_quote="", kind="revise", due=None, next_check=None,
+                    done_when=None, log_path=None, plan_path=None, baseline=None, ownership=None):
     """Validate the entire delta before changing the staged snapshot."""
     from hermes_cli.goals import GoalContract, contract_items
     from hermes_cli.goals_authority import (
@@ -174,7 +175,16 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if not str(reason or "").strip():
         return {"ok": False, "error_code": "reason_required", "error": "a revision needs a reason"}
     before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals),
-              "max_turns": state.max_turns}
+              "max_turns": state.max_turns, "due": state.due, "next_check": state.next_check,
+              "done_when": state.done_when, "log_path": state.log_path, "plan_path": state.plan_path,
+              "baseline": state.baseline, "ownership": state.ownership}
+    ownership_value = state.ownership if ownership is None else bool(ownership)
+    due_value = state.due if due is None else str(due or "").strip()
+    next_check_value = state.next_check if next_check is None else str(next_check or "").strip()
+    done_when_value = state.done_when if done_when is None else str(done_when or "").strip()
+    log_path_value = state.log_path if log_path is None else str(log_path or "").strip()
+    plan_path_value = state.plan_path if plan_path is None else str(plan_path or "").strip()
+    baseline_value = state.baseline if baseline is None else [dict(row) for row in baseline if isinstance(row, dict)]
     # A goal without explicit verification still has an implicit completion bar.
     # Materialize it before editing so adding a tiny check or changing the objective
     # cannot retire the unmet original outcome.
@@ -191,6 +201,22 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if max_turns is not None:
         from hermes_cli.goals import normalize_goal_max_turns
         after["max_turns"] = normalize_goal_max_turns(max_turns)
+    after.update({"due": due_value, "next_check": next_check_value, "done_when": done_when_value,
+                  "log_path": log_path_value, "plan_path": plan_path_value,
+                  "baseline": baseline_value, "ownership": ownership_value})
+    if ownership_value or any(value is not None for value in (due, next_check, done_when, log_path, plan_path, baseline)):
+        from hermes_cli.goal_lints import GoalLintError, due_change_findings, enforce_ownership
+        try:
+            enforce_ownership(due=due_value, done_when=done_when_value,
+                              verification=after["verification"], plan_path=plan_path_value,
+                              log_path=log_path_value, constraints=after["constraints"],
+                              stop_when=after["stop_when"], ownership=ownership_value,
+                              existing=state)
+            findings = due_change_findings(state.due, due_value, user_quote=user_quote, reason=reason)
+            if findings:
+                raise GoalLintError(findings)
+        except GoalLintError as exc:
+            return {"ok": False, "error_code": exc.findings[0].code, "error": str(exc)}
     if set(after) != set(before):
         return {"ok": False, "error_code": "unknown_field", "error": "unknown contract field"}
     removed = [item for field in (*state.contract.to_dict(), "subgoals")
@@ -216,6 +242,18 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     state.goal = after["goal"]
     state.contract = GoalContract.from_dict(after)
     state.subgoals = after["subgoals"]
+    old_due = state.due
+    state.due = due_value
+    state.next_check = next_check_value
+    state.done_when = done_when_value
+    state.log_path = log_path_value
+    state.plan_path = plan_path_value
+    if due is not None and due_value != str(old_due or "").strip():
+        from hermes_cli.goal_lints import append_due_baseline
+        baseline_value = append_due_baseline(baseline_value, old_due=old_due, new_due=due_value,
+                                             reason=reason, at=time.time())
+    state.baseline = baseline_value
+    state.ownership = ownership_value
     state.max_turns = after["max_turns"]
     # Replacement is a new continuation instance. Keep breach/contract history, but
     # require fresh proof of the new objective rather than accepting stale readbacks.
