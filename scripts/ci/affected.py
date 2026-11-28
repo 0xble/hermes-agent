@@ -47,7 +47,7 @@ PATH_MAP_FILE = Path(__file__).with_name('affected-map')
 MIN_TEXT_TOKEN = 8  # shorter basenames match too much prose to be a signal
 # Basenames shared by many files say nothing about which one a test reads.
 GENERIC_NAMES = {'__init__.py', '__main__.py', 'conftest.py', 'README.md', 'SKILL.md', 'AGENTS.md',
-                 'CLAUDE.md', 'config.yaml', 'settings.json', 'package.json', 'index.ts', 'index.js'}
+                 'CLAUDE.md', 'config.yaml', 'case.yaml', 'settings.json', 'package.json', 'index.ts', 'index.js'}
 
 
 GIT_TIMEOUT_SECONDS = 120
@@ -264,6 +264,13 @@ def path_reference_pattern(changed: list[str]) -> re.Pattern[str]:
     return re.compile('|'.join(re.escape(t) for t in sorted(tokens, key=len, reverse=True)))
 
 
+def nearby_tests(changed: list[str], tests: list[str]) -> set[str]:
+    """Tests in a changed file's own directory tree, which often load it by path."""
+    # Only production files: a changed test or helper already selects what uses it.
+    folders = {str(PurePosixPath(path).parent) for path in changed if not is_test_side(path)} - {'.'}
+    return {test for test in tests if any(test.startswith(folder + '/') for folder in folders)}
+
+
 def select(root: Path, base: str) -> tuple[str, list[str], str]:
     """Return (mode, tests, reason). mode is 'full' or 'affected'."""
     changed = changed_paths(root, base)
@@ -282,6 +289,7 @@ def select(root: Path, base: str) -> tuple[str, list[str], str]:
     pattern = path_reference_pattern(changed)
     naming = [path for path, source in sources.items() if pattern.search(source)]
     affected |= tests_reaching(naming, importers, test_set)
+    affected |= nearby_tests(changed, tests)
     affected |= mapped_targets(changed)
     return 'affected', sorted(affected), f'{len(changed)} changed files'
 

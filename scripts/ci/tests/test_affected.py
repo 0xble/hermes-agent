@@ -15,7 +15,7 @@ affected = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(affected)
 
 FILES = {
-    'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n',
+    'pyproject.toml': '[tool.pytest.ini_options]\ntestpaths = ["tests", "plugins"]\n',
     'pkg/__init__.py': '',
     'pkg/core.py': 'VALUE = 1\n',
     'pkg/mid.py': 'from pkg.core import VALUE\n',
@@ -134,6 +134,12 @@ class SelectionTest(unittest.TestCase):
                 mode, tests, reason = self.change(path, '# changed\n')
                 self.assertEqual((mode, tests), ('full', []))
                 self.assertIn(path, reason)
+
+    def test_file_selects_tests_in_its_own_directory_tree(self) -> None:
+        self.on_base({'plugins/guard/core.py': 'X = 1\n',
+                      'plugins/guard/tests/test_guard.py': 'SPEC = "loads core by path"\n'})
+        _, tests, _ = self.change('plugins/guard/core.py', 'X = 2\n')
+        self.assertEqual(tests, ['plugins/guard/tests/test_guard.py'])
 
     def test_prose_beside_ci_configuration_does_not_run_everything(self) -> None:
         mode, tests, _ = self.change('.github/workflows/README.md', '# notes\n')
