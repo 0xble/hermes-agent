@@ -10,6 +10,11 @@ caps, queues, pauses, or chunking:
 - Local receipt handoff scans use the declarative `idx_state_meta_local_policy_route`
   index and an SQL `json_each` target filter when a repoint supplies target ids.
   `_epoch` and `hand_off_conversations` remain in the same write transaction.
+- Boot's local-receipt scan (`gateway/session_local_recovery.py` `local_receipt_ids`, 3 calls
+  per boot) reads the same covering index. Its literal `GLOB` is the index predicate, because a bound
+  `LIKE` cannot imply it and the planner would scan every row and parse every receipt's JSON. On a
+  70k-receipt clone (2026-11-28) the scan dropped from 462 s to 17.9 s cold (0.3 s warm), and the
+  404-row result was identical. A missing index falls back to the unforced query.
 - Held-media collection uses the partial `idx_session_admissions_held` index. The
   exact predicate is shared by the schema DDL and production query, with no
   `json_valid` guard.
