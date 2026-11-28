@@ -55,6 +55,12 @@ def _clean_name(runner, name: str) -> str:
     return runner._sanitize_telegram_topic_title(clean)
 
 
+ICON_ACK_NOTE = (
+    "Telegram acknowledged the icon edit, but the Bot API cannot read a topic back and may not push a "
+    "bot's icon edit to open clients. If the app still shows the old icon, reopen the topic or restart "
+    "the app before retrying.")
+
+
 def _icon_choices(options) -> str:
     return " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
 
@@ -591,6 +597,10 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     if name and runner._session_db is not None:
         title = await runner._session_db.set_session_title_in_lineage(entry.session_id, name)
     warnings = []
+    if icon_id:
+        # The Bot API has no way to read a topic back, so Telegram's acknowledgement of the edit is
+        # all this tool can confirm, and Telegram may not push a bot's icon edit to open clients.
+        warnings.append(ICON_ACK_NOTE)
     settings = {
         "model_status": "unchanged", "reasoning_status": "unchanged",
         "model_effective_when": "unchanged", "reasoning_effective_when": "unchanged",
@@ -599,13 +609,14 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
         settings = await _apply_session_settings(
             runner, dest, entry, model, effort, reasoning_reset=reasoning_reset,
         )
-        warnings = settings["warnings"]
+        warnings.extend(settings["warnings"])
     readback = await _session_settings_readback(runner, dest, entry, model)
     warnings.extend(readback.pop("warnings"))
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
         "relay": relay_address(runner, source, entry.session_id), "name": name, "title": title,
         "icon": spec.icon if icon_id else None,
+        "icon_status": "accepted_by_telegram" if icon_id else None,
         "reasoning": effort, "warnings": warnings,
         "model_status": settings["model_status"], "reasoning_status": settings["reasoning_status"],
         **readback,

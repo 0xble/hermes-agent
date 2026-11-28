@@ -3289,7 +3289,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             kwargs["name"] = name
         if icon_custom_emoji_id:
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-        await self._bot.edit_forum_topic(**kwargs)
+        accepted = await self._bot.edit_forum_topic(**kwargs)
+        if not accepted:
+            # editForumTopic answers True on success. Anything else is not an acknowledgement, so
+            # nothing is recorded as written and the caller reports the edit as rejected.
+            logger.warning("[%s] Telegram did not acknowledge the DM topic edit in chat %s thread_id=%s (%r)",
+                           self.name, chat_id, thread_id, accepted)
+            return False
         if icon_custom_emoji_id:
             written = getattr(self, "_auto_topic_icons_written", None)
             if written is None:
