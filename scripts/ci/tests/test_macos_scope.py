@@ -23,7 +23,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git(tmp_path, 'config', 'user.email', 'ci@example.invalid')
     git(tmp_path, 'config', 'user.name', 'ci')
     (tmp_path / 'agent').mkdir()
-    (tmp_path / 'agent/core.py').write_text('X = 1\n')
+    (tmp_path / 'agent/core.py').write_text('X = 1\n', encoding='utf-8')
     git(tmp_path, 'add', '-A')
     git(tmp_path, 'commit', '-qm', 'base')
     git(tmp_path, 'switch', '-qc', 'change')
@@ -33,7 +33,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def commit(root: Path, path: str, text: str) -> None:
     (root / path).parent.mkdir(parents=True, exist_ok=True)
-    (root / path).write_text(text)
+    (root / path).write_text(text, encoding='utf-8')
     git(root, 'add', path)
     git(root, 'commit', '-qm', 'change')
 

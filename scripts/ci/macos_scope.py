@@ -31,8 +31,8 @@ GIT_TIMEOUT_SECONDS = 120
 
 
 def git(*args: str) -> str:
-    return subprocess.run(['git', *args], check=True, capture_output=True, text=True,
-                          timeout=GIT_TIMEOUT_SECONDS).stdout
+    return subprocess.run(['git', *args], check=True, capture_output=True, text=True, encoding='utf-8',
+                          errors='replace', timeout=GIT_TIMEOUT_SECONDS).stdout
 
 
 def reason_to_run(changed: list[str]) -> str | None:
@@ -45,7 +45,7 @@ def reason_to_run(changed: list[str]) -> str | None:
         if not path.endswith('.py'):
             continue
         try:
-            source = Path(path).read_text(encoding='utf-8', errors='replace')
+            source = Path(path).read_text(encoding='utf-8-sig', errors='replace')
         except OSError:
             continue  # deleted files are covered by their importers' own markers
         if MACOS_SOURCE.search(source):
