@@ -5234,4 +5234,3 @@ Lost-code audit for the v0.23.4 sync. Regenerate with `python scripts/fork_lost_
 
 - Plugins can register the 27 lifecycle events currently accepted by `hermes_cli.p
   - `website/docs/user-guide/features/plugins.md@-359 +359` intentionally dropped: no exact replacement in sync HEAD; upstream v0.23.4 or later fork revisions supersede this exact line
-
