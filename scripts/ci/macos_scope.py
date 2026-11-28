@@ -42,7 +42,7 @@ def git(*args: str) -> str:
 
 def reason_to_run(changed: list[str]) -> str | None:
     for path in changed:
-        if SHARED_SETUP.match(path):
+        if SHARED_SETUP.search(path):
             return f'shared setup changed: {path}'
         if MACOS_PATH.search(path):
             return f'macOS-specific path: {path}'
