@@ -310,7 +310,7 @@ def checkout_loop_reader(db: "SessionDB"):
         if failed_at and time.monotonic() - failed_at < _READ_OPEN_RETRY_SECONDS:
             return None
     import sqlite3
-    from hermes_state_dbfile import apply_database_pragmas
+    from hermes_state_wal import apply_database_pragmas
     conn = None
     try:
         conn = db._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
