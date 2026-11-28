@@ -304,6 +304,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
+## Active Patch Record: Compacted-history retention
+
+- **Patch identity:** `compacted-history-retention`.
+- **Contract:** `hermes sessions compact-history` archives inactive (`active = 0`) message rows older than the requested age as gzip JSONL and deletes them in bounded transactions through the normal FTS DELETE triggers. The archive destination is an explicit `--archive` CLI option or the built-in `/Volumes/Hermes Archive/compacted-history.jsonl.gz` default; no environment variable controls this behavior. Dry runs report rows and estimated content bytes without writing.
+- **Source surfaces:** `hermes_state_maintenance.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/subcommands/sessions.py`; regressions in `tests/hermes_state/test_compacted_history_retention.py` and `tests/hermes_cli/test_sessions_compact_history.py`.
+- **Verification:** `scripts/run_tests.sh tests/hermes_state/test_compacted_history_retention.py tests/hermes_cli/test_sessions_compact_history.py`; the exact-head gate must report `GATE: PASS`.
+- **Rollback:** Revert the commits carrying `Fork-Patch: compacted-history-retention`. No schema migration; existing archives are preserved.
+- **Retirement:** Remove when an upstream release provides equivalent bounded compacted-history archiving, deletion, FTS consistency, and explicit archive-destination behavior.
+
 ## Active Patch Record: Release-bound launcher recovery
 
 - **Patch identity:** `release-launcher-stability`.

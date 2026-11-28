@@ -59,7 +59,7 @@ def foreign_holder(state_db):
             proc.wait(timeout=10)
 
 
-def _args(action, force):
+def _args(action, force, archive=None):
     common = dict(sessions_action=action, force=force)
     if action == "prune":
         return Namespace(dry_run=False, yes=True, never_active=False, include_archived=False,
@@ -67,6 +67,9 @@ def _args(action, force):
                          **{name: None for name in sessions_cmd._FILTER_ARGS})
     if action == "optimize-storage":
         return Namespace(no_vacuum=False, yes=True, **common)
+    if action == "compact-history":
+        return Namespace(older_than="14d", archive=archive, dry_run=False,
+                         batch_size=500, yes=True, **common)
     return Namespace(**common)
 
 
@@ -96,7 +99,7 @@ def test_store_rewrites_refuse_and_name_the_holder_until_forced(action, state_db
                 if name in sessions_cmd._HELD_STORE_ACTIONS for a in sub._actions
                 for opt in a.option_strings if opt in ("--db", "--db-path", "--database")]
 
-    assert sessions_cmd.cmd_sessions(_args(action, force=True)) != 1
+    assert sessions_cmd.cmd_sessions(_args(action, force=True, archive=state_db.parent / "history.jsonl.gz")) != 1
     assert "Refusing" not in capsys.readouterr().out
 
 

@@ -43,6 +43,24 @@ def _add_refresh_prompts(sessions_subparsers) -> None:
     _flag(refresh, "--json", help="Machine-readable output")
 
 
+def _add_state_parser(sessions_subparsers, cmd_session_state) -> None:
+    state_parser = sessions_subparsers.add_parser("state", help="Read bounded session/topic/delivery state as JSON")
+    state_subs = state_parser.add_subparsers(dest="state_action", required=True)
+    topic_parser = state_subs.add_parser("resolve-topic", help="Resolve a Telegram topic binding")
+    topic_parser.add_argument("--chat-id", required=True)
+    topic_parser.add_argument("--thread-id", required=True)
+    topic_parser.set_defaults(func=cmd_session_state, state_action="resolve_topic")
+    inspect_parser = state_subs.add_parser("inspect", help="Inspect session metadata without messages")
+    inspect_parser.add_argument("--session-id", required=True)
+    inspect_parser.set_defaults(func=cmd_session_state, state_action="inspect_session")
+    delivery_parser = state_subs.add_parser("delivery", help="Inspect delivery obligations")
+    delivery_selector = delivery_parser.add_mutually_exclusive_group(required=True)
+    for flag in ("--session-id", "--session-key", "--obligation-id"):
+        delivery_selector.add_argument(flag)
+    delivery_parser.add_argument("--include-content", action="store_true", help="Include bounded delivery text")
+    delivery_parser.set_defaults(func=cmd_session_state, state_action="inspect_delivery")
+
+
 def _add_retention_prune_args(parser):
     parser.add_argument("--max-seconds", type=float,
         help="Stop retention pruning after this many seconds (also bounded by deletion_window); unfinished cleanup resumes next run")
@@ -56,6 +74,19 @@ def _add_retention_prune_args(parser):
     _flag(parser, "--now", help="Delete now even outside maintenance.deletion_window (prune deletes only inside it by default: a large delete stalls the live gateway's writes)")
     _flag(parser, "--force",
         help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped. With the gateway running, prune always goes through it")
+
+
+def _add_compacted_history_parser(sessions_subparsers) -> None:
+    parser = sessions_subparsers.add_parser(
+        "compact-history", help="Archive and delete inactive compacted message history (session_search recovery of deleted rows degrades)")
+    parser.add_argument("--older-than", default="14", metavar="AGE",
+        help="Retention age (bare number of days, or a duration like '14d'/'2w')")
+    parser.add_argument("--archive", type=Path, help="Gzip JSONL archive path")
+    parser.add_argument("--batch-size", type=int, default=500)
+    add_yes_flag(parser, "Skip confirmation")
+    _flag(parser, "--force",
+        help="Run even while another Hermes process holds state.db; only use with all other writers stopped")
+    _flag(parser, "--dry-run", help="Report rows and estimated bytes without changing anything")
 
 
 def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
@@ -74,21 +105,7 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     search_parser.add_argument("--before", help="Exclusive ISO-8601 or relative-duration upper bound")
     search_parser.set_defaults(func=cmd_session_search)
 
-    state_parser = sessions_subparsers.add_parser("state", help="Read bounded session/topic/delivery state as JSON")
-    state_subs = state_parser.add_subparsers(dest="state_action", required=True)
-    topic_parser = state_subs.add_parser("resolve-topic", help="Resolve a Telegram topic binding")
-    topic_parser.add_argument("--chat-id", required=True)
-    topic_parser.add_argument("--thread-id", required=True)
-    topic_parser.set_defaults(func=cmd_session_state, state_action="resolve_topic")
-    inspect_parser = state_subs.add_parser("inspect", help="Inspect session metadata without messages")
-    inspect_parser.add_argument("--session-id", required=True)
-    inspect_parser.set_defaults(func=cmd_session_state, state_action="inspect_session")
-    delivery_parser = state_subs.add_parser("delivery", help="Inspect delivery obligations")
-    delivery_selector = delivery_parser.add_mutually_exclusive_group(required=True)
-    for flag in ("--session-id", "--session-key", "--obligation-id"):
-        delivery_selector.add_argument(flag)
-    delivery_parser.add_argument("--include-content", action="store_true", help="Include bounded delivery text")
-    delivery_parser.set_defaults(func=cmd_session_state, state_action="inspect_delivery")
+    _add_state_parser(sessions_subparsers, cmd_session_state)
 
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument("--source", help="Filter by source (cli, telegram, discord, etc.)")
@@ -169,6 +186,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_export, "--delete-after-verified",
         help="md/qmd only: after verified single-session export, delete that session (needs --yes)")
     _flag(sessions_export, "--force", help="md/qmd only: overwrite an existing export file")
+
+    _add_compacted_history_parser(sessions_subparsers)
 
     sessions_delete = sessions_subparsers.add_parser("delete", help="Delete a specific session")
     sessions_delete.add_argument("session_id", help="Session ID to delete")

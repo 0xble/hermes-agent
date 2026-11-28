@@ -658,6 +658,25 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
 
 # -- delete / prune / archive -------------------------------------------------
 
+def _cmd_compact_history(db, args):
+    from hermes_cli.session_filters import parse_duration_seconds
+    seconds = parse_duration_seconds(str(args.older_than))
+    if seconds is None:
+        print("Error: --older-than must be a duration (for example, 14d or 2w)")
+        return 1
+    if not getattr(args, "dry_run", False) and not getattr(args, "yes", False):
+        refused = _confirm_or_exit_code(
+            f"Archive and delete inactive compacted history older than {args.older_than}? [y/N] "
+        )
+        if refused is not None:
+            return refused
+    days = seconds / 86400.0
+    result = db.compacted_history_retention(days, archive_path=args.archive,
+                                            dry_run=args.dry_run, batch_size=args.batch_size)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def _cmd_delete(db, args):
     resolved_session_id = db.resolve_session_id(args.session_id)
     if not resolved_session_id:
@@ -1450,7 +1469,7 @@ _PRE_DB_HANDLERS = {
 }
 _OBSERVATIONAL_DB_ACTIONS = frozenset({"list", "stats", "pinned"})
 _DB_HANDLERS = {
-    "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "rename": _cmd_rename, "pinned": _cmd_pinned,
+    "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "compact-history": _cmd_compact_history, "rename": _cmd_rename, "pinned": _cmd_pinned,
     "prune": partial(_cmd_prune_or_archive, action="prune"), "pin": partial(_cmd_pin, pinning=True),
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
@@ -1472,7 +1491,7 @@ def _print_empty_store(action: str, args) -> None:
 
 # VACUUM, the FTS-layout rebuild and bulk deletes rewrite the store; underneath a live gateway/Desktop/cron
 # writer that is the second-writer class behind the retired-WAL refusal (#110054). `--force` is the override.
-_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune"})
+_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune", "compact-history"})
 
 
 def cmd_sessions(args, sessions_parser=None):
