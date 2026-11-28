@@ -315,11 +315,14 @@ def _record_worker_result(context, code, last_output):
                  'last_output': last_output}, run_id=context['run_id'])
 
 
-def record_worker_loss(policy, reason, *, pid=None, bound=False):
+def record_worker_loss(policy, reason, *, pid=None, bound=False, restart=False):
     """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
-    Never raises: the caller's own loss handling must not depend on the board write.
+    ``restart``: the owner lost the attempt by stopping or restarting, so the dispatcher re-queues
+    it without charging the card (``kanban_owner_recovery.owner_restart_lost``); a loss already
+    recorded for the run keeps its verdict. Never raises: the caller's own loss handling must not
+    depend on the board write.
     """
     try:
         context = json.loads(policy.kanban_json or 'null')
@@ -333,13 +336,32 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False):
                                (context['task_id'],)).fetchone()
             if row is None or row[0] != 'running' or row[1] != run_id:
                 return
+            if restart and conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_lost'",
+                                        (context['task_id'], run_id)).fetchone():
+                return
             kb._append_event(conn, context['task_id'], 'worker_lost',
                              {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
+                              'run_id': run_id, 'pid': pid, 'bound': bool(bound),
+                              **({'restart': True} if restart else {})},
                              run_id=run_id)
     except Exception:
         import logging
         logging.getLogger(__name__).exception('kanban worker_lost record failed')
+
+
+def record_card_restart(db, session_id):
+    """Boot recovery settled a card attempt this owner lost by restarting (its turn was still in
+    flight): mark the run so the dispatcher re-queues it without charging the card."""
+    try:
+        from hermes_state_local import local_receipt
+        from gateway.session_policy import restore_policy
+        saved = local_receipt(db, session_id)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('kanban restart record failed')
+        return
+    if saved:
+        record_worker_loss(restore_policy(saved['policy']), 'owner restarted', restart=True)
 
 
 def _bound_worker_matches(conn, context):

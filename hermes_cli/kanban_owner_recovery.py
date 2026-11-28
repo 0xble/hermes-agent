@@ -206,10 +206,19 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
     return ""
 
 
-def reclaim_error(conn, task_id, claim_lock) -> str:
-    """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
-    note = owner_attempt_note(conn, task_id)
-    return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
+def owner_restart_lost(lost) -> bool:
+    """True when the owner recorded that it stopped or restarted under the run (``worker_lost`` with
+    ``restart``, from ``session_kanban.record_worker_loss``): the attempt ended for the host's
+    reason, not the card's, so it is re-queued without charging the card's retry budget."""
+    return bool(lost.get("restart"))
+
+
+def reclaim_verdict(conn, task_id, claim_lock) -> tuple[str, bool]:
+    """A stale-lock reclaim's ``(run error, owner restart)``: the error names how the attempt ended
+    when the owner recorded it, and an owner restart is not charged."""
+    lost = _latest_run_event(conn, task_id, "worker_lost")
+    note = owner_attempt_note(conn, task_id, lost)
+    return f"stale_lock={claim_lock}" + (f" [{note}]" if note else ""), owner_restart_lost(lost)
 
 
 def apply_attempt_note(conn, task_id, pid, dead) -> None:
@@ -218,14 +227,20 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
     turn never finished, so it books as a crash and charges the breaker, and the
-    protocol-violation streak (which reads the persisted payload) does not count it.
+    protocol-violation streak (which reads the persisted payload) does not count it. A loss the
+    owner recorded as its own stop or restart books as a re-queue instead, with no charge.
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
     if not note:
         return
     dead.event_payload["attempt_note"] = note
-    if lost:
+    if owner_restart_lost(lost) and not (dead.rate_limited or dead.terminal_provider):
+        # The owner stopped under this attempt (its turn never settled): re-queue, never charge.
+        dead.owner_restart, dead.protocol_violation, dead.event_kind = True, False, "reclaimed"
+        dead.event_payload.pop("protocol_violation", None)
+        dead.event_payload.update(worker_lost=lost, owner_restart=True, exit_kind=dead.kind)
+    elif lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
             from hermes_cli.kanban_db_dispatch import _PROTOCOL_VIOLATION_ERROR

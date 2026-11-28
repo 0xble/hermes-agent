@@ -178,6 +178,9 @@ def settle_recovered_unattended(db, epoch) -> int:
             continue
         release_admission_media(db, row['admission_id'])
         settled += 1
+        if 'kanban_card_v1' in (row.get('payload') or {}):
+            from gateway.session_kanban import record_card_restart
+            record_card_restart(db, row['target_session_id'])
         logger.info('Lost automation admission %s on session %s settled interrupted (not replayed)',
                     row['admission_id'], row['target_session_id'])
     return settled

@@ -578,14 +578,17 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
 
     A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
     without it the card's run learns nothing from its own loss. A deliberate Stop or a
-    superseded generation is not a loss. Tracked, so retirement joins the write.
+    superseded generation is not a loss. Lost while this owner stops (a restart or shutdown drain,
+    its own Stop included) is recorded as the owner's restart: the host's reason, not the card's.
+    Tracked, so retirement joins the write.
     """
+    stopping = bool(getattr(authority, 'retiring', False) or getattr(getattr(authority, 'runner', None), '_draining', False))
     if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
-            or reason in ('managed_worker_stopped', 'stale_generation')):
+            or reason == 'stale_generation' or (reason == 'managed_worker_stopped' and not stopping)):
         return None
     from gateway.session_kanban import record_worker_loss
     from gateway.session_runtime_workers import track_mutation
-    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
+    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason, restart=stopping,
                                                                pid=(scope or {}).get('pid'), bound=scope is not None)))
 
 
@@ -786,7 +789,9 @@ async def execute_managed(authority, ref, row, policy):
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
-                # this settles like an ordinary interrupted turn (the finally kills the child).
+                # this settles like an ordinary interrupted turn (the finally kills the child). A
+                # card stopped by this owner's own restart is noted so it is not charged.
+                _record_lost_attempt(authority, policy, None, 'managed_worker_stopped', scope)
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise

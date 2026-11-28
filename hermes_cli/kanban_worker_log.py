@@ -1,9 +1,10 @@
-"""Per-task worker log rotation, split out of ``hermes_cli.kanban_db_dispatch``."""
+"""Per-task worker log rotation and reading, split out of ``hermes_cli.kanban_db_dispatch``."""
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -85,3 +86,53 @@ def open_worker_log(log_path: Path):
         os.close(fd)
         raise
     return os.fdopen(fd, "ab")
+
+
+# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
+_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
+
+
+def _exit_summary_marker() -> str:
+    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
+    from agent.i18n import t
+    return t("cli.session.exit_resume_hint")
+
+
+def _log_noise_prefixes() -> tuple[str, ...]:
+    from agent.i18n import t
+    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
+
+
+def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
+
+    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
+    (``kanban_db_dispatch._default_spawn``), so when it exits without a terminal board call the
+    reason is usually sitting there: the model's own explanation of why it could
+    not comply (#88603), or the rendered provider error (#46593). The reap used to
+    discard it in favour of a canned message on every retry. Trims the CLI exit
+    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
+    on a missing/empty log.
+
+    ``board`` must come from the dispatching tick: ambient current-board resolution
+    is wrong for every board but the one the dispatcher thread happens to call
+    "current", so the log would silently not be found.
+    """
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_db_dispatch import _EXIT_TRAILER_RE
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    raw = _EXIT_TRAILER_RE.sub("", raw)
+    cut = raw.rfind(_exit_summary_marker())
+    if cut != -1:
+        raw = raw[:cut]
+    lines = []
+    for ln in raw.splitlines():
+        ln = _LOG_CHROME.sub("", ln).strip()
+        if ln and not ln.startswith(_log_noise_prefixes()):
+            lines.append(ln)
+    return " ".join(lines)[-400:]

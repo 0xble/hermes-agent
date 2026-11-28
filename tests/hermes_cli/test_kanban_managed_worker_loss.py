@@ -71,7 +71,7 @@ class _Board:
         self, tid: str = "t_lost", *, worker_pid=None, record_worker_pid: bool = True,
         claim_expires_in: int = 900, heartbeat_age=None, owner: bool = True,
         admission=("terminal", "interrupted"), worker_lost=None, dead_seconds: int = 120,
-        owner_pid=None,
+        owner_pid=None, lost_to_restart: bool = False,
     ) -> int:
         """A ``running`` card whose managed worker was lost."""
         worker_pid = _absent_pid() if worker_pid is None else int(worker_pid)
@@ -106,7 +106,8 @@ class _Board:
         if worker_lost:
             self.event(tid, run_id, "worker_lost",
                        {"reason": worker_lost, "claim_lock": lock, "run_id": run_id,
-                        "pid": worker_pid, "bound": False}, started + 24)
+                        "pid": worker_pid, "bound": False, **({"restart": True} if lost_to_restart else {})},
+                       started + 24)
         self.conn.commit()
         return run_id
 
@@ -310,3 +311,65 @@ def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
     board.conn.commit()
     record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
     assert count() == 1
+
+
+# --- an owner restart is the host's reason, never a failed attempt ------------------------
+
+def test_a_kanban_turn_stopped_by_its_owner_exits_as_an_owner_stop():
+    from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE, turn_exit_code
+    stopped = {"interrupted": True, "interrupt_source": "system"}
+    assert turn_exit_code(stopped, kanban_worker=True) == KANBAN_OWNER_STOP_EXIT_CODE
+    assert turn_exit_code(stopped, kanban_worker=False) == 130
+    assert turn_exit_code({"interrupted": True}, kanban_worker=True) == 130  # a user's Stop
+
+
+def test_a_worker_that_exits_as_an_owner_stop_is_requeued_without_a_charge(board):
+    from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+    from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE
+    run_id = board.running("t_stop", claim_expires_in=900, heartbeat_age=30, owner=False)
+    log = kb.worker_log_path("t_stop")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"\n{KANBAN_WORKER_EXIT_TRAILER}{KANBAN_OWNER_STOP_EXIT_CODE}\n", encoding="utf-8")
+    result = board.tick(failure_limit=1)
+    row, run = board.state("t_stop"), board.run(run_id)
+    assert (row["status"], row["consecutive_failures"], run["outcome"]) == ("ready", 0, "reclaimed")
+    assert json.loads(run["metadata"])["owner_restart"] is True
+    assert "t_stop" not in result.crashed and "t_stop" not in result.auto_blocked
+
+
+@pytest.mark.parametrize("shape", [
+    dict(claim_expires_in=900, heartbeat_age=30),                    # crash sweep: dead worker pid
+    dict(claim_expires_in=CLAIM_LAPSED, record_worker_pid=False),    # TTL reclaim: no pid ever bound
+], ids=["crash-sweep", "ttl-reclaim"])
+def test_an_attempt_lost_to_an_owner_restart_is_requeued_without_a_charge(board, shape):
+    run_id = board.running("t_restart", worker_lost="owner restarted", lost_to_restart=True, **shape)
+    board.tick(failure_limit=1)
+    row, run = board.state("t_restart"), board.run(run_id)
+    assert (row["status"], row["consecutive_failures"], run["outcome"]) == ("ready", 0, "reclaimed")
+    assert "managed worker lost: owner restarted" in run["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_loss_while_the_owner_drains_is_recorded_as_its_restart(board):
+    """A drain's own Stop and any loss during it are the owner's restart; a real loss recorded
+    before the restart keeps its verdict."""
+    from types import SimpleNamespace
+    from gateway.session_kanban import record_worker_loss
+    from gateway.session_managed_worker import _record_lost_attempt
+    run_id = board.running("t_drain", claim_expires_in=900, heartbeat_age=30)
+    policy = _owner_policy(board, "t_drain", run_id)
+    draining = SimpleNamespace(runner=SimpleNamespace(_draining=True))
+    await _record_lost_attempt(draining, policy, RuntimeError(), "managed_worker_stopped", None)
+    record_worker_loss(policy, "owner restarted", restart=True)  # boot recovery finds it recorded
+    events = [json.loads(r[0]) for r in board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id='t_drain' AND kind='worker_lost'")]
+    assert [(e["reason"], e.get("restart")) for e in events] == [("managed_worker_stopped", True)]
+    board.tick(failure_limit=1)
+    assert (board.state("t_drain")["consecutive_failures"], board.run(run_id)["outcome"]) == (0, "reclaimed")
+
+    crashed = board.running("t_crash", claim_expires_in=900, heartbeat_age=30)
+    policy = _owner_policy(board, "t_crash", crashed)
+    record_worker_loss(policy, "managed_worker_failed")
+    record_worker_loss(policy, "owner restarted", restart=True)
+    board.tick(failure_limit=5)
+    assert (board.state("t_crash")["consecutive_failures"], board.run(crashed)["outcome"]) == (1, "crashed")

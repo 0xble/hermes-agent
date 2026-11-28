@@ -273,7 +273,8 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
-    return ("nonzero_exit", code)
+    from hermes_cli.turn_exit import KANBAN_OWNER_STOP_EXIT_CODE
+    return ("owner_restart" if code == KANBAN_OWNER_STOP_EXIT_CODE else "nonzero_exit", code)
 
 
 _EXIT_TRAILER_RE = re.compile(
@@ -1002,54 +1003,6 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
-_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-
-
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
-
-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
-    (``_default_spawn``), so when it exits without a terminal board call the
-    reason is usually sitting there: the model's own explanation of why it could
-    not comply (#88603), or the rendered provider error (#46593). The reap used to
-    discard it in favour of a canned message on every retry. Trims the CLI exit
-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
-    on a missing/empty log.
-
-    ``board`` must come from the dispatching tick: ambient current-board resolution
-    is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_exit_summary_marker())
-    if cut != -1:
-        raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
-
-
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1064,12 +1017,14 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_restart: bool = False
+    """The profile owner stopped or restarted under the attempt: re-queued, never charged."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        return "rate_limited" if self.rate_limited else "reclaimed" if self.owner_restart else "crashed"
 
 
 def _classify_dead_worker(
@@ -1135,6 +1090,12 @@ def _classify_dead_worker_exit(
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
+        )
+    if kind == "owner_restart":
+        return _DeadWorker(
+            kind, code, f"pid {pid} ended when its profile owner stopped or restarted — requeued without "
+            "counting a failure", "reclaimed", {"pid": pid, "claimer": claimer, "exit_code": code, "owner_restart": True},
+            owner_restart=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -1247,7 +1208,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
-            else:
+            elif not dead.owner_restart:  # the host's restart, not the card's: never charged
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
@@ -2930,3 +2891,4 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli.kanban_worker_log import _worker_final_output
