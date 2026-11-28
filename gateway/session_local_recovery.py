@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 from gateway.config import Platform
@@ -496,10 +497,14 @@ def reset_local_session(store, old_entry, session_id, now, display_name):
 # The receipts boot restores: an open row (or one compressed away, for its catch-up), unsettled input
 # or a stored close. An ended session keeps its receipt and stays resumable; ``authorize`` restores it
 # on first touch, so the live registry no longer grows with every session ever opened (#143547 LC-36).
+_BOOT_RECEIPTS_INDEX = 'idx_state_meta_local_policy_route'
+# The literal GLOB is the partial index's own predicate: a bound LIKE cannot imply it, so the planner
+# scanned every state_meta row and json-parsed each receipt (4.5 GB, ~8 min a call, 3 calls a boot).
+# The covering index already carries each receipt's parsed session id, so no receipt JSON is read.
 _BOOT_RECEIPTS_SQL = (
-    "SELECT m.key FROM state_meta m LEFT JOIN sessions s "
+    f"SELECT m.key FROM state_meta m INDEXED BY {_BOOT_RECEIPTS_INDEX} LEFT JOIN sessions s "
     "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
-    "WHERE m.key LIKE ? AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
+    f"WHERE m.key GLOB '{POLICY_PREFIX}*' AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
     "OR EXISTS (SELECT 1 FROM session_admissions a WHERE a.target_session_id = substr(m.key, ?) "
     "AND a.status IN ('queued','started','unknown')) "
     "OR EXISTS (SELECT 1 FROM state_meta c WHERE c.key = ? || substr(m.key, ?)))")
@@ -564,9 +569,16 @@ def release_handed_off_receipts(db, *, epoch):
 def local_receipt_ids(authority):
     from gateway.session_viewer_close import CLOSE_PREFIX
     start = len(POLICY_PREFIX) + 1
+    params = (start, CLOSE_PREFIX, start)
     with authority.db._read_ctx() as conn:
-        return [row[0][len(POLICY_PREFIX):] for row in conn.execute(
-            _BOOT_RECEIPTS_SQL, (POLICY_PREFIX + '%', start, CLOSE_PREFIX, start))]
+        try:
+            rows = conn.execute(_BOOT_RECEIPTS_SQL, params).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Stores created before the index still answer correctly, only slower.
+            if _BOOT_RECEIPTS_INDEX not in str(exc) and 'no query solution' not in str(exc):
+                raise
+            rows = conn.execute(_BOOT_RECEIPTS_SQL.replace(f' INDEXED BY {_BOOT_RECEIPTS_INDEX}', ''), params).fetchall()
+    return [row[0][len(POLICY_PREFIX):] for row in rows]
 
 
 def recover_local_sessions(authority, *, schedule=False):
